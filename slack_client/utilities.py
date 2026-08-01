@@ -4,7 +4,7 @@ import aiohttp
 import logging
 import re
 import time
-from typing import Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional
 
 from slack_sdk.errors import SlackApiError
 
@@ -111,6 +111,13 @@ def strip_citations(text: str) -> str:
     cleaned_text = re.sub(r' {2,}', ' ', cleaned_text)
 
     return cleaned_text
+
+
+# THE ONE DEFINITION OF THE REMOTE-LOOKUP BUDGET. It lives here, beside the resolver that
+# spends it, because a second literal in a caller would be two definitions of one budget — and
+# the day someone raised the cap, a caller computing "the remainder" would hand out lookups the
+# resolver would not honour.
+ACTOR_REMOTE_LOOKUP_DEFAULT = 25
 
 
 class SlackUtilitiesMixin:
@@ -315,7 +322,9 @@ class SlackUtilitiesMixin:
         return user_id  # Fallback to user ID if fetch fails
 
     async def resolve_usernames(
-        self, user_ids: Iterable[str], api_client, max_remote_lookups: int = 25
+        self, user_ids: Iterable[str], api_client,
+        max_remote_lookups: int = ACTOR_REMOTE_LOOKUP_DEFAULT,
+        stats: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, str]:
         """BF2: batched, request-scoped, READ-ONLY display-name resolver.
 
@@ -331,7 +340,20 @@ class SlackUtilitiesMixin:
         deduped first; failures are negative-cached for this call; ids past the budget stay
         raw. So a cold rebuild of an old thread can't fan out into hundreds of sequential
         lookups or delay the turn, and a successful fetch is kept in the memory cache only.
+
+        `stats`, when given, is FILLED IN PLACE with what this call actually spent:
+        ``budget`` (the cap it was given), ``remote_lookups`` (users.info calls made) and
+        ``attempted_ids`` (every id it TRIED to resolve, resolved or not). A caller that must
+        split one remote budget across two resolutions — the shallow window's periphery and
+        origin phases — cannot compute the remainder any other way, and an id this call
+        attempted and failed must never be retried by the second, or one block's rendering of an
+        actor would depend on which of them ran.
+
+        THE CALLER SEEDS IT (never this method): the keys are read back unconditionally, and a
+        legal path here returns without reaching the remote pass at all.
         """
+        if stats is not None:
+            stats["budget"] = int(max_remote_lookups)
         cache = self.user_cache  # created by the client; get_username assumes it too
 
         resolved: Dict[str, str] = {}
@@ -384,6 +406,9 @@ class SlackUtilitiesMixin:
                 if uid in failed:
                     continue
                 budget -= 1
+                if stats is not None:
+                    stats["remote_lookups"] = int(stats.get("remote_lookups", 0)) + 1
+                    stats.setdefault("attempted_ids", set()).add(uid)
                 try:
                     result = await api_client.users_info(user=uid)
                 except Exception as e:

@@ -22,6 +22,14 @@ channel schema — as about what it now does.
 """
 from __future__ import annotations
 
+import pytest
+
+import prompts
+from config import config
+
+from message_processor.utilities import (SURFACE_CHANNEL,
+                                        local_tools_guidance_for,
+                                        reach_tools_for)
 from prompts import (CHANNEL_ACTIVITY_NO_REPLY_SUFFIX, CHANNEL_CROSS_THREAD_CONDUCT_SUFFIX,
                      CHANNEL_LOCAL_TOOLS_GUIDANCE, CHANNEL_POST_TO_THREAD_DESCRIPTION,
                      CHANNEL_POST_TO_THREAD_TARGET_DESCRIPTION, DESTINATION_CONTRACT_SUFFIX,
@@ -671,3 +679,188 @@ def test_the_gate_reads_exactly_what_it_read_before():
                                  "scope": "channel"}])
     assert snapshot.gate_text == snapshot.text
     assert "Only reply when tagged." in snapshot.gate_text
+
+
+# ================================================= the window guidance (§2i, Appendix A6)
+#
+# A shallow window is only safe if the model knows it is looking at one. The bytes declare the
+# edges; these words are what the model is told to DO about them — and every requirement here is
+# channel-stable, so all of it rides the cached pre-breakpoint instructions and costs nothing per
+# turn.
+
+REACH_SUBSETS = [
+    (),
+    ("search_slack",),
+    ("fetch_channel_history", "fetch_thread_messages"),
+    ("search_slack", "fetch_channel_history", "fetch_thread_messages"),
+]
+
+
+def test_the_verification_rule_states_both_halves():
+    """T60. The two halves do DIFFERENT jobs and a prompt carrying only the first is not
+    compliant.
+
+    The first stops a confident wrong quote. The second stops the far more likely failure — "I
+    don't see any discussion of X here" said about a channel that discussed X at length last
+    week, which is a false statement about the world delivered in the voice of someone who
+    checked. Grepping for one and calling it done is exactly how the half that matters gets
+    dropped in a later edit, which is why both are asserted separately.
+    """
+    for reach in REACH_SUBSETS:
+        text = prompts.render_window_guidance(reach)
+        assert "be able to point at the message that says it" in text, reach
+        assert "never evidence that it did not happen" in text, reach
+        assert "a claim about your view, not about the room" in text, reach
+
+
+def test_the_middle_sentence_needs_a_tool_to_be_honest():
+    """The go-and-read sentence is omitted when there is nothing to read WITH. Instructing the
+    model to reach for a tool it does not have is worse than naming none: it then reports a
+    failed tool call as an answer."""
+    assert prompts.WINDOW_GUIDANCE_VERIFY_FETCH in prompts.render_window_guidance(
+        ("search_slack",))
+    assert prompts.WINDOW_GUIDANCE_VERIFY_FETCH not in prompts.render_window_guidance(())
+    # …but the two halves that need no tool still ride.
+    empty = prompts.render_window_guidance(())
+    assert prompts.WINDOW_GUIDANCE_VERIFY_HEAD in empty
+    assert prompts.WINDOW_GUIDANCE_VERIFY_TAIL in empty
+
+
+@pytest.mark.parametrize("reach", REACH_SUBSETS)
+def test_the_channel_guidance_is_derived_plus_rendered_window_text(reach):
+    """T61. The tripwire, EXTENDED to the composition: channel guidance is (the DM text minus
+    exactly one bullet) PLUS the rendered window text, byte for byte, for every reach subset.
+
+    There is no static `CHANNEL_WINDOW_GUIDANCE` string to append — a test asserting one fails by
+    construction, which is the point: the words and the interpolation arrive together, so there
+    is no empty-constant no-op state to land the plumbing behind.
+    """
+    assert not hasattr(prompts, "CHANNEL_WINDOW_GUIDANCE")
+    composed = local_tools_guidance_for(SURFACE_CHANNEL, reach)
+    assert composed == (CHANNEL_LOCAL_TOOLS_GUIDANCE + "\n\n"
+                        + prompts.render_window_guidance(reach))
+    # The derived constant itself is UNCHANGED by the composition.
+    assert CHANNEL_LOCAL_TOOLS_GUIDANCE in composed
+    assert "post_to_thread" not in CHANNEL_LOCAL_TOOLS_GUIDANCE
+
+
+def test_the_dm_surface_gains_nothing():
+    """RULING-8. A DM has no window and no periphery; adding window guidance there would change
+    DM bytes for no reason. The default argument exists so the signature stays call-compatible,
+    not so the DM branch renders anything new."""
+    assert local_tools_guidance_for("dm") == LOCAL_TOOLS_GUIDANCE
+    assert local_tools_guidance_for("dm", ()) == LOCAL_TOOLS_GUIDANCE
+    assert "window, not the whole room" not in local_tools_guidance_for("dm")
+
+
+@pytest.mark.parametrize("search_on,history_on,expected", [
+    (True, True, ("search_slack", "fetch_channel_history", "fetch_thread_messages")),
+    (True, False, ("search_slack",)),
+    (False, True, ("fetch_channel_history", "fetch_thread_messages")),
+    (False, False, ()),
+])
+def test_the_named_reach_tools_are_the_exposed_ones(monkeypatch, search_on, history_on,
+                                                    expected):
+    """T62. The names are DERIVED from the same global switches the registry reads, never
+    hard-coded: both default true but both can be off, and a hard-coded list would promise a tool
+    the model cannot call.
+
+    With NONE exposed, the reach paragraph and the search-or-fetch clause are both ABSENT.
+    """
+    monkeypatch.setattr(config, "enable_search_tool", search_on, raising=False)
+    monkeypatch.setattr(config, "enable_history_tools", history_on, raising=False)
+    assert reach_tools_for() == expected
+
+    text = prompts.render_window_guidance(reach_tools_for())
+    for name in ("search_slack", "fetch_channel_history", "fetch_thread_messages"):
+        assert (name in text) is (name in expected), name
+    if not expected:
+        assert "To see past the window" not in text
+        assert prompts.WINDOW_GUIDANCE_VERIFY_FETCH not in text
+    else:
+        assert "To see past the window" in text
+
+
+def test_the_reach_list_renders_in_a_fixed_order_whatever_the_caller_passed():
+    """The rendered order is REACH_TOOLS', not the caller's. Two callers with the same set must
+    produce the same cached bytes, or the prefix forks on argument order alone."""
+    forward = prompts.render_window_guidance(
+        ("search_slack", "fetch_channel_history", "fetch_thread_messages"))
+    backward = prompts.render_window_guidance(
+        ("fetch_thread_messages", "fetch_channel_history", "search_slack"))
+    assert forward == backward
+    body = forward.split("To see past the window: ")[1]
+    assert body.index("search_slack") < body.index("fetch_channel_history")
+    assert body.index("fetch_channel_history") < body.index("fetch_thread_messages")
+
+
+def test_every_tool_the_prompt_names_is_callable(monkeypatch):
+    """T63. For each configuration, every reach name the guidance renders is a name the same
+    attempt's schema set actually contains. "The names exist" could not prove this — the point is
+    that the name and the SCHEMA agree, and they are decided by two different modules."""
+    from slack_client.history_tool import SlackHistoryToolMixin
+
+    class _Host(SlackHistoryToolMixin):
+        """The narrowest host the schema builder needs — the REAL method, not a copy of it."""
+        bot_user_id = "UBOT"
+
+    host = _Host()
+
+    for search_on, history_on in ((True, True), (True, False), (False, True), (False, False)):
+        monkeypatch.setattr(config, "enable_search_tool", search_on, raising=False)
+        monkeypatch.setattr(config, "enable_history_tools", history_on, raising=False)
+
+        # The registry's own two sources: `slack_client/base.py` guards the search schema on
+        # enable_search_tool, and registers whatever get_history_tools_for_openai returns.
+        exposed = set()
+        if config.enable_search_tool:
+            exposed.add("search_slack")
+        exposed.update(schema["name"] for schema in host.get_history_tools_for_openai()
+                       if isinstance(schema, dict) and schema.get("name"))
+
+        named = reach_tools_for()
+        assert set(named) <= exposed, (
+            f"the prompt names {set(named) - exposed} which the registry does not expose "
+            f"(search={search_on}, history={history_on})")
+        rendered = prompts.render_window_guidance(named)
+        for name in ("search_slack", "fetch_channel_history", "fetch_thread_messages"):
+            if name in rendered:
+                assert name in exposed, f"{name} is named in the prompt but not exposed"
+
+        # AND THROUGH THE COMPOSED INSTRUCTIONS, which is the text the model actually reads.
+        # Asserting only on `render_window_guidance(reach_tools_for())` proves the helper agrees
+        # with itself: the call site is free to pass nothing and silently take the full default,
+        # which is exactly the defect this half exists to catch — the guidance promised all three
+        # tools with both switches off, and no test noticed.
+        composed = local_tools_guidance_for(SURFACE_CHANNEL, reach_tools_for())
+        # SCOPED TO THE WINDOW SEGMENT, deliberately. The base etiquette block names the same
+        # tools in CONDITIONAL phrasing ("When search_slack is available…"), which is honest
+        # whatever the switches say, and T61 pins that text byte-for-byte as the DM text minus
+        # one bullet. The window guidance is the half that makes an UNCONDITIONAL promise —
+        # "To see past the window: <tool> does X" — so it is the half that must be derived.
+        window_segment = composed[len(CHANNEL_LOCAL_TOOLS_GUIDANCE):]
+        for name in ("search_slack", "fetch_channel_history", "fetch_thread_messages"):
+            if name in window_segment:
+                assert name in exposed, (
+                    f"the composed window guidance names {name}, which the registry does not "
+                    f"expose (search={search_on}, history={history_on})")
+        if not exposed:
+            assert "To see past the window" not in window_segment
+
+
+def test_the_system_prompt_passes_the_derived_reach_tools(monkeypatch):
+    """The CALL SITE, not the helper. `_get_system_prompt` builds the channel instructions, and
+    it must hand the materializer the DERIVED tuple rather than letting the default ride.
+
+    Read at the source because the composition above cannot see which argument its caller used:
+    with both switches on, the derived tuple and the default are the same value, so a call site
+    that passes nothing is indistinguishable from a correct one in every assertion but this.
+    """
+    import inspect
+
+    from message_processor.utilities import MessageUtilitiesMixin
+
+    source = inspect.getsource(MessageUtilitiesMixin._get_system_prompt)
+    assert "local_tools_guidance_for(tool_surface, reach_tools_for())" in source, (
+        "the system prompt must pass the derived reach tuple; passing only the surface takes "
+        "the full default and promises tools the registry may not expose")

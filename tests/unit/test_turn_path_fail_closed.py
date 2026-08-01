@@ -69,7 +69,7 @@ def _db():
     db.advance_channel_coverage_async = AsyncMock(return_value=True)
     db.get_channel_coverage_async = AsyncMock(return_value={
         "bootstrap_status": "running", "sweep_token": "tok",
-        "coverage_start_ts": f"{_NOW:.6f}"})
+        "inventory_start_ts": f"{_NOW:.6f}"})
     return db
 
 
@@ -425,3 +425,98 @@ async def test_an_unbudgeted_fetch_is_not_wrapped_in_a_timeout():
 
     page = await fetch_page(method, {"channel": CH}, attempts=1)
     assert page.messages == []
+
+
+# ------------------------------- W1: what the coordinator's removal must NOT have taken with it
+
+async def test_the_frontier_drain_survives_the_coordinator_removal():
+    """T4. The drain sat INSIDE the `if coordinator is not None` block that W1 deleted, so the
+    obvious excision would have taken it too.
+
+    It is not a compaction step. It is P1's ordering guarantee: every index ticket at or below
+    this turn's frontier has landed before anything else touches the channel's state, so a
+    thread whose reply is still being written cannot be missing from the window the turn is
+    about to render.
+
+    ITS HOME MOVED, AND THE GUARANTEE DID NOT — so this drives the REAL `prepare_channel_turn`
+    and watches a RECORDING DB. The ordering that matters is drain-before-READ-1: a drain that
+    merely happens, or one that happens after the anchor read, would satisfy a call-count check
+    while pinning the window against an index that had not caught up.
+    """
+    from message_processor import channel_stream as cs
+
+    order = []
+
+    async def _drain(channel_id, frontier, timeout=None):
+        order.append(("drain", channel_id, frontier))
+
+    class _RecordingDB:
+        async def read_channel_window_anchor_async(self, team_id, channel_id):
+            order.append(("read_1", channel_id))
+            return {"anchor": None, "inventory": None}
+
+    client = SimpleNamespace(self_team_id=TEAM, tool_registry=None)
+    saved_drain = cs.admission_watermark.drain
+    cs.admission_watermark.drain = _drain
+    try:
+        prepared = await cs.prepare_channel_turn(
+            client=client, db=_RecordingDB(), team_id=TEAM, channel_id=CH, h="9.0", frontier=41)
+    finally:
+        cs.admission_watermark.drain = saved_drain
+
+    # THE DRAIN COMES FIRST, with THIS turn's frontier, and READ 1 follows it. Moving the drain
+    # below the anchor read leaves the call count identical and fails exactly this line.
+    assert order == [("drain", CH, 41), ("read_1", CH)], order
+    assert prepared.frontier == 41
+
+
+def test_the_drain_call_is_not_inside_a_removed_conditional():
+    """T4's mutation check, at the source. The behavioural test above passes if the ordering
+    holds; this one fails if the call is ever put back behind a guard that a later removal could
+    take with it — which is precisely how it nearly disappeared."""
+    import inspect
+
+    from message_processor import channel_stream as cs
+    from message_processor.base import MessageProcessor
+
+    # Checked where the drain LIVES. The turn path no longer holds one, so reading that function
+    # for indentation would be reading an empty room.
+    assert "admission_watermark.drain(" not in inspect.getsource(
+        MessageProcessor._build_channel_turn_stream)
+
+    src = inspect.getsource(cs.prepare_channel_turn)
+    lines = src.splitlines()
+    drain_line = next(i for i, line in enumerate(lines)
+                      if "admission_watermark.drain(" in line)
+    indent = len(lines[drain_line]) - len(lines[drain_line].lstrip())
+    assert indent == 4, f"the drain is nested {indent} spaces deep; it must be unconditional"
+    # …and it PRECEDES the anchor read in the source too, so the ordering the behavioural test
+    # measures stays pinned even if that test is ever weakened.
+    read_line = next(i for i, line in enumerate(lines)
+                     if "read_channel_window_anchor_async(" in line)
+    assert drain_line < read_line, "the drain must precede READ 1"
+
+
+async def test_the_turn_path_drains_exactly_once_through_the_prepare_phase():
+    """#9. The drain belongs to `prepare_channel_turn` ALONE.
+
+    The turn path used to drain before calling the builder, which then drained again. Two waits
+    on one watermark, and two places the turn could fail, for an ordering guarantee the
+    split-phase build already makes structural — there is no code path from the composer to a
+    fetch that does not first await the prepare phase.
+
+    Read at the SOURCE as well as counted: with a fast watermark both shapes behave identically,
+    so a behavioural assertion alone would pass against the duplicate.
+    """
+    import inspect
+
+    from message_processor.base import MessageProcessor
+
+    source = inspect.getsource(MessageProcessor._build_channel_turn_stream)
+    assert "admission_watermark.drain(" not in source, (
+        "the turn path must not drain; prepare_channel_turn owns it")
+
+    from message_processor import channel_stream as cs
+    prepare = inspect.getsource(cs.prepare_channel_turn)
+    assert "admission_watermark.drain(" in prepare, (
+        "the prepare phase is the ONE owner of the drain")

@@ -189,7 +189,7 @@ async def test_seed_is_write_once(temp_db):
     assert await temp_db.seed_channel_coverage_async(TEAM, CH, "1000.0")
     assert not await temp_db.seed_channel_coverage_async(TEAM, CH, "500.0")
     row = await temp_db.get_channel_coverage_async(TEAM, CH)
-    assert row["coverage_start_ts"] == "1000.0"
+    assert row["inventory_start_ts"] == "1000.0"
     assert row["bootstrap_status"] == "pending"
 
 
@@ -237,7 +237,7 @@ async def test_advance_is_token_guarded(temp_db):
     await temp_db.acquire_coverage_sweep_async(TEAM, CH, "tok-a")
     assert not await temp_db.advance_channel_coverage_async(
         TEAM, CH, "tok-b", "900.0", "running")
-    assert (await temp_db.get_channel_coverage_async(TEAM, CH))["coverage_start_ts"] == "1000.0"
+    assert (await temp_db.get_channel_coverage_async(TEAM, CH))["inventory_start_ts"] == "1000.0"
 
 
 async def test_coverage_start_only_moves_backward(temp_db):
@@ -245,11 +245,11 @@ async def test_coverage_start_only_moves_backward(temp_db):
     await temp_db.acquire_coverage_sweep_async(TEAM, CH, "tok-a")
     assert await temp_db.advance_channel_coverage_async(
         TEAM, CH, "tok-a", "999.999900", "running")
-    assert (await temp_db.get_channel_coverage_async(TEAM, CH))["coverage_start_ts"] == "999.999900"
+    assert (await temp_db.get_channel_coverage_async(TEAM, CH))["inventory_start_ts"] == "999.999900"
     # A forward ts would shrink the declared horizon — refused silently, claim intact.
     assert await temp_db.advance_channel_coverage_async(
         TEAM, CH, "tok-a", "1000.000100", "running")
-    assert (await temp_db.get_channel_coverage_async(TEAM, CH))["coverage_start_ts"] == "999.999900"
+    assert (await temp_db.get_channel_coverage_async(TEAM, CH))["inventory_start_ts"] == "999.999900"
 
 
 async def test_advance_without_a_new_start_just_sets_status(temp_db):
@@ -258,7 +258,7 @@ async def test_advance_without_a_new_start_just_sets_status(temp_db):
     await temp_db.advance_channel_coverage_async(TEAM, CH, "tok-a", None, "limited",
                                                  "retention")
     row = await temp_db.get_channel_coverage_async(TEAM, CH)
-    assert (row["coverage_start_ts"], row["bootstrap_status"], row["coverage_reason"]) == (
+    assert (row["inventory_start_ts"], row["bootstrap_status"], row["inventory_reason"]) == (
         "1000.0", "limited", "retention")
 
 
@@ -273,9 +273,9 @@ async def test_terminal_states_stick_against_a_later_running(temp_db, terminal, 
     await temp_db.advance_channel_coverage_async(TEAM, CH, "tok-a", "900.0", terminal, reason)
     await temp_db.advance_channel_coverage_async(TEAM, CH, "tok-a", "800.0", "running", "tick")
     row = await temp_db.get_channel_coverage_async(TEAM, CH)
-    assert (row["bootstrap_status"], row["coverage_reason"]) == (terminal, reason)
+    assert (row["bootstrap_status"], row["inventory_reason"]) == (terminal, reason)
     # Coverage itself still extended — the horizon is honest even after the status settles.
-    assert row["coverage_start_ts"] == "800.0"
+    assert row["inventory_start_ts"] == "800.0"
 
 
 async def test_ceiling_pause_keeps_the_row_running(temp_db):
@@ -307,10 +307,10 @@ async def test_reset_reclaims_an_unavailable_channel(temp_db):
     assert await temp_db.reset_channel_coverage_async(TEAM, CH)
 
     row = await temp_db.get_channel_coverage_async(TEAM, CH)
-    assert (row["bootstrap_status"], row["coverage_reason"], row["sweep_token"],
+    assert (row["bootstrap_status"], row["inventory_reason"], row["sweep_token"],
             row["heartbeat_ts"]) == ("pending", None, None, None)
     # The horizon already walked is not thrown away — the reclaimed sweep resumes from it.
-    assert row["coverage_start_ts"] == "900.0"
+    assert row["inventory_start_ts"] == "900.0"
     # And a fresh worker can now claim it, which the terminal row refused.
     assert await temp_db.acquire_coverage_sweep_async(TEAM, CH, "tok-b")
 
@@ -330,7 +330,7 @@ async def test_reset_refuses_a_genuinely_finished_channel(temp_db, terminal, rea
     assert not await temp_db.reset_channel_coverage_async(TEAM, CH)
 
     row = await temp_db.get_channel_coverage_async(TEAM, CH)
-    assert (row["bootstrap_status"], row["coverage_reason"]) == (terminal, reason)
+    assert (row["bootstrap_status"], row["inventory_reason"]) == (terminal, reason)
     assert row["sweep_token"] == "tok-a"
 
 
@@ -353,3 +353,166 @@ async def test_reset_is_scoped_and_tolerates_a_missing_row(temp_db):
     assert not await temp_db.reset_channel_coverage_async("T_OTHER", CH)
     assert not await temp_db.reset_channel_coverage_async(TEAM, "C_NONE")
     assert (await temp_db.get_channel_coverage_async(TEAM, CH))["bootstrap_status"] == "limited"
+
+
+# ------------------------------------------------------- the inventory rename (respec §3.5)
+
+def test_the_coverage_rename_migrates_a_populated_table(tmp_path):
+    """T9. The sweep now builds a ROOT INVENTORY, not a coverage floor, and SQLite cannot rename
+    a column on the versions this database must still open — so it is a table rebuild, on a file
+    that already has rows in it. Every row has to come through with its values intact, and the
+    sweep's own accessors have to be able to read what comes out the other side.
+    """
+    import sqlite3
+
+    from database import _COVERAGE_RENAME_KEY, DatabaseManager
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(str(path), isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE bot_meta (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("""
+        CREATE TABLE channel_coverage (
+            team_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            coverage_start_ts TEXT NOT NULL,
+            bootstrap_status TEXT NOT NULL
+                CHECK (bootstrap_status IN ('pending', 'running', 'complete', 'limited')),
+            coverage_reason TEXT,
+            sweep_token TEXT,
+            heartbeat_ts TIMESTAMP,
+            updated_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (team_id, channel_id)
+        )
+    """)
+    rows = [
+        ("T1", "C1", "1000.000100", "complete", "genesis", None, None),
+        ("T1", "C2", "2000.000200", "limited", "retention", "tok-2", "2026-07-30 10:00:00"),
+        ("T1", "C3", "3000.000300", "running", None, "tok-3", "2026-07-30 11:00:00"),
+    ]
+    for row in rows:
+        conn.execute("INSERT INTO channel_coverage (team_id, channel_id, coverage_start_ts, "
+                     "bootstrap_status, coverage_reason, sweep_token, heartbeat_ts) "
+                     "VALUES (?,?,?,?,?,?,?)", row)
+
+    class _Conn:
+        """A pass-through whose `execute` can be intercepted — `sqlite3.Connection.execute` is
+        read-only, so failing one statement means wrapping rather than patching."""
+
+        def __init__(self, inner):
+            self._conn = inner
+            self.on_execute = None
+
+        def execute(self, sql, *args):
+            if self.on_execute is not None:
+                self.on_execute(sql)
+            return self._conn.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    manager = DatabaseManager.__new__(DatabaseManager)
+    manager.conn = _Conn(conn)
+    try:
+        # FIRST: a failure between the rebuild steps must roll BOTH the table and the marker
+        # back. A rename that committed a marker over a rolled-back table would skip the retry
+        # that fixes it, and the sweep would read columns that are not there.
+        def _fail_on_drop(sql):
+            if str(sql).startswith("DROP TABLE channel_coverage"):
+                raise sqlite3.OperationalError("disk I/O error")
+
+        manager.conn.on_execute = _fail_on_drop
+        with pytest.raises(sqlite3.OperationalError):
+            manager._migrate_coverage_to_inventory()
+        manager.conn.on_execute = None
+
+        assert manager.get_meta(_COVERAGE_RENAME_KEY) is None, "a marker outlived a rollback"
+        surviving = [r["name"] for r in conn.execute("PRAGMA table_info(channel_coverage)")]
+        assert "coverage_start_ts" in surviving, "a half-rebuilt table was committed"
+        assert len(list(conn.execute("SELECT * FROM channel_coverage"))) == 3
+        assert not list(conn.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'channel_coverage_new'"))
+
+        # THEN the retry, which must complete cleanly on the same file.
+        manager._migrate_coverage_to_inventory()
+
+        columns = [r["name"] for r in conn.execute("PRAGMA table_info(channel_coverage)")]
+        assert "inventory_start_ts" in columns and "inventory_reason" in columns
+        assert "coverage_start_ts" not in columns and "coverage_reason" not in columns
+
+        # EVERY row, with EVERY value, including the NULLs that distinguish a reason we never
+        # recorded from one we did.
+        migrated = {r["channel_id"]: dict(r) for r in
+                    conn.execute("SELECT * FROM channel_coverage")}
+        assert len(migrated) == 3
+        for team, channel, start, status, reason, token, heartbeat in rows:
+            got = migrated[channel]
+            assert (got["team_id"], got["inventory_start_ts"]) == (team, start)
+            assert (got["bootstrap_status"], got["inventory_reason"]) == (status, reason)
+            assert (got["sweep_token"], got["heartbeat_ts"]) == (token, heartbeat)
+
+        # The CHECK constraint has to survive the rebuild, or the status column stops being a
+        # closed vocabulary the moment it is rewritten.
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO channel_coverage (team_id, channel_id, "
+                         "inventory_start_ts, bootstrap_status) VALUES ('T1','C9','1.0','done')")
+
+        assert manager.get_meta(_COVERAGE_RENAME_KEY)
+        # Idempotent: a second run finds the new column and does nothing.
+        manager._migrate_coverage_to_inventory()
+        assert len(list(conn.execute("SELECT * FROM channel_coverage"))) == 3
+
+        # The sweep's OWN accessors, against THIS migrated file — not a fresh database, which
+        # would only prove the new DDL works and never that the rebuilt rows are readable.
+        import asyncio
+
+        async def _read_back():
+            manager.db_path = str(path)
+            row = await manager.get_channel_coverage_async("T1", "C2")
+            assert row["inventory_start_ts"] == "2000.000200"
+            assert (row["bootstrap_status"], row["inventory_reason"]) == ("limited", "retention")
+            assert await manager.advance_channel_coverage_async(
+                "T1", "C3", "tok-3", "2500.000100", "complete", "genesis")
+            advanced = await manager.get_channel_coverage_async("T1", "C3")
+            assert advanced["inventory_start_ts"] == "2500.000100"
+            assert advanced["inventory_reason"] == "genesis"
+
+        asyncio.run(_read_back())
+    finally:
+        conn.close()
+
+
+async def test_the_sweeps_own_accessors_read_the_renamed_columns(temp_db):
+    """The other half of T9: a rename nothing can read is a rename that broke the sweep."""
+    await temp_db.seed_channel_coverage_async(TEAM, CH, "1000.000100")
+    assert await temp_db.acquire_coverage_sweep_async(TEAM, CH, "tok")
+    assert await temp_db.advance_channel_coverage_async(
+        TEAM, CH, "tok", "500.000100", "limited", "depth_config")
+    row = await temp_db.get_channel_coverage_async(TEAM, CH)
+    assert row["inventory_start_ts"] == "500.000100"
+    assert (row["bootstrap_status"], row["inventory_reason"]) == ("limited", "depth_config")
+
+
+async def test_compare_and_delete_removes_a_dead_root_only_while_its_pin_holds(temp_db):
+    """W2-LIVE-2's cleanup accessor, against real SQLite.
+
+    The compare is on `COALESCE(last_index_event_ts, last_observed_reply_ts)` — the value READ 1
+    pins — not on `last_index_event_ts` alone, which compare-and-clear uses and which would skip
+    a row whose only timestamp is a reply observation.
+    """
+    team, channel = "T1", "C1"
+
+    # A row whose only timestamp is a REPLY observation: the COALESCE case that a
+    # last_index_event_ts-only compare would miss entirely.
+    await temp_db.record_thread_activity_async(team, channel, "10.0", reply_ts="20.0")
+    assert await temp_db.delete_thread_activity_if_unchanged_async(
+        team, channel, "10.0", if_event_ts_equals="19.0") is False, "a moved pin retains the row"
+    assert await temp_db.delete_thread_activity_if_unchanged_async(
+        team, channel, "10.0", if_event_ts_equals="20.0") is True
+    assert [r["root_ts"] for r in await temp_db.get_thread_activity_async(team, channel)] == []
+
+    # And the bootstrap hint with no timestamp at all deletes against an explicit None.
+    await temp_db.record_thread_activity_async(team, channel, "11.0", reply_count=3)
+    assert await temp_db.delete_thread_activity_if_unchanged_async(
+        team, channel, "11.0", if_event_ts_equals=None) is True
+    assert [r["root_ts"] for r in await temp_db.get_thread_activity_async(team, channel)] == []

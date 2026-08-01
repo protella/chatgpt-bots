@@ -406,6 +406,72 @@ CHANNEL_LOCAL_TOOLS_GUIDANCE = "\n".join(
     line for line in LOCAL_TOOLS_GUIDANCE.split("\n")
     if not line.startswith("- post_to_thread:"))
 
+# ---------------------------------------------------------------- the window guidance (§2i, A6)
+#
+# THESE ARE PARTS, NOT A FINISHED STRING. A shallow window is only safe if the model knows it is
+# looking at one, and what it must be told depends on which reach tools the turn actually has:
+# naming a tool the model cannot call is worse than naming none, because it then reports a failed
+# tool call as an answer. So the parts are assembled per call by `render_window_guidance`, and
+# there is deliberately NO `CHANNEL_WINDOW_GUIDANCE` constant holding a finished string.
+WINDOW_GUIDANCE_WINDOW = (
+    "What you can see of this channel is a window, not the whole room. The stream above holds "
+    "the most recent conversations and their replies, starting at the point the horizon line "
+    "names. Older messages exist. A thread whose first message is older than the window will "
+    "say so where its replies appear."
+)
+
+WINDOW_GUIDANCE_REACH = "To see past the window: {reach_list}."
+
+# Keyed by tool name; rendered in REACH_TOOLS order and joined with "; ".
+WINDOW_GUIDANCE_REACH_CLAUSES = {
+    "search_slack": "search_slack finds messages anywhere in this workspace by their content",
+    "fetch_channel_history": "fetch_channel_history reads further back in a channel",
+    "fetch_thread_messages": ("fetch_thread_messages reads a whole thread, including one whose "
+                              "start is out of view"),
+}
+
+# THE LOAD-BEARING PART. The head stops a confident wrong quote; the TAIL stops the far more
+# likely failure — "I don't see any discussion of X here" said about a channel that discussed X
+# at length last week, which is a false statement about the world delivered in the voice of
+# someone who checked. Both halves ride ALWAYS; only the middle depends on having a tool.
+WINDOW_GUIDANCE_VERIFY_HEAD = (
+    "Before you state what this channel said, decided or agreed, be able to point at the "
+    "message that says it."
+)
+WINDOW_GUIDANCE_VERIFY_FETCH = (
+    "If it is not in front of you, go and read it first rather than answering from memory or "
+    "inference."
+)
+WINDOW_GUIDANCE_VERIFY_TAIL = (
+    "Not seeing something here is never evidence that it did not happen — this channel almost "
+    "certainly contains more than you were shown, and saying \"there is no discussion of that\" "
+    "about a window is a claim about your view, not about the room."
+)
+
+# The order the reach list is rendered in, independent of how a caller ordered its tuple.
+REACH_TOOLS = ("search_slack", "fetch_channel_history", "fetch_thread_messages")
+
+
+def render_window_guidance(reach_tools=REACH_TOOLS) -> str:
+    """The §2i window guidance for one reach-tool tuple. A PURE FUNCTION of the tuple.
+
+    Part 1 always; part 2 only when the tuple is non-empty; part 3 always, with its middle
+    sentence omitted when the tuple is empty — there is then nothing to go and read with, and
+    instructing the model to reach for a tool it does not have is the failure this derivation
+    exists to prevent. Parts are joined by a blank line.
+    """
+    names = tuple(t for t in REACH_TOOLS if t in set(reach_tools or ()))
+    parts = [WINDOW_GUIDANCE_WINDOW]
+    if names:
+        clauses = [WINDOW_GUIDANCE_REACH_CLAUSES[name] for name in names]
+        parts.append(WINDOW_GUIDANCE_REACH.format(reach_list="; ".join(clauses)))
+    verify = [WINDOW_GUIDANCE_VERIFY_HEAD]
+    if names:
+        verify.append(WINDOW_GUIDANCE_VERIFY_FETCH)
+    verify.append(WINDOW_GUIDANCE_VERIFY_TAIL)
+    parts.append(" ".join(verify))
+    return "\n\n".join(parts)
+
 # CROSS-THREAD CONDUCT: a channel-wide, post-breakpoint paragraph carried whenever post_to_thread
 # is exposed on a channel turn — on ADDRESSED turns as well as silence-capable ones. The restraint
 # suffixes above reach only silence-capable turns, and the case this paragraph is about (somebody

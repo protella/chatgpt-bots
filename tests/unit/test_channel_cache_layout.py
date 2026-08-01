@@ -660,3 +660,54 @@ async def test_the_timeout_retry_carries_no_evidence_block_and_advertises_no_too
     assert host._get_system_prompt.call_args.kwargs["tools_available"] is False
     # …and the retry never reuses the turn's pinned exposure, which still has its tools.
     assert turn.channel_prepared is None
+
+
+# ============================== T51 — the cache key, and the four forks (§2c)
+
+def test_the_cache_key_stays_channel_scoped_and_forks_only_four_ways(monkeypatch, mock_env):
+    """T51. The key is the CHANNEL's, and exactly four documented things fork the prefix.
+
+    Inspecting two keys proves nothing on its own — two calls to a pure function of
+    `(team_id, channel_id)` were always going to agree. What makes the claim mean something is
+    DRIVING each of the four documented forks and showing no fifth arises from a channel turn.
+    """
+    from message_processor.channel_request import prompt_cache_key
+    from message_processor.channel_stream import OriginFetch, build_origin_pin, serialize_stream
+    from tests.unit.channel_turn_harness import build_stream, normalized
+
+    # THE KEY IS THE CHANNEL'S, for both origins of one periphery — the T16 shape. Two threads
+    # in one channel share a cache entry; that is the whole point of the stable prefix.
+    assert prompt_cache_key("T1", "C1") == prompt_cache_key("T1", "C1")
+    assert prompt_cache_key("T1", "C1") != prompt_cache_key("T1", "C2")
+    assert prompt_cache_key("T2", "C1") != prompt_cache_key("T1", "C1")
+
+    room = [normalized("1.0", "room chatter"), normalized("2.0", "more", sender_id="U2")]
+    a = build_stream(room, origin_root_ts="10.0",
+                     origin_messages=[normalized("10.0", "thread A")])
+    b = build_stream(room, origin_root_ts="20.0",
+                     origin_messages=[normalized("20.0", "thread B")])
+    # Same channel, two origins: ONE key, and the pre-breakpoint bytes are identical while the
+    # unions differ. A key that varied by origin would give every thread its own cache entry.
+    assert prompt_cache_key("T1", "C1") == prompt_cache_key("T1", "C1")
+    assert a.stream_sha256 == b.stream_sha256
+    assert a.union_sha256 != b.union_sha256
+    assert OriginFetch and build_origin_pin and serialize_stream  # the split-phase API is real
+
+    # THE FOUR FORKS, each DRIVEN rather than described.
+    test_fork_one_the_code_interpreter_container_is_thread_scoped(monkeypatch)
+    test_fork_two_an_mcp_failure_retry_drops_the_failed_server(monkeypatch)
+    test_fork_three_the_timeout_retry_drops_the_local_tools_entirely(mock_env)
+    test_fork_four_the_model_fallback_changes_the_mcp_eligibility(monkeypatch)
+
+    # AND NO FIFTH. Vary the requester, the thread and the per-user prefs — everything a channel
+    # turn can differ by that is NOT one of the four — and the tools array is byte-identical.
+    registry = _registry()
+    host = _tools_host()
+    reference = None
+    for requester, thread in (("U1", "A"), ("U2", "B"), ("U3", "C")):
+        cfg = _channel_config(user_id=requester, container="cntr_same")
+        tools = host._build_tools_array(cfg, "gpt-5.6-sol", registry=registry,
+                                        ci_container="cntr_same", surface=SURFACE_CHANNEL)
+        if reference is None:
+            reference = tools
+        assert tools == reference, f"{requester}/{thread} forked the prefix on its own"

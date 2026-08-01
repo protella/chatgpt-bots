@@ -212,8 +212,10 @@ class MessageProcessor(ThreadManagementMixin,
                     memory_enabled=bool(getattr(config, "enable_channel_memory", True))))
 
             # Step 2. A channel turn CREATES its state and never rebuilds one: the rebuild exists
-            # to reconstruct a transcript from conversations.replies, and the whole channel is
-            # about to be pinned. The state is still needed for what is not a transcript — the
+            # to reconstruct a transcript from conversations.replies, and the room the turn needs
+            # — a shallow recent window plus the complete origin thread — is about to be pinned
+            # by the stream builder instead. The state is still needed for what is not a
+            # transcript — the
             # config overrides, the participants, the root author, the timeout flag.
             #
             # The gate's coalesced cohort is no longer merged into that state either. Every member
@@ -240,10 +242,10 @@ class MessageProcessor(ThreadManagementMixin,
             # Check if this thread had a previous timeout.
             #
             # A CHANNEL turn only DECIDES here; the words wait. The notice is permanent prose, and
-            # posting it before the stream is built and the request admitted meant a coverage,
-            # history, timestamp, snapshot or budget failure could leave "Picking up from here"
-            # standing in the thread with no answer behind it — the turn's only visible output
-            # being a promise it then broke. It is posted below, once those have succeeded (still
+            # posting it before the stream is built and the request admitted meant a history,
+            # origin, timestamp or budget failure could leave "Picking up from here" standing in
+            # the thread with no answer behind it — the turn's only visible output being a promise
+            # it then broke. It is posted below, once those have succeeded (still
             # leased, still receipted). A DM has neither step, so it posts here as it always has.
             prior_timeout_owed = False
             if hasattr(thread_state, 'had_timeout') and thread_state.had_timeout:
@@ -888,10 +890,10 @@ class MessageProcessor(ThreadManagementMixin,
             # FAIL-CLOSED by design: the alternative is answering a room we cannot see, which
             # reads to everyone in it as a bot that has lost the thread of the conversation.
             #
-            # Five distinct conditions, five distinct things worth saying. They differ in what the
-            # user can do — wait, say less, or nothing at all — so a shared "something went wrong"
-            # would withhold the only actionable part. `HistoryFetchError` is caught above, before
-            # this, keeping the DM notice it has always had; its channel sibling
+            # Three distinct conditions, three distinct things worth saying. They differ in what
+            # the user can do — wait, say less, or nothing at all — so a shared "something went
+            # wrong" would withhold the only actionable part. `HistoryFetchError` is caught above,
+            # before this, keeping the DM notice it has always had; its channel sibling
             # `StreamTimestampError` is NOT a Slack failure and must not borrow that notice.
             code, notice = self._channel_stream_failure(e)
             if turn is not None:
@@ -1013,17 +1015,6 @@ class MessageProcessor(ThreadManagementMixin,
                 content=error_message
             )
         finally:
-            # §1m paths 1 and the fixed-headroom revalidation, POST-TURN. Everything this turn
-            # was going to do has happened by now, so a background crawl started here cannot
-            # race the answer it is cleanup for.
-            if channel_turn:
-                try:
-                    await self._post_turn_compaction(
-                        message, turn,
-                        team_id=getattr(client, "self_team_id", None) or "")
-                except Exception as compaction_error:  # noqa: BLE001
-                    self.log_debug(f"Post-turn compaction skipped: {compaction_error}")
-
             # Phase Q drain hook — runs while we STILL HOLD the lock so that (a) no new
             # message can jump ahead of the queued backlog and (b) stragglers arriving
             # during the linger enqueue (lock held) and join the same batch. Must never
@@ -1048,11 +1039,15 @@ class MessageProcessor(ThreadManagementMixin,
         """The error code and the honest user notice for one fail-closed channel condition.
 
         Honest means: say what we cannot do, say whether waiting helps, and do not invent a cause.
-        None of these is "something went wrong" — each is a specific state the runtime is in, two
-        of them are things the user can act on, and two say outright that retrying will not help.
+        None of these is "something went wrong" — each is a specific state the runtime is in.
+
+        The INVENTORY is not among them any more (§2f): a channel whose sweep has not settled,
+        or which has never been swept at all, answers from what it can reach and declares that
+        in its horizon. Nothing about the thread index refuses a turn.
         """
-        from message_processor.channel_stream import (CoverageNotReady, SnapshotUnsupportedError,
-                                                     StreamOverBudgetError, StreamTimestampError)
+        from message_processor.channel_stream import (OriginFetchError,
+                                                     StreamOverBudgetError,
+                                                     StreamTimestampError)
         if isinstance(error, StreamTimestampError):
             # NOT a Slack problem, so it must not wear the Slack notice: a timestamp we cannot
             # parse means a record — in a payload or in one of our own rows — is malformed, and
@@ -1066,21 +1061,18 @@ class MessageProcessor(ThreadManagementMixin,
                             "with an unexplained hole in it. Retrying won't clear this one; it "
                             "needs a fix on my side."),
             }
-        if isinstance(error, CoverageNotReady):
-            return "coverage_not_ready", {
-                "status": "Still reading this channel's history.",
-                "message": (f"{config.error_emoji} **Still Catching Up On This Channel**\n\n"
-                            "I'm still reading this channel's history, so I can't answer from a "
-                            "complete picture yet — and I'd rather say that than guess. Try again "
-                            "in a few minutes."),
-            }
-        if isinstance(error, SnapshotUnsupportedError):
-            return "snapshot_unsupported", {
-                "status": "This channel's history is compacted; I can't read it yet.",
-                "message": (f"{config.error_emoji} **Can't Read This Channel Right Now**\n\n"
-                            "This channel's history has been compacted into a summary that this "
-                            "version of me can't read from, so I can't see the conversation. "
-                            "Nothing is lost — this needs a fix on my side, not on yours."),
+        if isinstance(error, OriginFetchError):
+            # BRANCHED ON THE TYPE, never on the message. The origin thread is the conversation
+            # the turn is actually in, so a partial one is not a smaller answer — it is a
+            # different conversation. The periphery's own failures stay `history_fetch_failed`;
+            # distinguishing them by inspecting an error string is what this type exists to
+            # replace.
+            return "origin_fetch_failed", {
+                "status": "Couldn't read this thread completely.",
+                "message": (f"{config.error_emoji} **Couldn't Read This Thread**\n\n"
+                            "Slack didn't give me all of this thread, and I won't answer from "
+                            "part of a conversation — the half I'm missing is as likely to be "
+                            "the half that matters. Please try again in a moment."),
             }
         if isinstance(error, StreamOverBudgetError):
             return "stream_over_budget", {
@@ -1104,8 +1096,8 @@ class MessageProcessor(ThreadManagementMixin,
                                          h_pin, thread_config: dict, thread_state):
         """Steps 3-10: pin the capability profile, build the stream, ingest the origin's side state.
 
-        Steps 4-9 belong to `build_channel_stream` (the snapshot fail-close, the index drain, the
-        one sidecar transaction, the fetch, the serialization, the actor-tail reconcile). What is
+        Steps 4-9 belong to `build_channel_stream` (the index drain, the one sidecar
+        transaction, the fetch, the serialization, the actor-tail reconcile). What is
         left here is what a turn knows and the stream builder does not: which capability profile
         and which tool schemas this build was made against, and where the origin thread's files
         and people should be registered afterwards.
@@ -1113,81 +1105,36 @@ class MessageProcessor(ThreadManagementMixin,
         from message_processor.channel_request import (capability_profile_hash,
                                                        origin_participants_from_slice,
                                                        origin_slice_messages, tool_schema_version)
-        from message_processor.channel_snapshots import (PATH_PAGE_CEILING,
-                                                         PATH_SELECTION_REFUSED,
-                                                         REFUSED_RESULTS, RENDERED_RESULTS,
-                                                         SERIALIZER_VERSION)
-        from message_processor.channel_stream import PROD_NAMESPACE, build_channel_stream
-        from slack_client.history_fetch import FetchBudget
+        from message_processor.channel_stream import build_channel_stream
+        from message_processor.utilities import reach_tools_for
 
         team_id = getattr(client, "self_team_id", None) or ""
-        coordinator = getattr(self, "snapshot_coordinator", None)
 
-        # ---- plan §1a, in this exact order, and all of it BEFORE any Slack fetch --------------
-        # 1. H and the admission frontier are already pinned by the caller.
-        # 2. Drain mutation and index tickets TO THAT FRONTIER. THE ACTIVE POINTER IS NEVER
-        #    CONSULTED BEFORE THIS DRAIN: an observation still in flight would otherwise reach the
-        #    pointer after the turn had already read it, and the turn would render from a
-        #    generation a durable decision had condemned a moment earlier. `build_channel_stream`
-        #    drains again as its own step 5 — a drain that has already completed is a no-op wait.
-        # 3. Resolve pending invalidation, so those observations ARE on the pointer.
-        # 4. select_and_pin.
-        # Steps 5 (the one sidecar transaction) and 6 (the fetch) belong to the builder.
-        snapshot = None
-        selection: dict = {"result": "genesis"}
-        if coordinator is not None:
-            await admission_watermark.drain(
-                message.channel_id, h_pin.frontier,
-                timeout=getattr(config, "index_drain_timeout_seconds", None))
-            await coordinator.resolve_pending_invalidation(
-                team_id, message.channel_id, namespace=PROD_NAMESPACE)
-            selection = await coordinator.select_and_pin(
-                team_id, message.channel_id, SERIALIZER_VERSION, max_boundary=h_pin.h,
-                namespace=PROD_NAMESPACE)
-            turn.snapshot_selection = selection.get("result")
-            if selection.get("result") in RENDERED_RESULTS:
-                snapshot = selection.get("snapshot")
-                # The pin the outer finally releases. Set ONLY for a result we render from:
-                # select_and_pin pins nothing else, so a lease here would be an unbalanced unpin.
-                turn.snapshot_lease = selection.get("snapshot_id")
-            elif selection.get("result") in REFUSED_RESULTS:
-                # NEVER handed to the builder. These two retain their identity for telemetry and
-                # for the publication CAS, and they trigger recompaction — they are not something
-                # to render, and the turn below fails closed on the unresolved pointer.
-                self._trigger_compaction(message, turn, team_id=team_id,
-                                         path=PATH_SELECTION_REFUSED,
-                                         reason=selection.get("result"), h=h_pin.h)
-            # `no_eligible_generation` and `genesis` both render with NO summary block: the
-            # channel's generations all sit above THIS turn's ceiling, which is a fact about H,
-            # not about the snapshots. Nothing is recompacted — nothing here is invalid.
-
+        # NO DRAIN HERE. `prepare_channel_turn` owns it, alone: the split-phase build awaits that
+        # phase to completion before any fetch exists, which makes "the drain precedes all Slack
+        # I/O" structural rather than a convention two call sites have to keep. Draining here as
+        # well was a second wait on the same watermark and a second place the turn could fail,
+        # buying an ordering guarantee the builder already provides.
         registry = getattr(client, "tool_registry", None)
-        # Held by the caller so a page-ceiling failure is distinguishable from any other fetch
-        # failure by the BUDGET rather than by a string match on the error.
-        budget = FetchBudget()
-        try:
-            stream = await self._channel_stream_call(
-                build_channel_stream, message, client, turn, h_pin, thread_config, registry,
-                team_id=team_id, snapshot=snapshot, budget=budget,
-                capability_profile_hash=capability_profile_hash,
-                tool_schema_version=tool_schema_version, namespace=PROD_NAMESPACE)
-        except HistoryFetchError:
-            # §1m PATH 3 — the page ceiling, before any estimate exists. Distinguished by the
-            # BUDGET this caller holds, not by the error text: every other HistoryFetchError is a
-            # Slack problem a background crawl cannot fix, and enqueueing one for those would spend
-            # a crawl per rate-limit. This turn fails closed either way; the crawl is what makes
-            # the NEXT one able to succeed, and it is also how C05 recovery starts (R0-5).
-            if budget.pages_used >= int(getattr(config, "history_page_ceiling", 0) or 0) > 0:
-                self._trigger_compaction(message, turn, team_id=team_id,
-                                         path=PATH_PAGE_CEILING, reason="page_ceiling",
-                                         h=h_pin.h)
-            raise
+        # NO budgets are constructed here. The BUILDER owns the shared absolute deadline and
+        # builds all three itself — constructing them out here is what produced three
+        # independently started windows, and a turn that could spend three times its budget.
+        result = await self._channel_stream_call(
+            build_channel_stream, message, client, turn, h_pin, thread_config, registry,
+            team_id=team_id, origin_root_ts=message.thread_id,
+            reach_tools=reach_tools_for(),
+            capability_profile_hash=capability_profile_hash,
+            tool_schema_version=tool_schema_version)
+        # THE CARRIER, not a bare stream: the two booleans and the three page counts went to the
+        # telemetry emitter inside the builder, and everything downstream takes `.stream`.
+        stream = result.stream
         turn.channel_stream = stream
         turn.stream_build_present = True
         self.log_info(
             f"Channel stream for {message.channel_id}: {stream.message_count} message(s), "
-            f"{stream.byte_count} bytes, H={stream.pinned.H}, "
-            f"floor={stream.pinned.floor_ts} (inclusive={stream.pinned.floor_inclusive})")
+            f"{stream.root_count} root(s), {stream.byte_count} bytes, "
+            f"{stream.origin_count} origin message(s), H={stream.pinned.H}, "
+            f"floor={stream.periphery_floor_ts or '(none)'}")
 
         # Step 10 — the origin thread's side state, from the pinned stream rather than a refetch.
         slice_messages = origin_slice_messages(stream, message.thread_id)
@@ -1201,16 +1148,20 @@ class MessageProcessor(ThreadManagementMixin,
 
     async def _channel_stream_call(self, build_channel_stream, message: Message,
                                    client: BaseClient, turn, h_pin, thread_config: dict,
-                                   registry, *, team_id: str, snapshot, budget,
-                                   capability_profile_hash, tool_schema_version,
-                                   namespace: str):
-        """The builder call itself, kept whole so the page-ceiling guard above stays readable."""
+                                   registry, *, team_id: str, origin_root_ts, reach_tools,
+                                   capability_profile_hash, tool_schema_version):
+        """The builder call itself, kept whole so the caller above stays readable."""
         return await build_channel_stream(
             client=client, db=self.db,
             team_id=team_id,
             channel_id=message.channel_id,
             h=h_pin.h, frontier=h_pin.frontier,
-            namespace=namespace, snapshot=snapshot, budget=budget,
+            # A BUILD INPUT, not a telemetry label: the origin thread is FETCHED, not selected
+            # out of an existing window.
+            origin_root_ts=origin_root_ts,
+            # Frozen onto the pin so `serialize_stream` stays a pure function of it and the
+            # horizon's reach clause names only tools this attempt actually exposes.
+            reach_tools=reach_tools,
             capability_profile_hash=capability_profile_hash(thread_config),
             # The MCP manager is part of the effective tool surface, so the digest that claims to
             # identify this build's tools has to see it.
@@ -1219,88 +1170,11 @@ class MessageProcessor(ThreadManagementMixin,
             drain_timeout=getattr(config, "index_drain_timeout_seconds", None),
             barrier_context={"turn_id": getattr(turn, "turn_id", None),
                              "trigger_ts": (message.metadata or {}).get("ts")},
-            # CV8 stream_render joins to its turn by these three; the builder knows the window
-            # and the hashes, and nothing else about whose turn it is.
+            # CV8 stream_render joins to its turn by these; the builder knows the window and the
+            # hashes, and nothing else about whose turn it is. The origin root reaches the
+            # emitter as the build input above — it is no longer passed twice under two names.
             turn_id=getattr(turn, "turn_id", None),
-            origin_thread_ts=message.thread_id,
-            trigger_ts=(message.metadata or {}).get("ts"),
-            selection_result=getattr(turn, "snapshot_selection", None))
-
-    # ------------------------------------------------------ compaction triggers (plan §1m)
-
-    def _trigger_compaction(self, message: Message, turn, *, team_id: str, path: int,
-                            reason: Optional[str] = None, h: Optional[str] = None,
-                            evidence=None) -> None:
-        """Hand ONE trigger to the coordinator. Background, and it returns immediately.
-
-        SAME-TURN COMPACTION DOES NOT EXIST: no turn awaits a compaction, re-pins a winner under
-        its original H, or rebuilds its stream. The guarantee is the first turn AFTER SUCCESSFUL
-        PUBLICATION, not "the next turn" — a turn admitted while the crawl is still running fails
-        exactly as the triggering one did, and on a large channel that may be several turns.
-        """
-        coordinator = getattr(self, "snapshot_coordinator", None)
-        if coordinator is None:
-            return
-        try:
-            payload = {"reason": reason, "h": h}
-            if evidence is not None:
-                # Path 2 carries REAL admission components, so its crawl records
-                # headroom_source='measured' and owes no revalidation. Path 3 has none and falls
-                # back to the fixed heuristic, which is made safe by a recorded obligation.
-                payload["headroom_tokens"] = int(evidence.fixed_tokens)
-                payload["sizing_profile"] = evidence.sizing_profile
-            coordinator.trigger(team_id=team_id, channel_id=message.channel_id, path=path,
-                                **payload)
-        except Exception as e:  # noqa: BLE001 — a trigger never costs the turn that raised it
-            self.log_warning(f"Compaction trigger {path} not enqueued for "
-                             f"{message.channel_id}: {e}")
-
-    @staticmethod
-    def _compaction_evidence(estimate, *, model: str, h: Optional[str]):
-        """This turn's admission components in the ONE currency (R0-1), frozen onto the turn."""
-        from message_processor.turn_runtime import CompactionEvidence
-        window = int(config.get_model_token_limit(model))
-        return CompactionEvidence(
-            model=str(model), window=window,
-            trigger_tokens=int(window * config.compaction_trigger_ratio),
-            target_tokens=int(window * config.compaction_target_ratio),
-            sizing_profile=(f"{model}:{window}:{int(window * config.compaction_trigger_ratio)}"
-                            f":{int(window * config.compaction_target_ratio)}"),
-            total_tokens=int(estimate.total_tokens), limit_tokens=int(estimate.limit_tokens),
-            compactable_tokens=int(estimate.compactable_tokens),
-            fixed_tokens=int(estimate.fixed_tokens), admitted=bool(estimate.fits), h=h)
-
-    async def _post_turn_compaction(self, message: Message, turn, *, team_id: str) -> None:
-        """§1m PATH 1, and the fixed-headroom REVALIDATION, once the turn is over.
-
-        The triggering turn has ALREADY COMPLETED NORMALLY — the enqueue is cleanup for next time,
-        which is why it lives here rather than at admission: firing mid-turn would put a background
-        crawl in flight against the very channel the turn is still answering from.
-
-        Revalidation runs here too, and only here: MEASUREMENT HAPPENS UNDER THE CLAIM, and this
-        turn's real admission components are the measurement. A publication made under
-        `headroom_source='fixed'` owes exactly this, and an over-target result — including the band
-        between target and trigger, where the ordinary paths would enqueue nothing — enqueues the
-        recompaction DURABLY before the obligation is closed.
-        """
-        from message_processor.channel_snapshots import PATH_NEAR_TRIGGER
-        coordinator = getattr(self, "snapshot_coordinator", None)
-        evidence = getattr(turn, "compaction_evidence", None)
-        if coordinator is None or evidence is None:
-            return
-        try:
-            pinned = getattr(turn, "snapshot_lease", None)
-            if pinned:
-                snapshot = await coordinator.db.get_snapshot_row_async(pinned)
-                if snapshot:
-                    await coordinator.revalidate(team_id, message.channel_id, snapshot=snapshot,
-                                                 evidence=evidence)
-            if evidence.near_trigger:
-                self._trigger_compaction(message, turn, team_id=team_id,
-                                         path=PATH_NEAR_TRIGGER, reason="near_trigger",
-                                         h=evidence.h, evidence=evidence)
-        except Exception as e:  # noqa: BLE001 — never let cleanup break a turn that succeeded
-            self.log_warning(f"Post-turn compaction step skipped for {message.channel_id}: {e}")
+            trigger_ts=(message.metadata or {}).get("ts"))
 
     async def _admit_channel_request(self, message: Message, client: BaseClient, turn,
                                      thread_state, thread_config: dict,
@@ -1324,13 +1198,10 @@ class MessageProcessor(ThreadManagementMixin,
         runs before this turn exists.
         """
         from message_processor.channel_request import (ChannelTurnContext, RequesterFacts,
-                                                       build_rehydration_item,
                                                        canonical_files_from_stream,
                                                        cohort_sources_from_message,
                                                        merge_absent_source_files,
                                                        raise_if_over_budget)
-        from message_processor.channel_snapshots import PATH_OVER_BUDGET
-        from message_processor.channel_stream import StreamOverBudgetError
 
         meta = message.metadata or {}
         cohort = cohort_sources_from_message(message)
@@ -1345,25 +1216,6 @@ class MessageProcessor(ThreadManagementMixin,
                 num_members = (peek(message.channel_id) or {}).get("num_members")
             except Exception:  # noqa: BLE001 — a member count never costs a turn
                 num_members = None
-
-        # §1k — the origin thread's PRE-BOUNDARY tail, built BEFORE the context because the
-        # context is frozen and the assembler is synchronous: this needs its own bounded fetch,
-        # and the assembler only renders what it is handed. Its receipt/chrome evidence rides on
-        # the stream, from the SAME sidecar transaction the stream was pinned in.
-        #
-        # Only when a snapshot is pinned (there is no pre-boundary tail at genesis) and only for a
-        # threaded origin. Every failure inside is an honest omission item rather than a turn
-        # failure, so the one thing that must hold here is that nothing escapes into the turn.
-        rehydration_item = None
-        if getattr(stream, "boundary_ts", None) and message.thread_id:
-            try:
-                rehydration_item = await build_rehydration_item(
-                    client=client, db=self.db, stream=stream,
-                    origin_thread_ts=message.thread_id,
-                    preboundary_receipts=getattr(stream, "preboundary_receipts", None) or None)
-            except Exception as e:  # noqa: BLE001 — context is never worth a turn
-                self.log_warning(
-                    f"Rehydration for {message.channel_id}/{message.thread_id} not built: {e}")
 
         ctx = ChannelTurnContext(
             stream=stream,
@@ -1399,7 +1251,6 @@ class MessageProcessor(ThreadManagementMixin,
             num_members=num_members,
             wake_source=meta.get("wake_source"),
             queued_batch_size=meta.get("queued_batch_size"),
-            rehydration_item=rehydration_item,
         )
         turn.channel_turn_context = ctx
 
@@ -1412,23 +1263,8 @@ class MessageProcessor(ThreadManagementMixin,
         self.log_info(
             f"Channel request admission for {message.channel_id}: ~{estimate.total_tokens:,} of "
             f"{estimate.limit_tokens:,} usable input tokens {estimate.breakdown}")
-        # Plan §1m: this turn's own admission components, frozen for the trigger paths. Recorded
-        # BEFORE the refusal below, because the refusal is exactly the case that needs them.
-        turn.compaction_evidence = self._compaction_evidence(estimate, model=model, h=turn.H)
-        try:
-            raise_if_over_budget(estimate, channel_id=str(message.channel_id),
-                                 counted_text=("" if estimate.fits else request.countable_text))
-        except StreamOverBudgetError:
-            # §1m PATH 2 — over budget after a COMPLETE fetch. The turn FAILS CLOSED, honestly,
-            # and the crawl runs in the background with `headroom_source='measured'`: this turn
-            # HAS real admission components, so no heuristic is involved and no revalidation is
-            # owed. Guarded by R0-1: a request pushed over by a 300k-token attachment must not
-            # induce a compaction loop for a cause compaction cannot touch.
-            if estimate.compaction_indicated:
-                self._trigger_compaction(
-                    message, turn, team_id=ctx.team_id, path=PATH_OVER_BUDGET,
-                    reason="over_budget", h=turn.H, evidence=turn.compaction_evidence)
-            raise
+        raise_if_over_budget(estimate, channel_id=str(message.channel_id),
+                             counted_text=("" if estimate.fits else request.countable_text))
         await self.finalize_deferred_documents(
             list(document_inputs or []), client, message, thinking_id,
             reserves=estimate.document_reserves,

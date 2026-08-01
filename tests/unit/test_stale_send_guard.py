@@ -1061,9 +1061,8 @@ def test_no_delivery_boundary_can_swallow_a_suppression():
                     if any(kw.arg == "lease" for kw in c.keywords):
                         hands_lease = True
                     # …but only for a callee that could refuse. A local named `lease` is not
-                    # necessarily a SEND lease — a turn also holds a compaction-snapshot lease and
-                    # a reaction lease — and reading the name alone flagged
-                    # `coordinator.unpin(lease)` as a delivery boundary.
+                    # necessarily a SEND lease — a turn also holds a reaction lease — and
+                    # reading the name alone flagged non-delivery calls as delivery boundaries.
                     callee = (c.func.attr if isinstance(c.func, ast.Attribute)
                               else getattr(c.func, "id", ""))
                     if (callee in TRANSPORT or callee in propagating) and any(

@@ -67,6 +67,31 @@ def envelope(event, *, session=SESSION, version=8, contract="binary-v1", **field
     return row
 
 
+def stream_render_payload(**overrides):
+    """Every §8 field, because every one of them is MANDATORY on a stream_render row.
+
+    A fixture carrying a handful of fields was legal until the checker learned the contract;
+    once it did, a minimal row is exactly the defect the contract exists to catch, so the
+    fixtures widen in the same change that makes the fields mandatory rather than after it.
+    """
+    payload = {
+        "channel_id": "C1", "H": "1.9",
+        "periphery_floor_ts": "1.0", "inventory_start_ts": "0.5", "inventory_state": "warm",
+        "stream_sha256": "f" * 64, "union_sha256": "e" * 64,
+        "serializer_config_hash": "d" * 64, "sidecar_versions_hash": "c" * 64,
+        "actor_map_hash": "b" * 64, "receipts_membership_hash": "a" * 64,
+        "capability_profile_hash": "9" * 64,
+        "byte_count": 420, "origin_byte_count": 120, "message_count": 7, "origin_count": 2,
+        "candidate_count": 9, "root_count": 3, "orphan_root_count": 0,
+        "receipts_included_count": 1, "receipts_excluded_count": 0,
+        "history_pages": 1, "reply_pages": 0, "origin_pages": 1,
+        "selection_version": 1, "serializer_version": 3,
+        "reselected": False, "anchor_advanced": False,
+    }
+    payload.update(overrides)
+    return payload
+
+
 def healthy_rows(session=SESSION):
     """One gated channel turn that answered, start to finish, with every v8 event present.
 
@@ -82,16 +107,13 @@ def healthy_rows(session=SESSION):
                  attempt_id=attempt_id, wake=True, model="gpt-5.6-luna"),
         envelope("turn_start", session=session, channel_id="C1", trigger_ts="1.0",
                  turn_id=turn_id, surface="channel", gated=True, attempt_id=attempt_id),
-        envelope("stream_render", session=session, channel_id="C1", trigger_ts="1.0",
-                 turn_id=turn_id, origin_thread_ts="1.0", H="1.9", byte_count=420,
-                 message_count=7, stream_sha256="f" * 64, serializer_version=3),
+        envelope("stream_render", session=session, trigger_ts="1.0",
+                 turn_id=turn_id, origin_thread_ts="1.0", **stream_render_payload()),
         envelope("model_response", session=session, turn_id=turn_id, attempt_seq=1, status="ok",
                  model="gpt-5.6-sol", input_tokens=100, output_tokens=10),
         envelope("outbound_receipt", session=session, channel_id="C1", message_ts="2.0",
                  owner_turn_id=turn_id, op="register", prior_state="absent",
                  new_state="in_flight", applied=True),
-        envelope("compaction_snapshot", session=session, channel_id="C1", op="read",
-                 snapshot_id="s1", generation=4, boundary_ts="0.5", serializer_version=3),
         envelope("turn_outcome", session=session, channel_id="C1", trigger_ts="1.0",
                  turn_id=turn_id, attempt_id=attempt_id, kind="reply", chars=12,
                  detached_started=False, stream_build_present=True,
@@ -137,15 +159,16 @@ def test_a_ledger_written_by_the_real_emitter_passes(tmp_path):
                              classifier_ms=400, source_count=1)
             pt.turn_start("C1", "1.0", turn_id="t1", origin_thread_ts="1.0", surface="channel",
                           gated=True, attempt_id="a1")
+            # THE FULL FIELD SET, exactly as `_emit_stream_render` sends it in production —
+            # it splats `stream.stream_render_fields()`, so a hand-call carrying a handful of
+            # fields would make this round trip prove less than the real path does.
             pt.stream_render(turn_id="t1", origin_thread_ts="1.0", trigger_ts="1.0",
-                             channel_id="C1", H="1.9", byte_count=420, message_count=7)
+                             **stream_render_payload())
             pt.model_response(turn_id="t1", attempt_seq=1, status="ok", model="gpt-5.6-sol",
                               input_tokens=100, output_tokens=10, cached_input_tokens=64)
             pt.outbound_receipt(channel_id="C1", message_ts="2.0", owner_turn_id="t1",
                                 op="register", prior_state="absent", new_state="in_flight",
                                 applied=True)
-            pt.compaction_snapshot(op="read", channel_id="C1", snapshot_id="s1", generation=4,
-                                   boundary_ts="0.5", serializer_version=3)
 
             # The real assembler, over the real destination record.
             record = DestinationRecord(channel_id="C1", thread_root_ts="1.0", first_ts="2.0",
@@ -183,12 +206,8 @@ def test_the_handwritten_healthy_fixture_agrees_with_the_emitter(tmp_path):
 
 def test_legal_absences_are_not_violations(tmp_path):
     """The emitter omits None. A minimal-but-honest turn — no chars, no error, no H, an ungated
-    turn with no attempt_id, a receipt with no prior state, a DIRECT-WRITE snapshot op with only
-    its op and channel, a destination whose thread root and char count are null — is HEALTHY.
-
-    The snapshot row here is `op=read` deliberately: a direct-write op is best-effort and carries
-    no identity, so its pointer fields are legitimately absent. The OUTBOX-routed ops (`build`,
-    `publish`) are graded against their literal schema instead — see test_compaction_outbox.py."""
+    turn with no attempt_id, a receipt with no prior state, a destination whose thread root and
+    char count are null — is HEALTHY."""
     rows = [
         envelope("session_start", build="deadbee"),
         envelope("turn_start", channel_id="C1", trigger_ts="1.0", turn_id="t9",
@@ -199,7 +218,6 @@ def test_legal_absences_are_not_violations(tmp_path):
                                 "state": "observed", "chars": None, "kind": "stream"}]),
         envelope("outbound_receipt", channel_id="C1", message_ts="2.0", owner_turn_id="t9",
                  op="pending_resolve", new_state="finalized", applied=True),
-        envelope("compaction_snapshot", channel_id="C1", op="read"),
         envelope("session_end"),
     ]
     code, payload = check(write_ledger(tmp_path, rows))
@@ -424,22 +442,6 @@ def test_a_refused_receipt_with_no_reason_is_only_a_warning(tmp_path):
     code, payload = check(write_ledger(tmp_path, rows))
     assert code == 0, payload["violations"]
     assert "outbound_receipt_refused_without_reason" in warning_names(payload)
-
-
-def test_snapshot_with_an_unknown_op_fails(tmp_path):
-    rows = healthy_rows()
-    rows[row_index(rows, "compaction_snapshot")]["op"] = "peek"
-    code, payload = check(write_ledger(tmp_path, rows))
-    assert code == 1
-    assert "compaction_snapshot_bad_op" in names(payload)
-
-
-def test_snapshot_with_no_channel_fails(tmp_path):
-    rows = healthy_rows()
-    del rows[row_index(rows, "compaction_snapshot")]["channel_id"]
-    code, payload = check(write_ledger(tmp_path, rows))
-    assert code == 1
-    assert "compaction_snapshot_missing_field" in names(payload)
 
 
 def test_destination_with_an_unknown_state_fails(tmp_path):

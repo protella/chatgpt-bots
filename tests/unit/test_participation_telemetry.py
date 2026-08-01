@@ -27,6 +27,7 @@ from base_client import Message
 from config import config
 from message_processor import participation_telemetry as pt
 from message_processor.participation import ParticipationEngine, WakeDecision
+from tools import participation_ledger_check as plc
 
 
 @pytest.fixture
@@ -1352,7 +1353,7 @@ def test_stream_render_carries_the_builders_own_fields(sink):
     serializer owns what identifies a build, and restating those keys here would be a second
     thing to keep in step with it."""
     fields = {"channel_id": "C1", "snapshot_id": None, "generation": None, "boundary": "5.0",
-              "floor_inclusive": True, "H": "99.0", "coverage_start_ts": "5.0",
+              "floor_inclusive": True, "H": "99.0", "inventory_start_ts": "5.0",
               "serializer_version": 1, "serializer_config_hash": "cfg", "actor_map_hash": "am",
               "sidecar_versions_hash": "sc", "capability_profile_hash": "cp", "byte_count": 120,
               "message_count": 3, "stream_sha256": "deadbeef", "receipts_included_count": 1,
@@ -1371,10 +1372,16 @@ def test_stream_render_carries_the_builders_own_fields(sink):
 
 def test_a_real_build_emits_one_stream_render_that_matches_its_own_fields(sink):
     from tests.unit.channel_turn_harness import build_stream, normalized
-    from message_processor.channel_stream import _emit_stream_render
+    from message_processor.channel_stream import (PageCounts, StreamBuildResult,
+                                                  _emit_stream_render)
+
+    def _carrier(stream):
+        return StreamBuildResult(stream=stream, reselected=False, anchor_advanced=False,
+                                 pages=PageCounts(history=1, reply=0, origin=0))
 
     stream = build_stream([normalized("10.0", "hello")])
-    _emit_stream_render(stream, turn_id="s:8", origin_thread_ts="10.0", trigger_ts="10.0")
+    _emit_stream_render(_carrier(stream), turn_id="s:8", origin_root_ts="10.0",
+                        trigger_ts="10.0")
     row = sink("stream_render")[0]
     for key, value in stream.stream_render_fields().items():
         if value is None:
@@ -1398,73 +1405,6 @@ def test_an_outbound_receipt_row_records_the_refusal_not_the_intent(sink):
     assert (row["op"], row["prior_state"], row["new_state"]) == (
         "register", "finalized", "finalized")
     assert row["owner_turn_id"] == "s:1" and row["message_ts"] == "50.0"
-
-
-def test_a_compaction_pointer_read_is_observable(sink):
-    """P2's fail-closed path leaves no other trace: the turn refuses before it renders anything."""
-    pt.compaction_snapshot(op="read", channel_id="C1", snapshot_id="snap-1", generation=3,
-                           boundary_ts="40.0", serializer_version=1)
-    row = sink("compaction_snapshot")[0]
-    assert (row["op"], row["snapshot_id"], row["generation"]) == ("read", "snap-1", 3)
-    assert row["boundary_ts"] == "40.0" and row["serializer_version"] == 1
-
-
-def test_a_failed_generation_is_never_invisible(sink):
-    """MANDATED TEST 13. One `op=build` per GENERATION ATTEMPT, success or failure, and its
-    `call_count` aggregates a multi-call map+reduce — an attempt that burned nine calls and then
-    failed is exactly the row cost analysis needs, and the one a success-only event would drop."""
-    pt.compaction_snapshot(op="build", channel_id="C1", model="gpt-5.6-luna", tokens_in=90_000,
-                           tokens_out=4_200, cached_input_tokens=61_000, call_count=9,
-                           attempt_seq=1, status="failed", reason="reduce_call_failed")
-    row = sink("compaction_snapshot")[0]
-    assert (row["op"], row["status"], row["reason"]) == ("build", "failed", "reduce_call_failed")
-    assert (row["call_count"], row["attempt_seq"]) == (9, 1)
-    # THE AUTHORITATIVE NAMES. `input_tokens`/`output_tokens` belong to model_response and its
-    # per-call turn population; one vocabulary here, no aliases.
-    assert (row["tokens_in"], row["tokens_out"]) == (90_000, 4_200)
-    assert row["cached_input_tokens"] == 61_000
-    assert "input_tokens" not in row and "output_tokens" not in row
-
-
-def test_a_resumed_attempt_reports_the_calls_it_made_before_the_restart(sink):
-    """MANDATED TEST 41. An attempt spanning a restart emits ONE build carrying the checkpoint's
-    ACCUMULATED totals; a mutation discard ends that attempt with its own build, and the next
-    attempt starts at attempt_seq+1 with the accumulators zeroed."""
-    pt.compaction_snapshot(op="build", channel_id="C1", model="gpt-5.6-luna", tokens_in=140_000,
-                           tokens_out=6_000, cached_input_tokens=90_000, call_count=12,
-                           attempt_seq=2, status="discarded", reason="mutation_observed")
-    pt.compaction_snapshot(op="build", channel_id="C1", model="gpt-5.6-luna", tokens_in=0,
-                           tokens_out=0, cached_input_tokens=0, call_count=0, attempt_seq=3,
-                           status="ok")
-    discarded, resumed = sink("compaction_snapshot")
-    assert (discarded["attempt_seq"], discarded["status"]) == (2, "discarded")
-    assert discarded["call_count"] == 12          # the pre-restart calls are still on the record
-    assert (resumed["attempt_seq"], resumed["status"]) == (3, "ok")
-    assert resumed["call_count"] == 0             # zeroed accumulators, not the old attempt's
-    assert "reason" not in resumed                # nothing failed; nothing to explain
-
-
-def test_a_stale_copy_publication_still_records_a_build(sink):
-    """MANDATED TEST 64. A stale-retained copy IS a publication — it puts a new generation on the
-    pointer — so it emits the pair like any other, and its build says no model call was made.
-    Without it the checker's build-before-publish rule fails a perfectly correct copy."""
-    pt.compaction_snapshot(op="build", channel_id="C1", model="gpt-5.6-luna", tokens_in=0,
-                           tokens_out=0, cached_input_tokens=0, call_count=0, attempt_seq=1,
-                           status="copied")
-    row = sink("compaction_snapshot")[0]
-    assert (row["status"], row["call_count"]) == ("copied", 0)
-    assert "reason" not in row                    # a copy is not a failure
-
-
-def test_an_odd_build_status_is_written_and_warned_about(sink):
-    """Same rule as every other vocabulary here: the odd line is written, because losing the
-    record is worse than recording an odd label — the drift is made audible, not fatal."""
-    pt._warned_vocabulary.clear()
-    with patch.object(pt, "logger") as log:
-        pt.compaction_snapshot(op="build", channel_id="C1", status="succeeded", attempt_seq=1)
-        assert log.warning.call_count == 1
-    assert sink("compaction_snapshot")[0]["status"] == "succeeded"
-    pt._warned_vocabulary.clear()
 
 
 # --------------------------------------------------------------------------- model_response
@@ -1503,10 +1443,6 @@ def test_the_v8_vocabularies_cover_what_the_code_writes():
     assert {"register", "promote", "finalize", "demote", "transfer", "delete",
             "reconcile_finalize", "pending_resolve"} == pt.RECEIPT_OPS
     assert {"absent", "in_flight", "finalized", "chrome"} == pt.RECEIPT_STATES
-    assert {"read", "build", "publish", "invalidate", "stale_retained"} == pt.SNAPSHOT_OPS
-    # Only these two carry an identity and a cardinality contract; the rest are direct writes.
-    assert pt.OUTBOX_OPS == {"build", "publish"}
-    assert pt.BUILD_STATUSES == {"ok", "failed", "discarded", "copied"}
     assert pt.MODEL_RESPONSE_STATUSES == {"ok", "error"}
     assert pt.TURN_SURFACES == {"channel", "dm"}
     # turn_outcome reuses the terminal vocabulary on purpose: a turn and its gate attempt
@@ -1542,14 +1478,17 @@ class _StreamClient:
 
 def _stream_db(snapshot=None):
     db = MagicMock()
-    db.read_channel_sidecars_async = AsyncMock(return_value={
-        "window": ("5.0", True),
-        "coverage": {"coverage_start_ts": "5.0", "bootstrap_status": "complete",
-                     "reason": "genesis"},
-        "receipt_feature_epoch_ts": None, "receipts": [], "activity": [],
+    db.read_channel_window_anchor_async = AsyncMock(return_value={
+        "anchor": {"floor_ts": "5.0", "selection_version": 1},
+        "inventory": {"inventory_start_ts": "5.0", "bootstrap_status": "complete",
+                      "reason": "genesis"}})
+    db.read_channel_discovery_roots_async = AsyncMock(return_value={
+        "activity_roots": {}, "receipt_roots": ()})
+    db.read_channel_sidecars_for_async = AsyncMock(return_value={
+        "ids": [], "receipt_feature_epoch_ts": None, "receipts": [],
         "image_analyses": [], "document_extractions": [], "ambient_artifacts": [],
         "tool_usage": {}, "versions_hash": "h"})
-    db.get_active_snapshot_async = AsyncMock(return_value=snapshot)
+    db.advance_channel_window_anchor_async = AsyncMock(return_value=True)
     db.clear_thread_dirty_async = AsyncMock(return_value=True)
     return db
 
@@ -1571,9 +1510,10 @@ async def test_a_build_writes_one_stream_render_naming_its_turn(sink, _stream_si
     window an answer was written from."""
     from message_processor.channel_stream import build_channel_stream
 
-    stream = await build_channel_stream(
+    result = await build_channel_stream(
         client=_StreamClient(), db=_stream_db(), team_id="T1", channel_id="C1", h="99.0",
-        turn_id="s:10", origin_thread_ts="10.0", trigger_ts="10.0")
+        turn_id="s:10", origin_root_ts="10.0", trigger_ts="10.0")
+    stream = result.stream
 
     rows = sink("stream_render")
     assert len(rows) == 1
@@ -1581,25 +1521,6 @@ async def test_a_build_writes_one_stream_render_naming_its_turn(sink, _stream_si
     assert rows[0]["origin_thread_ts"] == "10.0" and rows[0]["trigger_ts"] == "10.0"
     assert rows[0]["stream_sha256"] == stream.stream_sha256
     assert rows[0]["H"] == "99.0"
-
-
-@pytest.mark.asyncio
-async def test_a_fail_closed_snapshot_read_is_written_and_no_stream_is_rendered(
-        sink, _stream_singletons):
-    """The only two facts P2 can report about a compacted channel: the pointer was read, and
-    nothing was built. A stream_render here would claim a window this turn never had."""
-    from message_processor.channel_stream import (SnapshotUnsupportedError,
-                                                 build_channel_stream)
-
-    pointer = {"snapshot_id": "snap-1", "generation": 2, "boundary_ts": "40.0"}
-    with pytest.raises(SnapshotUnsupportedError):
-        await build_channel_stream(
-            client=_StreamClient(), db=_stream_db(snapshot=pointer), team_id="T1",
-            channel_id="C1", h="99.0", turn_id="s:11")
-
-    assert sink("stream_render") == []
-    row = sink("compaction_snapshot")[0]
-    assert (row["op"], row["snapshot_id"], row["channel_id"]) == ("read", "snap-1", "C1")
 
 
 def test_base_py_hands_the_builder_the_turn_it_is_building_for():
@@ -1615,10 +1536,248 @@ def test_base_py_hands_the_builder_the_turn_it_is_building_for():
     # to catch.
     source = (inspect.getsource(MessageProcessor._build_channel_turn_stream)
               + inspect.getsource(MessageProcessor._channel_stream_call))
-    for kwarg in ("turn_id=", "origin_thread_ts=", "trigger_ts="):
+    # `origin_root_ts` replaced `origin_thread_ts`: the origin thread is a BUILD INPUT now — it
+    # is fetched, not selected out of an existing window — and the emitter reads that same value
+    # rather than being handed the root a second time under a telemetry-only name.
+    for kwarg in ("turn_id=", "origin_root_ts=", "trigger_ts="):
         assert kwarg in source
     # And the kwargs are on the BUILDER CALL, not merely somewhere in the two functions.
     call = inspect.getsource(MessageProcessor._channel_stream_call)
     assert call.count("build_channel_stream(") == 1
-    for kwarg in ("turn_id=", "origin_thread_ts=", "trigger_ts="):
+    for kwarg in ("turn_id=", "origin_root_ts=", "trigger_ts="):
         assert kwarg in call.split("build_channel_stream(", 1)[1]
+
+
+_HASH = "a" * 64
+
+
+def stream_render_row(**overrides):
+    """A COMPLETE `stream_render` row — every §8 field, all of them mandatory.
+
+    Shared rather than duplicated because two tests need it for opposite reasons: T8 asserts a
+    real ledger passes the checker, and T54 asserts each rule by breaking exactly one field at a
+    time. A minimal row would fail T8 the moment the fields became mandatory, so the fixture and
+    the rule that makes it necessary land together.
+    """
+    row = {
+        "v": 8, "at": 3.0, "session": "S", "gate_contract": "binary-v1",
+        "event": "stream_render", "turn_id": "t1",
+        "channel_id": "C1", "H": "1.9",
+        "periphery_floor_ts": "1.0", "inventory_start_ts": "0.5",
+        "inventory_state": "warm",
+        "stream_sha256": _HASH, "union_sha256": _HASH, "serializer_config_hash": _HASH,
+        "sidecar_versions_hash": _HASH, "actor_map_hash": _HASH,
+        "receipts_membership_hash": _HASH, "capability_profile_hash": _HASH,
+        "byte_count": 10, "origin_byte_count": 4, "message_count": 1, "origin_count": 1,
+        "candidate_count": 3, "root_count": 1, "orphan_root_count": 0,
+        "receipts_included_count": 1, "receipts_excluded_count": 0,
+        "history_pages": 1, "reply_pages": 0, "origin_pages": 1,
+        "selection_version": 1, "serializer_version": 3,
+        "reselected": False, "anchor_advanced": False,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_the_ledger_has_no_compaction_vocabulary(tmp_path):
+    """T8. `compaction_snapshot` and the outbox that carried it are gone, and CONTRACT_VERSION
+    does NOT move for it.
+
+    That last part is the claim worth testing. v8's turn population — turn_start, turn_outcome,
+    stream_render, model_response, outbound_receipt — is unchanged in identity, and no
+    completeness rule ever named the removed event, so no denominator anybody computes off a v8
+    ledger is invalidated. Bumping the version would tell every existing analysis its rows were
+    a different contract when they were not.
+    """
+    assert pt.CONTRACT_VERSION == 8
+    for name in ("compaction_snapshot", "SNAPSHOT_OPS", "OUTBOX_OPS", "BUILD_STATUSES",
+                 "BUILD_REASON_STATUSES", "FIT_RESULTS", "OUTBOX_EVENT",
+                 "canonical_body_bytes", "extract_canonical_body", "validate_outbox_body",
+                 "emit_outbox_body", "flush_sync"):
+        assert not hasattr(pt, name), f"participation_telemetry still exports {name}"
+
+    # And the checker accepts a real ledger, with no build-before-publish rule left to impose.
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    checker = Path(__file__).resolve().parents[2] / "tools" / "participation_ledger_check.py"
+    source = checker.read_text(encoding="utf-8")
+    for name in ("compaction_snapshot", "compaction_publish_without_build",
+                 "compaction_publish_before_build", "_check_compaction_outbox", "OUTBOX_OPS"):
+        assert name not in source, f"the checker still carries {name}"
+
+    ledger = tmp_path / "participation.jsonl"
+    rows = [
+        {"v": 8, "at": 1.0, "session": "S", "gate_contract": "binary-v1",
+         "event": "session_start", "build": "abc"},
+        {"v": 8, "at": 2.0, "session": "S", "gate_contract": "binary-v1", "event": "turn_start",
+         "channel_id": "C1", "trigger_ts": "1.0", "turn_id": "t1", "surface": "channel",
+         "gated": False},
+        stream_render_row(),
+        {"v": 8, "at": 4.0, "session": "S", "gate_contract": "binary-v1",
+         "event": "turn_outcome", "channel_id": "C1", "trigger_ts": "1.0", "turn_id": "t1",
+         "kind": "silence", "detached_started": False, "stream_build_present": True,
+         "destinations": []},
+        {"v": 8, "at": 5.0, "session": "S", "gate_contract": "binary-v1", "event": "session_end"},
+    ]
+    ledger.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    result = subprocess.run([sys.executable, str(checker), str(ledger), "--json"],
+                            capture_output=True, text=True, cwd=str(tmp_path))
+    assert result.returncode == 0, result.stdout
+    assert json.loads(result.stdout)["violations"] == []
+
+
+# ================================================ T54 — the stream_render checker contract (§8a)
+
+def _run_checker(tmp_path, rows):
+    """Run the REAL checker over a ledger built from `rows`, and return its violation names."""
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    checker = Path(__file__).resolve().parents[2] / "tools" / "participation_ledger_check.py"
+    ledger = tmp_path / "participation.jsonl"
+    ledger.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    result = subprocess.run([sys.executable, str(checker), str(ledger), "--json"],
+                            capture_output=True, text=True, cwd=str(tmp_path))
+    payload = json.loads(result.stdout)
+    return result.returncode, [v["name"] for v in payload["violations"]]
+
+
+def _ledger(*, render=None, renders=None, stream_build_present=True, outcome_extra=None):
+    """A complete one-turn session, with the stream_render row(s) under test substituted in."""
+    if renders is None:
+        renders = [] if render is None else [render]
+    outcome = {"v": 8, "at": 4.0, "session": "S", "gate_contract": "binary-v1",
+               "event": "turn_outcome", "channel_id": "C1", "trigger_ts": "1.0",
+               "turn_id": "t1", "kind": "silence", "detached_started": False,
+               "stream_build_present": stream_build_present, "destinations": []}
+    outcome.update(outcome_extra or {})
+    return [
+        {"v": 8, "at": 1.0, "session": "S", "gate_contract": "binary-v1",
+         "event": "session_start", "build": "abc"},
+        {"v": 8, "at": 2.0, "session": "S", "gate_contract": "binary-v1", "event": "turn_start",
+         "channel_id": "C1", "trigger_ts": "1.0", "turn_id": "t1", "surface": "channel",
+         "gated": False},
+        *renders,
+        outcome,
+        {"v": 8, "at": 5.0, "session": "S", "gate_contract": "binary-v1", "event": "session_end"},
+    ]
+
+
+def test_the_stream_render_contract_is_enforced(tmp_path):
+    """T54. Every §8a rule, asserted by BREAKING ONE FIELD AT A TIME against the real checker.
+
+    The row is the only durable evidence of what the model was shown. A checker that accepts a
+    malformed one turns a bad answer into an unexplainable one months later, which is when
+    somebody actually reads these.
+    """
+    # The complete row passes — the baseline every case below deviates from by exactly one field.
+    assert _run_checker(tmp_path, _ledger(render=stream_render_row())) == (0, [])
+
+    # RULE 1 — THE HASHES. Six have no caller-omitted path, so empty is a defect.
+    for field in ("stream_sha256", "union_sha256", "serializer_config_hash",
+                  "sidecar_versions_hash", "actor_map_hash", "receipts_membership_hash"):
+        code, names = _run_checker(tmp_path, _ledger(render=stream_render_row(**{field: ""})))
+        assert code == 1 and "stream_render_bad_hash" in names, field
+    # `capability_profile_hash` ALONE may be empty: the builder defaults it that way, so the
+    # probe and every utility build legitimately emit one.
+    assert _run_checker(
+        tmp_path, _ledger(render=stream_render_row(capability_profile_hash=""))) == (0, [])
+    # Wrong shape is a defect for all seven — uppercase is not lowercase hex, and 63 is not 64.
+    for bad in (_HASH.upper(), _HASH[:63], "not-a-hash", 12345):
+        code, names = _run_checker(
+            tmp_path, _ledger(render=stream_render_row(stream_sha256=bad)))
+        assert code == 1 and "stream_render_bad_hash" in names, bad
+
+    # RULE 2 — THE COUNTS. Twelve non-negative ints; bools are not ints here.
+    for field in ("byte_count", "origin_byte_count", "message_count", "origin_count",
+                  "candidate_count", "root_count", "orphan_root_count",
+                  "receipts_included_count", "receipts_excluded_count",
+                  "history_pages", "reply_pages", "origin_pages"):
+        code, names = _run_checker(tmp_path, _ledger(render=stream_render_row(**{field: -1})))
+        assert code == 1 and "stream_render_bad_count" in names, field
+        code, names = _run_checker(tmp_path, _ledger(render=stream_render_row(**{field: True})))
+        assert code == 1 and "stream_render_bad_count" in names, field
+    # THE THREE PAGE COUNTS ARE THREE FIELDS, never one sum: only separate counts can show the
+    # history walk stayed inside its ceiling while the reply fan-out ran unbounded.
+    row = stream_render_row()
+    assert {"history_pages", "reply_pages", "origin_pages"} <= set(row)
+    assert "periphery_pages" not in row
+
+    # VERSIONS SIT OUTSIDE THE COUNT RULE — validated as ints and nothing more. A bound on them
+    # would be a bound on how many times the format may change.
+    for field in ("selection_version", "serializer_version"):
+        assert _run_checker(
+            tmp_path, _ledger(render=stream_render_row(**{field: 9999}))) == (0, [])
+        code, names = _run_checker(tmp_path,
+                                   _ledger(render=stream_render_row(**{field: "3"})))
+        assert code == 1 and "stream_render_bad_count" in names, field
+
+    # ROOT_COUNT <= MESSAGE_COUNT. Roots are a subset of the rendered message items, so this
+    # catches a count computed over the wrong subject, which no type check would notice.
+    code, names = _run_checker(
+        tmp_path, _ledger(render=stream_render_row(root_count=5, message_count=2)))
+    assert code == 1 and "stream_render_bad_count" in names
+
+    # RULE 4 — BOOLEANS, and the two floor strings whose EMPTY VALUE IS A VALUE.
+    for field in ("reselected", "anchor_advanced"):
+        code, names = _run_checker(tmp_path,
+                                   _ledger(render=stream_render_row(**{field: "false"})))
+        assert code == 1 and "stream_render_bad_bool" in names, field
+    for field in ("periphery_floor_ts", "inventory_start_ts"):
+        assert _run_checker(
+            tmp_path, _ledger(render=stream_render_row(**{field: ""}))) == (0, []), field
+        code, names = _run_checker(tmp_path, _ledger(render=stream_render_row(**{field: 1.0})))
+        assert code == 1 and "stream_render_bad_field" in names, field
+
+    # INVENTORY_STATE — one of the SIX, and the list is closed.
+    for state in ("absent", "cold", "warm", "limited_retention", "limited_depth", "unavailable"):
+        assert _run_checker(
+            tmp_path, _ledger(render=stream_render_row(inventory_state=state))) == (0, []), state
+    code, names = _run_checker(
+        tmp_path, _ledger(render=stream_render_row(inventory_state="pending")))
+    assert code == 1 and "stream_render_bad_inventory_state" in names
+
+    # PRESENCE — every mandatory field. Absence and None are ONE case, because record() omits
+    # None-valued fields rather than writing null.
+    for field in plc.STREAM_RENDER_MANDATORY:
+        row = stream_render_row()
+        row.pop(field)
+        code, names = _run_checker(tmp_path, _ledger(render=row))
+        assert code == 1 and "stream_render_missing_field" in names, field
+
+    # RETIRED FIELDS ARE REJECTED, each one actually sent through the checker. Asserting the
+    # constant lists them would prove only that I typed them; these rows prove the checker acts.
+    for retired, value in (("snapshot_id", "snap-1"), ("generation", 4), ("boundary", "1.0"),
+                           ("floor_inclusive", True), ("coverage_start_ts", "0.5"),
+                           ("selection_result", "reanchored"), ("reanchored", True)):
+        code, names = _run_checker(
+            tmp_path, _ledger(render=stream_render_row(**{retired: value})))
+        assert code == 1 and "stream_render_retired_field" in names, retired
+
+    # RULE 3 — THE turn_error VOCABULARY, and retired codes are VIOLATIONS not grandfathered:
+    # a fresh row carrying one means a producer survived the excision.
+    for code_name in ("stream_data_invalid", "stream_over_budget", "history_fetch_failed",
+                      "origin_fetch_failed"):
+        assert _run_checker(tmp_path, _ledger(
+            render=stream_render_row(),
+            outcome_extra={"error": code_name})) == (0, []), code_name
+    for retired in ("snapshot_unsupported", "coverage_not_ready", "invented_code"):
+        code, names = _run_checker(tmp_path, _ledger(
+            render=stream_render_row(), outcome_extra={"error": retired}))
+        assert code == 1 and "turn_outcome_bad_error" in names, retired
+
+    # RULE 5 — ALL THREE CARDINALITY DIRECTIONS.
+    code, names = _run_checker(tmp_path, _ledger(render=None, stream_build_present=True))
+    assert code == 1 and "stream_render_absent_for_build" in names
+    code, names = _run_checker(tmp_path, _ledger(render=stream_render_row(),
+                                                 stream_build_present=False))
+    assert code == 1 and "stream_render_without_build" in names
+    # TWO ROWS FOR ONE turn_id — the direction "exactly one" needs and presence cannot give.
+    code, names = _run_checker(tmp_path, _ledger(
+        renders=[stream_render_row(), stream_render_row(at=3.5)]))
+    assert code == 1 and "stream_render_duplicate" in names

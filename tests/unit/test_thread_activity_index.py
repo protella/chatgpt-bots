@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from config import config
 from database import DatabaseManager
+from slack_client.admission_watermark import FAILED, REPAIRED
 from slack_client.event_handlers import activity_index
 from slack_client.event_handlers.activity_index import (feed_thread_activity_index,
                                                         normalize_activity_event)
@@ -394,7 +395,7 @@ async def test_first_feed_seeds_channel_coverage_once(client, temp_db, monkeypat
     assert len(seeds) == 1
     row = await temp_db.get_channel_coverage_async(TEAM, CH)
     assert row["bootstrap_status"] == "pending"
-    assert float(row["coverage_start_ts"]) > 0
+    assert float(row["inventory_start_ts"]) > 0
 
 
 async def test_feed_never_raises_when_the_database_fails(client, monkeypatch):
@@ -674,3 +675,124 @@ def test_the_index_logs_into_the_configured_slack_bot_tree():
     assert activity_index.logger.name.startswith("slack_bot.")
     assert activity_index.logger.handlers
     assert activity_index.logger.propagate is False
+
+
+# ------------------------------- W1: the write path after the mutation half was removed
+
+async def test_the_activity_write_survives_the_mutation_removal(client, temp_db, wm):
+    """T13. `_apply_observation` used to commit an index row and a mutation observation as ONE
+    ticketed transaction. W1 removes the mutation half, so it calls the ALREADY-EXISTING
+    `record_thread_activity_async` — the same monotonic merge, through the same upsert.
+
+    The ticket contract is what must not have moved with it: the write still RAISES on failure
+    so the admission ticket fails, a cancellation leaves no half-state, and a replay is still
+    idempotent. All four cases, because the interesting failure is the one where a swallowed
+    error lets a turn believe the index caught up on a write that never landed.
+    """
+    # 1. A normal upsert lands, through the surviving accessor.
+    calls = []
+    original = temp_db.record_thread_activity_async
+
+    async def _spy(**kwargs):
+        calls.append(kwargs)
+        return await original(**kwargs)
+
+    temp_db.record_thread_activity_async = _spy
+    ticket = wm.issue(CH)
+    await feed_thread_activity_index(client, _reply(), ticket=ticket)
+    assert calls and calls[0]["root_ts"] == ROOT and calls[0]["reply_ts"] == "101.000100"
+    assert ticket.state != FAILED
+    rows = await _rows(temp_db)
+    assert rows and rows[0]["last_observed_reply_ts"] == "101.000100"
+
+    # 2. A DB error PROPAGATES, so the ticket fails. The feed retries in place first, so this
+    #    raises on every attempt rather than once.
+    async def _boom(**kwargs):
+        raise RuntimeError("WAL writer gone")
+
+    temp_db.record_thread_activity_async = _boom
+    failing = wm.issue(CH)
+    await feed_thread_activity_index(client, _reply(ts="102.000100"), ticket=failing)
+    assert failing.state == FAILED, "a lost index write must fail its ticket, not pass quietly"
+
+    # 3. A cancellation AT THE WRITE SEAM — not before it. The accessor is autocommit, so the
+    #    interesting instant is after the statement has been handed to SQLite, where a naive
+    #    reading would expect a half-committed row. Cancelling before the call would only prove
+    #    "we never wrote", which is not the claim.
+    import asyncio
+
+    seam_reached = {"hit": False}
+
+    async def _cancelled_at_seam(**kwargs):
+        # Let the real write run to completion, THEN cancel where the awaiting feed resumes.
+        await original(**kwargs)
+        seam_reached["hit"] = True
+        raise asyncio.CancelledError
+
+    temp_db.record_thread_activity_async = _cancelled_at_seam
+    cancelled_ticket = wm.issue(CH)
+    with pytest.raises(asyncio.CancelledError):
+        await feed_thread_activity_index(client, _reply(ts="103.000100"),
+                                         ticket=cancelled_ticket)
+    assert seam_reached["hit"], "the cancellation must land after the write, not before it"
+    # The ticket fails rather than staying pending: every later turn whose frontier includes it
+    # would otherwise wait out the drain timeout.
+    assert cancelled_ticket.state == FAILED
+    # And the row that DID land is a complete row, not a torn one — autocommit means the write
+    # either happened or did not, and recovery is the replay below rather than a repair.
+    landed = {r["root_ts"]: dict(r) for r in await _rows(temp_db)}
+    assert landed[ROOT]["last_observed_reply_ts"] == "103.000100"
+
+    #    THE RETAINED RETRY LIFECYCLE, which is the point of failing the ticket rather than
+    #    swallowing: the feed hands `complete_failed` a `retry` closure, and the repair worker is
+    #    what turns a FAILED ticket into a REPAIRED one and brings the channel back into service.
+    #    A fresh-ticket resubmit (below) proves idempotency; it does NOT prove that the ORIGINAL
+    #    failure is ever cleared, and a channel left degraded fails every later turn's drain.
+    assert wm.is_degraded(CH), "a failed observation must degrade the channel until repaired"
+    assert cancelled_ticket.retry is not None, "nothing retained to replay"
+
+    temp_db.record_thread_activity_async = original
+    repaired_any, remaining = await wm._repair_pass()
+    assert repaired_any and remaining == 0
+    assert cancelled_ticket.state == REPAIRED
+    assert not wm.is_degraded(CH), "the channel must leave degraded state once repaired"
+
+    #    Idempotent RECOVERY after a write that may already have landed: replaying the same
+    #    event over the committed row changes nothing.
+    before_replay = [dict(r) for r in await _rows(temp_db)]
+    await feed_thread_activity_index(client, _reply(ts="103.000100"), ticket=wm.issue(CH))
+    assert [dict(r) for r in await _rows(temp_db)] == before_replay
+
+    # 4. A replay is idempotent — the same event twice is one row, at the same values.
+    temp_db.record_thread_activity_async = original
+    await feed_thread_activity_index(client, _reply(ts="104.000100"), ticket=wm.issue(CH))
+    once = await _rows(temp_db)
+    await feed_thread_activity_index(client, _reply(ts="104.000100"), ticket=wm.issue(CH))
+    twice = await _rows(temp_db)
+    assert len(once) == len(twice)
+    assert [dict(r) for r in once] == [dict(r) for r in twice]
+
+
+async def test_our_own_housekeeping_delete_is_not_human_activity(client, temp_db, wm):
+    """T14. `_deletion_was_ours` is NOT dead code, and this pins the decision to keep it.
+
+    It has a live caller in `_index_row`, where the receipt ledger is the oracle for an
+    ANONYMOUS deletion: a row in any state means we posted that ts, so removing it is our own
+    housekeeping — the "Uploading…" indicator behind every image post is the loudest case — and
+    not activity under a thread. Dropping it during a later cleanup would silently start
+    recording our own tidying as somebody talking.
+    """
+    ours, theirs = "500.000100", "600.000100"
+    await temp_db.register_receipt_async(TEAM, CH, ours, turn_id="t1", state="in_flight",
+                                         thread_root_ts=ROOT)
+
+    # A deletion of a message WE posted records nothing.
+    await feed_thread_activity_index(
+        client, _deleted({"ts": ours, "thread_ts": ROOT}, ours), ticket=wm.issue(CH))
+    assert await _rows(temp_db) == []
+
+    # A third party's deletion does — the root comes back dirty so the next turn refetches it.
+    await feed_thread_activity_index(
+        client, _deleted({"ts": theirs, "thread_ts": ROOT}, theirs), ticket=wm.issue(CH))
+    rows = await _rows(temp_db)
+    assert rows and rows[0]["root_ts"] == ROOT and rows[0]["dirty"] == 1

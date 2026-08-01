@@ -37,7 +37,7 @@ reserve the charge recorded, so bytes sent can never exceed bytes admitted.
 
 The price of a bound is capacity: English prose costs about 4.5 bytes per real token, so a channel
 whose window has grown past roughly the usable token figure in BYTES is refused while it would
-still fit. Refusing early is the intended trade — P4's compaction is the answer to a window that
+still fit. Refusing early is the intended trade — a shallower window is the answer to a room that
 big, not a hopeful multiplier.
 
 `handlers/text.py` still converts the API's own context-length 400 into an over-budget outcome.
@@ -48,18 +48,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field, replace
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from config import CHANNEL_CAPABILITY_KEYS, config
 from logger import setup_logger
-from message_processor.channel_stream import (REHYDRATION_REASONS, ChannelStream, ReceiptRec,
-                                              StreamOverBudgetError, StreamTimestampError,
-                                              _fetch_replies, artifact_render_bytes,
-                                              render_late_artifact,
-                                              render_late_artifact_failure, render_rehydration,
-                                              render_rehydration_omission, serialize_stream,
-                                              truncate_utf8)
+from message_processor.channel_stream import (ChannelStream, StreamOverBudgetError,
+                                              StreamTimestampError)
 from message_processor.utilities import (StreamActor, TurnCoordinates, api_part,
                                         build_capability_state_suffix,
                                         build_channel_topic_evidence,
@@ -71,7 +66,6 @@ from message_processor.utilities import (StreamActor, TurnCoordinates, api_part,
                                         build_structural_settings_suffix,
                                         build_taggable_roster_evidence,
                                         effective_request_model)
-from slack_client.history_fetch import FetchBudget
 from slack_client.normalizer import FileRef, NormalizedMessage, TimestampError, ts_key
 from token_counter import (ITEM_STRUCTURAL_OVERHEAD, admission_charge,
                            estimate_tokens_conservative)
@@ -197,12 +191,6 @@ class ChannelTurnContext:
     batched_image_parts: Tuple[Dict[str, Any], ...] = ()
     batched_images_omitted: int = 0
     cohort_sources: Tuple[CohortSource, ...] = ()
-    # POST-BREAKPOINT, and built before the context is pinned: A5 artifact evidence the pinned
-    # snapshot's manifest does not account for, and §1k's origin-thread pre-boundary tail. Both
-    # are origin- or snapshot-specific, which is exactly why they are not canonical items — two
-    # origins in one channel still share one identical cacheable prefix.
-    late_artifact_items: Tuple[Dict[str, Any], ...] = ()
-    rehydration_item: Optional[Dict[str, Any]] = None
     canonical_files: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     origin_participants: Dict[str, str] = field(default_factory=dict)
     requester: RequesterFacts = field(default_factory=RequesterFacts)
@@ -302,14 +290,13 @@ class AdmissionEstimate:
     """The charge, and WHICH PART OF THE REQUEST IS CARRYING IT (R0-1).
 
     One currency, one total — the components are a split of the same number, never a second
-    measurement. `compactable_tokens` is what the canonical stream costs and is therefore the
-    only part compaction can move; everything else (instructions, tools, attachments, the
-    post-breakpoint evidence and the suffix) is fixed headroom that a summary cannot shrink.
+    measurement. `stream_tokens` is what the canonical stream costs; `overhead_tokens` is
+    everything else (instructions, tools, attachments, the post-breakpoint evidence and the
+    suffix).
 
-    The split exists so an over-budget turn can answer one question before it triggers anything:
-    would compacting have helped? A request pushed over by a 300k-token attachment would
-    otherwise trigger compaction, publish a summary, and arrive over budget again — a futile
-    loop charged to the channel, every turn, for a cause compaction cannot touch.
+    The split is kept because it is what makes a refusal diagnostic useful: an operator reading
+    "Too Much For One Request" wants to know whether the room or the attachment is what did not
+    fit, and one total cannot say.
     """
     total_tokens: int
     limit_tokens: int
@@ -320,7 +307,7 @@ class AdmissionEstimate:
     document_reserves: Tuple[Tuple[str, int], ...]
     # The canonical (pre-breakpoint) stream's own contribution: its item text plus the structural
     # framing each of those items pays for. Zero when the caller passed unmarked items.
-    compactable_tokens: int = 0
+    stream_tokens: int = 0
 
     @property
     def fits(self) -> bool:
@@ -331,21 +318,9 @@ class AdmissionEstimate:
         return max(0, self.total_tokens - self.limit_tokens)
 
     @property
-    def fixed_tokens(self) -> int:
-        """The non-compactable remainder. No summary makes this smaller."""
-        return self.total_tokens - self.compactable_tokens
-
-    @property
-    def compaction_headroom(self) -> int:
-        """What a compacted canonical stream would have to fit inside — the whole answer to
-        "how much would compacting actually save". Zero or negative means nothing it could
-        produce would fit, because the fixed part alone is already over."""
-        return self.limit_tokens - self.fixed_tokens
-
-    @property
-    def compaction_indicated(self) -> bool:
-        """Is the COMPACTABLE component what overflowed? The R0-1 trigger predicate."""
-        return (not self.fits) and self.compaction_headroom > 0 and self.compactable_tokens > 0
+    def overhead_tokens(self) -> int:
+        """Everything the request costs that is not the stream itself."""
+        return self.total_tokens - self.stream_tokens
 
 
 def _text_tokens(content: Any) -> int:
@@ -369,8 +344,7 @@ def estimate_admission(*, instructions: str, input_items: Sequence[Dict[str, Any
                        tools: Optional[Sequence[Dict[str, Any]]],
                        raw_document_texts: Sequence[Tuple[str, str]],
                        native_file_bounds: Sequence[int],
-                       model: Optional[str],
-                       variant_headroom: int = 0) -> AdmissionEstimate:
+                       model: Optional[str]) -> AdmissionEstimate:
     """What this request can cost AT WORST, before anything is sent.
 
     An upper bound in every term: text is charged one token per utf-8 byte (no byte-level BPE
@@ -387,11 +361,6 @@ def estimate_admission(*, instructions: str, input_items: Sequence[Dict[str, Any
     already bought — a short document's reserve would not even hold the truncation marker, so its
     summary would be dropped entirely. One entry PER DOCUMENT, keyed but not deduplicated, so two
     documents that share a key are two charges and two grants [r4-3].
-
-    `variant_headroom` is the extra room a post-breakpoint block needs when a LATER variant of it
-    could be longer than the one assembled here — the `failed_attachments_note` pattern, and §1k
-    rehydration's marker-versus-content pair. It is fixed headroom by construction: a variant of
-    post-breakpoint evidence is not something compaction reaches.
     """
     items = [item for item in input_items if isinstance(item, dict)]
     breakdown = {
@@ -406,17 +375,16 @@ def estimate_admission(*, instructions: str, input_items: Sequence[Dict[str, Any
     }
     reserves = tuple((key, admission_charge(text)) for key, text in raw_document_texts)
     breakdown["document_text"] = sum(charge for _key, charge in reserves)
-    # Absent rather than zero: a key present in every breakdown would change every existing
-    # refusal diagnostic to report a term that is almost never in play.
-    if variant_headroom > 0:
-        breakdown["variant_headroom"] = int(variant_headroom)
     total = sum(breakdown.values())
     limit = config.get_model_token_limit(model or config.gpt_model)
-    canonical = [item for item in items if item.get("_stream")]
-    compactable = (sum(_text_tokens(item.get("content")) for item in canonical)
-                   + len(canonical) * ITEM_STRUCTURAL_OVERHEAD)
+    # BOTH MARKERS: the room's content is the canonical stream PLUS the origin block, which sits
+    # after the breakpoint but is still the conversation rather than evidence about it. A
+    # refusal that reported the origin as overhead would point the reader at the wrong cause.
+    canonical = [item for item in items if item.get("_stream") or item.get("_origin")]
+    stream_tokens = (sum(_text_tokens(item.get("content")) for item in canonical)
+                     + len(canonical) * ITEM_STRUCTURAL_OVERHEAD)
     return AdmissionEstimate(total_tokens=total, limit_tokens=limit, breakdown=breakdown,
-                             document_reserves=reserves, compactable_tokens=compactable)
+                             document_reserves=reserves, stream_tokens=stream_tokens)
 
 
 def _count_image_parts(input_items: Sequence[Dict[str, Any]]) -> int:
@@ -904,275 +872,6 @@ def build_developer_suffix(ctx: ChannelTurnContext, *, processor: Any,
     return "\n\n".join(s for s in sections if s and str(s).strip())
 
 
-# ------------------------------------------------- post-breakpoint snapshot evidence (A5 / A6)
-
-
-# The A5 body producer is SHARED with the compaction projection, which embeds the same bytes and
-# hashes them into the capture manifest — see `channel_stream.artifact_render_bytes`. Late-evidence
-# suppression compares those hashes, so a second local renderer here would make every captured
-# artifact look changed and render it twice.
-_artifact_render_bytes = artifact_render_bytes
-
-
-def _late_artifact_content(entry: Mapping[str, Any], *, snapshot_id: str) -> Optional[str]:
-    """One A5 item's content, or None when the entry must not be rendered at all."""
-    namespace = str(entry.get("artifact_namespace") or "")
-    source_ts = str(entry.get("source_ts") or "")
-
-    def failure(reason: str) -> str:
-        return render_late_artifact_failure(reason=reason, source_ts=source_ts,
-                                            snapshot_id=snapshot_id)
-
-    row = entry.get("row")
-    if not row:
-        return failure("row_missing")
-    try:
-        body = _artifact_render_bytes(namespace, row)
-    except Exception as e:  # noqa: BLE001
-        logger.warning(f"late artifact {namespace}/{entry.get('row_id')} could not be "
-                       f"rendered: {e}")
-        return failure("render_error")
-    if body is None:
-        return None
-    # The STATUSLESS namespaces carry the literal "complete", so only the content hash can say
-    # whether the render changed since capture. Identical bytes are already inside the summary.
-    captured = entry.get("manifest_content_hash")
-    if captured and str(captured) == hashlib.sha256(body.encode("utf-8")).hexdigest():
-        return None
-    try:
-        return render_late_artifact({**dict(entry), "render": body}, snapshot_id=snapshot_id)
-    except ValueError as e:
-        logger.warning(f"late artifact {namespace}/{entry.get('row_id')}: {e}")
-        return failure("render_error")
-
-
-async def build_late_artifact_items(*, db: Any,
-                                    stream: ChannelStream) -> Tuple[Dict[str, Any], ...]:
-    """§1i late evidence: pre-boundary artifacts the PINNED snapshot's manifest does not account
-    for, one user-role item each.
-
-    Against the PINNED snapshot, never the active one — an overlapping turn may pin S1 after S2
-    became active, and its evidence is S1's business. Keyed by the FULL tuple
-    `(source_ts, snapshot_id, artifact_namespace, row_id)`: `(source_ts, snapshot_id)` alone
-    collides the moment one message carries two artifacts, which is the ordinary case for an
-    image plus its document.
-    """
-    snapshot_id = stream.snapshot_id
-    boundary_ts = stream.boundary_ts
-    if not snapshot_id or not boundary_ts:
-        return ()
-    pinned = stream.pinned
-    try:
-        entries = await db.late_artifact_evidence_async(
-            pinned.team_id, pinned.channel_id, snapshot_id,
-            boundary_ts=boundary_ts, high_ts=pinned.H)
-    except Exception as e:  # noqa: BLE001
-        # Never a turn failure: the canonical window is intact, and one missing artifact block is
-        # a smaller lie than refusing a question the model could have answered.
-        logger.warning(f"{pinned.channel_id} late-artifact evidence unavailable for "
-                       f"{snapshot_id}: {e}")
-        return ()
-
-    ordered: List[Tuple[Tuple[Any, ...], Dict[str, Any]]] = []
-    seen: set = set()
-    for entry in entries or ():
-        namespace = str(entry.get("artifact_namespace") or "")
-        row_id = str(entry.get("row_id") or "")
-        source_ts = str(entry.get("source_ts") or "")
-        key = (source_ts, snapshot_id, namespace, row_id)
-        if key in seen:
-            continue
-        seen.add(key)
-        content = _late_artifact_content(entry, snapshot_id=snapshot_id)
-        if content is None:
-            continue
-        try:
-            sort_key: Tuple[Any, ...] = (ts_key(source_ts), namespace, row_id)
-        except TimestampError:
-            logger.warning(f"{pinned.channel_id} late artifact {namespace}/{row_id} carries an "
-                           f"unusable source ts {source_ts!r}; omitting it")
-            continue
-        ordered.append((sort_key, {"role": ROLE_USER, "content": content,
-                                   "metadata": {"channel_id": pinned.channel_id}}))
-    ordered.sort(key=lambda pair: pair[0])
-    return tuple(item for _key, item in ordered)
-
-
-# The A6 omission line is ONE line, so the content variant is longer in every realistic case —
-# but admission charges the larger of the two anyway, because a variant that could grow the
-# request after it was admitted is exactly the shape of an overflow nobody sees coming.
-REHYDRATION_OMISSION_CHARGE = max(
-    admission_charge(render_rehydration_omission(reason)) for reason in REHYDRATION_REASONS)
-
-
-def rehydration_variant_headroom(item: Optional[Mapping[str, Any]]) -> int:
-    """The extra room the §1k block needs so a late switch to the omission marker cannot
-    overflow — the `failed_attachments_note` pattern, in the same byte currency."""
-    if not item:
-        return 0
-    content = item.get("content")
-    if not isinstance(content, str):
-        return 0
-    return max(0, REHYDRATION_OMISSION_CHARGE - admission_charge(content))
-
-
-def _rehydration_item(content: str, *, channel_id: str,
-                      origin_thread_ts: str) -> Dict[str, Any]:
-    # No `ts` in the metadata: the stale-send guard reads that off user items, and this block is
-    # evidence about a thread rather than a message anyone is answering.
-    return {"role": ROLE_USER, "content": content,
-            "metadata": {"channel_id": channel_id, "thread_root_ts": str(origin_thread_ts)}}
-
-
-def _preboundary_pin(pinned: Any, messages: Sequence[NormalizedMessage],
-                     rows: Sequence[Mapping[str, Any]], floor_ts: str) -> Any:
-    """The canonical pin, re-aimed at the pre-boundary tail with ITS OWN receipt evidence.
-
-    Rehydration must not borrow the window's receipts: they cover `(boundary, H]` by
-    construction, so every pre-boundary message of ours would look like a post-epoch message
-    with no row and be excluded. Rebuilding the pin means the serializer decides roles and chrome
-    for these messages exactly as it does for canonical ones, with no second copy of that policy.
-    """
-    receipts = tuple(
-        ReceiptRec(ts=str(row.get("message_ts")), state=str(row.get("state") or ""),
-                   turn_id=row.get("turn_id"), thread_root_ts=row.get("thread_root_ts"))
-        for row in rows if row.get("message_ts"))
-    # The artifact rows are dropped rather than carried: the pinned sidecar read covers
-    # `(boundary, H]`, so it has nothing to say about these messages. Their pre-boundary
-    # artifacts ride the A5 late-evidence items instead.
-    sidecars = replace(pinned.sidecars, window=(floor_ts, True), receipts=receipts,
-                       image_analyses=(), document_extractions=(), ambient_artifacts=(),
-                       tool_usage=())
-    return replace(pinned, snapshot=None, window=(floor_ts, True),
-                   fetch_snapshot=tuple(messages), sidecars=sidecars,
-                   receipt_map=tuple((r.ts, r.state, r.turn_id, r.thread_root_ts)
-                                     for r in receipts))
-
-
-async def _preboundary_receipt_rows(db: Any, pinned: Any,
-                                    boundary_ts: str) -> List[Dict[str, Any]]:
-    """Rehydration's own atomically pinned pre-boundary receipt/chrome evidence (§1k)."""
-    payload = await db.read_channel_sidecars_async(
-        pinned.team_id, pinned.channel_id, pinned.H, (boundary_ts, False),
-        preboundary_receipts=True)
-    return list((payload or {}).get("preboundary_receipts") or ())
-
-
-async def build_rehydration_item(*, client: Any, db: Any, stream: ChannelStream,
-                                 origin_thread_ts: Optional[str],
-                                 preboundary_receipts: Optional[
-                                     Sequence[Mapping[str, Any]]] = None,
-                                 budget_clock: Optional[Any] = None
-                                 ) -> Optional[Dict[str, Any]]:
-    """§1k: the origin thread's PRE-BOUNDARY tail, as one post-breakpoint evidence item.
-
-    Outside the canonical `PinnedTuple` on purpose — it is origin-specific, and two origins in
-    one channel must still share one identical cacheable prefix.
-
-    The fetch budget is INDEPENDENT of the turn's: `REHYDRATION_PAGE_BUDGET` pages and
-    `REHYDRATION_TIME_BUDGET` seconds of its own, so a deep thread can never spend the window
-    fetch's ceiling and can never turn the turn path into an unbounded crawl. Exhausting either
-    is an omission, and every other failure is one too: this block is context, and a turn that
-    refused to answer because a nine-month-old thread would not page is a worse outcome than a
-    turn that says so in one line.
-    """
-    pinned = stream.pinned
-    channel_id = pinned.channel_id
-    boundary_ts = stream.boundary_ts
-    if not boundary_ts or not origin_thread_ts:
-        return None
-    root_ts = str(origin_thread_ts)
-    try:
-        # A thread that began after the boundary is already whole inside the canonical window.
-        if ts_key(root_ts) > ts_key(boundary_ts):
-            return None
-        boundary_key = ts_key(boundary_ts)
-    except TimestampError:
-        return None
-
-    page_ceiling = max(1, int(config.rehydration_page_budget))
-    kwargs = {"clock": budget_clock} if budget_clock is not None else {}
-    fetch_budget = FetchBudget(total_seconds=float(config.rehydration_time_budget),
-                               page_ceiling=page_ceiling, **kwargs)
-    floor_ts = pinned.coverage.start_ts
-    try:
-        fetched = await _fetch_replies(client, channel_id=channel_id, team_id=pinned.team_id,
-                                       root_ts=root_ts, floor_ts=floor_ts, floor_inclusive=True,
-                                       high=pinned.H, budget=fetch_budget)
-    except Exception as e:  # noqa: BLE001
-        exhausted = (fetch_budget.pages_used >= page_ceiling
-                     or fetch_budget.remaining_seconds() <= 0)
-        reason = "fetch_budget_exhausted" if exhausted else "fetch_error"
-        logger.warning(f"{channel_id} rehydration of {root_ts} omitted ({reason}): {e}")
-        return _rehydration_item(render_rehydration_omission(reason), channel_id=channel_id,
-                                 origin_thread_ts=root_ts)
-    if not fetched:
-        # Slack returned the thread and it holds nothing at all — the root is below retention.
-        return _rehydration_item(render_rehydration_omission("retention"),
-                                 channel_id=channel_id, origin_thread_ts=root_ts)
-
-    canonical_ts = {message.ts for message in pinned.fetch_snapshot}
-    try:
-        candidates = sorted((m for m in fetched
-                             if m.ts not in canonical_ts and ts_key(m.ts) <= boundary_key),
-                            key=lambda m: ts_key(m.ts))
-    except TimestampError as e:
-        logger.warning(f"{channel_id} rehydration of {root_ts} omitted (fetch_error): {e}")
-        return _rehydration_item(render_rehydration_omission("fetch_error"),
-                                 channel_id=channel_id, origin_thread_ts=root_ts)
-    if not candidates:
-        return None
-
-    rows = preboundary_receipts
-    if rows is None:
-        try:
-            rows = await _preboundary_receipt_rows(db, pinned, boundary_ts)
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"{channel_id} rehydration of {root_ts} omitted (fetch_error): "
-                           f"pre-boundary receipt evidence unavailable: {e}")
-            return _rehydration_item(render_rehydration_omission("fetch_error"),
-                                     channel_id=channel_id, origin_thread_ts=root_ts)
-    rendered = serialize_stream(
-        _preboundary_pin(pinned, candidates, rows, floor_ts)).message_items
-
-    # THE ROOT ALWAYS CONSUMES A SLOT, whether or not it survived classification — which is why
-    # this is never "the latest 20 messages", and why A6's label says so.
-    root_item = next((i for i in rendered if i.metadata.get("ts") == root_ts), None)
-    replies = [item for item in rendered if item is not root_item]
-    cap = max(1, int(config.rehydration_max_messages))
-    kept = replies[-(cap - 1):] if cap > 1 else []
-    bounded = len(kept) < len(replies)
-
-    max_bytes = max(1, int(config.rehydration_max_bytes))
-    root_text = root_item.content if root_item is not None else ""
-    root_truncated = False
-    spent = len(root_text.encode("utf-8"))
-    if root_item is not None and spent > max_bytes:
-        root_text, root_truncated = truncate_utf8(root_text, max_bytes)
-        spent = len(root_text.encode("utf-8"))
-        kept = []
-        bounded = True
-    fitted: List[str] = []
-    for item in reversed(kept):
-        cost = len(item.content.encode("utf-8"))
-        if spent + cost > max_bytes:
-            bounded = True
-            break
-        spent += cost
-        fitted.append(item.content)
-    fitted.reverse()
-
-    blocks = [b for b in ([root_text] if root_item is not None else []) + fitted if b.strip()]
-    if not blocks:
-        return None
-    if not (root_item is not None and root_text.strip()):
-        root_truncated = False
-    return _rehydration_item(
-        render_rehydration(blocks, bounded_n=(cap - 1) if bounded else None,
-                           root_truncated=root_truncated),
-        channel_id=channel_id, origin_thread_ts=root_ts)
-
-
 # ---------------------------------------------------------------- the assembler
 
 
@@ -1193,10 +892,9 @@ def assemble_channel_request(*, processor: Any, client: Any, ctx: ChannelTurnCon
     instructions = _channel_instructions(processor, client, ctx, registry=registry)
     items: List[Dict[str, Any]] = []
 
-    # ITERATED, never named. The canonical sequence is the STREAM's to define (A1), and naming
-    # its members here is what silently dropped the v2 summary item out of every request that
-    # had one: the compacted history existed, hashed into `stream_sha256`, and never reached the
-    # model, which then answered from a window it believed was whole.
+    # ITERATED, never named. The canonical sequence is the STREAM's to define (A1); naming its
+    # members here is how an item the build produced silently fails to reach the model, which
+    # then answers from a window it believes is whole.
     canonical = tuple(stream.items)
     if stream.end_marker_item not in canonical:
         raise StreamTimestampError(
@@ -1210,13 +908,13 @@ def assemble_channel_request(*, processor: Any, client: Any, ctx: ChannelTurnCon
         items.append({"role": item.role, "content": content,
                       "metadata": dict(item.metadata), "_stream": True})
 
-    # Post-breakpoint evidence the SNAPSHOT made necessary, in Appendix A order: A5 artifacts
-    # that completed after the summary was written, then §1k's origin-thread pre-boundary tail.
-    # Both are absent rather than empty when there is nothing to say — an empty item would be
-    # bytes in every request forever.
-    items.extend(dict(item) for item in ctx.late_artifact_items)
-    if ctx.rehydration_item:
-        items.append(dict(ctx.rehydration_item))
+    # THE ORIGIN BLOCK. It goes FIRST after the breakpoint because it is the conversation this
+    # turn is in; everything below is evidence ABOUT it. Metadata rides the items for the same
+    # reason the canonical ones carry it — the stale-send guard reads metadata.ts, and the
+    # payload builder strips it. The items carry `_origin`, never `_stream`: see
+    # `origin_input_items`, `estimate_admission` and `to_input_items` for why it takes a second
+    # marker rather than reusing the first.
+    items.extend(stream.origin_input_items())
 
     # Step 4, in order.
     for built in (build_trigger_supplement(ctx, processor), build_trigger_fallback(ctx),
@@ -1237,8 +935,7 @@ def assemble_channel_request(*, processor: Any, client: Any, ctx: ChannelTurnCon
         estimate = estimate_admission(
             instructions=instructions, input_items=items, tools=tools,
             raw_document_texts=ctx.raw_document_texts,
-            native_file_bounds=ctx.native_file_bounds, model=model,
-            variant_headroom=rehydration_variant_headroom(ctx.rehydration_item))
+            native_file_bounds=ctx.native_file_bounds, model=model)
     return ChannelRequest(instructions=instructions, input_items=items, tools=tools,
                           prompt_cache_key=prompt_cache_key(ctx.team_id, ctx.channel_id),
                           evidence_hash=evidence_hash, estimate=estimate)
@@ -1306,12 +1003,22 @@ def _evidence_hash(items: Sequence[Dict[str, Any]]) -> str:
 
 
 def to_input_items(request: ChannelRequest) -> List[Dict[str, Any]]:
-    """The request's items with the assembler's own bookkeeping key removed.
+    """The request's items with the assembler's own bookkeeping keys removed.
+
+    BOTH markers go. `_origin` is as much ours as `_stream` is, and this function is the seam
+    that promises the assembler's bookkeeping does not leave with the items — a marker that
+    survived it would make that promise false for every caller downstream.
+
+    IT IS NOT THE CRASH GUARD, and saying so would be a lie the code invites someone to rely
+    on: `_channel_input_items` (`openai_client/base.py:55`) rebuilds each role item from `role`
+    and `content` alone, so an unstripped marker is dropped there rather than sent. Two
+    independent layers, one of them belt and one braces.
 
     `metadata` stays: the stale-send guard reads `metadata.ts` off role:user items, and the
     channel layout builder strips it before the payload goes out (openai_client/base.py).
     """
-    return [{k: v for k, v in item.items() if k != "_stream"} for item in request.input_items]
+    return [{k: v for k, v in item.items() if k not in ("_stream", "_origin")}
+            for item in request.input_items]
 
 
 def cohort_source_from_message(message: Any, *, files: Sequence[FileRef] = ()) -> CohortSource:
@@ -1390,15 +1097,23 @@ def origin_slice_messages(stream: ChannelStream,
                           origin_thread_ts: Optional[str]) -> Tuple[NormalizedMessage, ...]:
     """The origin thread's NormalizedMessages, root included.
 
-    Selected on `root_ts` rather than through `origin_slice`, which returns rendered items: the
-    side-state ingester needs the FileRefs, and a top-level trigger with no replies yet carries no
-    `thread_root_ts` at all — matching on the item metadata would return nothing for exactly the
-    turn that most obviously has an origin.
+    ITS SOURCE IS `origin_snapshot`, not a `root_ts` filter over the periphery. The origin thread
+    is now FETCHED whole and pinned in its own snapshot, so filtering the periphery would return
+    only the part of the thread that happens to sit above the window floor — which for an old
+    thread is nothing at all, on exactly the turn that most obviously has an origin.
+
+    Raw messages rather than `origin_slice`'s rendered items: the side-state ingester needs the
+    FileRefs. The name and signature are kept because several callers pass a thread ts they
+    already hold; it is checked against the snapshot's own root so a mismatched argument returns
+    nothing rather than someone else's thread.
     """
     if not origin_thread_ts:
         return ()
     want = str(origin_thread_ts)
-    return tuple(m for m in stream.pinned.fetch_snapshot if m.root_ts == want)
+    pinned_root = str(stream.pinned.origin_root_ts or "")
+    if pinned_root and pinned_root != want:
+        return ()
+    return tuple(stream.pinned.origin_snapshot)
 
 
 def cohort_sources_from_message(message: Any) -> Tuple[CohortSource, ...]:

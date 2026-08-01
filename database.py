@@ -9,13 +9,15 @@ import hashlib
 import json
 import os
 import re
+import time
 import uuid
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Iterable, List, Any, Sequence, Tuple
+from typing import Optional, Sequence, Dict, Iterable, List, Any, Tuple
 import logging
 import asyncio
+from config import dev_epoch_fence_requested
 from logger import LoggerMixin
 
 logger = logging.getLogger(__name__)
@@ -30,174 +32,31 @@ _UNSET = object()
 # ever, via set_meta_if_absent_async — see the bot_meta design note in init_schema.
 OUTBOUND_RECEIPTS_EPOCH_KEY = "outbound_receipts_feature_epoch_ts"
 
-# bot_meta key recording that the §1h v1-pointer retirement has run. One-shot: re-running it
-# would be harmless today but the guard keeps the delete honest about being a migration.
-_V1_POINTER_RETIREMENT_KEY = "snapshot_v1_pointers_retired_at"
+# bot_meta keys recording that the two one-shot respec §3 migrations have run.
+_P4A_CLEANUP_KEY = "p4a_compaction_schema_dropped"
+_COVERAGE_RENAME_KEY = "channel_coverage_renamed_to_inventory_at"
 
 # Receipt states, in the order the state machine allows: chrome and in_flight may promote,
 # finalized is absorbing.
 _RECEIPT_STATES = ("in_flight", "finalized", "chrome")
 
-# The non-null 'prod' sentinel of P4 §3c. Snapshot namespaces are either this or a
-# test_epoch_id. Defined here rather than imported from message_processor.channel_stream
-# because that module imports database — the dependency only runs one way.
-PROD_NAMESPACE = "prod"
-
-# The ONE snapshot status enum (P4 §1g). Legal transitions are candidate -> published |
-# published_stale, published/published_stale -> invalidated, and physical deletion from
-# candidate or invalidated only.
-SNAPSHOT_STATUSES = ("candidate", "published", "published_stale", "invalidated")
-_VALID_SNAPSHOT_STATUSES = ("published", "published_stale")
-
-# The sizing evidence §1m dominance reads long after the crawl checkpoint carrying it is gone.
-# NULL is a never-dominating sentinel, legal ONLY on legacy v1 rows: the candidate accessor
-# rejects a v2 row missing any of these.
-SNAPSHOT_SIZING_FIELDS = ("headroom_source", "headroom_tokens", "effective_window",
-                          "sizing_profile", "fit_result")
-
-# Artifact namespaces with no native status column: they capture the literal "complete", so a
-# later comparison is always defined and the content hash alone carries the change signal.
-_STATUSLESS_ARTIFACT_NAMESPACES = ("document_extraction", "tool_provenance")
-
-_SNAPSHOT_COLUMNS = """
-                snapshot_id TEXT PRIMARY KEY,
-                team_id TEXT NOT NULL,
-                channel_id TEXT NOT NULL,
-                namespace TEXT NOT NULL DEFAULT 'prod',
-                serializer_version INTEGER NOT NULL,
-                generation INTEGER,
-                boundary_ts TEXT NOT NULL,
-                summary_text TEXT,
-                root_anchors_json TEXT,
-                created_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                invalidated_at TIMESTAMP,
-                status TEXT NOT NULL DEFAULT 'candidate'
-                    CHECK (status IN ('candidate', 'published', 'published_stale',
-                                      'invalidated')),
-                source_floor_ts TEXT,
-                parent_snapshot_id TEXT,
-                prompt_version TEXT,
-                model TEXT,
-                source_hash TEXT,
-                payload_hash TEXT,
-                mutation_frontier INTEGER,
-                payload_bytes BLOB,
-                anchor_payload_bytes BLOB,
-                headroom_source TEXT,
-                headroom_tokens INTEGER,
-                effective_window INTEGER,
-                sizing_profile TEXT,
-                fit_result TEXT
-"""
-
-_POINTER_COLUMNS = """
-                team_id TEXT NOT NULL,
-                channel_id TEXT NOT NULL,
-                namespace TEXT NOT NULL DEFAULT 'prod',
-                serializer_version INTEGER NOT NULL,
-                active_snapshot_id TEXT,
-                updated_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (team_id, channel_id, namespace, serializer_version)
-"""
-
-# Startup validation compares against these verbatim (§3c: a mismatch FAILS STARTUP).
-_SNAPSHOT_KEY_COLUMNS = ("team_id", "channel_id", "namespace", "serializer_version")
-_SNAPSHOT_INDEXES = ("idx_channel_snapshot_generation", "idx_channel_snapshot_scope")
+# Ids per `IN (...)` statement in the render pin. SQLite's default variable limit is 999 and a
+# channel turn can legitimately pin more identities than that, so the read chunks rather than
+# letting a platform limit decide whether a turn renders.
+_SIDECAR_ID_CHUNK = 500
 
 
-def _snapshot_index_sql(table: str) -> Tuple[str, ...]:
-    """The two snapshot indexes, against `table` (the rebuild names its scratch table)."""
-    suffix = "" if table == "channel_snapshots" else "_new"
-    return (
-        f"CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_snapshot_generation{suffix} "
-        f"ON {table} (team_id, channel_id, namespace, serializer_version, generation)",
-        f"CREATE INDEX IF NOT EXISTS idx_channel_snapshot_scope{suffix} "
-        f"ON {table} (team_id, channel_id, namespace, serializer_version)",
-    )
+def _ts_sort(raw: Any) -> float:
+    """A Slack ts as a float, for re-sorting rows that arrived across several chunks.
 
-
-def canonical_body_bytes(body: Any) -> bytes:
-    """The ONE canonical body serialization (§1l), function-locally imported.
-
-    `database` -> `message_processor` -> `database` is a real cycle, so the import cannot sit
-    at module level. There is exactly one implementation in the tree deliberately: two would
-    make identical bodies compare unequal over key order or \\uXXXX escaping alone, which is
-    the whole failure the byte-comparison exists to catch.
+    Sorting only — never a window comparison. The accessors compare timestamps as REAL in SQL,
+    and this exists to restore the ORDER BY that chunking split, so a one-chunk read and a
+    five-chunk read over the same ids return the same order.
     """
-    from message_processor.participation_telemetry import (  # noqa: PLC0415
-        canonical_body_bytes as _canonical,
-    )
-    return _canonical(body)
-
-
-def canonical_json(value: Any) -> str:
-    """Canonical JSON for stored maps — sorted keys, no insignificant whitespace, so two
-    encodings of the same map are byte-identical."""
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
-
-
-def _ts_key(raw: Any) -> Tuple[int, int]:
-    """A Slack ts as (seconds, microseconds), for Python-side ordering.
-
-    Integer fields, never a float: "1752600000.000001" and "1752600000.000002" are distinct
-    messages and comparing them as floats at a boundary decides inclusion by rounding. This is
-    `slack_client.normalizer.parse_ts` restated locally — that module reaches `slack_client`,
-    which imports this one. Unparseable input sorts first rather than raising: sorting rows is
-    not the place to discover a bad timestamp.
-    """
-    text = str(raw).strip() if raw is not None else ""
-    whole, _, frac = text.partition(".")
-    if not whole.isdigit() or (frac and not frac.isdigit()):
-        return (0, 0)
-    return int(whole), int((frac + "000000")[:6]) if frac else 0
-
-
-def validate_outbox_body(body: Any, *, crawl_id: str, attempt_seq: int, event_seq: int,
-                         created_ts: float) -> Optional[str]:
-    """The SIX-CLAUSE checklist of §1l — None when valid, else the failing clause name.
-
-    Delegated to `participation_telemetry`, function-locally for the cycle above, so the DB
-    layer and the emitter can never disagree about what a valid payload is.
-    """
-    from message_processor.participation_telemetry import (  # noqa: PLC0415
-        validate_outbox_body as _validate,
-    )
-    return _validate(body, crawl_id=crawl_id, attempt_seq=attempt_seq, event_seq=event_seq,
-                     created_ts=created_ts)
-
-
-def _table_column_names(ddl: str) -> Tuple[str, ...]:
-    """Column names from one of the DDL fragments above, in declaration order."""
-    names = []
-    for raw in ddl.strip().splitlines():
-        line = raw.strip()
-        if not line or line.startswith(("CHECK", "PRIMARY", "UNIQUE", "FOREIGN")):
-            continue
-        head = line.split()[0]
-        if head.isidentifier():
-            names.append(head)
-    return tuple(names)
-
-
-_SNAPSHOT_COLUMN_NAMES = _table_column_names(_SNAPSHOT_COLUMNS)
-
-# The §1n checkpoint columns that hold canonical JSON. None of them holds message text: they
-# are inventories, digests, aggregates, derived summaries, frozen render bytes of OUR OWN
-# artifacts, and receipt proof states.
-_CHECKPOINT_JSON_COLUMNS = ("root_inventory", "history_span_density", "actor_snapshot",
-                            "chunk_hashes", "chunk_aggregates", "chunk_summaries",
-                            "frozen_renders", "frozen_receipts")
-
-_CHECKPOINT_COLUMN_NAMES = (
-    "team_id", "channel_id", "namespace", "crawl_id", "crawl_mode", "phase", "pinned_H",
-    "mutation_frontier", "source_floor_ts", "input_floor_ts", "input_floor_inclusive",
-    "parent_snapshot_id", "boundary_ts", "serializer_version", "serializer_config_hash",
-    "prompt_version", "sizing_profile", "headroom_source", "headroom_tokens",
-    "profile_version", "inventory_cursor_ts", "root_inventory", "history_span_density",
-    "actor_snapshot", "actor_snapshot_hash", "chunk_index", "chunk_hashes", "chunk_aggregates",
-    "chunk_summaries", "frozen_renders", "frozen_receipts", "attempt_seq", "attempt_tokens_in",
-    "attempt_tokens_out", "attempt_cached_input_tokens", "attempt_call_count", "event_count",
-    "consecutive_discards", "next_attempt_after", "updated_at")
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 @dataclass(frozen=True)
@@ -225,8 +84,8 @@ class TransitionResult:
 # A sweep token is abandoned if its holder has not heartbeat within this window.
 _COVERAGE_SWEEP_STALE_MINUTES = 10
 
-# The ONE thread-activity merge rule. Shared by the plain accessor and the ticketed
-# activity+mutation unit (§1c) so the two paths can never drift into different monotonicity.
+# The ONE thread-activity merge rule: both ts columns only ever move forward, and the advisory
+# count never moves downward.
 _ACTIVITY_UPSERT_SQL = """
     INSERT INTO channel_thread_activity
         (team_id, channel_id, root_ts, last_observed_reply_ts, advisory_reply_count,
@@ -391,6 +250,108 @@ def memory_content_hash(text: str) -> str:
     Paired with normalize_memory_line so text that is equal after normalization hashes equal.
     """
     return hashlib.sha256(normalize_memory_line(text).encode()).hexdigest()[:16]
+
+
+# --- the dev-only epoch overlay (Docs/specs/EPOCH_FENCE_SPEC.md §7.1d, §7.1h-bis) -----------
+#
+# THE DERIVED-STATE RULE. A production row may persist under a fence IFF it records an OBSERVABLE
+# FACT about a real Slack object — the message really was posted, the thread really has a reply —
+# because those objects exist whether or not a fence is up. POLICY, SELECTION and PREFERENCE state
+# is OVERLAID: it is the state that decides what a LATER run sees, so carrying it across a battery
+# boundary is exactly how one run contaminates the next. Receipts, the activity index, artifacts
+# and the coverage inventory therefore still write through; settings, standing policy, channel
+# memory, `channel_window_anchor` and `response_feedback` are redirected below.
+#
+# The redirect lives at the ACCESSOR rather than at each call site: it is one place instead of
+# dozens, and it reaches the reads inside the channel-stream build without that module needing to
+# know a fence exists. An unfenced process runs identical code to before — the guard is a single
+# empty-dict test inside `overlay_for_channel`, and that dict cannot become non-empty without
+# `DEV_EPOCH_FENCE_ENABLE`.
+
+_EPOCH_UNRESOLVED = object()
+_epoch_hooks: Dict[str, Any] = {}
+
+
+def _epoch_hook(name: str):
+    """One attribute of the fence module, or None when no fence is requested.
+
+    THE FLAG IS TESTED BEFORE THE IMPORT, on every call, and that ordering is the whole point:
+    without it these accessors would pull `message_processor.epoch_fence` into `sys.modules` the
+    first time anybody read a channel setting, defeating the import gates in `main.py` and
+    `slack_client/messaging.py`. With `DEV_EPOCH_FENCE_ENABLE` empty the fence module is never
+    imported through the database layer either, so flag-off really is import-inert everywhere.
+
+    Resolution is cached, the flag test is NOT — the check runs ahead of the cache, so turning the
+    flag off mid-process (which the harness demonstrations do) is honoured rather than answered
+    from a stale binding. An import failure caches None: a dev harness must never break a
+    production read, and `main.initialize` is what refuses to start when the flag asked for one.
+    """
+    if not dev_epoch_fence_requested():
+        return None
+    hook = _epoch_hooks.get(name, _EPOCH_UNRESOLVED)
+    if hook is _EPOCH_UNRESOLVED:
+        try:
+            from message_processor import epoch_fence
+        except Exception:  # noqa: BLE001
+            hook = None
+        else:
+            hook = getattr(epoch_fence, name, None)
+        _epoch_hooks[name] = hook
+    return hook
+
+
+def _epoch_overlay(channel_id, team_id=None):
+    """The overlay a durable channel read/write must be served from, or None."""
+    hook = _epoch_hook("overlay_for_channel")
+    return hook(channel_id, team_id) if hook is not None else None
+
+
+def _epoch_memory_row(memory_id):
+    """The overlay owning a `channel_memory` row id, or None. See `overlay_by_memory_id`."""
+    hook = _epoch_hook("overlay_by_memory_id")
+    return hook(memory_id) if hook is not None else None
+
+
+def _epoch_feedback_row(message_ts, user_id, source):
+    """The overlay holding a `response_feedback` row, or None. See `overlay_by_feedback`."""
+    hook = _epoch_hook("overlay_by_feedback")
+    return hook(message_ts, user_id, source) if hook is not None else None
+
+
+def _epoch_fence_up():
+    """True when ANY fence is installed. The cheap gate for the channel-less accessors."""
+    hook = _epoch_hook("any_fence_installed")
+    return bool(hook()) if hook is not None else False
+
+
+def _epoch_refuse_production_write(channel_id, what: str) -> None:
+    """Raise when `channel_id` is fenced.
+
+    `update_channel_memory_async(id)`, `delete_channel_memory_async(id)` and
+    `delete_response_feedback_async(ts, user, source)` name a ROW and no channel, so the overlay
+    band cannot route them: an id BELOW the band is a production row, and a production row in a
+    FENCED channel is one that predates the battery. Writing it would break the promise that no
+    production policy or preference row moves while a fence is up — and it is the one leak the
+    band cannot see. Rows in unfenced channels fall straight through; the fence is one channel's
+    fence.
+    """
+    if not _epoch_fence_up() or not channel_id:
+        return
+    if _epoch_overlay(channel_id) is None:
+        return
+    EpochEffectRefused = _epoch_hook("EpochEffectRefused")
+    if EpochEffectRefused is None:      # unreachable — a fence is up, so the module resolved
+        return
+    raise EpochEffectRefused(
+        f"{what} names a PRODUCTION row in fenced channel {channel_id}; it predates the battery "
+        f"and the fence does not rewrite production rows. Nothing was changed.")
+
+
+def _epoch_settings_fields(**fields):
+    """Drop the `_UNSET` sentinels so the overlay applies the SAME partial semantics as the
+    production write: only the fields present in the call are written, and a modal submission that
+    omits a block preserves the overlay's value for it."""
+    return {k: v for k, v in fields.items() if v is not _UNSET}
 
 
 def _decode_muted_threads(raw) -> List[str]:
@@ -595,11 +556,6 @@ class DatabaseManager(LoggerMixin):
             isolation_level=None  # Autocommit mode
         )
         self.conn.row_factory = sqlite3.Row  # Enable column access by name
-
-        # §1m: malformed obligation rows log CRITICAL once per row hash per boot. A busy
-        # channel arbitrates on every trigger, and one CRITICAL per trigger would bury the
-        # message it needs to surface.
-        self._malformed_pending_seen: set = set()
 
         # Enable WAL mode for better concurrency
         self.conn.execute("PRAGMA journal_mode=WAL")
@@ -1159,19 +1115,20 @@ class DatabaseManager(LoggerMixin):
             )
         """)
 
-        # Spec §4 honest horizon: how far back this channel's history is actually known.
-        # There are deliberately NO persisted pagination cursors — coverage_start_ts IS the
-        # resume point (a restart re-pages from latest=coverage_start_ts, inclusive=false), so
+        # How far back this channel's ROOT INVENTORY reaches — which thread roots exist and when
+        # each last saw a reply. It never gates the stream and never renders content.
+        # There are deliberately NO persisted pagination cursors — inventory_start_ts IS the
+        # resume point (a restart re-pages from latest=inventory_start_ts, inclusive=false), so
         # it may only ever move BACKWARD and only after a page is fully processed. sweep_token
         # is the single-worker claim; a holder proves liveness with heartbeat_ts.
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS channel_coverage (
                 team_id TEXT NOT NULL,
                 channel_id TEXT NOT NULL,
-                coverage_start_ts TEXT NOT NULL,
+                inventory_start_ts TEXT NOT NULL,
                 bootstrap_status TEXT NOT NULL
                     CHECK (bootstrap_status IN ('pending', 'running', 'complete', 'limited')),
-                coverage_reason TEXT,
+                inventory_reason TEXT,
                 sweep_token TEXT,
                 heartbeat_ts TIMESTAMP,
                 updated_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -1179,226 +1136,26 @@ class DatabaseManager(LoggerMixin):
             )
         """)
 
-        # Spec §7. Snapshot rows are IMMUTABLE and keyed by an opaque id; which one is current
-        # lives in a separate pointer row so publication is a compare-and-swap and a lost racer
-        # discards its own candidate instead of overwriting the winner. A candidate carries
-        # generation NULL until it wins the CAS — retention counts published generations only,
-        # and the UNIQUE index (NULLs distinct in SQLite) lets candidates coexist.
-        #
-        # `namespace` is NOT NULL and carries 'prod' or a test_epoch_id (P4 §3c): a nullable
-        # namespace in a composite key does not enforce one production pointer in SQLite. An
-        # existing P1 database is REBUILT into this shape by _migrate_snapshot_namespace.
-        self.conn.execute(f"CREATE TABLE IF NOT EXISTS channel_snapshots ({_SNAPSHOT_COLUMNS})")
-        self.conn.execute(
-            f"CREATE TABLE IF NOT EXISTS channel_snapshot_pointer ({_POINTER_COLUMNS})")
-        # On a legacy P1 database the table above already exists WITHOUT `namespace`, so these
-        # indexes cannot be built yet — _migrate_snapshot_namespace recreates them after the
-        # rebuild. Indexing here would fail startup on the very database the rebuild is for.
-        if any(r["name"] == "namespace"
-               for r in self.conn.execute("PRAGMA table_info(channel_snapshots)")):
-            for statement in _snapshot_index_sql("channel_snapshots"):
-                self.conn.execute(statement)
-
-        self._init_compaction_schema()
+        # The persisted periphery floor. NOT a coverage claim and NOT a horizon: it is the policy
+        # decision "this is where the recent window starts", and it only ever moves FORWARD.
+        # selection_version invalidates it when the selection POLICY changes, independently of
+        # the serializer grammar — a policy change must be able to move a floor without
+        # necessarily changing a rendered byte.
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS channel_window_anchor (
+                team_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                floor_ts TEXT NOT NULL,
+                selection_version INTEGER NOT NULL,
+                updated_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (team_id, channel_id)
+            )
+        """)
 
         self.conn.commit()
 
         # Run migrations for existing databases
         self._run_migrations()
-    
-    def _init_compaction_schema(self):
-        """The P4 compaction tables. Created on every boot; rebuilt by nothing."""
-        # §1c. AUTOINCREMENT is REQUIRED, not incidental: retention deletes rows, and a reused
-        # rowid would make a persisted frontier compare wrongly. observation_identity is NEVER
-        # NULL — SQLite treats NULLs as distinct, so a nullable column in the unique key would
-        # defeat the idempotent replay the key exists for.
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS snapshot_mutation_observations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                team_id TEXT NOT NULL,
-                channel_id TEXT NOT NULL,
-                subject_ts TEXT NOT NULL,
-                kind TEXT NOT NULL CHECK (kind IN ('edit', 'delete')),
-                observation_identity TEXT NOT NULL,
-                observed_at TEXT NOT NULL,
-                UNIQUE (team_id, channel_id, subject_ts, kind, observation_identity)
-            )
-        """)
-        self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_mutation_obs_scope "
-            "ON snapshot_mutation_observations (team_id, channel_id, id)")
-
-        # §1i. Typed identity + content hash + status, because artifacts complete by MUTATING
-        # the same row id: a same-row pending -> ready completion is detected by the hash or
-        # status changing, so a pending capture never suppresses the later ready summary.
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS snapshot_capture_manifest (
-                snapshot_id TEXT NOT NULL,
-                artifact_namespace TEXT NOT NULL,
-                row_id TEXT NOT NULL,
-                source_ts TEXT NOT NULL,
-                captured_render_version TEXT NOT NULL,
-                content_hash TEXT NOT NULL,
-                status_at_capture TEXT NOT NULL,
-                PRIMARY KEY (snapshot_id, artifact_namespace, row_id)
-            )
-        """)
-
-        # §1j. Every anchored root gets a row, including the ones that rendered
-        # [root unavailable]: a missing row would mean "this snapshot never anchored that
-        # thread", which is false and would let a later mutation of that root go unnoticed.
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS snapshot_anchor_provenance (
-                team_id TEXT NOT NULL,
-                snapshot_id TEXT NOT NULL,
-                root_ts TEXT NOT NULL,
-                status TEXT NOT NULL
-                    CHECK (status IN ('available', 'unavailable', 'refused', 'unsafe')),
-                projection_sha256 TEXT NOT NULL,
-                observation_frontier INTEGER NOT NULL,
-                receipt_proof TEXT,
-                PRIMARY KEY (team_id, snapshot_id, root_ts)
-            )
-        """)
-        self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_anchor_provenance_snapshot "
-            "ON snapshot_anchor_provenance (snapshot_id)")
-        self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_anchor_provenance_root "
-            "ON snapshot_anchor_provenance (team_id, root_ts)")
-
-        # §1n. Every column is a count, a timestamp, a hash, a derived summary or a version —
-        # no column holds message text, and none holds a Slack cursor (cursors expire and
-        # would silently resume from a different place).
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS compaction_crawl_checkpoints (
-                team_id TEXT NOT NULL,
-                channel_id TEXT NOT NULL,
-                namespace TEXT NOT NULL,
-                crawl_id TEXT NOT NULL,
-                crawl_mode TEXT NOT NULL CHECK (crawl_mode IN ('raw', 'incremental')),
-                phase INTEGER NOT NULL,
-                pinned_H TEXT NOT NULL,
-                mutation_frontier INTEGER NOT NULL,
-                source_floor_ts TEXT NOT NULL,
-                input_floor_ts TEXT NOT NULL,
-                input_floor_inclusive INTEGER NOT NULL,
-                parent_snapshot_id TEXT,
-                boundary_ts TEXT,
-                serializer_version INTEGER NOT NULL,
-                serializer_config_hash TEXT NOT NULL,
-                prompt_version TEXT NOT NULL,
-                sizing_profile TEXT NOT NULL,
-                headroom_source TEXT NOT NULL,
-                headroom_tokens INTEGER NOT NULL,
-                profile_version TEXT NOT NULL,
-                inventory_cursor_ts TEXT,
-                root_inventory TEXT NOT NULL,
-                history_span_density TEXT NOT NULL,
-                actor_snapshot TEXT NOT NULL,
-                actor_snapshot_hash TEXT NOT NULL,
-                chunk_index INTEGER NOT NULL,
-                chunk_hashes TEXT NOT NULL,
-                chunk_aggregates TEXT NOT NULL,
-                chunk_summaries TEXT NOT NULL,
-                frozen_renders TEXT NOT NULL,
-                frozen_receipts TEXT NOT NULL,
-                attempt_seq INTEGER NOT NULL,
-                attempt_tokens_in INTEGER NOT NULL,
-                attempt_tokens_out INTEGER NOT NULL,
-                attempt_cached_input_tokens INTEGER NOT NULL,
-                attempt_call_count INTEGER NOT NULL,
-                event_count INTEGER NOT NULL,
-                consecutive_discards INTEGER NOT NULL,
-                next_attempt_after TEXT,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (team_id, channel_id, namespace)
-            )
-        """)
-        self.conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_crawl_checkpoint_crawl "
-            "ON compaction_crawl_checkpoints (crawl_id)")
-
-        # §1n THE EVENT SKELETON. THERE IS NO TEXT COLUMN: every field is a timestamp, an id,
-        # a rank, a byte count or a hash, so the never-persist-conversation-history rule holds
-        # BY SCHEMA SHAPE rather than by anyone's care in what they write. `seq` is NULL while
-        # a candidate — neither walk knows the global order — and sealing assigns it
-        # contiguously; a PARTIAL unique index is what makes that constraint hold continuously
-        # after sealing rather than only at the instant it was checked.
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS compaction_event_skeleton (
-                crawl_id TEXT NOT NULL,
-                seq INTEGER,
-                ts TEXT NOT NULL,
-                root_ts TEXT NOT NULL,
-                kind_rank INTEGER NOT NULL,
-                source_rank INTEGER NOT NULL,
-                actor_id TEXT NOT NULL,
-                projected_byte_len INTEGER NOT NULL,
-                base_canonical_bytes INTEGER NOT NULL,
-                projection_sha256 TEXT NOT NULL,
-                UNIQUE (crawl_id, ts, kind_rank)
-            )
-        """)
-        self.conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_skeleton_seq "
-            "ON compaction_event_skeleton (crawl_id, seq) WHERE seq IS NOT NULL")
-
-        # §1l. DELIVERY ORDER IS outbox_seq, never the identity triple: crawl_id is a random
-        # uuid4, so identity order is not time order and a drainer ordering by the triple would
-        # emit backward the moment a lexicographically smaller crawl_id was inserted.
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS compaction_telemetry_outbox (
-                outbox_seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                crawl_id TEXT NOT NULL,
-                attempt_seq INTEGER NOT NULL,
-                event_seq INTEGER NOT NULL,
-                payload TEXT NOT NULL,
-                created_ts REAL NOT NULL,
-                UNIQUE (crawl_id, attempt_seq, event_seq)
-            )
-        """)
-
-        # §1m. The two structural dormancy invariants are CHECK constraints; the third —
-        # dormant_profile_key must exist as a key in `requirements` — is JSON and is enforced
-        # by the accessor, which fails closed by treating a malformed row as dormant.
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS pending_recompaction (
-                team_id TEXT NOT NULL,
-                channel_id TEXT NOT NULL,
-                namespace TEXT NOT NULL,
-                obligated_snapshot_id TEXT NOT NULL,
-                obligated_generation INTEGER NOT NULL,
-                requirements TEXT NOT NULL,
-                state TEXT NOT NULL CHECK (state IN ('active', 'dormant')),
-                dormant_profile_key TEXT,
-                next_attempt_after TEXT,
-                reason TEXT NOT NULL,
-                created_ts TEXT NOT NULL,
-                PRIMARY KEY (team_id, channel_id, namespace),
-                CHECK ((state = 'active'
-                        AND dormant_profile_key IS NULL AND next_attempt_after IS NULL)
-                    OR (state = 'dormant'
-                        AND dormant_profile_key IS NOT NULL
-                        AND next_attempt_after IS NOT NULL))
-            )
-        """)
-
-        # §1m. Written by the reconciliation transaction that removes the requirement, so
-        # there is no window where the requirement is gone and no intent exists. Duplicate
-        # insertion collides on the primary key: FIRST WRITE WINS.
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS compaction_cancellation_intent (
-                team_id TEXT NOT NULL,
-                channel_id TEXT NOT NULL,
-                namespace TEXT NOT NULL,
-                crawl_id TEXT NOT NULL,
-                obligated_snapshot_id TEXT NOT NULL,
-                reason TEXT NOT NULL,
-                created_ts TEXT NOT NULL,
-                PRIMARY KEY (team_id, channel_id, namespace, crawl_id)
-            )
-        """)
 
     @contextmanager
     def _migration_step(self, name: str):
@@ -1456,6 +1213,11 @@ class DatabaseManager(LoggerMixin):
         Each phase is isolated by `_migration_step` so a failure is loud and
         contained instead of silently skipping every later phase.
         """
+        # BEFORE every other step, and required-critical: each step below and the running bot
+        # assume the P4a schema is gone. Deliberately ahead of the pre-v3 backup — a pre-v3
+        # database predates P4a entirely, so there is nothing there for this to drop.
+        self._migrate_drop_compaction_schema()
+
         # Rollback path FIRST: snapshot the database before any migration writes to
         # it. The gpt-5.6 swap below bulk-overwrites every user's model/effort, and
         # the two destructive drops each take their own tagged backup only AFTER
@@ -1833,142 +1595,96 @@ class DatabaseManager(LoggerMixin):
         # index exists to prevent, made invisible.
         self._migrate_channel_document_uniqueness()
 
-        # Also OUTSIDE _migration_step, for the same reason and one more: a database whose
-        # uniqueness constraints do not include `namespace` cannot enforce one production
-        # pointer per channel, and serving traffic on it would let a fenced test epoch and
-        # production contend for the same pointer row.
-        self._migrate_snapshot_namespace()
-        self._migrate_retire_v1_pointers()
+        # Also OUTSIDE _migration_step: the sweep's own accessors read the renamed columns, so
+        # a database left on the old names would fail every inventory read after this boot.
+        self._migrate_coverage_to_inventory()
 
-    # ----------------------------------------------------------------- snapshot namespace (§3c)
+    # -------------------------------------------------------------- inventory rename (respec §3.5)
 
-    def _snapshot_schema_mismatch(self) -> Optional[str]:
-        """Why the rebuilt snapshot schema is unacceptable, or None when it is correct.
+    def _record_migration_key(self, key: str) -> None:
+        """Mark a one-shot migration done. Idempotent; commits on its own."""
+        self.conn.execute("INSERT OR IGNORE INTO bot_meta (key, value) VALUES (?, ?)",
+                          (key, datetime.now().isoformat()))
+        self.conn.commit()
 
-        Checks keys, columns and indexes — the three things §3c's validation names. Returned
-        as a reason string so the startup failure says what is wrong.
+    def _migrate_drop_compaction_schema(self):
+        """Drop the P4a compaction schema and the P1 snapshot store, once (respec §3.3).
+
+        The stream builder no longer reads a snapshot pointer, so a stale row cannot fail a turn —
+        but it CAN keep megabytes of summary payload blobs and crawl skeletons in a database whose
+        every writer and reader was removed in the same wave. Nothing dropped here is a transcript,
+        a config row, or anything Slack does not still hold.
         """
-        snapshot_columns = {r["name"] for r in
-                            self.conn.execute("PRAGMA table_info(channel_snapshots)")}
-        expected_snapshot = {
-            line.split()[0] for line in
-            (raw.strip() for raw in _SNAPSHOT_COLUMNS.strip().splitlines())
-            if line and not line.startswith(("CHECK", "PRIMARY", "UNIQUE"))}
-        expected_snapshot = {c for c in expected_snapshot if c.isidentifier()}
-        missing = expected_snapshot - snapshot_columns
-        if missing:
-            return f"channel_snapshots is missing {sorted(missing)}"
-
-        pointer_columns = {r["name"] for r in
-                           self.conn.execute("PRAGMA table_info(channel_snapshot_pointer)")}
-        if "namespace" not in pointer_columns:
-            return "channel_snapshot_pointer is missing 'namespace'"
-
-        pointer_key = [r["name"] for r in
-                       self.conn.execute("PRAGMA table_info(channel_snapshot_pointer)")
-                       if r["pk"]]
-        if set(pointer_key) != set(_SNAPSHOT_KEY_COLUMNS):
-            return (f"channel_snapshot_pointer primary key is {sorted(pointer_key)}, "
-                    f"expected {sorted(_SNAPSHOT_KEY_COLUMNS)}")
-
-        indexes = {r["name"] for r in
-                   self.conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
-        for name in _SNAPSHOT_INDEXES:
-            if name not in indexes:
-                return f"index {name} is missing"
-        generation_cols = [r["name"] for r in
-                           self.conn.execute("PRAGMA index_info(idx_channel_snapshot_generation)")]
-        if "namespace" not in generation_cols:
-            return ("idx_channel_snapshot_generation does not include 'namespace', so it "
-                    "cannot enforce one production pointer per channel")
-        return None
-
-    def _migrate_snapshot_namespace(self):
-        """Rebuild channel_snapshots / channel_snapshot_pointer with `namespace` in their keys.
-
-        SQLite cannot alter a key in place, so this is the standard table-rebuild pattern, all
-        of it inside ONE transaction: CREATE new, INSERT...SELECT backfilling namespace='prod'
-        (existing rows are production by definition), DROP old, RENAME, recreate indexes.
-
-        The new §1f provenance and SIZING EVIDENCE columns are backfilled NULL — legacy v1 rows
-        were published before any of that evidence existed, and NULL is a NEVER-DOMINATING
-        sentinel (§1m). Inventing plausible sizing values would be unsafe in the one direction
-        that matters: a fabricated `under_target` would discharge an obligation on the strength
-        of a measurement nobody made.
-
-        FAILS STARTUP on a validation mismatch, unlike _migration_step which logs and continues.
-        """
-        if self._snapshot_schema_mismatch() is None:
+        if self.get_meta(_P4A_CLEANUP_KEY):
             return
+        # ATOMIC: the drops and the completion marker commit together or not at all. A partial
+        # drop that recorded the marker would leave orphaned tables nothing will ever revisit;
+        # a partial drop that did NOT record it is simply retried on the next boot.
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            for table in ("compaction_cancellation_intent", "pending_recompaction",
+                          "compaction_telemetry_outbox", "compaction_event_skeleton",
+                          "compaction_crawl_checkpoints", "snapshot_anchor_provenance",
+                          "snapshot_capture_manifest", "snapshot_mutation_observations",
+                          "channel_snapshot_pointer", "channel_snapshots"):
+                self.conn.execute(f"DROP TABLE IF EXISTS {table}")
+            # IN THE SAME TRANSACTION as the drops.
+            self.conn.execute("INSERT OR IGNORE INTO bot_meta (key, value) VALUES (?, ?)",
+                              (_P4A_CLEANUP_KEY, datetime.now().isoformat()))
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
 
-        legacy_snapshot_cols = [r["name"] for r in
-                                self.conn.execute("PRAGMA table_info(channel_snapshots)")]
-        legacy_pointer_cols = [r["name"] for r in
-                               self.conn.execute("PRAGMA table_info(channel_snapshot_pointer)")]
-        carried_snapshot = [c for c in legacy_snapshot_cols if c != "namespace"]
-        carried_pointer = [c for c in legacy_pointer_cols if c != "namespace"]
+    def _migrate_coverage_to_inventory(self):
+        """Rename channel_coverage's coverage_* columns to inventory_* (respec §3.5).
+
+        The sweep now builds a ROOT INVENTORY, not a coverage floor, and the column names are
+        what a reader of this schema goes by. SQLite cannot rename a column on the versions this
+        database must still open, so it is the standard table rebuild in ONE transaction.
+
+        FAILS STARTUP on error, unlike _migration_step: every inventory accessor below reads the
+        new names, so a half-renamed table serves traffic that cannot read its own index.
+        """
+        if self.get_meta(_COVERAGE_RENAME_KEY):
+            return
+        columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(channel_coverage)")}
+        if not columns or "inventory_start_ts" in columns:
+            self._record_migration_key(_COVERAGE_RENAME_KEY)
+            return
 
         self.conn.execute("BEGIN IMMEDIATE")
         try:
+            self.conn.execute("""
+                CREATE TABLE channel_coverage_new (
+                    team_id TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    inventory_start_ts TEXT NOT NULL,
+                    bootstrap_status TEXT NOT NULL
+                        CHECK (bootstrap_status IN ('pending', 'running', 'complete', 'limited')),
+                    inventory_reason TEXT,
+                    sweep_token TEXT,
+                    heartbeat_ts TIMESTAMP,
+                    updated_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (team_id, channel_id)
+                )
+            """)
             self.conn.execute(
-                f"CREATE TABLE channel_snapshots_new ({_SNAPSHOT_COLUMNS})")
-            self.conn.execute(
-                f"INSERT INTO channel_snapshots_new "
-                f"({', '.join(carried_snapshot)}, namespace) "
-                f"SELECT {', '.join(carried_snapshot)}, '{PROD_NAMESPACE}' "
-                f"FROM channel_snapshots")
-            # A legacy row that was published carries a generation; one that never won its CAS
-            # does not. Statuses are derived from that and from invalidated_at, never invented.
-            self.conn.execute(
-                "UPDATE channel_snapshots_new SET status = CASE "
-                "  WHEN invalidated_at IS NOT NULL THEN 'invalidated' "
-                "  WHEN generation IS NOT NULL THEN 'published' "
-                "  ELSE 'candidate' END")
-            self.conn.execute(
-                f"CREATE TABLE channel_snapshot_pointer_new ({_POINTER_COLUMNS})")
-            self.conn.execute(
-                f"INSERT INTO channel_snapshot_pointer_new "
-                f"({', '.join(carried_pointer)}, namespace) "
-                f"SELECT {', '.join(carried_pointer)}, '{PROD_NAMESPACE}' "
-                f"FROM channel_snapshot_pointer")
-
-            self.conn.execute("DROP TABLE channel_snapshots")
-            self.conn.execute("DROP TABLE channel_snapshot_pointer")
-            self.conn.execute(
-                "ALTER TABLE channel_snapshots_new RENAME TO channel_snapshots")
-            self.conn.execute(
-                "ALTER TABLE channel_snapshot_pointer_new RENAME TO channel_snapshot_pointer")
-            for statement in _snapshot_index_sql("channel_snapshots"):
-                self.conn.execute(statement)
+                "INSERT INTO channel_coverage_new "
+                "SELECT team_id, channel_id, coverage_start_ts, bootstrap_status, "
+                "       coverage_reason, sweep_token, heartbeat_ts, updated_ts "
+                "FROM channel_coverage")
+            self.conn.execute("DROP TABLE channel_coverage")
+            self.conn.execute("ALTER TABLE channel_coverage_new RENAME TO channel_coverage")
+            # IN THE SAME TRANSACTION as the rebuild: a marker that outlived a rolled-back
+            # rename would skip the retry that fixes it.
+            self.conn.execute("INSERT OR IGNORE INTO bot_meta (key, value) VALUES (?, ?)",
+                              (_COVERAGE_RENAME_KEY, datetime.now().isoformat()))
             self.conn.execute("COMMIT")
         except Exception:
             self.conn.execute("ROLLBACK")
             raise
-
-        mismatch = self._snapshot_schema_mismatch()
-        if mismatch:
-            raise RuntimeError(
-                f"Snapshot namespace migration left an unusable schema: {mismatch}")
-        self.log_info("DB: rebuilt channel_snapshots/pointer with namespace in their keys")
-
-    def _migrate_retire_v1_pointers(self):
-        """§1h: retire v1 pointer rows by DELETING them, once.
-
-        The sweep protects active pointer targets, so without this the v1 generations would
-        persist indefinitely. Deleting the pointer — not the rows — is what makes them
-        sweepable by ordinary retention; compaction under v2 starts fresh.
-        """
-        if self.get_meta(_V1_POINTER_RETIREMENT_KEY):
-            return
-        cursor = self.conn.execute(
-            "DELETE FROM channel_snapshot_pointer WHERE serializer_version < 2")
-        retired = cursor.rowcount or 0
-        self.conn.execute(
-            "INSERT OR IGNORE INTO bot_meta (key, value) VALUES (?, ?)",
-            (_V1_POINTER_RETIREMENT_KEY, datetime.now().isoformat()))
-        self.conn.commit()
-        if retired:
-            self.log_info(f"DB: retired {retired} v1 snapshot pointer row(s) for serializer v2")
+        self.log_info("DB: renamed channel_coverage coverage_* columns to inventory_*")
 
     def _migrate_channel_document_uniqueness(self):
         """Dedup channel document rows, then make the duplication impossible. FAILS STARTUP.
@@ -2313,6 +2029,11 @@ class DatabaseManager(LoggerMixin):
     
     def get_channel_settings(self, channel_id: str) -> Optional[Dict]:
         """Get per-channel settings (Phase 7). Returns a dict or None if the channel has no row."""
+        overlay = _epoch_overlay(channel_id)
+        if overlay is not None:
+            store, key = overlay
+            fenced = store.channel_settings(key)
+            return {k: v for k, v in fenced.items() if k != "ambient_memory"}
         cursor = self.conn.execute(
             "SELECT response_mode, reply_in_channel, participation_level, "
             "snoozed_until, muted_threads, model, reasoning_effort, verbosity, updated_ts, updated_by "
@@ -2354,6 +2075,15 @@ class DatabaseManager(LoggerMixin):
         changed. muted_threads is a deprecated inert JSON column (nothing reads it — the
         per-thread mute mechanism was removed); it takes a Python list, None/[] clears it.
         """
+        overlay = _epoch_overlay(channel_id)
+        if overlay is not None:
+            store, key = overlay
+            store.set_channel_settings(key, **_epoch_settings_fields(
+                response_mode=response_mode, reply_in_channel=reply_in_channel,
+                participation_level=participation_level, snoozed_until=snoozed_until,
+                muted_threads=muted_threads, model=model, reasoning_effort=reasoning_effort,
+                verbosity=verbosity, ambient_memory=ambient_memory, updated_by=updated_by))
+            return
         built = _build_channel_settings_write(
             channel_id, response_mode=response_mode,
             reply_in_channel=reply_in_channel, participation_level=participation_level,
@@ -2386,6 +2116,10 @@ class DatabaseManager(LoggerMixin):
     def get_channel_memory(self, channel_id: str) -> List[Dict]:
         """Return durable memory visible to a channel: its own channel-scope rows + shared
         workspace-scope rows. A channel NEVER sees another channel's channel-scope rows."""
+        overlay = _epoch_overlay(channel_id)
+        if overlay is not None:
+            store, key = overlay
+            return store.memory(key)
         cursor = self.conn.execute(
             "SELECT id, channel_id, scope, content, author, created_ts, updated_ts "
             "FROM channel_memory WHERE (scope = 'channel' AND channel_id = ?) OR scope = 'workspace' "
@@ -4262,6 +3996,10 @@ class DatabaseManager(LoggerMixin):
 
     async def get_channel_settings_async(self, channel_id: str) -> Optional[Dict]:
         """Async version of get_channel_settings."""
+        overlay = _epoch_overlay(channel_id)
+        if overlay is not None:
+            store, key = overlay
+            return store.channel_settings(key)
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             await db.execute("PRAGMA journal_mode=WAL")
@@ -4307,6 +4045,15 @@ class DatabaseManager(LoggerMixin):
         muted_threads is a deprecated inert JSON column (nothing reads it — the per-thread mute
         mechanism was removed).
         """
+        overlay = _epoch_overlay(channel_id)
+        if overlay is not None:
+            store, key = overlay
+            store.set_channel_settings(key, **_epoch_settings_fields(
+                response_mode=response_mode, reply_in_channel=reply_in_channel,
+                participation_level=participation_level, snoozed_until=snoozed_until,
+                muted_threads=muted_threads, model=model, reasoning_effort=reasoning_effort,
+                verbosity=verbosity, ambient_memory=ambient_memory, updated_by=updated_by))
+            return
         built = _build_channel_settings_write(
             channel_id, response_mode=response_mode,
             reply_in_channel=reply_in_channel, participation_level=participation_level,
@@ -4343,6 +4090,13 @@ class DatabaseManager(LoggerMixin):
         it. `settings` are the same keyword fields set_channel_settings_async takes; passing none
         of them writes only the policy.
         """
+        overlay = _epoch_overlay(channel_id)
+        if overlay is not None:
+            store, key = overlay
+            store.set_channel_settings(key, **_epoch_settings_fields(updated_by=author,
+                                                                     **settings))
+            store.set_steering(key, policy)
+            return
         built = _build_channel_settings_write(channel_id, updated_by=author, **settings)
         text = (policy or "").strip()
         async with aiosqlite.connect(self.db_path, isolation_level=None) as db:
@@ -4374,6 +4128,10 @@ class DatabaseManager(LoggerMixin):
     # --- Per-channel memory (Phase 9), async variants ---
     async def get_channel_memory_async(self, channel_id: str) -> List[Dict]:
         """Async version of get_channel_memory (channel-scope for this channel + shared workspace)."""
+        overlay = _epoch_overlay(channel_id)
+        if overlay is not None:
+            store, key = overlay
+            return store.memory(key)
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             await db.execute("PRAGMA journal_mode=WAL")
@@ -4388,6 +4146,10 @@ class DatabaseManager(LoggerMixin):
 
     async def get_channel_policy_async(self, channel_id: str) -> Optional[Dict]:
         """Async version of get_channel_policy. Never returns facts."""
+        overlay = _epoch_overlay(channel_id)
+        if overlay is not None:
+            store, key = overlay
+            return store.steering_row(key)
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             await db.execute("PRAGMA journal_mode=WAL")
@@ -4407,6 +4169,11 @@ class DatabaseManager(LoggerMixin):
         behaves here, and merging a new one into an old one accumulates contradictions nobody
         chose. Blank means the operator cleared it, which is a deletion: an empty row would
         render an empty instructions heading."""
+        overlay = _epoch_overlay(channel_id)
+        if overlay is not None:
+            store, key = overlay
+            store.set_steering(key, content)
+            return
         text = (content or "").strip()
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("PRAGMA journal_mode=WAL")
@@ -4441,6 +4208,13 @@ class DatabaseManager(LoggerMixin):
         submits second. `expected_hash` is memory_content_hash of the policy the writer was
         shown, or "" / None when it was shown no policy at all.
         """
+        overlay = _epoch_overlay(channel_id)
+        if overlay is not None:
+            # The CAS runs against the OVERLAY's hash, not production's: a fenced modal save must
+            # keep the concurrency guard rather than fail against a hash the real row still holds.
+            store, key = overlay
+            return store.set_steering_if_unchanged(key, content, expected_hash=expected_hash,
+                                                   hasher=memory_content_hash)
         expected = expected_hash or ""
         text = (content or "").strip()
         async with aiosqlite.connect(self.db_path, isolation_level=None) as db:
@@ -4822,6 +4596,10 @@ class DatabaseManager(LoggerMixin):
     async def add_channel_memory_async(self, channel_id: str, content: str, scope: str = "channel",
                                        author: Optional[str] = None) -> int:
         """Async version of add_channel_memory; returns the new id."""
+        overlay = _epoch_overlay(channel_id)
+        if overlay is not None:
+            store, key = overlay
+            return store.add_memory(key, content, scope=scope, author=author)
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("PRAGMA journal_mode=WAL")
             cursor = await db.execute(
@@ -4833,6 +4611,14 @@ class DatabaseManager(LoggerMixin):
 
     async def update_channel_memory_async(self, memory_id: int, content: str):
         """Async version of update_channel_memory."""
+        overlay = _epoch_memory_row(memory_id)
+        if overlay is not None:
+            store, key = overlay
+            store.update_memory(key, int(memory_id), content)
+            return
+        if _epoch_fence_up():
+            _epoch_refuse_production_write(
+                await self._channel_of_memory_row(memory_id), "update_channel_memory")
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("PRAGMA journal_mode=WAL")
             await db.execute(
@@ -4843,6 +4629,14 @@ class DatabaseManager(LoggerMixin):
 
     async def delete_channel_memory_async(self, memory_id: int):
         """Async version of delete_channel_memory."""
+        overlay = _epoch_memory_row(memory_id)
+        if overlay is not None:
+            store, key = overlay
+            store.delete_memory(key, int(memory_id))
+            return
+        if _epoch_fence_up():
+            _epoch_refuse_production_write(
+                await self._channel_of_memory_row(memory_id), "delete_channel_memory")
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("PRAGMA journal_mode=WAL")
             await db.execute("DELETE FROM channel_memory WHERE id = ?", (memory_id,))
@@ -4872,6 +4666,19 @@ class DatabaseManager(LoggerMixin):
         """
         if not channel_id or not marker_author:
             return None
+        overlay = _epoch_overlay(channel_id)
+        if overlay is not None:
+            # The preference marker is POLICY — it steers how the bot behaves in the room — so it
+            # is overlaid rather than written through. The spec's full design REFUSED this writer
+            # instead, with an honest tool error; slim overlays it, because the per-case reset
+            # already denies it the thing refusal was protecting (a case rewriting its own
+            # participation settings and carrying that into the next one).
+            store, key = overlay
+            for row in store.memory(key):
+                if row["author"] == marker_author and row["scope"] == "channel":
+                    store.update_memory(key, row["id"], content)
+                    return row["id"]
+            return store.add_memory(key, content, scope="channel", author=marker_author)
         async with aiosqlite.connect(self.db_path, isolation_level=None) as db:
             await db.execute("PRAGMA journal_mode=WAL")
             await db.execute("PRAGMA busy_timeout=5000")
@@ -4967,6 +4774,40 @@ class DatabaseManager(LoggerMixin):
 
         cap = max(1, int(max_rows)) if max_rows is not None else None
 
+        overlay = _epoch_overlay(channel_id)
+        if overlay is not None:
+            # The same keep / delete / add decision against the overlay's rows. The concurrency
+            # guards the production path carries — BEGIN IMMEDIATE, the changed-since-open
+            # conflict check — have no counterpart here: one battery drives one modal, and the
+            # overlay is process-local, so there is no second writer to serialize against.
+            store, key = overlay
+            from message_processor.channel_steering import PREF_AUTHOR_PREFIX
+            current = {r["id"]: r["content"] for r in store.memory(key)
+                       if r["scope"] == "channel"
+                       and not (r["author"] or "").startswith(PREF_AUTHOR_PREFIX)}
+            seed_ids = {int(mid): h for mid, h in (seed or [])}
+            for mem_id, seed_hash in seed_ids.items():
+                if seed_hash in line_hashes or mem_id not in current:
+                    continue
+                if memory_content_hash(current[mem_id]) != seed_hash:
+                    result["conflicts"] += 1
+                    continue
+                store.delete_memory(key, mem_id)
+                current.pop(mem_id, None)
+                result["deleted"].append(mem_id)
+            existing = {memory_content_hash(c) for c in current.values()}
+            for line in norm_lines:
+                if memory_content_hash(line) in existing:
+                    continue
+                if cap is not None and len(current) >= cap:
+                    result["over_cap"] += 1
+                    continue
+                new_id = store.add_memory(key, line, scope="channel", author=author)
+                current[new_id] = line
+                existing.add(memory_content_hash(line))
+                result["added"].append(line)
+            return result
+
         async with aiosqlite.connect(self.db_path, isolation_level=None) as db:
             db.row_factory = aiosqlite.Row
             await db.execute("PRAGMA journal_mode=WAL")
@@ -5047,6 +4888,18 @@ class DatabaseManager(LoggerMixin):
                                              message_ts: str, user_id: str, signal: int,
                                              source: str) -> None:
         """Async version of record_response_feedback (upsert per message/user/source)."""
+        overlay = _epoch_overlay(channel_id)
+        if overlay is not None:
+            # PREFERENCE state: a 👍 on a test message is not a judgement about production, and the
+            # battery clicks these buttons deliberately. Those clicks must not enter the real
+            # signal, so the overlay holds them and the production table is untouched.
+            FeedbackRow = _epoch_hook("FeedbackRow")
+            store, key = overlay
+            store.add_feedback(key, FeedbackRow(
+                channel_id=channel_id, thread_ts=thread_ts, message_ts=message_ts,
+                user_id=user_id, signal=int(signal), source=source,
+                created_ts=f"{time.time():.6f}"))
+            return
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("PRAGMA journal_mode=WAL")
             await db.execute("""
@@ -5060,6 +4913,15 @@ class DatabaseManager(LoggerMixin):
 
     async def delete_response_feedback_async(self, message_ts: str, user_id: str, source: str) -> None:
         """Async version of delete_response_feedback."""
+        overlay = _epoch_feedback_row(message_ts, user_id, source)
+        if overlay is not None:
+            store, key = overlay
+            store.delete_feedback(key, message_ts, user_id, source)
+            return
+        if _epoch_fence_up():
+            _epoch_refuse_production_write(
+                await self._channel_of_feedback_row(message_ts, user_id, source),
+                "delete_response_feedback")
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("PRAGMA journal_mode=WAL")
             await db.execute(
@@ -5070,6 +4932,14 @@ class DatabaseManager(LoggerMixin):
 
     async def get_channel_feedback_ratio_async(self, channel_id: str, days: int = 30):
         """Async version of get_channel_feedback_ratio."""
+        overlay = _epoch_overlay(channel_id)
+        if overlay is not None:
+            store, key = overlay
+            rows = store.feedback(key)
+            positive = sum(1 for r in rows if r.signal > 0)
+            negative = sum(1 for r in rows if r.signal < 0)
+            total = positive + negative
+            return positive, negative, (positive / total if total else None)
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             await db.execute("PRAGMA journal_mode=WAL")
@@ -5918,8 +5788,8 @@ class DatabaseManager(LoggerMixin):
             return None
 
     # =====================================================================================
-    # Single-stream P1 (Docs/SINGLE_STREAM_SPEC.md §4/§5/§7): meta, outbound receipts,
-    # thread-activity index, coverage, compaction snapshots.
+    # Single-stream P1 (Docs/SINGLE_STREAM_SPEC.md §4/§5): meta, outbound receipts,
+    # thread-activity index, the root inventory.
     #
     # Two rules hold across every accessor below. Slack timestamps compare as REAL, never as
     # TEXT ("999.123456" sorts after "1000.5" as text). NULL-safety is spelled out with CASE
@@ -6396,73 +6266,6 @@ class DatabaseManager(LoggerMixin):
         async with self._stream_conn() as db:
             await db.execute(_ACTIVITY_UPSERT_SQL, params)
 
-    async def record_activity_and_mutation_async(
-            self, *, observation: Optional[Dict[str, Any]] = None,
-            mutation: Optional[Dict[str, Any]] = None) -> None:
-        """Commit an activity observation and a mutation observation as ONE unit (§1c).
-
-        The admission ticket completes only when both have landed, so they share a transaction
-        and a retry replays both idempotently: the activity half is the same monotonic merge
-        record_thread_activity_async performs, the mutation half is INSERT OR IGNORE on its
-        identity key. Raises on any write failure — a mutation we could not record is a
-        mutation the invalidation frontier will never see, which must fail the ticket rather
-        than pass quietly. Both halves absent is a legal no-op.
-        """
-        activity_params = None
-        if observation:
-            activity_params = _activity_upsert_params(
-                observation["team_id"], observation["channel_id"], observation["root_ts"],
-                observation.get("reply_ts"), observation.get("reply_count"),
-                observation.get("event_ts"), bool(observation.get("mark_dirty")))
-
-        mutation_params = None
-        if mutation:
-            kind = mutation["kind"]
-            if kind not in ("edit", "delete"):
-                raise ValueError(f"invalid mutation kind: {kind!r}")
-            identity = mutation["observation_identity"]
-            # SQLite treats NULLs as distinct, so a NULL identity would defeat the unique key
-            # and let a replayed delivery insert a second row.
-            if identity is None or identity == "":
-                raise ValueError("mutation observation_identity must never be empty")
-            mutation_params = (mutation["team_id"], mutation["channel_id"],
-                               str(mutation["subject_ts"]), kind, str(identity),
-                               str(mutation.get("observed_at")
-                                   or datetime.now().isoformat()))
-
-        if activity_params is None and mutation_params is None:
-            return
-
-        async with self._stream_conn() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            try:
-                if activity_params is not None:
-                    await db.execute(_ACTIVITY_UPSERT_SQL, activity_params)
-                if mutation_params is not None:
-                    await db.execute(
-                        "INSERT OR IGNORE INTO snapshot_mutation_observations "
-                        "(team_id, channel_id, subject_ts, kind, observation_identity, "
-                        " observed_at) VALUES (?, ?, ?, ?, ?, ?)",
-                        mutation_params)
-                await db.execute("COMMIT")
-            except Exception:
-                try:
-                    await db.execute("ROLLBACK")
-                except Exception:
-                    pass
-                raise
-
-    async def max_mutation_observation_id_async(self, team_id: str, channel_id: str) -> int:
-        """The channel's current mutation frontier; 0 when nothing has been observed."""
-        async with self._stream_conn() as db:
-            async with db.execute(
-                "SELECT COALESCE(MAX(id), 0) FROM snapshot_mutation_observations "
-                "WHERE team_id = ? AND channel_id = ?",
-                (team_id, channel_id)
-            ) as cursor:
-                row = await cursor.fetchone()
-                return int(row[0]) if row else 0
-
     async def clear_thread_dirty_async(self, team_id: str, channel_id: str, root_ts: str,
                                        if_event_ts_equals: Optional[str]) -> bool:
         """Compare-and-clear: only clears if no newer event landed since the reader looked.
@@ -6475,6 +6278,36 @@ class DatabaseManager(LoggerMixin):
                 "UPDATE channel_thread_activity SET dirty = 0, updated_ts = CURRENT_TIMESTAMP "
                 "WHERE team_id = ? AND channel_id = ? AND root_ts = ? "
                 "  AND last_index_event_ts IS ?",
+                (team_id, channel_id, str(root_ts),
+                 str(if_event_ts_equals) if if_event_ts_equals else None))
+            return bool(cursor.rowcount)
+
+    async def delete_thread_activity_if_unchanged_async(
+            self, team_id: str, channel_id: str, root_ts: str,
+            if_event_ts_equals: Optional[str]) -> bool:
+        """Compare-and-DELETE one activity row. Returns True when the row actually went.
+
+        The mirror of compare-and-clear above, for a root the fan-out proved is GONE from Slack:
+        `conversations.replies` answered `thread_not_found` and nothing visible vouches for it.
+        Without the delete the dead row is exempt from the floor, re-fires the same refused fetch
+        on every turn, and the channel can never build again — which is not a hypothetical, it is
+        the state that took #dev-ops down.
+
+        THE COMPARE IS ON `COALESCE(last_index_event_ts, last_observed_reply_ts)`, which is the
+        value READ 1 pinned in `activity_roots` — not on `last_index_event_ts` alone, which is
+        what compare-and-clear uses and would miss a row whose only timestamp is a reply
+        observation. If it MOVED, something learned about this root after the pin and the row
+        stays for the next turn to reassess.
+
+        `IS` compares NULL-safely, so a bootstrap hint carrying no timestamp at all deletes
+        against an explicit None. The delete is recoverable by construction: any future event on
+        the root re-creates the row through the index.
+        """
+        async with self._stream_conn() as db:
+            cursor = await db.execute(
+                "DELETE FROM channel_thread_activity "
+                "WHERE team_id = ? AND channel_id = ? AND root_ts = ? "
+                "  AND COALESCE(last_index_event_ts, last_observed_reply_ts) IS ?",
                 (team_id, channel_id, str(root_ts),
                  str(if_event_ts_equals) if if_event_ts_equals else None))
             return bool(cursor.rowcount)
@@ -6530,7 +6363,7 @@ class DatabaseManager(LoggerMixin):
         async with self._stream_conn() as db:
             cursor = await db.execute(
                 "INSERT OR IGNORE INTO channel_coverage "
-                "(team_id, channel_id, coverage_start_ts, bootstrap_status) "
+                "(team_id, channel_id, inventory_start_ts, bootstrap_status) "
                 "VALUES (?, ?, ?, 'pending')",
                 (team_id, channel_id, str(start_ts)))
             return bool(cursor.rowcount)
@@ -6578,7 +6411,7 @@ class DatabaseManager(LoggerMixin):
                                              reason: Optional[str] = None) -> bool:
         """Extend coverage backward and/or set the bootstrap status. Token-guarded.
 
-        coverage_start_ts is the resume point, so it only ever moves BACKWARD and only for a
+        inventory_start_ts is the resume point, so it only ever moves BACKWARD and only for a
         page that was fully processed. A terminal status (`complete`/`limited`) is never talked
         back down to `running` — a channel that reached genesis or Slack's retention wall stays
         there for the rest of P1.
@@ -6589,20 +6422,20 @@ class DatabaseManager(LoggerMixin):
             cursor = await db.execute(
                 """
                 UPDATE channel_coverage SET
-                    coverage_start_ts = CASE
-                        WHEN :new_start IS NULL THEN coverage_start_ts
-                        WHEN CAST(:new_start AS REAL) < CAST(coverage_start_ts AS REAL)
+                    inventory_start_ts = CASE
+                        WHEN :new_start IS NULL THEN inventory_start_ts
+                        WHEN CAST(:new_start AS REAL) < CAST(inventory_start_ts AS REAL)
                             THEN :new_start
-                        ELSE coverage_start_ts END,
+                        ELSE inventory_start_ts END,
                     bootstrap_status = CASE
                         WHEN bootstrap_status IN ('complete', 'limited')
                              AND :status NOT IN ('complete', 'limited')
                             THEN bootstrap_status
                         ELSE :status END,
-                    coverage_reason = CASE
+                    inventory_reason = CASE
                         WHEN bootstrap_status IN ('complete', 'limited')
                              AND :status NOT IN ('complete', 'limited')
-                            THEN coverage_reason
+                            THEN inventory_reason
                         ELSE :reason END,
                     heartbeat_ts = CURRENT_TIMESTAMP,
                     updated_ts = CURRENT_TIMESTAMP
@@ -6622,17 +6455,17 @@ class DatabaseManager(LoggerMixin):
         demote. A retention wall, a depth cap and `complete` are facts about history rather than
         reachability, so the predicate excludes them and a finished channel is never re-walked.
         Untokened by design: the caller is a join event, not a claim holder, and clearing
-        sweep_token here is exactly the takeover. coverage_start_ts is left alone so an
+        sweep_token here is exactly the takeover. inventory_start_ts is left alone so an
         interrupted backward walk resumes where it stopped.
         """
         async with self._stream_conn() as db:
             cursor = await db.execute(
                 """
                 UPDATE channel_coverage
-                SET bootstrap_status = 'pending', coverage_reason = NULL, sweep_token = NULL,
+                SET bootstrap_status = 'pending', inventory_reason = NULL, sweep_token = NULL,
                     heartbeat_ts = NULL, updated_ts = CURRENT_TIMESTAMP
                 WHERE team_id = ? AND channel_id = ?
-                  AND bootstrap_status = 'limited' AND coverage_reason = ?
+                  AND bootstrap_status = 'limited' AND inventory_reason = ?
                 """,
                 (team_id, channel_id, _COVERAGE_UNAVAILABLE_REASON))
             return bool(cursor.rowcount)
@@ -6642,8 +6475,8 @@ class DatabaseManager(LoggerMixin):
         """The declared horizon for one channel, or None when it has never been seeded."""
         async with self._stream_conn() as db:
             async with db.execute(
-                "SELECT team_id, channel_id, coverage_start_ts, bootstrap_status, "
-                "       coverage_reason, sweep_token, heartbeat_ts, updated_ts "
+                "SELECT team_id, channel_id, inventory_start_ts, bootstrap_status, "
+                "       inventory_reason, sweep_token, heartbeat_ts, updated_ts "
                 "FROM channel_coverage WHERE team_id = ? AND channel_id = ?",
                 (team_id, channel_id)
             ) as cursor:
@@ -6656,11 +6489,10 @@ class DatabaseManager(LoggerMixin):
     #
     # A channel turn renders the window (floor_ts, floor_inclusive] .. H. There are exactly two
     # kinds of floor and they differ ONLY in that flag:
-    #   * genesis — floor is the coverage row's `coverage_start_ts`, INCLUSIVE. That ts is the
+    #   * genesis — floor is the coverage row's `inventory_start_ts`, INCLUSIVE. That ts is the
     #     oldest message the sweep actually processed, so excluding it would drop a real message
     #     nothing else will ever show us.
-    #   * snapshot — floor is the snapshot's `boundary_ts`, EXCLUSIVE. The boundary message is
-    #     already inside the summary; including it would render it twice.
+    #   * an explicit floor passed by the caller, whose `floor_inclusive` flag it supplies.
     # H is always an INCLUSIVE upper bound: it is a ts this process admitted, so the message at
     # H exists and belongs in the window.
     #
@@ -6669,130 +6501,157 @@ class DatabaseManager(LoggerMixin):
     # lexicographically and the two orderings disagree exactly at the boundary this window is
     # defined by.
 
-    async def read_channel_sidecars_async(self, team_id: str, channel_id: str, high_ts: str,
-                                          window: Optional[Tuple[str, bool]] = None,
-                                          *, preboundary_receipts: bool = False) -> Dict:
-        """Every DB row one channel turn renders from, in ONE transaction.
+    # --- the window anchor + the two staged reads (SHALLOW_STREAM_RESPEC §4.2, §4.6) -------
 
-        The turn path reads this once, before any Slack call, and pins the result: discovery and
-        rendering then work from the SAME rows. Split reads would let a root be discovered from
-        an activity row the renderer never saw (a thread fetched for nothing) or, worse, a
-        message rendered without the sidecar marker that explains it.
+    async def advance_channel_window_anchor_async(
+            self, team_id: str, channel_id: str, floor_ts: str,
+            selection_version: int) -> bool:
+        """Move the periphery floor forward. True when the row actually moved.
 
-        BEGIN DEFERRED before the first SELECT makes the whole read one MVCC snapshot, so the
-        coverage floor cannot belong to a different instant than the rows predicated on it. The
-        transaction commits and the connection closes before the caller touches Slack — holding
-        a read transaction across network I/O is how a WAL file grows without bound.
+        THREE version rules, and the middle one is the whole point:
 
-        `window` is (floor_ts, floor_inclusive); None means genesis, and the floor is then the
-        coverage row read HERE. NOT read: channel_summaries and channel memory/steering, which
-        the turn takes from its own stamped snapshot.
+          * HIGHER incoming version -> overwrite unconditionally (a policy change resets the
+            floor, which is what SELECTION_VERSION exists to do);
+          * EQUAL version           -> the floor may only move FORWARD;
+          * LOWER incoming version  -> REJECTED outright.
 
-        `preboundary_receipts` additionally pins the receipt and chrome evidence BELOW the
-        floor, in this SAME transaction. §1k rehydration renders the origin thread's
-        pre-boundary tail and needs its own role/chrome evidence for it; the ordinary read
-        deliberately stops at the floor, which is not enough.
+        The lower-version rejection is what stops an old process — a rolling restart, a straggler
+        turn holding a pre-upgrade pin — from overwriting a newer-version row and dragging the
+        floor back to a policy that is no longer in force. ONE statement, so two concurrent turns
+        converge without either reading the other's write first.
+
+        The empty-floor sentinel never reaches here: a build with no floor writes no row.
         """
-        payload: Dict[str, Any] = {
-            "window": None, "coverage": None, "receipt_feature_epoch_ts": None,
-            "receipts": [], "activity": [], "image_analyses": [],
-            "document_extractions": [], "ambient_artifacts": [], "tool_usage": {},
-            "preboundary_receipts": [],
-            "versions_hash": "",
-        }
+        overlay = _epoch_overlay(channel_id, team_id)
+        if overlay is not None:
+            # SELECTION state, and the easiest to miss: every build advances it, so a battery
+            # would leave the channel's floor wherever the last case left it and the NEXT
+            # battery's first turn would render a window shaped by the previous run.
+            store, key = overlay
+            return store.advance_window_anchor(key, floor_ts, selection_version)
+        async with self._stream_conn() as db:
+            cursor = await db.execute(
+                """
+                INSERT INTO channel_window_anchor
+                    (team_id, channel_id, floor_ts, selection_version, updated_ts)
+                VALUES (:team, :ch, :floor, :ver, CURRENT_TIMESTAMP)
+                ON CONFLICT(team_id, channel_id) DO UPDATE SET
+                    floor_ts          = excluded.floor_ts,
+                    selection_version = excluded.selection_version,
+                    updated_ts        = CURRENT_TIMESTAMP
+                WHERE excluded.selection_version > channel_window_anchor.selection_version
+                   OR (excluded.selection_version = channel_window_anchor.selection_version
+                       AND CAST(excluded.floor_ts AS REAL)
+                           > CAST(channel_window_anchor.floor_ts AS REAL))
+                """,
+                {"team": team_id, "ch": channel_id, "floor": str(floor_ts),
+                 "ver": int(selection_version)})
+            return bool(cursor.rowcount)
+
+    async def read_channel_window_anchor_async(self, team_id: str,
+                                               channel_id: str) -> Dict[str, Any]:
+        """READ 1 STAGE 1. Anchor + inventory, and BOTH ARE PINNED.
+
+        One transaction returning exactly two things:
+          * the window anchor row -> {"floor_ts", "selection_version"} or None
+          * the inventory row     -> {"inventory_start_ts", "bootstrap_status", "reason"} or
+            **None when the row is ABSENT**
+
+        BOTH RENDER. The anchor becomes the periphery floor, which is pre-breakpoint bytes; the
+        inventory state becomes the horizon's index clause. They are frozen into the pin at the
+        moment they are read and are NEVER re-read for the rest of the turn.
+
+        It reads NO activity and NO receipt rows: those need a window, and the window is not
+        known until the history walk has run. Stage 2 below owns them.
+        """
+        payload: Dict[str, Any] = {"anchor": None, "inventory": None}
+        # Under a fence the ANCHOR comes from the overlay and the INVENTORY still comes from
+        # production: the inventory records an observable fact — how far the index has actually
+        # walked this channel — while the anchor decides what the next run's window contains.
+        # The overlay's anchor starts as None, so a fenced channel's first turn takes the cold
+        # path and derives its own floor instead of inheriting whatever the room was doing before.
+        overlay = _epoch_overlay(channel_id, team_id)
         async with self._stream_conn() as db:
             await db.execute("BEGIN DEFERRED")
             try:
+                if overlay is not None:
+                    store, key = overlay
+                    payload["anchor"] = store.window_anchor(key)
+                else:
+                    async with db.execute(
+                        "SELECT floor_ts, selection_version FROM channel_window_anchor "
+                        "WHERE team_id = ? AND channel_id = ?",
+                        (team_id, channel_id)
+                    ) as cursor:
+                        row = await cursor.fetchone()
+                    if row is not None:
+                        payload["anchor"] = {"floor_ts": row["floor_ts"],
+                                             "selection_version": int(row["selection_version"])}
+
                 async with db.execute(
-                    "SELECT coverage_start_ts, bootstrap_status, coverage_reason "
+                    "SELECT inventory_start_ts, bootstrap_status, inventory_reason "
                     "FROM channel_coverage WHERE team_id = ? AND channel_id = ?",
                     (team_id, channel_id)
                 ) as cursor:
                     row = await cursor.fetchone()
-                coverage = dict(row) if row else None
-                if coverage:
-                    payload["coverage"] = {
-                        "coverage_start_ts": coverage["coverage_start_ts"],
-                        "bootstrap_status": coverage["bootstrap_status"],
-                        "reason": coverage["coverage_reason"],
+                if row is not None:
+                    payload["inventory"] = {
+                        "inventory_start_ts": row["inventory_start_ts"],
+                        "bootstrap_status": row["bootstrap_status"],
+                        "reason": row["inventory_reason"],
                     }
-                if window is not None:
-                    floor_ts, floor_inclusive = str(window[0]), bool(window[1])
-                elif coverage and coverage["coverage_start_ts"]:
-                    floor_ts, floor_inclusive = str(coverage["coverage_start_ts"]), True
-                else:
-                    # Unseeded: no floor, so there is no window to predicate on. The caller
-                    # fails the turn closed on the coverage gate. The hash is still computed —
-                    # an empty string here would be a pseudo-hash that collides with every
-                    # other unseeded read and with anything that ever fails to set it.
-                    await db.execute("COMMIT")
-                    payload["versions_hash"] = self._sidecar_versions_hash(payload)
-                    return payload
-                payload["window"] = (floor_ts, floor_inclusive)
-                low_op = ">=" if floor_inclusive else ">"
-                bounds = {"floor": floor_ts, "high": str(high_ts)}
+                await db.execute("COMMIT")
+            except Exception:
+                try:
+                    await db.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+        return payload
 
-                def _window_sql(column: str) -> str:
-                    return (f"CAST({column} AS REAL) {low_op} CAST(:floor AS REAL) "
-                            f"AND CAST({column} AS REAL) <= CAST(:high AS REAL)")
+    async def read_channel_discovery_roots_async(self, team_id: str, channel_id: str, *,
+                                                 floor_ts: str,
+                                                 high_ts: str) -> Dict[str, Any]:
+        """READ 1 STAGE 2. DISCOVERY ONLY — nothing here is ever rendered.
 
-                async with db.execute(
-                    "SELECT value FROM bot_meta WHERE key = ?",
-                    (OUTBOUND_RECEIPTS_EPOCH_KEY,)
-                ) as cursor:
-                    row = await cursor.fetchone()
-                payload["receipt_feature_epoch_ts"] = row["value"] if row else None
+        Returns `{"activity_roots": {root_ts: pinned event ts | None},
+                  "receipt_roots": (root_ts, ...)}`.
 
-                # Receipts are predicated into the SAME window as everything else, by the ts of
-                # the message each one describes. Two reasons, both about isolation:
-                #   * above H — a receipt committed after this turn pinned its frontier must not
-                #     add a thread to its root inventory. It would spend the shared page budget,
-                #     and a failure fetching it would fail a turn whose stream cannot contain it.
-                #   * below the floor — the message is outside the window either way, so its
-                #     row can decide nothing about the stream; a channel we have posted in for
-                #     a year would otherwise hand every turn a root inventory that grows without
-                #     bound. Human activity under those older roots still reaches us, through the
-                #     activity index, which is the thing that remembers pre-floor roots.
-                async with db.execute(
-                    f"SELECT message_ts, turn_id, state, thread_root_ts "
-                    f"FROM outbound_receipts WHERE team_id = :team AND channel_id = :ch "
-                    f"  AND {_window_sql('message_ts')} "
-                    f"ORDER BY CAST(message_ts AS REAL)",
-                    {"team": team_id, "ch": channel_id, **bounds}
-                ) as cursor:
-                    payload["receipts"] = [dict(r) for r in await cursor.fetchall()]
+        **`activity_roots` IS A MAPPING, not a set**, and the value is what compare-and-clear
+        compares against: the event ts THIS read pinned for that root
+        (`COALESCE(last_index_event_ts, last_observed_reply_ts)`, None for a bootstrap
+        reply-count hint with no event ts). A root's dirty flag is cleared only when the stored
+        value still equals the one pinned here — a root whose ts MOVED saw a mutation this fetch
+        did not, and must stay dirty. A set could not express that and the clear would be unsafe.
 
-                if preboundary_receipts:
-                    # The strict complement of the window below the floor, so a receipt is in
-                    # exactly one of the two lists and never in both.
-                    below_op = "<" if floor_inclusive else "<="
-                    async with db.execute(
-                        f"SELECT message_ts, turn_id, state, thread_root_ts "
-                        f"FROM outbound_receipts "
-                        f"WHERE team_id = :team AND channel_id = :ch "
-                        f"  AND CAST(message_ts AS REAL) {below_op} CAST(:floor AS REAL) "
-                        f"ORDER BY CAST(message_ts AS REAL)",
-                        {"team": team_id, "ch": channel_id, **bounds}
-                    ) as cursor:
-                        payload["preboundary_receipts"] = [
-                            dict(r) for r in await cursor.fetchall()]
+        `floor_ts` is the EFFECTIVE floor — the stored floor only when the history walk actually
+        reached it, otherwise the walk's early-stop floor. Windowing on the STORED floor would
+        let a stale anchor pull months of roots out of the index and into reply fan-out, which is
+        the deep-walk failure this design replaces, reached through the database instead of
+        through Slack.
 
-                # Activity rows are selected by ACTIVITY semantics, never by a root_ts window:
-                # a root older than the floor is exactly the case only the index can surface,
-                # and filtering on root_ts would discard it.
-                #
-                # A dirty row keeps its exemption from the FLOOR (an edit or a deletion says
-                # nothing about where the mutated message sits, so the root must come back until
-                # someone fetches it) but not from H: a mutation that landed after this turn's
-                # frontier cannot appear in its stream, so scheduling a fetch for it would let a
-                # later event delay — or fail — an already-admitted older turn. Those rows stay
-                # dirty and untouched, and the next turn, whose H is above them, picks them up.
-                # A dirty row with no event ts at all is a bootstrap reply-count hint rather than
-                # a mutation, so there is nothing to place above H and it is admitted.
+        Staleness here costs at most one redundant reply fetch, or one reply the next turn picks
+        up. It can never produce wrong bytes — which is what makes it discovery and not a pin.
+        """
+        bounds = {"team": team_id, "ch": channel_id, "floor": str(floor_ts),
+                  "high": str(high_ts)}
+
+        def _window_sql(column: str) -> str:
+            return (f"CAST({column} AS REAL) >= CAST(:floor AS REAL) "
+                    f"AND CAST({column} AS REAL) <= CAST(:high AS REAL)")
+
+        activity_roots: Dict[str, Optional[str]] = {}
+        receipt_roots: List[str] = []
+        async with self._stream_conn() as db:
+            await db.execute("BEGIN DEFERRED")
+            try:
+                # The landed activity predicate, verbatim: a dirty row keeps its exemption from
+                # the FLOOR (an edit says nothing about where the mutated message sits, so the
+                # root must come back until someone fetches it) but NOT from H — a mutation
+                # above this turn's frontier cannot appear in its stream.
                 async with db.execute(
                     f"""
-                    SELECT root_ts, last_observed_reply_ts, advisory_reply_count,
-                           last_index_event_ts, dirty
+                    SELECT root_ts, last_observed_reply_ts, last_index_event_ts
                     FROM channel_thread_activity
                     WHERE team_id = :team AND channel_id = :ch
                       AND ((dirty = 1
@@ -6806,72 +6665,156 @@ class DatabaseManager(LoggerMixin):
                                AND {_window_sql('last_index_event_ts')}))
                     ORDER BY CAST(root_ts AS REAL)
                     """,
-                    {"team": team_id, "ch": channel_id, **bounds}
+                    bounds
                 ) as cursor:
-                    payload["activity"] = [dict(r) for r in await cursor.fetchall()]
+                    for row in await cursor.fetchall():
+                        pinned = row["last_index_event_ts"] or row["last_observed_reply_ts"]
+                        activity_roots[str(row["root_ts"])] = (
+                            str(pinned) if pinned is not None else None)
 
-                thread_prefix = f"{channel_id}:%"
+                # Our own posts name the threads we are already part of. Predicated into the
+                # SAME window as everything else, by the ts of the message each receipt
+                # describes (FX1 finding F3, preserved).
                 async with db.execute(
                     f"""
-                    SELECT id, thread_id, message_ts, url, image_type, analysis, metadata_json
-                    FROM images
-                    WHERE thread_id LIKE :prefix AND message_ts IS NOT NULL
+                    SELECT DISTINCT thread_root_ts
+                    FROM outbound_receipts
+                    WHERE team_id = :team AND channel_id = :ch
+                      AND thread_root_ts IS NOT NULL
                       AND {_window_sql('message_ts')}
-                    ORDER BY CAST(message_ts AS REAL), id
+                    ORDER BY CAST(thread_root_ts AS REAL)
                     """,
-                    {"prefix": thread_prefix, **bounds}
+                    bounds
                 ) as cursor:
-                    images = []
-                    for r in await cursor.fetchall():
-                        row_dict = dict(r)
-                        raw = row_dict.pop("metadata_json", None)
-                        try:
-                            row_dict["metadata"] = json.loads(raw) if raw else None
-                        except (json.JSONDecodeError, TypeError, ValueError):
-                            row_dict["metadata"] = None
-                        images.append(row_dict)
-                    payload["image_analyses"] = images
+                    receipt_roots = [str(r["thread_root_ts"]) for r in await cursor.fetchall()]
+                await db.execute("COMMIT")
+            except Exception:
+                try:
+                    await db.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+        return {"activity_roots": activity_roots, "receipt_roots": tuple(receipt_roots)}
 
-                async with db.execute(
-                    f"""
-                    SELECT id, thread_id, message_ts, filename, mime_type, file_id, summary
-                    FROM documents
-                    WHERE thread_id LIKE :prefix AND message_ts IS NOT NULL
-                      AND {_window_sql('message_ts')}
-                    ORDER BY CAST(message_ts AS REAL), id
-                    """,
-                    {"prefix": thread_prefix, **bounds}
-                ) as cursor:
-                    payload["document_extractions"] = [dict(r) for r in await cursor.fetchall()]
+    async def read_channel_sidecars_for_async(self, team_id: str, channel_id: str,
+                                              message_ts: Sequence[str]) -> Dict[str, Any]:
+        """READ 2. THE RENDER PIN: one transaction, EXACT identities, nothing else.
 
-                async with db.execute(
-                    f"""
-                    SELECT id, source_ts, conversation_ts, kind, ref, title, summary, status,
-                           derivation_source
-                    FROM ambient_artifacts
-                    WHERE channel_id = :ch AND {_window_sql('source_ts')}
-                    ORDER BY CAST(source_ts AS REAL), id
-                    """,
-                    {"ch": channel_id, **bounds}
-                ) as cursor:
-                    payload["ambient_artifacts"] = [dict(r) for r in await cursor.fetchall()]
+        Replaces the `(floor, high]` window form on the turn path. The window form dragged in
+        every artifact row between a possibly-ancient origin root and H; the identities are what
+        the build actually renders.
 
+        ITS SUBJECT IS CANDIDATES, NOT SELECTIONS: every normalized periphery candidate plus
+        every normalized origin message. Eligibility needs receipt state and the receipt epoch,
+        which live here, so a pin restricted to already-selected ids could never be built at all.
+
+        The builder calls it TWICE — once over the periphery candidate ids, once over the
+        origin-only ids — with the shared call's rows winning any overlap. Each call is still ONE
+        transaction over an exact id list, which is the property this signature exists to give.
+
+        The `IN (...)` lists are CHUNKED at 500 ids per statement inside the one transaction, so
+        SQLite's variable limit is never the thing that decides a turn.
+        """
+        ids = sorted({str(ts) for ts in (message_ts or ()) if ts})
+        payload: Dict[str, Any] = {
+            "ids": ids, "receipt_feature_epoch_ts": None, "receipts": [],
+            "image_analyses": [], "document_extractions": [], "ambient_artifacts": [],
+            "tool_usage": {}, "versions_hash": "",
+        }
+
+        def _chunks() -> List[List[str]]:
+            return [ids[i:i + _SIDECAR_ID_CHUNK] for i in range(0, len(ids), _SIDECAR_ID_CHUNK)]
+
+        async with self._stream_conn() as db:
+            await db.execute("BEGIN DEFERRED")
+            try:
                 async with db.execute(
-                    f"""
-                    SELECT message_ts, tools_json FROM message_tool_usage
-                    WHERE channel_id = :ch AND {_window_sql('message_ts')}
-                    ORDER BY CAST(message_ts AS REAL), id
-                    """,
-                    {"ch": channel_id, **bounds}
+                    "SELECT value FROM bot_meta WHERE key = ?",
+                    (OUTBOUND_RECEIPTS_EPOCH_KEY,)
                 ) as cursor:
+                    row = await cursor.fetchone()
+                payload["receipt_feature_epoch_ts"] = row["value"] if row else None
+
+                if ids:
+                    thread_prefix = f"{channel_id}:%"
+                    receipts: List[Dict] = []
+                    images: List[Dict] = []
+                    documents: List[Dict] = []
+                    ambient: List[Dict] = []
                     usage: Dict[str, List[Dict]] = {}
-                    for r in await cursor.fetchall():
-                        try:
-                            parsed = json.loads(r["tools_json"])
-                        except (json.JSONDecodeError, TypeError, ValueError):
-                            continue
-                        if isinstance(parsed, list):
-                            usage[str(r["message_ts"])] = parsed
+                    for chunk in _chunks():
+                        marks = ",".join("?" * len(chunk))
+
+                        async with db.execute(
+                            f"SELECT message_ts, turn_id, state, thread_root_ts "
+                            f"FROM outbound_receipts "
+                            f"WHERE team_id = ? AND channel_id = ? AND message_ts IN ({marks}) "
+                            f"ORDER BY CAST(message_ts AS REAL)",
+                            (team_id, channel_id, *chunk)
+                        ) as cursor:
+                            receipts.extend(dict(r) for r in await cursor.fetchall())
+
+                        async with db.execute(
+                            f"SELECT id, thread_id, message_ts, url, image_type, analysis, "
+                            f"       metadata_json "
+                            f"FROM images "
+                            f"WHERE thread_id LIKE ? AND message_ts IN ({marks}) "
+                            f"ORDER BY CAST(message_ts AS REAL), id",
+                            (thread_prefix, *chunk)
+                        ) as cursor:
+                            for r in await cursor.fetchall():
+                                row_dict = dict(r)
+                                raw = row_dict.pop("metadata_json", None)
+                                try:
+                                    row_dict["metadata"] = json.loads(raw) if raw else None
+                                except (json.JSONDecodeError, TypeError, ValueError):
+                                    row_dict["metadata"] = None
+                                images.append(row_dict)
+
+                        async with db.execute(
+                            f"SELECT id, thread_id, message_ts, filename, mime_type, file_id, "
+                            f"       summary "
+                            f"FROM documents "
+                            f"WHERE thread_id LIKE ? AND message_ts IN ({marks}) "
+                            f"ORDER BY CAST(message_ts AS REAL), id",
+                            (thread_prefix, *chunk)
+                        ) as cursor:
+                            documents.extend(dict(r) for r in await cursor.fetchall())
+
+                        async with db.execute(
+                            f"SELECT id, source_ts, conversation_ts, kind, ref, title, summary, "
+                            f"       status, derivation_source "
+                            f"FROM ambient_artifacts "
+                            f"WHERE channel_id = ? AND source_ts IN ({marks}) "
+                            f"ORDER BY CAST(source_ts AS REAL), id",
+                            (channel_id, *chunk)
+                        ) as cursor:
+                            ambient.extend(dict(r) for r in await cursor.fetchall())
+
+                        async with db.execute(
+                            f"SELECT message_ts, tools_json FROM message_tool_usage "
+                            f"WHERE channel_id = ? AND message_ts IN ({marks}) "
+                            f"ORDER BY CAST(message_ts AS REAL), id",
+                            (channel_id, *chunk)
+                        ) as cursor:
+                            for r in await cursor.fetchall():
+                                try:
+                                    parsed = json.loads(r["tools_json"])
+                                except (json.JSONDecodeError, TypeError, ValueError):
+                                    continue
+                                if isinstance(parsed, list):
+                                    usage[str(r["message_ts"])] = parsed
+
+                    # Chunking splits the ORDER BY, so the merged lists are re-sorted into the
+                    # accessor's own order — a single-chunk read and a five-chunk read over the
+                    # same ids must be byte-comparable.
+                    payload["receipts"] = sorted(receipts, key=lambda r: _ts_sort(r["message_ts"]))
+                    payload["image_analyses"] = sorted(
+                        images, key=lambda r: (_ts_sort(r["message_ts"]), r["id"]))
+                    payload["document_extractions"] = sorted(
+                        documents, key=lambda r: (_ts_sort(r["message_ts"]), r["id"]))
+                    payload["ambient_artifacts"] = sorted(
+                        ambient, key=lambda r: (_ts_sort(r["source_ts"]), r["id"]))
                     payload["tool_usage"] = usage
                 await db.execute("COMMIT")
             except Exception:
@@ -6892,15 +6835,18 @@ class DatabaseManager(LoggerMixin):
         miss, and a hash that moved because a row was touched without changing what it renders
         would throw away every cache hit for nothing.
         """
+        # THE PINNED GRAMMAR: the epoch, the id list, and the rows that actually render.
+        # `coverage`, `window` and `activity` are GONE — all three were discovery, and discovery
+        # moved to READ 1. They happened to be inert in this payload, so keeping them changed no
+        # hash value; but a hash whose material includes fields its own contract removed is one
+        # edit away from meaning something nobody intended, and "inert today" is not a property
+        # anyone should have to re-verify to read this function.
         material = {
-            "coverage": payload.get("coverage"),
-            "window": list(payload.get("window") or []),
             "epoch": payload.get("receipt_feature_epoch_ts"),
+            # The read carries its subject: "these rows, for these messages".
+            "ids": list(payload.get("ids") or []),
             "receipts": [[r.get("message_ts"), r.get("state"), r.get("turn_id"),
                           r.get("thread_root_ts")] for r in payload.get("receipts") or []],
-            "activity": [[r.get("root_ts"), r.get("last_observed_reply_ts"),
-                          r.get("last_index_event_ts"), r.get("dirty")]
-                         for r in payload.get("activity") or []],
             "images": [[r.get("message_ts"), r.get("url"), r.get("analysis"),
                         (r.get("metadata") or {}).get("filename")
                         if isinstance(r.get("metadata"), dict) else None]
@@ -6913,13 +6859,6 @@ class DatabaseManager(LoggerMixin):
                         for r in payload.get("ambient_artifacts") or []],
             "tools": sorted((ts, json.dumps(tools, sort_keys=True))
                             for ts, tools in (payload.get("tool_usage") or {}).items()),
-            # Rehydration's own pre-boundary evidence changes what renders, so it belongs in
-            # the hash. A read that pinned it and found nothing renders the same bytes as one
-            # that never asked, and hashes the same — the hash tracks rendered content, not
-            # which query produced it.
-            "preboundary": [[r.get("message_ts"), r.get("state"), r.get("turn_id"),
-                             r.get("thread_root_ts")]
-                            for r in payload.get("preboundary_receipts") or []] or None,
         }
         blob = json.dumps(material, sort_keys=True, separators=(",", ":"), default=str)
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()
@@ -6982,1938 +6921,6 @@ class DatabaseManager(LoggerMixin):
                 f"ON CONFLICT (thread_id, message_ts, file_id) WHERE {_CHANNEL_DOCS_PREDICATE} "
                 "DO NOTHING", columns)
             return bool(cursor.rowcount)
-
-    # --- compaction snapshots (spec §7, P4 §1) --------------------------------------------
-    #
-    # `namespace` is NOT NULL everywhere below; production passes PROD_NAMESPACE. The legacy
-    # v1 accessors default to it so a P1 caller keeps working while P4 lands around it.
-
-    async def insert_channel_snapshot_async(self, snapshot_id: str, team_id: str,
-                                            channel_id: str, serializer_version: int,
-                                            boundary_ts: str, summary_text: str,
-                                            root_anchors: Optional[List[Dict]] = None,
-                                            namespace: str = PROD_NAMESPACE) -> str:
-        """Store a CANDIDATE snapshot (generation NULL until it wins publication)."""
-        async with self._stream_conn() as db:
-            await db.execute(
-                "INSERT INTO channel_snapshots "
-                "(snapshot_id, team_id, channel_id, namespace, serializer_version, boundary_ts, "
-                " summary_text, root_anchors_json, status) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'candidate')",
-                (snapshot_id, team_id, channel_id, namespace, int(serializer_version),
-                 str(boundary_ts), summary_text,
-                 json.dumps(root_anchors) if root_anchors is not None else None))
-        return snapshot_id
-
-    async def publish_channel_snapshot_async(self, team_id: str, channel_id: str,
-                                             serializer_version: int, new_id: str,
-                                             expected_previous_id: Optional[str],
-                                             namespace: str = PROD_NAMESPACE) -> bool:
-        """Compare-and-swap `new_id` into the active pointer. False = another turn won.
-
-        The pointer row is INSERT OR IGNOREd first so the genesis publish (expected None) has
-        a row to swap against — two racers at genesis then contend on the same CAS instead of
-        both inserting. Generation is assigned only on success, counting published rows only,
-        so a lost candidate never burns a generation number.
-
-        Raises ValueError when `new_id` does not exist, belongs to another scope, or has
-        already been published: that is a caller bug, and returning False would invite the
-        caller to delete a snapshot it does not own. Only unpublished candidates may be
-        published — otherwise an old generation supplied with the current pointer as
-        `expected_previous_id` would roll the active pointer backward. Re-publishing the id
-        that is already active is the one idempotent exception. A candidate invalidated under
-        us is a legitimate race and returns False.
-        """
-        async with self._stream_conn() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            try:
-                await db.execute(
-                    "INSERT OR IGNORE INTO channel_snapshot_pointer "
-                    "(team_id, channel_id, namespace, serializer_version, active_snapshot_id) "
-                    "VALUES (?, ?, ?, ?, NULL)",
-                    (team_id, channel_id, namespace, int(serializer_version)))
-
-                async with db.execute(
-                    "SELECT team_id, channel_id, namespace, serializer_version, generation, "
-                    "       invalidated_at FROM channel_snapshots WHERE snapshot_id = ?",
-                    (new_id,)
-                ) as cursor:
-                    candidate = await cursor.fetchone()
-                if candidate is None:
-                    await db.execute("ROLLBACK")
-                    raise ValueError(f"unknown snapshot_id: {new_id!r}")
-                if (candidate["team_id"] != team_id
-                        or candidate["channel_id"] != channel_id
-                        or candidate["namespace"] != namespace
-                        or candidate["serializer_version"] != int(serializer_version)):
-                    await db.execute("ROLLBACK")
-                    raise ValueError(
-                        f"snapshot {new_id!r} belongs to another scope "
-                        f"({candidate['team_id']}/{candidate['channel_id']}"
-                        f"/{candidate['namespace']}/v{candidate['serializer_version']})")
-                if candidate["invalidated_at"] is not None:
-                    await db.execute("ROLLBACK")
-                    self.log_warning(f"Snapshot {new_id} invalidated before publication")
-                    return False
-                if candidate["generation"] is not None:
-                    async with db.execute(
-                        "SELECT active_snapshot_id FROM channel_snapshot_pointer "
-                        "WHERE team_id = ? AND channel_id = ? AND namespace = ? "
-                        "  AND serializer_version = ?",
-                        (team_id, channel_id, namespace, int(serializer_version))
-                    ) as cursor:
-                        pointer = await cursor.fetchone()
-                    active = pointer["active_snapshot_id"] if pointer else None
-                    if active == new_id and expected_previous_id == new_id:
-                        await db.execute("COMMIT")
-                        return True
-                    await db.execute("ROLLBACK")
-                    raise ValueError(
-                        f"snapshot {new_id!r} is already published "
-                        f"(generation {candidate['generation']}); republishing it would roll "
-                        f"the active pointer back from {active!r}")
-
-                cursor = await db.execute(
-                    "UPDATE channel_snapshot_pointer SET active_snapshot_id = ?, "
-                    "       updated_ts = CURRENT_TIMESTAMP "
-                    "WHERE team_id = ? AND channel_id = ? AND namespace = ? "
-                    "  AND serializer_version = ? AND active_snapshot_id IS ?",
-                    (new_id, team_id, channel_id, namespace, int(serializer_version),
-                     expected_previous_id))
-                if not cursor.rowcount:
-                    await db.execute("ROLLBACK")
-                    self.log_info(
-                        f"Snapshot publish lost the CAS for {channel_id} "
-                        f"(expected {expected_previous_id})")
-                    return False
-
-                await db.execute(
-                    "UPDATE channel_snapshots SET generation = ("
-                    "    SELECT COALESCE(MAX(generation), 0) + 1 FROM channel_snapshots "
-                    "    WHERE team_id = ? AND channel_id = ? AND namespace = ? "
-                    "      AND serializer_version = ? AND generation IS NOT NULL), "
-                    "    status = 'published' "
-                    "WHERE snapshot_id = ? AND generation IS NULL",
-                    (team_id, channel_id, namespace, int(serializer_version), new_id))
-                await db.execute("COMMIT")
-                return True
-            except Exception:
-                try:
-                    await db.execute("ROLLBACK")
-                except Exception:
-                    pass
-                raise
-
-    async def get_active_snapshot_async(self, team_id: str, channel_id: str,
-                                        serializer_version: int,
-                                        namespace: str = PROD_NAMESPACE) -> Optional[Dict]:
-        """The published snapshot for this scope, or None at genesis (null sentinel).
-
-        An INVALIDATED active snapshot is still returned, carrying invalidated_at — the reader
-        decides whether to recompact or degrade honestly (§7); it is never silently hidden.
-        """
-        async with self._stream_conn() as db:
-            async with db.execute(
-                "SELECT s.* FROM channel_snapshot_pointer p "
-                "JOIN channel_snapshots s ON s.snapshot_id = p.active_snapshot_id "
-                "WHERE p.team_id = ? AND p.channel_id = ? AND p.namespace = ? "
-                "  AND p.serializer_version = ?",
-                (team_id, channel_id, namespace, int(serializer_version))
-            ) as cursor:
-                row = await cursor.fetchone()
-        return self._snapshot_row(row)
-
-    async def get_snapshot_async(self, snapshot_id: str) -> Optional[Dict]:
-        """One snapshot by id, pinned or not."""
-        async with self._stream_conn() as db:
-            async with db.execute(
-                "SELECT * FROM channel_snapshots WHERE snapshot_id = ?", (snapshot_id,)
-            ) as cursor:
-                row = await cursor.fetchone()
-        return self._snapshot_row(row)
-
-    # Interfaces §3.1 spells this name; get_snapshot_async is its P1 alias and stays.
-    async def get_snapshot_row_async(self, snapshot_id: str) -> Optional[Dict[str, Any]]:
-        """One snapshot row by id, with root_anchors decoded."""
-        return await self.get_snapshot_async(snapshot_id)
-
-    @staticmethod
-    def _snapshot_row(row) -> Optional[Dict]:
-        if not row:
-            return None
-        snapshot = dict(row)
-        snapshot["root_anchors"] = (json.loads(snapshot["root_anchors_json"])
-                                    if snapshot.get("root_anchors_json") else [])
-        return snapshot
-
-    async def invalidate_snapshot_async(self, snapshot_id: str) -> bool:
-        """Mark a snapshot stale (an edit/delete at or before its boundary). Idempotent.
-
-        The status machine (§1g) permits published/published_stale -> invalidated only, so a
-        candidate keeps its status: an unpublished candidate is discarded by deletion, never
-        by being statused.
-        """
-        async with self._stream_conn() as db:
-            cursor = await db.execute(
-                "UPDATE channel_snapshots SET invalidated_at = CURRENT_TIMESTAMP, "
-                "       status = CASE WHEN status IN ('published', 'published_stale') "
-                "                     THEN 'invalidated' ELSE status END "
-                "WHERE snapshot_id = ? AND invalidated_at IS NULL", (snapshot_id,))
-            return bool(cursor.rowcount)
-
-    async def delete_snapshot_async(self, snapshot_id: str) -> bool:
-        """Delete a snapshot with its manifest and anchor rows. Refuses an active pointer's."""
-        async with self._stream_conn() as db:
-            cursor = await db.execute(
-                "DELETE FROM channel_snapshots WHERE snapshot_id = ? AND snapshot_id NOT IN "
-                "(SELECT active_snapshot_id FROM channel_snapshot_pointer "
-                " WHERE active_snapshot_id IS NOT NULL)",
-                (snapshot_id,))
-            if not cursor.rowcount:
-                return False
-            await db.execute("DELETE FROM snapshot_capture_manifest WHERE snapshot_id = ?",
-                             (snapshot_id,))
-            await db.execute("DELETE FROM snapshot_anchor_provenance WHERE snapshot_id = ?",
-                             (snapshot_id,))
-            return True
-
-    # ----------------------------------------------------------------- selection (§1b)
-
-    async def select_snapshot_for_pin_async(
-            self, team_id: str, channel_id: str, namespace: str, serializer_version: int,
-            max_boundary: Optional[str], *,
-            refused_lineage: Sequence[str] = ()) -> Dict[str, Any]:
-        """The §1b selection, as ONE atomic read. Always carries `result`.
-
-        SIX MUTUALLY DISTINGUISHABLE outcomes:
-          pinned                 — the newest valid generation with boundary_ts <= max_boundary;
-          pinned_stale           — the same, but a published_stale generation;
-          genesis                — NO generation has ever been published in this namespace;
-          no_eligible_generation — generations exist and every one is VALID, but each sits
-                                   above THIS TURN's ceiling. See below;
-          raw_rebuild_required   — a generation exists but none is selectable (invalidated, or
-                                   refused as retirement-pending). The IDENTITY IS RETAINED for
-                                   telemetry and for the publication CAS; this is NEVER reported
-                                   as genesis, which would restart the very compaction the
-                                   invalidation was about;
-          payload_corrupt        — the selected generation's bytes fail their payload_hash.
-                                   Handled exactly like raw_rebuild_required, identity retained,
-                                   CRITICAL logged. Corrupt bytes are NEVER rendered.
-
-        **`no_eligible_generation` RENDERS — it is not a refuse-to-render state.** It renders
-        EXACTLY as genesis: no summary block, the honest coverage floor. `raw_rebuild_required`
-        and `payload_corrupt` are the only two results the caller must not hand to the builder;
-        this is not a third. Nothing here is invalid, so the turn must NOT recompact.
-
-        It is a separate tag rather than plain genesis because the two are different CONTROL
-        states that telemetry has to tell apart: a channel holding a summary that is merely not
-        yet eligible under this H is not the same as a channel that has never been compacted at
-        all, and collapsing them would make the first invisible. The identity of the newest
-        ineligible generation is RETAINED so telemetry can name it.
-
-        `refused_lineage` is the retirement-pending set: those ids are excluded from selection
-        from the moment the coordinator marks them, before the deletion transaction runs.
-        """
-        refused = {str(s) for s in refused_lineage if s}
-        result: Dict[str, Any] = {"result": "genesis", "snapshot": None,
-                                  "snapshot_id": None, "generation": None}
-        async with self._stream_conn() as db:
-            await db.execute("BEGIN DEFERRED")
-            try:
-                async with db.execute(
-                    "SELECT * FROM channel_snapshots "
-                    "WHERE team_id = ? AND channel_id = ? AND namespace = ? "
-                    "  AND serializer_version = ? AND generation IS NOT NULL "
-                    "ORDER BY generation DESC",
-                    (team_id, channel_id, namespace, int(serializer_version))
-                ) as cursor:
-                    generations = [dict(r) for r in await cursor.fetchall()]
-                await db.execute("COMMIT")
-            except Exception:
-                try:
-                    await db.execute("ROLLBACK")
-                except Exception:
-                    pass
-                raise
-
-        if not generations:
-            return result
-
-        ceiling = _ts_key(max_boundary) if max_boundary is not None else None
-        fallback = generations[0]
-        unusable = False
-        ineligible: Optional[Dict[str, Any]] = None
-        for row in generations:
-            if row["snapshot_id"] in refused or row["status"] not in _VALID_SNAPSHOT_STATUSES:
-                unusable = True
-                continue
-            if ceiling is not None and _ts_key(row["boundary_ts"]) > ceiling:
-                # Excluded by THIS TURN's ceiling, not by anything wrong with the row. Calling
-                # that raw_rebuild_required would trigger a recompaction nothing needs; calling
-                # it genesis would hide a compacted channel among the never-compacted ones.
-                ineligible = ineligible or row
-                continue
-            snapshot = self._snapshot_row(row)
-            if not self._payload_intact(snapshot):
-                self.log_error(
-                    f"CRITICAL: snapshot {row['snapshot_id']} failed its payload_hash check; "
-                    f"its persisted bytes are corrupt and will not be rendered")
-                return {"result": "payload_corrupt", "snapshot": snapshot,
-                        "snapshot_id": row["snapshot_id"], "generation": row["generation"]}
-            return {"result": "pinned_stale" if row["status"] == "published_stale" else "pinned",
-                    "snapshot": snapshot, "snapshot_id": row["snapshot_id"],
-                    "generation": row["generation"]}
-
-        if not unusable and ineligible is not None:
-            return {"result": "no_eligible_generation",
-                    "snapshot": self._snapshot_row(ineligible),
-                    "snapshot_id": ineligible["snapshot_id"],
-                    "generation": ineligible["generation"]}
-        if not unusable:
-            return result
-        return {"result": "raw_rebuild_required", "snapshot": self._snapshot_row(fallback),
-                "snapshot_id": fallback["snapshot_id"], "generation": fallback["generation"]}
-
-    @staticmethod
-    def _payload_intact(snapshot: Optional[Dict[str, Any]]) -> bool:
-        """Recompute SHA-256 over the persisted payload bytes and compare (§1g).
-
-        A legacy v1 row carries neither column and is not claiming an integrity guarantee, so
-        it passes: a stored hash that is never checked is not integrity, and an absent hash is
-        not a failed one.
-        """
-        if not snapshot:
-            return True
-        stored = snapshot.get("payload_hash")
-        if not stored:
-            return True
-        payload = snapshot.get("payload_bytes")
-        if payload is None:
-            return False
-        if isinstance(payload, str):
-            payload = payload.encode("utf-8")
-        return hashlib.sha256(payload).hexdigest() == stored
-
-    async def snapshot_manifest_async(self, snapshot_id: str) -> List[Dict[str, Any]]:
-        """This snapshot's frozen capture manifest (§1i), in render order."""
-        async with self._stream_conn() as db:
-            async with db.execute(
-                "SELECT * FROM snapshot_capture_manifest WHERE snapshot_id = ? "
-                "ORDER BY CAST(source_ts AS REAL), artifact_namespace, row_id",
-                (snapshot_id,)
-            ) as cursor:
-                return [dict(r) for r in await cursor.fetchall()]
-
-    async def snapshot_anchor_provenance_async(self, snapshot_id: str) -> List[Dict[str, Any]]:
-        """This snapshot's anchor provenance rows (§1j), oldest root first."""
-        async with self._stream_conn() as db:
-            async with db.execute(
-                "SELECT * FROM snapshot_anchor_provenance WHERE snapshot_id = ? "
-                "ORDER BY CAST(root_ts AS REAL)",
-                (snapshot_id,)
-            ) as cursor:
-                return [dict(r) for r in await cursor.fetchall()]
-
-    # ----------------------------------------------------------------- candidates (§1g)
-
-    async def insert_compaction_candidate_async(
-            self, *, snapshot: Dict[str, Any], manifest_rows: Sequence[Dict[str, Any]] = (),
-            anchor_rows: Sequence[Dict[str, Any]] = ()) -> str:
-        """Insert a validated candidate with its manifest and anchor rows, in ONE transaction.
-
-        Nothing is inserted until output validation has passed (§1g), which is why an ordinary
-        discarded candidate has no rows to clean up and is absent from the §1j physical-delete
-        list. Inserting first and deleting on failure would put the cleanup burden on every
-        failure path, including the ones that crash.
-
-        A v2 candidate MISSING ANY SIZING FIELD is REJECTED: those columns are nullable for the
-        legacy migration, not for new writes, and a v2 generation published without its
-        evidence would be permanently undominating for no reason anyone intended.
-        """
-        row = dict(snapshot)
-        snapshot_id = str(row.get("snapshot_id") or uuid.uuid4().hex)
-        row["snapshot_id"] = snapshot_id
-        row["status"] = "candidate"
-        row.setdefault("namespace", PROD_NAMESPACE)
-        row.pop("generation", None)
-        row.pop("root_anchors", None)
-
-        serializer_version = int(row.get("serializer_version") or 0)
-        if serializer_version >= 2:
-            missing = [f for f in SNAPSHOT_SIZING_FIELDS if row.get(f) in (None, "")]
-            if missing:
-                raise ValueError(
-                    f"v2 candidate {snapshot_id} is missing sizing evidence {missing}; a "
-                    f"generation published without it can never dominate an obligation")
-
-        payload = row.get("payload_bytes")
-        if isinstance(payload, str):
-            payload = payload.encode("utf-8")
-            row["payload_bytes"] = payload
-        if payload is not None:
-            row.setdefault("payload_hash", hashlib.sha256(payload).hexdigest())
-            if not row.get("summary_text"):
-                row["summary_text"] = payload.decode("utf-8", "replace")
-
-        anchors = row.pop("root_anchors_json", None)
-        if anchors is not None and not isinstance(anchors, str):
-            anchors = json.dumps(anchors)
-        row["root_anchors_json"] = anchors
-
-        columns = [c for c in row if c in _SNAPSHOT_COLUMN_NAMES]
-        placeholders = ", ".join("?" * len(columns))
-        async with self._stream_conn() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            try:
-                await db.execute(
-                    f"INSERT INTO channel_snapshots ({', '.join(columns)}) "
-                    f"VALUES ({placeholders})",
-                    [row[c] for c in columns])
-                await self._write_manifest_rows(db, snapshot_id, manifest_rows)
-                await self._write_anchor_rows(db, snapshot_id, row["team_id"], anchor_rows)
-                await db.execute("COMMIT")
-            except Exception:
-                try:
-                    await db.execute("ROLLBACK")
-                except Exception:
-                    pass
-                raise
-        return snapshot_id
-
-    @staticmethod
-    async def _write_manifest_rows(db, snapshot_id: str,
-                                   manifest_rows: Sequence[Dict[str, Any]]) -> None:
-        for entry in manifest_rows or ():
-            await db.execute(
-                "INSERT OR REPLACE INTO snapshot_capture_manifest "
-                "(snapshot_id, artifact_namespace, row_id, source_ts, captured_render_version, "
-                " content_hash, status_at_capture) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (snapshot_id, entry["artifact_namespace"], str(entry["row_id"]),
-                 str(entry["source_ts"]), str(entry.get("captured_render_version") or "v1"),
-                 entry["content_hash"], str(entry["status_at_capture"])))
-
-    @staticmethod
-    async def _write_anchor_rows(db, snapshot_id: str, team_id: str,
-                                 anchor_rows: Sequence[Dict[str, Any]]) -> None:
-        for entry in anchor_rows or ():
-            await db.execute(
-                "INSERT OR REPLACE INTO snapshot_anchor_provenance "
-                "(team_id, snapshot_id, root_ts, status, projection_sha256, "
-                " observation_frontier, receipt_proof) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (str(entry.get("team_id") or team_id), snapshot_id, str(entry["root_ts"]),
-                 entry["status"], entry["projection_sha256"],
-                 int(entry["observation_frontier"]), entry.get("receipt_proof")))
-
-    async def delete_candidate_rows_async(self, snapshot_id: str) -> None:
-        """Snapshot row + manifest rows + anchor rows, ONE transaction.
-
-        The single helper every physical-delete site of §1j calls. SQLite foreign keys are OFF
-        in this database, so nothing cascades: an orphan manifest or anchor row would outlive
-        its snapshot and could fail a later publication's anchor check for a generation that no
-        longer exists.
-        """
-        async with self._stream_conn() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            try:
-                await self._delete_snapshot_rows(db, [snapshot_id])
-                await db.execute("COMMIT")
-            except Exception:
-                try:
-                    await db.execute("ROLLBACK")
-                except Exception:
-                    pass
-                raise
-
-    @staticmethod
-    async def _delete_snapshot_rows(db, snapshot_ids: Sequence[str]) -> int:
-        ids = [str(s) for s in snapshot_ids if s]
-        if not ids:
-            return 0
-        marks = ", ".join("?" * len(ids))
-        cursor = await db.execute(
-            f"DELETE FROM channel_snapshots WHERE snapshot_id IN ({marks})", ids)
-        removed = cursor.rowcount or 0
-        await db.execute(
-            f"DELETE FROM snapshot_capture_manifest WHERE snapshot_id IN ({marks})", ids)
-        await db.execute(
-            f"DELETE FROM snapshot_anchor_provenance WHERE snapshot_id IN ({marks})", ids)
-        return removed
-
-    # ----------------------------------------------------------------- publication (§1d)
-
-    async def publish_compaction_candidate_async(
-            self, *, team_id: str, channel_id: str, namespace: str, serializer_version: int,
-            snapshot_id: str, expected_previous_id: Optional[str], source_floor_ts: str,
-            boundary_ts: str, mutation_frontier: int, current_profile: str,
-            status: str = "published",
-            outbox_rows: Sequence[Dict[str, Any]] = (),
-            satisfy: Optional[Dict[str, Any]] = None,
-            dormancy: Optional[Dict[str, Any]] = None,
-            crawl_id: Optional[str] = None) -> Dict[str, Any]:
-        """The whole publication, as ONE `BEGIN IMMEDIATE`. Returns
-        {"won": bool, "reason": str|None, "generation": int|None}.
-
-        In this order:
-          1. FINAL-PROFILE predicate — the candidate's sizing_profile must still equal the
-             channel's current effective profile. A profile can change after the last chunk
-             boundary, at which point no boundary is left to cancel at.
-          2. FRONTIER predicate — no observation with id > mutation_frontier whose subject_ts
-             falls in [source_floor_ts, boundary_ts].
-          3. ANCHOR predicate — no observation for ANY recorded anchor root with id > that
-             root's own observation_frontier. Anchor roots may PREDATE source_floor_ts, so
-             predicate 2 structurally cannot reach them.
-          4. Pointer CAS on (team, channel, namespace, serializer_version).
-          5. Generation assignment and status.
-          6. Outbox rows (§1l) — an identity conflict with DIFFERING bytes rolls the whole
-             transaction back, publication included.
-          7. `satisfy` / `dormancy` — the §1m obligation moves commit HERE, so a crash cannot
-             leave an active row behind a publication that already failed to dominate.
-
-        ON ANY PREDICATE OR CAS FAILURE the candidate row, its manifest rows and its
-        anchor-provenance rows are PHYSICALLY DELETED (§1j sites i-iv).
-        """
-        reason: Optional[str] = None
-        generation: Optional[int] = None
-        async with self._stream_conn() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            try:
-                async with db.execute(
-                    "SELECT * FROM channel_snapshots WHERE snapshot_id = ?", (snapshot_id,)
-                ) as cursor:
-                    candidate = await cursor.fetchone()
-                if candidate is None:
-                    await db.execute("ROLLBACK")
-                    raise ValueError(f"unknown snapshot_id: {snapshot_id!r}")
-                candidate = dict(candidate)
-
-                if candidate.get("sizing_profile") != current_profile:
-                    reason = "profile_changed"
-                elif await self._frontier_violation(db, team_id, channel_id, mutation_frontier,
-                                                    source_floor_ts, boundary_ts):
-                    reason = "frontier"
-                elif await self._anchor_violation(db, team_id, snapshot_id):
-                    reason = "anchor"
-
-                if reason is None:
-                    await db.execute(
-                        "INSERT OR IGNORE INTO channel_snapshot_pointer "
-                        "(team_id, channel_id, namespace, serializer_version, "
-                        " active_snapshot_id) VALUES (?, ?, ?, ?, NULL)",
-                        (team_id, channel_id, namespace, int(serializer_version)))
-                    cursor = await db.execute(
-                        "UPDATE channel_snapshot_pointer SET active_snapshot_id = ?, "
-                        "       updated_ts = CURRENT_TIMESTAMP "
-                        "WHERE team_id = ? AND channel_id = ? AND namespace = ? "
-                        "  AND serializer_version = ? AND active_snapshot_id IS ?",
-                        (snapshot_id, team_id, channel_id, namespace, int(serializer_version),
-                         expected_previous_id))
-                    if not cursor.rowcount:
-                        reason = "cas"
-
-                if reason is not None:
-                    await db.execute("ROLLBACK")
-                else:
-                    async with db.execute(
-                        "SELECT COALESCE(MAX(generation), 0) + 1 AS g FROM channel_snapshots "
-                        "WHERE team_id = ? AND channel_id = ? AND namespace = ? "
-                        "  AND serializer_version = ? AND generation IS NOT NULL",
-                        (team_id, channel_id, namespace, int(serializer_version))
-                    ) as cursor:
-                        generation = int((await cursor.fetchone())["g"])
-                    await db.execute(
-                        "UPDATE channel_snapshots SET generation = ?, status = ? "
-                        "WHERE snapshot_id = ?", (generation, status, snapshot_id))
-
-                    await self._insert_outbox_rows(db, outbox_rows)
-                    if satisfy is not None:
-                        await self._satisfy_pending(db, team_id, channel_id, namespace,
-                                                    candidate, generation, satisfy)
-                    if dormancy is not None:
-                        await self._apply_dormancy(db, team_id, channel_id, namespace, dormancy)
-                    if crawl_id:
-                        await self._delete_crawl_state(db, team_id, channel_id, namespace,
-                                                       crawl_id)
-                    await db.execute("COMMIT")
-            except Exception:
-                try:
-                    await db.execute("ROLLBACK")
-                except Exception:
-                    pass
-                raise
-
-        if reason is not None:
-            await self.delete_candidate_rows_async(snapshot_id)
-            self.log_info(
-                f"Compaction candidate {snapshot_id} discarded for {channel_id}: {reason}")
-            return {"won": False, "reason": reason, "generation": None}
-        return {"won": True, "reason": None, "generation": generation}
-
-    @staticmethod
-    async def _frontier_violation(db, team_id: str, channel_id: str, frontier: int,
-                                  source_floor_ts: str, boundary_ts: str) -> bool:
-        async with db.execute(
-            "SELECT 1 FROM snapshot_mutation_observations "
-            "WHERE team_id = ? AND channel_id = ? AND id > ? "
-            "  AND CAST(subject_ts AS REAL) >= CAST(? AS REAL) "
-            "  AND CAST(subject_ts AS REAL) <= CAST(? AS REAL) LIMIT 1",
-            (team_id, channel_id, int(frontier), str(source_floor_ts), str(boundary_ts))
-        ) as cursor:
-            return await cursor.fetchone() is not None
-
-    @staticmethod
-    async def _anchor_violation(db, team_id: str, snapshot_id: str) -> bool:
-        async with db.execute(
-            "SELECT 1 FROM snapshot_anchor_provenance a "
-            "JOIN snapshot_mutation_observations o "
-            "  ON o.team_id = a.team_id AND o.subject_ts = a.root_ts "
-            "WHERE a.snapshot_id = ? AND a.team_id = ? "
-            "  AND o.id > a.observation_frontier LIMIT 1",
-            (snapshot_id, team_id)
-        ) as cursor:
-            return await cursor.fetchone() is not None
-
-    # ----------------------------------------------------------------- retirement (§1f, R0-5)
-
-    async def retire_snapshot_lineage_async(
-            self, *, team_id: str, channel_id: str, namespace: str, serializer_version: int,
-            lineage_ids: Sequence[str], expected_active_id: Optional[str],
-            expected_generation: Optional[int]) -> Dict[str, Any]:
-        """Phase 3 of the three-phase retirement: ONE guarded `BEGIN IMMEDIATE`.
-
-        Expected-pointer/generation CAS, published -> invalidated for the whole lineage (the
-        status machine permits physical deletion only from candidate or invalidated, so this is
-        what makes the delete legal), restore the NEWEST VALID ANCESTOR or delete the pointer
-        row, then physically delete the retired rows with their manifest and anchor rows.
-
-        GENESIS ONLY WHEN NO VALID ANCESTOR EXISTS. A corrupt incremental generation frequently
-        has an earlier valid ancestor still physically present and still readable; retiring the
-        lineage and claiming genesis would discard a perfectly good summary.
-        """
-        ids = [str(s) for s in lineage_ids if s]
-        if not ids:
-            return {"ok": False, "restored": None, "reason": "empty_lineage"}
-        marks = ", ".join("?" * len(ids))
-        async with self._stream_conn() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            try:
-                async with db.execute(
-                    "SELECT active_snapshot_id FROM channel_snapshot_pointer "
-                    "WHERE team_id = ? AND channel_id = ? AND namespace = ? "
-                    "  AND serializer_version = ?",
-                    (team_id, channel_id, namespace, int(serializer_version))
-                ) as cursor:
-                    pointer = await cursor.fetchone()
-                active = pointer["active_snapshot_id"] if pointer else None
-                if active != expected_active_id:
-                    await db.execute("ROLLBACK")
-                    return {"ok": False, "restored": None, "reason": "pointer"}
-
-                if expected_generation is not None:
-                    async with db.execute(
-                        "SELECT generation FROM channel_snapshots WHERE snapshot_id = ?",
-                        (expected_active_id,)
-                    ) as cursor:
-                        row = await cursor.fetchone()
-                    if row is None or row["generation"] != int(expected_generation):
-                        await db.execute("ROLLBACK")
-                        return {"ok": False, "restored": None, "reason": "generation"}
-
-                await db.execute(
-                    f"UPDATE channel_snapshots SET status = 'invalidated', "
-                    f"       invalidated_at = COALESCE(invalidated_at, CURRENT_TIMESTAMP) "
-                    f"WHERE snapshot_id IN ({marks}) "
-                    f"  AND status IN ('published', 'published_stale')", ids)
-
-                async with db.execute(
-                    f"SELECT snapshot_id FROM channel_snapshots "
-                    f"WHERE team_id = ? AND channel_id = ? AND namespace = ? "
-                    f"  AND serializer_version = ? AND generation IS NOT NULL "
-                    f"  AND status IN ('published', 'published_stale') "
-                    f"  AND snapshot_id NOT IN ({marks}) "
-                    f"ORDER BY generation DESC LIMIT 1",
-                    [team_id, channel_id, namespace, int(serializer_version), *ids]
-                ) as cursor:
-                    ancestor = await cursor.fetchone()
-                restored = ancestor["snapshot_id"] if ancestor else None
-
-                if restored:
-                    await db.execute(
-                        "UPDATE channel_snapshot_pointer SET active_snapshot_id = ?, "
-                        "       updated_ts = CURRENT_TIMESTAMP "
-                        "WHERE team_id = ? AND channel_id = ? AND namespace = ? "
-                        "  AND serializer_version = ?",
-                        (restored, team_id, channel_id, namespace, int(serializer_version)))
-                else:
-                    await db.execute(
-                        "DELETE FROM channel_snapshot_pointer "
-                        "WHERE team_id = ? AND channel_id = ? AND namespace = ? "
-                        "  AND serializer_version = ?",
-                        (team_id, channel_id, namespace, int(serializer_version)))
-
-                await self._delete_snapshot_rows(db, ids)
-                await db.execute("COMMIT")
-            except Exception:
-                try:
-                    await db.execute("ROLLBACK")
-                except Exception:
-                    pass
-                raise
-        self.log_info(
-            f"Retired {len(ids)} snapshot generation(s) for {channel_id}; "
-            f"restored {restored or 'genesis'}")
-        return {"ok": True, "restored": restored, "reason": None}
-
-    async def rollback_published_generation_async(
-            self, *, team_id: str, channel_id: str, namespace: str, serializer_version: int,
-            expected_snapshot_id: str) -> Dict[str, Any]:
-        """R0-5 rollback of ONE rejected generation. Aborts wholesale when the active pointer
-        no longer holds the expected snapshot_id — separate statements would let a concurrent
-        publication be retired by accident."""
-        return await self.retire_snapshot_lineage_async(
-            team_id=team_id, channel_id=channel_id, namespace=namespace,
-            serializer_version=serializer_version, lineage_ids=[expected_snapshot_id],
-            expected_active_id=expected_snapshot_id, expected_generation=None)
-
-    # ----------------------------------------------------------------- observations (§1c)
-
-    async def mutation_observations_after_async(
-            self, team_id: str, channel_id: str, frontier: int, *,
-            floor_ts: Optional[str] = None, high_ts: Optional[str] = None,
-            subject_ts_in: Sequence[str] = ()) -> List[Dict[str, Any]]:
-        """Observations above `frontier`, narrowed by the UNION of two selectors.
-
-        The span and the explicit ts set are OR'd, never AND'd: §1d names two STRUCTURALLY
-        DISTINCT predicates, and the span one cannot reach an anchor root by construction —
-        an anchor root may PREDATE `source_floor_ts`. ANDing them would silently
-        UNDER-INVALIDATE, which is exactly the failure §1c exists to prevent.
-
-        An ABSENT selector contributes nothing rather than matching everything; with neither
-        selector the frontier alone applies.
-        """
-        selectors: List[str] = []
-        params: List[Any] = [team_id, channel_id, int(frontier)]
-        if floor_ts is not None or high_ts is not None:
-            span = []
-            if floor_ts is not None:
-                span.append("CAST(subject_ts AS REAL) >= CAST(? AS REAL)")
-                params.append(str(floor_ts))
-            if high_ts is not None:
-                span.append("CAST(subject_ts AS REAL) <= CAST(? AS REAL)")
-                params.append(str(high_ts))
-            selectors.append(f"({' AND '.join(span)})")
-        subjects = [str(s) for s in subject_ts_in if s]
-        if subjects:
-            selectors.append(f"(subject_ts IN ({', '.join('?' * len(subjects))}))")
-            params.extend(subjects)
-        narrowing = f" AND ({' OR '.join(selectors)})" if selectors else ""
-        async with self._stream_conn() as db:
-            async with db.execute(
-                f"SELECT * FROM snapshot_mutation_observations "
-                f"WHERE team_id = ? AND channel_id = ? AND id > ?{narrowing} ORDER BY id",
-                params
-            ) as cursor:
-                return [dict(r) for r in await cursor.fetchall()]
-
-    async def affected_snapshot_ids_async(self, team_id: str, channel_id: str, namespace: str,
-                                          subject_ts: str) -> List[str]:
-        """Every generation a mutation at `subject_ts` invalidates (§1c + the §1j extension).
-
-        Span coverage (source_floor_ts <= subject_ts <= boundary_ts) OR a RENDERED ANCHOR ROOT
-        matching it — anchor roots reach older than source_floor_ts, and they are evidence the
-        snapshot rendered, so they are inside its correctness envelope regardless of where they
-        sit relative to the summarized span. Never only the active generation: falling back to
-        an ancestor that summarized the same source would silently restore the lie.
-        """
-        async with self._stream_conn() as db:
-            async with db.execute(
-                """
-                SELECT s.snapshot_id FROM channel_snapshots s
-                WHERE s.team_id = :team AND s.channel_id = :ch AND s.namespace = :ns
-                  AND s.status IN ('published', 'published_stale')
-                  AND ((s.source_floor_ts IS NOT NULL
-                        AND CAST(s.source_floor_ts AS REAL) <= CAST(:ts AS REAL)
-                        AND CAST(s.boundary_ts AS REAL) >= CAST(:ts AS REAL))
-                       OR EXISTS (SELECT 1 FROM snapshot_anchor_provenance a
-                                  WHERE a.snapshot_id = s.snapshot_id
-                                    AND a.team_id = s.team_id AND a.root_ts = :ts))
-                ORDER BY s.generation
-                """,
-                {"team": team_id, "ch": channel_id, "ns": namespace, "ts": str(subject_ts)}
-            ) as cursor:
-                return [r["snapshot_id"] for r in await cursor.fetchall()]
-
-    async def sweep_mutation_observations_async(self, team_id: str, channel_id: str) -> int:
-        """Delete observations below the §1c watermark W. Returns the number removed.
-
-        W = min(mutation_frontier over non-deleted selectable generations, over live crawl
-        checkpoints, and over in-flight candidates). With none of those, W is the current max
-        id + 1 and everything is sweepable.
-        """
-        async with self._stream_conn() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            try:
-                frontiers: List[int] = []
-                async with db.execute(
-                    "SELECT MIN(mutation_frontier) AS m FROM channel_snapshots "
-                    "WHERE team_id = ? AND channel_id = ? AND mutation_frontier IS NOT NULL "
-                    "  AND status IN ('candidate', 'published', 'published_stale')",
-                    (team_id, channel_id)
-                ) as cursor:
-                    value = (await cursor.fetchone())["m"]
-                if value is not None:
-                    frontiers.append(int(value))
-                async with db.execute(
-                    "SELECT MIN(mutation_frontier) AS m FROM compaction_crawl_checkpoints "
-                    "WHERE team_id = ? AND channel_id = ?", (team_id, channel_id)
-                ) as cursor:
-                    value = (await cursor.fetchone())["m"]
-                if value is not None:
-                    frontiers.append(int(value))
-
-                if frontiers:
-                    watermark = min(frontiers)
-                else:
-                    async with db.execute(
-                        "SELECT COALESCE(MAX(id), 0) + 1 AS m "
-                        "FROM snapshot_mutation_observations "
-                        "WHERE team_id = ? AND channel_id = ?", (team_id, channel_id)
-                    ) as cursor:
-                        watermark = int((await cursor.fetchone())["m"])
-
-                cursor = await db.execute(
-                    "DELETE FROM snapshot_mutation_observations "
-                    "WHERE team_id = ? AND channel_id = ? AND id < ?",
-                    (team_id, channel_id, int(watermark)))
-                removed = cursor.rowcount or 0
-                await db.execute("COMMIT")
-            except Exception:
-                try:
-                    await db.execute("ROLLBACK")
-                except Exception:
-                    pass
-                raise
-        return removed
-
-    # ----------------------------------------------------------------- crawl state (§1n)
-
-    async def load_crawl_checkpoint_async(self, team_id: str, channel_id: str,
-                                          namespace: str) -> Optional[Dict[str, Any]]:
-        """The crawl checkpoint for this scope, JSON columns decoded."""
-        async with self._stream_conn() as db:
-            async with db.execute(
-                "SELECT * FROM compaction_crawl_checkpoints "
-                "WHERE team_id = ? AND channel_id = ? AND namespace = ?",
-                (team_id, channel_id, namespace)
-            ) as cursor:
-                row = await cursor.fetchone()
-        if row is None:
-            return None
-        checkpoint = dict(row)
-        for column in _CHECKPOINT_JSON_COLUMNS:
-            raw = checkpoint.get(column)
-            try:
-                checkpoint[column] = json.loads(raw) if raw else None
-            except (json.JSONDecodeError, TypeError, ValueError):
-                checkpoint[column] = None
-        return checkpoint
-
-    async def upsert_crawl_checkpoint_async(self, checkpoint: Dict[str, Any]) -> None:
-        """Write the whole checkpoint row. JSON columns are canonically encoded."""
-        row = self._checkpoint_row(checkpoint)
-        columns = list(row)
-        async with self._stream_conn() as db:
-            await db.execute(
-                f"INSERT INTO compaction_crawl_checkpoints ({', '.join(columns)}) "
-                f"VALUES ({', '.join('?' * len(columns))}) "
-                f"ON CONFLICT(team_id, channel_id, namespace) DO UPDATE SET "
-                + ", ".join(f"{c} = excluded.{c}" for c in columns
-                            if c not in ("team_id", "channel_id", "namespace")),
-                [row[c] for c in columns])
-
-    @staticmethod
-    def _checkpoint_row(checkpoint: Dict[str, Any]) -> Dict[str, Any]:
-        row = {k: v for k, v in checkpoint.items() if k in _CHECKPOINT_COLUMN_NAMES}
-        for column in _CHECKPOINT_JSON_COLUMNS:
-            value = row.get(column)
-            if value is None:
-                row[column] = canonical_json({} if column.endswith(
-                    ("inventory", "snapshot", "summaries", "renders", "receipts")) else [])
-            elif not isinstance(value, str):
-                row[column] = canonical_json(value)
-        row.setdefault("updated_at", datetime.now().isoformat())
-        return row
-
-    async def delete_crawl_state_async(self, team_id: str, channel_id: str, namespace: str,
-                                       crawl_id: str) -> None:
-        """Checkpoint + event skeleton, together. The skeleton never outlives its crawl."""
-        async with self._stream_conn() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            try:
-                await self._delete_crawl_state(db, team_id, channel_id, namespace, crawl_id)
-                await db.execute("COMMIT")
-            except Exception:
-                try:
-                    await db.execute("ROLLBACK")
-                except Exception:
-                    pass
-                raise
-
-    @staticmethod
-    async def _delete_crawl_state(db, team_id: str, channel_id: str, namespace: str,
-                                  crawl_id: str) -> None:
-        await db.execute(
-            "DELETE FROM compaction_crawl_checkpoints "
-            "WHERE team_id = ? AND channel_id = ? AND namespace = ? AND crawl_id = ?",
-            (team_id, channel_id, namespace, crawl_id))
-        await db.execute("DELETE FROM compaction_event_skeleton WHERE crawl_id = ?", (crawl_id,))
-
-    async def live_checkpoint_parent_ids_async(self) -> List[str]:
-        """Every live crawl checkpoint's parent_snapshot_id — the sweep protects these.
-
-        Without it the sweep can retire the one lineage an in-progress incremental crawl needs,
-        forcing a fall back to raw; on a channel whose Slack retention is shallow that destroys
-        the only usable lineage for no reason.
-        """
-        async with self._stream_conn() as db:
-            async with db.execute(
-                "SELECT DISTINCT parent_snapshot_id FROM compaction_crawl_checkpoints "
-                "WHERE parent_snapshot_id IS NOT NULL"
-            ) as cursor:
-                return [r["parent_snapshot_id"] for r in await cursor.fetchall()]
-
-    async def commit_crawl_page_async(self, *, team_id: str, channel_id: str, namespace: str,
-                                      crawl_id: str,
-                                      skeleton_rows: Sequence[Dict[str, Any]] = (),
-                                      checkpoint_patch: Dict[str, Any]) -> None:
-        """PAGE-ATOMIC: the page's rows AND its cursor advance in ONE transaction.
-
-        A CURSOR NEVER ADVANCES OUTSIDE THE TRANSACTION THAT COMMITS ITS ROWS. Both crash
-        orderings are fatal otherwise — a cursor ahead of its rows is a permanent gap nothing
-        later notices, and rows ahead of the cursor is replay ambiguity.
-
-        REPLIES-OVER-HISTORY PRECEDENCE is enforced by the durable `source_rank`: a candidate
-        replaces an existing row only when its rank is STRICTLY HIGHER. Rank is persisted
-        precisely so precedence survives a restart — without it a history walk replayed after a
-        crash could overwrite a replies copy already sealed in, and the broadcast would lose its
-        real root. Arrival order is therefore irrelevant.
-        """
-        patch = {k: v for k, v in (checkpoint_patch or {}).items()
-                 if k in _CHECKPOINT_COLUMN_NAMES
-                 and k not in ("team_id", "channel_id", "namespace")}
-        for column in _CHECKPOINT_JSON_COLUMNS:
-            if column in patch and not isinstance(patch[column], str):
-                patch[column] = canonical_json(patch[column])
-        patch["updated_at"] = datetime.now().isoformat()
-
-        async with self._stream_conn() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            try:
-                for entry in skeleton_rows or ():
-                    await db.execute(
-                        """
-                        INSERT INTO compaction_event_skeleton
-                            (crawl_id, seq, ts, root_ts, kind_rank, source_rank, actor_id,
-                             projected_byte_len, base_canonical_bytes, projection_sha256)
-                        VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT (crawl_id, ts, kind_rank) DO UPDATE SET
-                            root_ts = excluded.root_ts,
-                            source_rank = excluded.source_rank,
-                            actor_id = excluded.actor_id,
-                            projected_byte_len = excluded.projected_byte_len,
-                            base_canonical_bytes = excluded.base_canonical_bytes,
-                            projection_sha256 = excluded.projection_sha256
-                        WHERE excluded.source_rank > compaction_event_skeleton.source_rank
-                        """,
-                        (crawl_id, str(entry["ts"]), str(entry.get("root_ts") or "0"),
-                         int(entry["kind_rank"]), int(entry["source_rank"]),
-                         str(entry["actor_id"]), int(entry["projected_byte_len"]),
-                         int(entry["base_canonical_bytes"]), str(entry["projection_sha256"])))
-                if patch:
-                    assignments = ", ".join(f"{c} = ?" for c in patch)
-                    await db.execute(
-                        f"UPDATE compaction_crawl_checkpoints SET {assignments} "
-                        f"WHERE team_id = ? AND channel_id = ? AND namespace = ? "
-                        f"  AND crawl_id = ?",
-                        [*patch.values(), team_id, channel_id, namespace, crawl_id])
-                await db.execute("COMMIT")
-            except Exception:
-                try:
-                    await db.execute("ROLLBACK")
-                except Exception:
-                    pass
-                raise
-
-    async def seal_event_skeleton_async(self, crawl_id: str) -> Dict[str, Any]:
-        """The ONE atomic sealing transaction (§1n). Returns {"events": int, "roots": {...}}.
-
-        Sort by the composite triple (ts, root_ts, kind_rank) — root_ts is the sentinel "0" for
-        top-level, never None, because comparing None with a string is not safely orderable, and
-        `kind` is a CLOSED INTEGER RANK so ranks are compared rather than kind strings. Assign
-        CONTIGUOUS seq 0..N-1, then RECOMPUTE every per-root aggregate FROM THE SEALED ROWS:
-        walk-time aggregates saw pre-precedence duplicates, so only the sealed rows are
-        authoritative. Phase advances to 2 in the same commit — chunks are index ranges over
-        `seq`, which does not exist until this runs.
-        """
-        async with self._stream_conn() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            try:
-                async with db.execute(
-                    "SELECT rowid AS rid, ts, root_ts, kind_rank "
-                    "FROM compaction_event_skeleton WHERE crawl_id = ?", (crawl_id,)
-                ) as cursor:
-                    rows = [dict(r) for r in await cursor.fetchall()]
-                rows.sort(key=lambda r: (_ts_key(r["ts"]), _ts_key(r["root_ts"]),
-                                         int(r["kind_rank"])))
-                for seq, row in enumerate(rows):
-                    await db.execute(
-                        "UPDATE compaction_event_skeleton SET seq = ? WHERE rowid = ?",
-                        (seq, row["rid"]))
-
-                roots: Dict[str, Dict[str, Any]] = {}
-                for row in rows:
-                    root_ts = str(row["root_ts"])
-                    if root_ts == "0" or row["ts"] == root_ts:
-                        continue
-                    entry = roots.setdefault(
-                        root_ts, {"root_ts": root_ts, "reply_count": 0,
-                                  "last_canonical_message_ts": None})
-                    entry["reply_count"] += 1
-                    current = entry["last_canonical_message_ts"]
-                    if current is None or _ts_key(row["ts"]) > _ts_key(current):
-                        entry["last_canonical_message_ts"] = str(row["ts"])
-
-                async with db.execute(
-                    "SELECT root_inventory FROM compaction_crawl_checkpoints "
-                    "WHERE crawl_id = ?", (crawl_id,)
-                ) as cursor:
-                    checkpoint = await cursor.fetchone()
-                if checkpoint is not None:
-                    try:
-                        inventory = json.loads(checkpoint["root_inventory"] or "{}")
-                    except (json.JSONDecodeError, TypeError, ValueError):
-                        inventory = {}
-                    if not isinstance(inventory, dict):
-                        inventory = {}
-                    for root_ts, aggregate in roots.items():
-                        entry = dict(inventory.get(root_ts) or {})
-                        entry.update(aggregate)
-                        entry["done"] = True
-                        inventory[root_ts] = entry
-                    for root_ts, entry in inventory.items():
-                        if root_ts not in roots:
-                            entry["reply_count"] = 0
-                            entry["last_canonical_message_ts"] = None
-                    await db.execute(
-                        "UPDATE compaction_crawl_checkpoints "
-                        "SET root_inventory = ?, phase = 2, event_count = ?, "
-                        "    inventory_cursor_ts = NULL, updated_at = ? WHERE crawl_id = ?",
-                        (canonical_json(inventory), len(rows), datetime.now().isoformat(),
-                         crawl_id))
-                await db.execute("COMMIT")
-            except Exception:
-                try:
-                    await db.execute("ROLLBACK")
-                except Exception:
-                    pass
-                raise
-        return {"events": len(rows), "roots": roots}
-
-    async def skeleton_slice_async(self, crawl_id: str, seq_start: int,
-                                   seq_end: int) -> List[Dict[str, Any]]:
-        """Skeleton rows [seq_start, seq_end) in skeleton order.
-
-        REFUSES while any row is unsealed: chunks are index ranges over `seq`, and `seq` does
-        not exist before sealing assigns it, so a phase II that started early would read a
-        partial and arbitrary chunk.
-        """
-        async with self._stream_conn() as db:
-            async with db.execute(
-                "SELECT COUNT(*) AS n FROM compaction_event_skeleton "
-                "WHERE crawl_id = ? AND seq IS NULL", (crawl_id,)
-            ) as cursor:
-                unsealed = int((await cursor.fetchone())["n"])
-            if unsealed:
-                raise ValueError(
-                    f"crawl {crawl_id} has {unsealed} unsealed skeleton row(s): phase II may "
-                    f"not start before sealing commits")
-            async with db.execute(
-                "SELECT * FROM compaction_event_skeleton "
-                "WHERE crawl_id = ? AND seq >= ? AND seq < ? ORDER BY seq",
-                (crawl_id, int(seq_start), int(seq_end))
-            ) as cursor:
-                return [dict(r) for r in await cursor.fetchall()]
-
-    async def skeleton_count_async(self, crawl_id: str) -> int:
-        """How many skeleton rows this crawl holds (candidate or sealed)."""
-        async with self._stream_conn() as db:
-            async with db.execute(
-                "SELECT COUNT(*) AS n FROM compaction_event_skeleton WHERE crawl_id = ?",
-                (crawl_id,)
-            ) as cursor:
-                return int((await cursor.fetchone())["n"])
-
-    # ----------------------------------------------------------------- telemetry outbox (§1l)
-
-    async def insert_outbox_rows_async(self, rows: Sequence[Dict[str, Any]]) -> None:
-        """Validate and insert outbox rows in ONE transaction.
-
-        A row dict is {crawl_id, attempt_seq, event_seq, body} where `body` is the CANONICAL
-        BODY DICT. `created_ts` is the row's own REAL Unix seconds and MUST equal body["at"].
-        """
-        async with self._stream_conn() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            try:
-                await self._insert_outbox_rows(db, rows)
-                await db.execute("COMMIT")
-            except Exception:
-                try:
-                    await db.execute("ROLLBACK")
-                except Exception:
-                    pass
-                raise
-
-    @staticmethod
-    async def _insert_outbox_rows(db, rows: Sequence[Dict[str, Any]]) -> None:
-        """The insert path, inside the caller's transaction.
-
-        A UNIQUE conflict is resolved by BYTE-COMPARING THE STORED CANONICAL BODY: identical is
-        an idempotent retry of work already durably recorded, different is a contract failure
-        that must roll the enclosing state change back. `INSERT OR IGNORE` passes the first and
-        silently swallows the second, so it is not used here.
-        """
-        for entry in rows or ():
-            crawl_id = str(entry["crawl_id"])
-            attempt_seq = int(entry["attempt_seq"])
-            event_seq = int(entry["event_seq"])
-            body = entry.get("body")
-            payload = entry.get("payload")
-            if body is None and isinstance(payload, str):
-                body = json.loads(payload)
-            created_ts = float(entry.get("created_ts", (body or {}).get("at", 0.0)))
-            clause = validate_outbox_body(body, crawl_id=crawl_id, attempt_seq=attempt_seq,
-                                          event_seq=event_seq, created_ts=created_ts)
-            if clause:
-                raise ValueError(
-                    f"outbox payload for ({crawl_id}, {attempt_seq}, {event_seq}) fails "
-                    f"clause {clause!r}; the transaction must not commit on top of it")
-            encoded = canonical_body_bytes(body).decode("utf-8")
-
-            async with db.execute(
-                "SELECT payload FROM compaction_telemetry_outbox "
-                "WHERE crawl_id = ? AND attempt_seq = ? AND event_seq = ?",
-                (crawl_id, attempt_seq, event_seq)
-            ) as cursor:
-                existing = await cursor.fetchone()
-            if existing is not None:
-                if existing["payload"].encode("utf-8") == encoded.encode("utf-8"):
-                    continue
-                raise ValueError(
-                    f"outbox identity ({crawl_id}, {attempt_seq}, {event_seq}) already holds a "
-                    f"DIFFERENT canonical body; two distinct events claiming one identity is a "
-                    f"defect at its source")
-            await db.execute(
-                "INSERT INTO compaction_telemetry_outbox "
-                "(crawl_id, attempt_seq, event_seq, payload, created_ts) VALUES (?, ?, ?, ?, ?)",
-                (crawl_id, attempt_seq, event_seq, encoded, created_ts))
-
-    async def read_outbox_batch_async(self, limit: int = 50) -> List[Dict[str, Any]]:
-        """The next batch IN `outbox_seq` ORDER, re-validated on read.
-
-        Ordering is by outbox_seq, never the identity triple: crawl_id is a random uuid4, so
-        identity order is not time order. An invalid row is returned carrying
-        `"invalid": <clause>` so the drainer takes the poison path instead of the outage path —
-        a row can be corrupted after it lands, which insert-time validation cannot see.
-        """
-        async with self._stream_conn() as db:
-            async with db.execute(
-                "SELECT * FROM compaction_telemetry_outbox ORDER BY outbox_seq LIMIT ?",
-                (int(limit),)
-            ) as cursor:
-                rows = [dict(r) for r in await cursor.fetchall()]
-        batch: List[Dict[str, Any]] = []
-        for row in rows:
-            try:
-                body = json.loads(row["payload"])
-            except (json.JSONDecodeError, TypeError, ValueError):
-                body = None
-            clause = validate_outbox_body(
-                body, crawl_id=row["crawl_id"], attempt_seq=row["attempt_seq"],
-                event_seq=row["event_seq"], created_ts=row["created_ts"])
-            entry = dict(row)
-            entry["body"] = body
-            if clause:
-                entry["invalid"] = clause
-            batch.append(entry)
-        return batch
-
-    async def delete_outbox_row_async(self, outbox_seq: int) -> bool:
-        """Delete one delivered row. Only ever called AFTER durable acknowledgement."""
-        async with self._stream_conn() as db:
-            cursor = await db.execute(
-                "DELETE FROM compaction_telemetry_outbox WHERE outbox_seq = ?",
-                (int(outbox_seq),))
-            return bool(cursor.rowcount)
-
-    # ------------------------------------------------- pending recompaction + intent (§1m)
-
-    async def load_pending_recompaction_async(self, team_id: str, channel_id: str,
-                                              namespace: str) -> Optional[Dict[str, Any]]:
-        """The obligation row for this scope, VALIDATED and FAIL-CLOSED.
-
-        A row failing any dormancy invariant REFUSES TO ARBITRATE: it comes back as
-        {"state": "dormant", "malformed": "<field>"} with a CRITICAL bounded to once per row
-        hash per boot. Reading a malformed row as active would let it BYPASS THE BACKOFF, which
-        is the one outcome this machinery exists to prevent.
-        """
-        async with self._stream_conn() as db:
-            async with db.execute(
-                "SELECT * FROM pending_recompaction "
-                "WHERE team_id = ? AND channel_id = ? AND namespace = ?",
-                (team_id, channel_id, namespace)
-            ) as cursor:
-                row = await cursor.fetchone()
-        return self._validated_pending(row)
-
-    async def all_pending_recompactions_async(self) -> List[Dict[str, Any]]:
-        """Every obligation row, for coordinator boot hydration."""
-        async with self._stream_conn() as db:
-            async with db.execute(
-                "SELECT * FROM pending_recompaction ORDER BY created_ts"
-            ) as cursor:
-                rows = await cursor.fetchall()
-        return [self._validated_pending(row) for row in rows]
-
-    def _validated_pending(self, row) -> Optional[Dict[str, Any]]:
-        if row is None:
-            return None
-        entry = dict(row)
-        try:
-            requirements = json.loads(entry.get("requirements") or "")
-        except (json.JSONDecodeError, TypeError, ValueError):
-            requirements = None
-        malformed: Optional[str] = None
-        if not isinstance(requirements, dict) or not requirements:
-            malformed = "requirements"
-            requirements = requirements if isinstance(requirements, dict) else {}
-        elif entry["state"] == "active":
-            if entry["dormant_profile_key"] is not None:
-                malformed = "dormant_profile_key"
-            elif entry["next_attempt_after"] is not None:
-                malformed = "next_attempt_after"
-        elif entry["state"] == "dormant":
-            if entry["dormant_profile_key"] is None:
-                malformed = "dormant_profile_key"
-            elif entry["next_attempt_after"] is None:
-                malformed = "next_attempt_after"
-            elif entry["dormant_profile_key"] not in requirements:
-                malformed = "dormant_profile_key"
-        entry["requirements"] = requirements
-        if malformed:
-            entry["state"] = "dormant"
-            entry["malformed"] = malformed
-            self._log_malformed_pending(entry, malformed)
-        return entry
-
-    def _log_malformed_pending(self, entry: Dict[str, Any], field: str) -> None:
-        """CRITICAL, bounded to once per row hash per boot: a busy channel arbitrates on every
-        trigger, and one CRITICAL per trigger would bury the message it needs to surface."""
-        digest = hashlib.sha256(canonical_json(
-            {k: str(v) for k, v in sorted(entry.items()) if k != "requirements"}
-        ).encode("utf-8")).hexdigest()
-        if digest in self._malformed_pending_seen:
-            return
-        self._malformed_pending_seen.add(digest)
-        self.log_error(
-            f"CRITICAL: pending_recompaction row for {entry.get('channel_id')} has a malformed "
-            f"{field}; treating it as DORMANT so it cannot bypass the backoff")
-
-    async def merge_pending_recompaction_async(
-            self, *, team_id: str, channel_id: str, namespace: str, profile_key: str,
-            required_headroom: int, obligated_snapshot_id: str, obligated_generation: int,
-            reason: str) -> None:
-        """`BEGIN IMMEDIATE` transactional read-modify-write of the whole row (§1m).
-
-        The requirement map takes the MAX PER KEY — generation 11 measured at 40k must not
-        erase generation 10's still-unsatisfied 90k requirement under the same key, which a
-        scalar headroom field would do. Keys the incoming enqueue does not mention are left
-        untouched. `(obligated_snapshot_id, obligated_generation)` move AS A PAIR and only on a
-        GREATER generation: updating one without the other would leave the row naming a
-        snapshot that is not the generation it claims. The EARLIEST created_ts is KEPT, so age
-        reflects when the channel first needed attention. A plain read-merge-write would let two
-        concurrent enqueues interleave and lose the larger per-key requirement.
-        """
-        async with self._stream_conn() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            try:
-                async with db.execute(
-                    "SELECT * FROM pending_recompaction "
-                    "WHERE team_id = ? AND channel_id = ? AND namespace = ?",
-                    (team_id, channel_id, namespace)
-                ) as cursor:
-                    row = await cursor.fetchone()
-                if row is None:
-                    await db.execute(
-                        "INSERT INTO pending_recompaction "
-                        "(team_id, channel_id, namespace, obligated_snapshot_id, "
-                        " obligated_generation, requirements, state, dormant_profile_key, "
-                        " next_attempt_after, reason, created_ts) "
-                        "VALUES (?, ?, ?, ?, ?, ?, 'active', NULL, NULL, ?, ?)",
-                        (team_id, channel_id, namespace, obligated_snapshot_id,
-                         int(obligated_generation),
-                         canonical_json({str(profile_key): int(required_headroom)}),
-                         reason, datetime.now().isoformat()))
-                else:
-                    try:
-                        requirements = json.loads(row["requirements"] or "{}")
-                    except (json.JSONDecodeError, TypeError, ValueError):
-                        requirements = {}
-                    if not isinstance(requirements, dict):
-                        requirements = {}
-                    key = str(profile_key)
-                    requirements[key] = max(int(requirements.get(key, 0)),
-                                            int(required_headroom))
-                    if int(obligated_generation) > int(row["obligated_generation"]):
-                        pair = (obligated_snapshot_id, int(obligated_generation))
-                    else:
-                        pair = (row["obligated_snapshot_id"], int(row["obligated_generation"]))
-                    await db.execute(
-                        "UPDATE pending_recompaction SET requirements = ?, "
-                        "  obligated_snapshot_id = ?, obligated_generation = ? "
-                        "WHERE team_id = ? AND channel_id = ? AND namespace = ?",
-                        (canonical_json(requirements), pair[0], pair[1],
-                         team_id, channel_id, namespace))
-                await db.execute("COMMIT")
-            except Exception:
-                try:
-                    await db.execute("ROLLBACK")
-                except Exception:
-                    pass
-                raise
-
-    async def cas_pending_recompaction_async(
-            self, *, team_id: str, channel_id: str, namespace: str, expect_state: str,
-            new_state: str, expect_profile_key: Optional[str] = None,
-            expect_pair: Optional[Tuple[str, int]] = None, deadline_passed: bool = False,
-            next_attempt_after: Optional[str] = None,
-            dormant_profile_key: Optional[str] = None) -> bool:
-        """One conditional state move. True only for the winner; losers do nothing.
-
-        Every predicate — state, the obligated (snapshot_id, generation) PAIR, the dormancy
-        profile key and the deadline — is checked inside ONE `BEGIN IMMEDIATE`, and the move
-        commits BEFORE any task is created. Creating the task first and updating after is the
-        same race in the other direction: two triggers both see `dormant`, both build tasks,
-        and one obligation runs twice.
-        """
-        now = datetime.now().isoformat()
-        async with self._stream_conn() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            try:
-                async with db.execute(
-                    "SELECT * FROM pending_recompaction "
-                    "WHERE team_id = ? AND channel_id = ? AND namespace = ?",
-                    (team_id, channel_id, namespace)
-                ) as cursor:
-                    row = await cursor.fetchone()
-                won = row is not None and row["state"] == expect_state
-                if won and expect_pair is not None:
-                    won = (row["obligated_snapshot_id"] == expect_pair[0]
-                           and int(row["obligated_generation"]) == int(expect_pair[1]))
-                if won and expect_profile_key is not None:
-                    if row["state"] == "dormant":
-                        won = row["dormant_profile_key"] == expect_profile_key
-                    else:
-                        try:
-                            requirements = json.loads(row["requirements"] or "{}")
-                        except (json.JSONDecodeError, TypeError, ValueError):
-                            requirements = {}
-                        won = expect_profile_key in requirements
-                if won and deadline_passed:
-                    deadline = row["next_attempt_after"]
-                    won = deadline is None or str(deadline) <= now
-                if won:
-                    if new_state == "dormant":
-                        await db.execute(
-                            "UPDATE pending_recompaction SET state = 'dormant', "
-                            "  dormant_profile_key = ?, next_attempt_after = ? "
-                            "WHERE team_id = ? AND channel_id = ? AND namespace = ?",
-                            (dormant_profile_key, next_attempt_after,
-                             team_id, channel_id, namespace))
-                    else:
-                        await db.execute(
-                            "UPDATE pending_recompaction SET state = ?, "
-                            "  dormant_profile_key = NULL, next_attempt_after = NULL "
-                            "WHERE team_id = ? AND channel_id = ? AND namespace = ?",
-                            (new_state, team_id, channel_id, namespace))
-                    await db.execute("COMMIT")
-                else:
-                    await db.execute("ROLLBACK")
-            except Exception:
-                try:
-                    await db.execute("ROLLBACK")
-                except Exception:
-                    pass
-                raise
-        return bool(won)
-
-    async def reconcile_pending_profiles_async(self, *, team_id: str, channel_id: str,
-                                               namespace: str,
-                                               current_profile: str) -> List[str]:
-        """RETIRE requirement-map entries keyed to a profile that no longer exists.
-
-        After a model, window or threshold change no current-profile publication can ever
-        dominate an entry keyed to the old profile, and the old model may not even be callable
-        any more — so the entry is DELETED with an INFO log, never pursued forever. Dormancy
-        whose `dormant_profile_key` is not the current effective profile is CLEARED rather than
-        inherited: pruning the old entry without that would leave a brand-new obligation sitting
-        under the old one's deadline, silently suppressed before it was ever attempted.
-
-        Returns the retired keys.
-        """
-        async with self._stream_conn() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            try:
-                async with db.execute(
-                    "SELECT * FROM pending_recompaction "
-                    "WHERE team_id = ? AND channel_id = ? AND namespace = ?",
-                    (team_id, channel_id, namespace)
-                ) as cursor:
-                    row = await cursor.fetchone()
-                if row is None:
-                    await db.execute("COMMIT")
-                    return []
-                try:
-                    requirements = json.loads(row["requirements"] or "{}")
-                except (json.JSONDecodeError, TypeError, ValueError):
-                    requirements = {}
-                if not isinstance(requirements, dict):
-                    requirements = {}
-                retired = sorted(k for k in requirements if k != current_profile)
-                for key in retired:
-                    requirements.pop(key, None)
-
-                if not requirements:
-                    await db.execute(
-                        "DELETE FROM pending_recompaction "
-                        "WHERE team_id = ? AND channel_id = ? AND namespace = ?",
-                        (team_id, channel_id, namespace))
-                else:
-                    keep_dormant = (row["state"] == "dormant"
-                                    and row["dormant_profile_key"] == current_profile)
-                    await db.execute(
-                        "UPDATE pending_recompaction SET requirements = ?, state = ?, "
-                        "  dormant_profile_key = ?, next_attempt_after = ? "
-                        "WHERE team_id = ? AND channel_id = ? AND namespace = ?",
-                        (canonical_json(requirements),
-                         "dormant" if keep_dormant else "active",
-                         row["dormant_profile_key"] if keep_dormant else None,
-                         row["next_attempt_after"] if keep_dormant else None,
-                         team_id, channel_id, namespace))
-                await db.execute("COMMIT")
-            except Exception:
-                try:
-                    await db.execute("ROLLBACK")
-                except Exception:
-                    pass
-                raise
-        for key in retired:
-            self.log_info(
-                f"Retired obsolete recompaction profile {key!r} for {channel_id}: it describes "
-                f"a configuration that no longer exists")
-        return retired
-
-    async def write_cancellation_intent_async(self, intent: Dict[str, Any], *,
-                                              retire_keys: Sequence[str] = ()) -> None:
-        """Insert the intent AND remove the requirement, in ONE transaction (§1m).
-
-        The intent is written BEFORE the requirement is gone, so boot can never find an orphan
-        checkpoint with no obligation left to explain it. Duplicate insertion collides on the
-        primary key — FIRST WRITE WINS, so a re-reconciliation of the same crawl_id cannot
-        install a different reason or obligated_snapshot_id over it.
-        """
-        team_id = intent["team_id"]
-        channel_id = intent["channel_id"]
-        namespace = intent["namespace"]
-        async with self._stream_conn() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            try:
-                await db.execute(
-                    "INSERT OR IGNORE INTO compaction_cancellation_intent "
-                    "(team_id, channel_id, namespace, crawl_id, obligated_snapshot_id, reason, "
-                    " created_ts) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (team_id, channel_id, namespace, str(intent["crawl_id"]),
-                     str(intent["obligated_snapshot_id"]), str(intent["reason"]),
-                     str(intent.get("created_ts") or datetime.now().isoformat())))
-                keys = [str(k) for k in retire_keys if k]
-                if keys:
-                    async with db.execute(
-                        "SELECT requirements FROM pending_recompaction "
-                        "WHERE team_id = ? AND channel_id = ? AND namespace = ?",
-                        (team_id, channel_id, namespace)
-                    ) as cursor:
-                        row = await cursor.fetchone()
-                    if row is not None:
-                        try:
-                            requirements = json.loads(row["requirements"] or "{}")
-                        except (json.JSONDecodeError, TypeError, ValueError):
-                            requirements = {}
-                        for key in keys:
-                            requirements.pop(key, None)
-                        if requirements:
-                            await db.execute(
-                                "UPDATE pending_recompaction SET requirements = ? "
-                                "WHERE team_id = ? AND channel_id = ? AND namespace = ?",
-                                (canonical_json(requirements), team_id, channel_id, namespace))
-                        else:
-                            await db.execute(
-                                "DELETE FROM pending_recompaction "
-                                "WHERE team_id = ? AND channel_id = ? AND namespace = ?",
-                                (team_id, channel_id, namespace))
-                await db.execute("COMMIT")
-            except Exception:
-                try:
-                    await db.execute("ROLLBACK")
-                except Exception:
-                    pass
-                raise
-
-    async def get_cancellation_intent_async(self, team_id: str, channel_id: str,
-                                            namespace: str,
-                                            crawl_id: str) -> Optional[Dict[str, Any]]:
-        """One intent row, for boot recovery's "intent plus orphan checkpoint" check."""
-        async with self._stream_conn() as db:
-            async with db.execute(
-                "SELECT * FROM compaction_cancellation_intent "
-                "WHERE team_id = ? AND channel_id = ? AND namespace = ? AND crawl_id = ?",
-                (team_id, channel_id, namespace, crawl_id)
-            ) as cursor:
-                row = await cursor.fetchone()
-        return dict(row) if row else None
-
-    async def all_cancellation_intents_async(self) -> List[Dict[str, Any]]:
-        """Every outstanding intent, for boot recovery."""
-        async with self._stream_conn() as db:
-            async with db.execute(
-                "SELECT * FROM compaction_cancellation_intent ORDER BY created_ts"
-            ) as cursor:
-                return [dict(r) for r in await cursor.fetchall()]
-
-    async def finish_cancellation_discard_async(
-            self, *, team_id: str, channel_id: str, namespace: str, crawl_id: str,
-            outbox_rows: Sequence[Dict[str, Any]] = (),
-            candidate_id: Optional[str] = None) -> bool:
-        """THE shared atomic accessor BOTH live chunk-boundary cleanup and boot recovery call.
-
-        ONE `BEGIN IMMEDIATE` containing all of: the outbox insertion for the discarded
-        op=build; deletion of the checkpoint, the event skeleton and any validated candidate
-        with its manifest and anchor-provenance rows; release of the parent-sweep protection
-        (which the checkpoint held, so deleting it IS the release); and deletion of the intent
-        row.
-
-        One code path is the contract, not an optimization: a single transaction deleting both
-        the checkpoint and the intent CANNOT crash between them, so intent-without-checkpoint is
-        genuinely impossible rather than merely unlikely. Giving the two callers separate
-        implementations is exactly how that divergence gets introduced.
-        """
-        async with self._stream_conn() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            try:
-                await self._insert_outbox_rows(db, outbox_rows)
-                await self._delete_crawl_state(db, team_id, channel_id, namespace, crawl_id)
-                if candidate_id:
-                    await self._delete_snapshot_rows(db, [candidate_id])
-                cursor = await db.execute(
-                    "DELETE FROM compaction_cancellation_intent "
-                    "WHERE team_id = ? AND channel_id = ? AND namespace = ? AND crawl_id = ?",
-                    (team_id, channel_id, namespace, crawl_id))
-                removed = bool(cursor.rowcount)
-                await db.execute("COMMIT")
-            except Exception:
-                try:
-                    await db.execute("ROLLBACK")
-                except Exception:
-                    pass
-                raise
-        return removed
-
-    async def terminal_publish_nothing_async(
-            self, *, team_id: str, channel_id: str, namespace: str, crawl_id: str,
-            expect_state: str = "active",
-            expect_pair: Optional[Tuple[str, int]] = None,
-            expect_profile_key: Optional[str] = None,
-            dormant_profile_key: str, next_attempt_after: str,
-            outbox_rows: Sequence[Dict[str, Any]] = (),
-            candidate_id: Optional[str] = None) -> Dict[str, Any]:
-        """The PUBLISH-NOTHING terminal transaction of §1m. ONE `BEGIN IMMEDIATE`.
-
-        An attempt can exhaust its bounded retries WITHOUT PUBLISHING ANYTHING — §1e's honest
-        "publish nothing" outcome — and then there is no publication transaction to host the
-        state change. Stitching `cas_pending_recompaction_async` to
-        `finish_cancellation_discard_async` reopens the crash window this transaction exists to
-        close: a crash between them leaves an ACTIVE row behind an attempt that already gave up,
-        and boot retries it with the backoff unwritten — the single case where the channel is
-        MOST stuck.
-
-        In order: read the row, evaluate the THREE predicates, run the cleanup, then apply
-        `active -> dormant` only when all three hold.
-
-        **THE CLEANUP RUNS ON THE MISMATCH BRANCH TOO**, and that is load-bearing rather than
-        defensive. The crawl state must die with the attempt because a revived attempt starts a
-        NEW crawl with a FRESH `H`; a surviving checkpoint still pins the OLD `H`, and the resume
-        reset list does not treat a changed `H` as a reason to discard — so the revival would
-        resume against a ceiling the channel has long since moved past and publish a boundary
-        that was already wrong when the attempt gave up.
-
-        Returns `{"ok": bool, "mismatch": None | "profile" | "state" | "pair"}`. The three
-        mismatch classes ROUTE DIFFERENTLY and are never collapsed:
-          profile      — the task really is sized for a configuration that no longer exists;
-                         the caller takes the OBSOLESCENCE path;
-          state / pair — an older attempt finished late. Discard ONLY THE STALE ATTEMPT; the
-                         newer obligation is left SCHEDULED AND UNTOUCHED. Treating this as
-                         obsolescence would retire a live, current-profile obligation that
-                         nothing is wrong with.
-        """
-        if not dormant_profile_key or not next_attempt_after:
-            # Checked BEFORE the transaction so a caller bug cannot half-apply the cleanup. A
-            # dormant row missing either field cannot be honestly attached to a profile.
-            raise ValueError(
-                "terminal_publish_nothing_async requires both dormant_profile_key and "
-                "next_attempt_after: dormancy must name the profile it belongs to")
-
-        async with self._stream_conn() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            try:
-                async with db.execute(
-                    "SELECT * FROM pending_recompaction "
-                    "WHERE team_id = ? AND channel_id = ? AND namespace = ?",
-                    (team_id, channel_id, namespace)
-                ) as cursor:
-                    row = await cursor.fetchone()
-
-                mismatch = self._terminal_mismatch(
-                    row, expect_state=expect_state, expect_pair=expect_pair,
-                    expect_profile_key=expect_profile_key,
-                    dormant_profile_key=dormant_profile_key)
-
-                await self._insert_outbox_rows(db, outbox_rows)
-                await self._delete_crawl_state(db, team_id, channel_id, namespace, crawl_id)
-                if candidate_id:
-                    await self._delete_snapshot_rows(db, [candidate_id])
-
-                if mismatch is None:
-                    await db.execute(
-                        "UPDATE pending_recompaction SET state = 'dormant', "
-                        "  dormant_profile_key = ?, next_attempt_after = ? "
-                        "WHERE team_id = ? AND channel_id = ? AND namespace = ?",
-                        (str(dormant_profile_key), str(next_attempt_after),
-                         team_id, channel_id, namespace))
-                await db.execute("COMMIT")
-            except Exception:
-                try:
-                    await db.execute("ROLLBACK")
-                except Exception:
-                    pass
-                raise
-
-        if mismatch is not None:
-            self.log_info(
-                f"Publish-nothing terminal for {channel_id} discarded the stale attempt "
-                f"{crawl_id} ({mismatch} mismatch); the obligation row was left alone")
-        return {"ok": mismatch is None, "mismatch": mismatch}
-
-    @staticmethod
-    def _terminal_mismatch(row, *, expect_state: str, expect_pair: Optional[Tuple[str, int]],
-                           expect_profile_key: Optional[str],
-                           dormant_profile_key: str) -> Optional[str]:
-        """Which of the three §1m predicates failed, PROFILE FIRST.
-
-        Profile is evaluated first because it is what separates obsolescence from a late
-        attempt: the state/pair classes are defined as SAME-PROFILE supersession, so a profile
-        disagreement can never be reported as one of them.
-
-        A row that does not carry `dormant_profile_key` in its `requirements` is a PROFILE
-        mismatch, not a malformed write: marking it dormant anyway would create exactly the row
-        the dormancy validator has to fail closed on. An ABSENT row is a `state` mismatch —
-        there is no obligation left to retire and none to reschedule, so the harmless
-        stale-attempt route is the honest one.
-        """
-        if row is None:
-            return "state"
-        try:
-            requirements = json.loads(row["requirements"] or "{}")
-        except (json.JSONDecodeError, TypeError, ValueError):
-            requirements = None
-        if not isinstance(requirements, dict):
-            return "profile"
-        if expect_profile_key is not None and expect_profile_key not in requirements:
-            return "profile"
-        if str(dormant_profile_key) not in requirements:
-            return "profile"
-        if row["state"] != expect_state:
-            return "state"
-        if expect_pair is not None and (
-                row["obligated_snapshot_id"] != expect_pair[0]
-                or int(row["obligated_generation"]) != int(expect_pair[1])):
-            return "pair"
-        return None
-
-    # ------------------------------------------------- §1m satisfaction / dormancy helpers
-
-    @staticmethod
-    async def _satisfy_pending(db, team_id: str, channel_id: str, namespace: str,
-                               candidate: Dict[str, Any], generation: int,
-                               satisfy: Dict[str, Any]) -> None:
-        """Delete only the map entries this publication DOMINATES (§1m).
-
-        Satisfaction requires ALL of: the SAME profile key, a proven headroom >= the carried
-        requirement for that key, AND fit_result = under_target. An `under_trigger` publication
-        NEVER discharges an obligation — the fallback is the escape hatch for a channel that
-        cannot get under target at all, and the obligation exists precisely to restore
-        under-target fit. Entries under other keys, or under the same key with a stricter
-        requirement, SURVIVE, and the ROW disappears only when the map empties.
-        """
-        profile_key = satisfy.get("profile_key", candidate.get("sizing_profile"))
-        fit_result = satisfy.get("fit_result", candidate.get("fit_result"))
-        proven = satisfy.get("proven_headroom", candidate.get("headroom_tokens"))
-        if fit_result != "under_target" or proven is None or not profile_key:
-            return
-        async with db.execute(
-            "SELECT * FROM pending_recompaction "
-            "WHERE team_id = ? AND channel_id = ? AND namespace = ?",
-            (team_id, channel_id, namespace)
-        ) as cursor:
-            row = await cursor.fetchone()
-        if row is None or int(generation) <= int(row["obligated_generation"]):
-            return
-        try:
-            requirements = json.loads(row["requirements"] or "{}")
-        except (json.JSONDecodeError, TypeError, ValueError):
-            return
-        if not isinstance(requirements, dict):
-            return
-        required = requirements.get(str(profile_key))
-        if required is None or int(proven) < int(required):
-            return
-        requirements.pop(str(profile_key), None)
-        if requirements:
-            keep_dormant = (row["state"] == "dormant"
-                            and row["dormant_profile_key"] in requirements)
-            await db.execute(
-                "UPDATE pending_recompaction SET requirements = ?, state = ?, "
-                "  dormant_profile_key = ?, next_attempt_after = ? "
-                "WHERE team_id = ? AND channel_id = ? AND namespace = ?",
-                (canonical_json(requirements), "dormant" if keep_dormant else "active",
-                 row["dormant_profile_key"] if keep_dormant else None,
-                 row["next_attempt_after"] if keep_dormant else None,
-                 team_id, channel_id, namespace))
-        else:
-            await db.execute(
-                "DELETE FROM pending_recompaction "
-                "WHERE team_id = ? AND channel_id = ? AND namespace = ?",
-                (team_id, channel_id, namespace))
-
-    @staticmethod
-    async def _apply_dormancy(db, team_id: str, channel_id: str, namespace: str,
-                              dormancy: Dict[str, Any]) -> None:
-        """The active -> dormant move, committed inside the publication transaction.
-
-        Writing them separately would let a crash in between leave an ACTIVE row behind a
-        publication that already failed to dominate — and boot would immediately retry it,
-        backoff unwritten.
-        """
-        profile_key = dormancy.get("profile_key") or dormancy.get("dormant_profile_key")
-        deadline = dormancy.get("next_attempt_after")
-        if not profile_key or not deadline:
-            raise ValueError(
-                "dormancy requires both a dormant_profile_key and a next_attempt_after: a "
-                "dormant row missing either cannot be honestly attached to a profile")
-        await db.execute(
-            "UPDATE pending_recompaction SET state = 'dormant', dormant_profile_key = ?, "
-            "  next_attempt_after = ? "
-            "WHERE team_id = ? AND channel_id = ? AND namespace = ?",
-            (str(profile_key), str(deadline), team_id, channel_id, namespace))
-
-    # ----------------------------------------------------------------- sweep + late evidence
-
-    async def sweep_snapshots_async(self, pinned_ids: Optional[Iterable[str]] = None,
-                                    retain_generations: Optional[int] = None,
-                                    retain_days: Optional[int] = None,
-                                    protected_ids: Iterable[str] = ()) -> int:
-        """Delete snapshots nothing can still need. Returns the number removed.
-
-        Retained = the UNION of: the newest `retain_generations` published generations per
-        scope, anything younger than `retain_days`, whatever the pointers name, everything
-        pinned by a live turn/retry/detached job, `protected_ids`, and EVERY LIVE CRAWL
-        CHECKPOINT'S `parent_snapshot_id` (§1n) — retiring that one lineage would force an
-        in-progress incremental crawl back to raw.
-
-        Manifest and anchor-provenance rows are deleted WITH their snapshots (physical-delete
-        site v); SQLite foreign keys are off, so nothing cascades.
-        """
-        retain_generations = 3 if retain_generations is None else int(retain_generations)
-        retain_days = 7 if retain_days is None else int(retain_days)
-        protected = {str(p) for p in (pinned_ids or []) if p}
-        protected.update(str(p) for p in (protected_ids or ()) if p)
-        protected.update(await self.live_checkpoint_parent_ids_async())
-
-        pin_clause = ""
-        params: List[Any] = []
-        if protected:
-            ordered = sorted(protected)
-            pin_clause = f"AND snapshot_id NOT IN ({', '.join('?' * len(ordered))}) "
-            params.extend(ordered)
-        params.append(retain_generations)
-        async with self._stream_conn() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            try:
-                async with db.execute(
-                    f"""
-                    SELECT snapshot_id FROM channel_snapshots
-                    WHERE snapshot_id NOT IN (
-                            SELECT active_snapshot_id FROM channel_snapshot_pointer
-                            WHERE active_snapshot_id IS NOT NULL)
-                      {pin_clause}
-                      AND (
-                        (generation IS NULL
-                         AND created_ts < datetime('now', '-1 day'))
-                        OR (generation IS NOT NULL
-                            AND created_ts < datetime('now', '-{retain_days} days')
-                            AND generation <= (
-                                SELECT COALESCE(MAX(s2.generation), 0) FROM channel_snapshots s2
-                                WHERE s2.team_id = channel_snapshots.team_id
-                                  AND s2.channel_id = channel_snapshots.channel_id
-                                  AND s2.namespace = channel_snapshots.namespace
-                                  AND s2.serializer_version =
-                                      channel_snapshots.serializer_version
-                                  AND s2.generation IS NOT NULL) - ?)
-                      )
-                    """,
-                    params
-                ) as cursor:
-                    doomed = [r["snapshot_id"] for r in await cursor.fetchall()]
-                removed = await self._delete_snapshot_rows(db, doomed)
-                # An event skeleton whose checkpoint is gone has nothing left to describe.
-                await db.execute(
-                    "DELETE FROM compaction_event_skeleton WHERE crawl_id NOT IN "
-                    "(SELECT crawl_id FROM compaction_crawl_checkpoints)")
-                await db.execute("COMMIT")
-            except Exception:
-                try:
-                    await db.execute("ROLLBACK")
-                except Exception:
-                    pass
-                raise
-        if removed:
-            self.log_info(f"Snapshots: swept {removed} row(s)")
-        return removed
-
-    async def late_artifact_evidence_async(self, team_id: str, channel_id: str,
-                                           snapshot_id: str, *, boundary_ts: str,
-                                           high_ts: str) -> List[Dict[str, Any]]:
-        """Pre-boundary artifacts the pinned snapshot's manifest does NOT already account for.
-
-        Computed against THAT snapshot's manifest, never the active one: an overlapping turn
-        may pin S1 after S2 became active, and its evidence is S1's business.
-
-        An entry is returned when the manifest has NO row for it, when the manifest row's
-        `status_at_capture` differs from the artifact's live status (a same-row pending -> ready
-        completion), or when the namespace is STATUSLESS (`document_extraction`,
-        `tool_provenance`) — those carry the literal "complete", so only the content hash can
-        say whether the render changed, and the caller finishes that comparison against the
-        `manifest_content_hash` carried here.
-
-        Keyed by the FULL tuple (source_ts, snapshot_id, artifact_namespace, row_id):
-        (source_ts, snapshot_id) alone collides whenever one message carries several artifacts.
-        Ordered (source_ts, artifact_namespace, row_id), matching Appendix A5.
-        """
-        thread_prefix = f"{channel_id}:%"
-        bounds = {"boundary": str(boundary_ts), "high": str(high_ts),
-                  "prefix": thread_prefix, "ch": channel_id, "snap": snapshot_id}
-        entries: List[Dict[str, Any]] = []
-        async with self._stream_conn() as db:
-            await db.execute("BEGIN DEFERRED")
-            try:
-                async with db.execute(
-                    "SELECT artifact_namespace, row_id, content_hash, status_at_capture "
-                    "FROM snapshot_capture_manifest WHERE snapshot_id = ?", (snapshot_id,)
-                ) as cursor:
-                    manifest = {(r["artifact_namespace"], r["row_id"]): dict(r)
-                                for r in await cursor.fetchall()}
-
-                async with db.execute(
-                    """
-                    SELECT id, message_ts AS source_ts, url, analysis, metadata_json,
-                           image_type AS status
-                    FROM images
-                    WHERE thread_id LIKE :prefix AND message_ts IS NOT NULL
-                      AND CAST(message_ts AS REAL) <= CAST(:boundary AS REAL)
-                      AND CAST(message_ts AS REAL) <= CAST(:high AS REAL)
-                    """, bounds
-                ) as cursor:
-                    rows = [("image_analysis", dict(r)) for r in await cursor.fetchall()]
-
-                async with db.execute(
-                    """
-                    SELECT id, message_ts AS source_ts, filename, file_id, summary,
-                           'complete' AS status
-                    FROM documents
-                    WHERE thread_id LIKE :prefix AND message_ts IS NOT NULL
-                      AND CAST(message_ts AS REAL) <= CAST(:boundary AS REAL)
-                      AND CAST(message_ts AS REAL) <= CAST(:high AS REAL)
-                    """, bounds
-                ) as cursor:
-                    rows += [("document_extraction", dict(r)) for r in await cursor.fetchall()]
-
-                async with db.execute(
-                    """
-                    SELECT id, source_ts, kind, ref, title, summary, status,
-                           derivation_source
-                    FROM ambient_artifacts
-                    WHERE channel_id = :ch
-                      AND CAST(source_ts AS REAL) <= CAST(:boundary AS REAL)
-                      AND CAST(source_ts AS REAL) <= CAST(:high AS REAL)
-                    """, bounds
-                ) as cursor:
-                    rows += [("ambient_artifact", dict(r)) for r in await cursor.fetchall()]
-
-                async with db.execute(
-                    """
-                    SELECT id, message_ts AS source_ts, tools_json, 'complete' AS status
-                    FROM message_tool_usage
-                    WHERE channel_id = :ch
-                      AND CAST(message_ts AS REAL) <= CAST(:boundary AS REAL)
-                      AND CAST(message_ts AS REAL) <= CAST(:high AS REAL)
-                    """, bounds
-                ) as cursor:
-                    rows += [("tool_provenance", dict(r)) for r in await cursor.fetchall()]
-                await db.execute("COMMIT")
-            except Exception:
-                try:
-                    await db.execute("ROLLBACK")
-                except Exception:
-                    pass
-                raise
-
-        for artifact_namespace, row in rows:
-            row_id = str(row["id"])
-            captured = manifest.get((artifact_namespace, row_id))
-            statusless = artifact_namespace in _STATUSLESS_ARTIFACT_NAMESPACES
-            if captured and not statusless and captured["status_at_capture"] == str(
-                    row.get("status")):
-                continue
-            entries.append({
-                "snapshot_id": snapshot_id,
-                "artifact_namespace": artifact_namespace,
-                "row_id": row_id,
-                "source_ts": str(row["source_ts"]),
-                "status": row.get("status"),
-                "manifest_content_hash": captured["content_hash"] if captured else None,
-                "manifest_status_at_capture": (captured["status_at_capture"] if captured
-                                               else None),
-                "row": row,
-            })
-        entries.sort(key=lambda e: (_ts_key(e["source_ts"]), e["artifact_namespace"],
-                                    e["row_id"]))
-        return entries
 
     # MCP tool caching methods
     def save_mcp_tool(self, server_label: str, tool_name: str, description: Optional[str] = None, input_schema: Optional[str] = None):
@@ -8999,6 +7006,199 @@ class DatabaseManager(LoggerMixin):
             self.conn.commit()
         except Exception as e:
             self.log_error(f"DB: Error clearing MCP tools: {e}", exc_info=True)
+
+    async def _channel_of_memory_row(self, memory_id) -> Optional[str]:
+        """Which channel a `channel_memory` row belongs to. Only ever called with a fence up."""
+        async with self._stream_conn() as db:
+            async with db.execute(
+                "SELECT channel_id FROM channel_memory WHERE id = ?", (memory_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return row["channel_id"] if row else None
+
+    async def _channel_of_feedback_row(self, message_ts: str, user_id: str,
+                                       source: str) -> Optional[str]:
+        """Which channel a `response_feedback` row belongs to. Only ever called with a fence up."""
+        async with self._stream_conn() as db:
+            async with db.execute(
+                "SELECT channel_id FROM response_feedback "
+                " WHERE message_ts = ? AND user_id = ? AND source = ?",
+                (message_ts, user_id, source)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return row["channel_id"] if row else None
+
+    # --- the dev-only epoch fence lease (Docs/specs/EPOCH_FENCE_SPEC.md §7.1b) ------------
+    #
+    # ONE table, and it is created HERE rather than in init_schema on purpose: every method below
+    # is reached only from the fence watcher, which only exists when DEV_EPOCH_FENCE_ENABLE is
+    # set. A production process never calls any of them, so it never creates the table.
+    #
+    # All three timestamp columns are TEXT holding Slack-style ts strings, compared with
+    # slack_client.normalizer.parse_ts — one comparator for every time in this system, so a lease
+    # check can never disagree with a window check. They are NOT declared TIMESTAMP: SQLite gives
+    # that NUMERIC affinity, and a numeric-looking ts coerced to REAL loses its exact fractional
+    # representation. The ONE exception is the expiry compare below, which uses CAST(… AS REAL)
+    # against a 300-second window — a coarse "has this expired" where sixth-decimal rounding
+    # cannot change the answer.
+
+    async def ensure_epoch_fence_schema_async(self) -> None:
+        """Create the fence lease table. Called only by the flag-gated watcher."""
+        async with self._stream_conn() as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS epoch_fence_lease (
+                    team_id       TEXT NOT NULL,
+                    channel_id    TEXT NOT NULL,
+                    lease_id      TEXT NOT NULL,
+                    owner_token   TEXT NOT NULL,
+                    state         TEXT NOT NULL CHECK (state IN ('armed', 'active', 'closing',
+                                                                 'released', 'invalidated')),
+                    applied_command_id INTEGER,
+                    test_epoch_id TEXT,
+                    start_ts      TEXT,
+                    heartbeat_ts  TEXT NOT NULL,
+                    expiry_ts     TEXT NOT NULL,
+                    created_ts    TEXT NOT NULL,
+                    PRIMARY KEY (team_id, channel_id)
+                )
+            """)
+
+    async def acquire_epoch_lease_async(self, team_id: str, channel_id: str, lease_id: str,
+                                        owner_token: str, now_ts: str, expiry_ts: str,
+                                        command_id: Optional[int] = None) -> bool:
+        """CAS acquire. True only when a row actually changed.
+
+        Acquisition succeeds when ANY of three things holds, and the whole thing is ONE statement:
+        no row exists (the INSERT), the stored row is 'released', or the stored expiry has passed
+        whatever the state. The released case is load-bearing — without it the first battery would
+        permanently burn the only allowlisted channel.
+
+        `state='invalidated'` is NOT acquirable. It is cleared only by an explicit release, which
+        moves it to 'released' and makes the second rule apply: an invalidated battery must be
+        looked at, not silently overwritten by the next one.
+
+        Acquisition lands in 'armed', never 'active' — there is no case open yet, and
+        authorize_effect refuses channel work until the first advance installs one. Reacquisition
+        CLEARS test_epoch_id/start_ts so a new battery never inherits the previous one's case, and
+        REWRITES created_ts: a takeover mints a new lease_id, so it IS a new lease and carrying the
+        displaced lease's creation time forward would misdate it.
+        """
+        async with self._stream_conn() as db:
+            cursor = await db.execute(
+                """
+                INSERT INTO epoch_fence_lease
+                    (team_id, channel_id, lease_id, owner_token, state,
+                     test_epoch_id, start_ts, heartbeat_ts, expiry_ts, created_ts,
+                     applied_command_id)
+                VALUES (:team, :ch, :lease, :token, 'armed', NULL, NULL, :now, :expiry, :now, :cmd)
+                ON CONFLICT(team_id, channel_id) DO UPDATE SET
+                    lease_id = excluded.lease_id, owner_token = excluded.owner_token,
+                    state = 'armed', test_epoch_id = NULL, start_ts = NULL,
+                    heartbeat_ts = excluded.heartbeat_ts, expiry_ts = excluded.expiry_ts,
+                    created_ts = excluded.created_ts,
+                    applied_command_id = excluded.applied_command_id
+                WHERE epoch_fence_lease.state = 'released'
+                   OR (epoch_fence_lease.state != 'invalidated'
+                       AND CAST(epoch_fence_lease.expiry_ts AS REAL)
+                           <= CAST(excluded.heartbeat_ts AS REAL))
+                """,
+                {"team": team_id, "ch": channel_id, "lease": lease_id, "token": owner_token,
+                 "now": now_ts, "expiry": expiry_ts, "cmd": command_id})
+            return bool(cursor.rowcount)
+
+    async def heartbeat_epoch_lease_async(self, team_id: str, channel_id: str, owner_token: str,
+                                          now_ts: str, expiry_ts: str) -> bool:
+        """Compare-and-bump on `owner_token`. False on a token mismatch.
+
+        It does NOT revive an EXPIRED lease: the harness must re-acquire, because the expiry is
+        the dead-man's switch and reviving past it would let a harness that came back from the
+        dead resume a battery whose overlays are gone.
+        """
+        async with self._stream_conn() as db:
+            cursor = await db.execute(
+                """
+                UPDATE epoch_fence_lease
+                   SET heartbeat_ts = :now, expiry_ts = :expiry
+                 WHERE team_id = :team AND channel_id = :ch
+                   AND owner_token = :token
+                   AND state IN ('armed', 'active', 'closing')
+                   AND CAST(expiry_ts AS REAL) > CAST(:now AS REAL)
+                """,
+                {"team": team_id, "ch": channel_id, "token": owner_token,
+                 "now": now_ts, "expiry": expiry_ts})
+            return bool(cursor.rowcount)
+
+    async def advance_epoch_subepoch_async(self, team_id: str, channel_id: str, owner_token: str,
+                                           test_epoch_id: str, start_ts: str, expiry_ts: str,
+                                           command_id: Optional[int] = None) -> bool:
+        """Install a new case. CAS on `owner_token` AND a live, unexpired, non-invalidated row."""
+        async with self._stream_conn() as db:
+            cursor = await db.execute(
+                """
+                UPDATE epoch_fence_lease
+                   SET state = 'active', test_epoch_id = :case, start_ts = :start,
+                       heartbeat_ts = :start, expiry_ts = :expiry,
+                       applied_command_id = :cmd
+                 WHERE team_id = :team AND channel_id = :ch
+                   AND owner_token = :token
+                   AND state IN ('armed', 'active', 'closing')
+                   AND CAST(expiry_ts AS REAL) > CAST(:start AS REAL)
+                """,
+                {"team": team_id, "ch": channel_id, "token": owner_token, "case": test_epoch_id,
+                 "start": start_ts, "expiry": expiry_ts, "cmd": command_id})
+            return bool(cursor.rowcount)
+
+    async def release_epoch_lease_async(self, team_id: str, channel_id: str, owner_token: str,
+                                        command_id: Optional[int] = None) -> bool:
+        """Compare-and-release. Clears the case columns so the next acquire starts clean.
+
+        A release from 'invalidated' is the ONLY way out of that state, and it is deliberate: a
+        human must look at an invalidated battery before the channel takes another one.
+        """
+        async with self._stream_conn() as db:
+            cursor = await db.execute(
+                """
+                UPDATE epoch_fence_lease
+                   SET state = 'released', test_epoch_id = NULL, start_ts = NULL,
+                       applied_command_id = :cmd
+                 WHERE team_id = :team AND channel_id = :ch AND owner_token = :token
+                """,
+                {"team": team_id, "ch": channel_id, "token": owner_token, "cmd": command_id})
+            return bool(cursor.rowcount)
+
+    async def read_epoch_lease_async(self, team_id: str, channel_id: str) -> Optional[Dict]:
+        """The lease row, or None. THE ROW IS THE TRUTH for every replay decision."""
+        async with self._stream_conn() as db:
+            async with db.execute(
+                "SELECT * FROM epoch_fence_lease WHERE team_id = ? AND channel_id = ?",
+                (team_id, channel_id)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def invalidate_stale_epoch_leases_async(self, now_ts: str) -> List[Dict]:
+        """Boot recovery: INVALIDATE every battery a restart interrupted, and return what it hit.
+
+        The lease row is durable and the runtime state is not, so a live unexpired row at boot
+        means a battery whose overlays died with the previous process. An EXPIRED row is left
+        alone — it is already reacquirable and needs no human.
+        """
+        async with self._stream_conn() as db:
+            async with db.execute(
+                """
+                SELECT * FROM epoch_fence_lease
+                 WHERE state IN ('armed', 'active', 'closing')
+                   AND CAST(expiry_ts AS REAL) > CAST(? AS REAL)
+                """,
+                (now_ts,)
+            ) as cursor:
+                rows = [dict(r) for r in await cursor.fetchall()]
+            for row in rows:
+                await db.execute(
+                    "UPDATE epoch_fence_lease SET state = 'invalidated' "
+                    " WHERE team_id = ? AND channel_id = ?",
+                    (row["team_id"], row["channel_id"]))
+            return rows
 
     def close(self):
         """Close database connection."""
