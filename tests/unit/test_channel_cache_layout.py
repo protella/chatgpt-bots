@@ -47,6 +47,11 @@ def _slack_host():
                          ("get_lookup_channel_tool_schema", "lookup_channel"),
                          ("get_resolve_channel_name_tool_schema", "resolve_channel_name")):
         getattr(s, getter).return_value = {"type": "function", "name": name, "parameters": {}}
+    # W3: search_slack now registers a CHANNEL schema too (only that surface returns thread_ts),
+    # and register() reads a bare MagicMock as a factory returning a mock — which would leave the
+    # channel surface exposing a tool with a MagicMock for a name.
+    s.get_search_tool_channel_schema = lambda cfg=None: {
+        "type": "function", "name": "search_slack", "parameters": {}}
     # react_to_message is the one tool whose two variants genuinely differ, so both are real.
     s.workspace_emojis = SimpleNamespace(get_custom_emoji_names=lambda: ["shipit"])
     s._custom_emoji_available = SlackMessagingMixin._custom_emoji_available.__get__(s)
@@ -711,3 +716,26 @@ def test_the_cache_key_stays_channel_scoped_and_forks_only_four_ways(monkeypatch
         if reference is None:
             reference = tools
         assert tools == reference, f"{requester}/{thread} forked the prefix on its own"
+
+
+def test_a_profile_change_moves_the_capability_hash_once():
+    """T107 (respec §6.2). The capability pin already derives from `CHANNEL_CAPABILITY_KEYS`, so
+    the three new channel columns enter it for free: changing one gives the channel a cold prefix
+    for exactly one turn, and changing nothing leaves the hash where it was.
+
+    Both halves matter. A hash blind to the new columns would let a channel that just turned web
+    search off keep serving the cached prefix of a bot that still had it; a hash that moved on
+    every turn would forfeit the cache the pin exists to protect."""
+    from message_processor.channel_request import capability_profile_hash
+
+    stored = {"model": "gpt-5.6-terra", "enable_web_search": 1}
+    first = capability_profile_hash(_channel_config(channel_settings=dict(stored)))
+    # Same profile, a different requester and a different thread: still one machine, one hash.
+    assert first == capability_profile_hash(
+        _channel_config(user_id="U2", channel_settings=dict(stored),
+                        container="cntr_thread_b"))
+
+    for changed in ({"enable_web_search": 0}, {"enable_mcp": 0}, {"image_model": "gpt-image-1"}):
+        moved = capability_profile_hash(
+            _channel_config(channel_settings={**stored, **changed}))
+        assert moved != first, changed

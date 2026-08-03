@@ -22,6 +22,23 @@ os.environ['TESTING'] = 'true'
 import tempfile  # noqa: E402
 os.environ['DATABASE_DIR'] = tempfile.mkdtemp(prefix='pytest-bot-db-')
 
+# DISARM THE DEV TURN BARRIERS FOR THE WHOLE SUITE, before config.py's load_dotenv() can hand
+# them to us. An operator arming these in .env for a live battery arms them for EVERY process
+# that imports config — pytest included — and then any test that drives a channel turn blocks at
+# a real seam for DEV_TURN_BARRIERS_TIMEOUT (120s by default). The suite does not fail, it HANGS,
+# which reads like an infrastructure problem rather than a stray env var. Measured: a full run
+# stalled indefinitely at ~14s of CPU until these were cleared.
+#
+# A test that wants a barrier sets it explicitly with monkeypatch (see test_dev_barriers.py),
+# so clearing the inherited value costs nothing and cannot mask a real one.
+#
+# SET TO EMPTY, NEVER pop(). `load_dotenv()` does not override a variable that is already
+# present, but it will happily supply one that is ABSENT — so deleting these here just hands
+# config.py's load_dotenv the .env value a moment later, and the seams end up armed anyway.
+# An empty string is present-and-falsy, which is what `dev_barriers._enabled` treats as off.
+for _dev_barrier_var in ('DEV_TURN_BARRIERS', 'DEV_TURN_BARRIERS_DIR', 'DEV_TURN_BARRIERS_TIMEOUT'):
+    os.environ[_dev_barrier_var] = ''
+
 @pytest.fixture
 def mock_env(monkeypatch):
     """Mock environment variables for testing"""
@@ -30,9 +47,12 @@ def mock_env(monkeypatch):
         'SLACK_BOT_TOKEN': 'xoxb-test-token',
         'SLACK_APP_TOKEN': 'xapp-test-token',
         'OPENAI_KEY': 'sk-test-key',
-        'GPT_MODEL': 'gpt-5',
+        # GPT_MODEL and DEFAULT_VERBOSITY must be REAL values: config.validate() refuses to boot
+        # on either one outside its allowlist, because the channel capability resolver falls back
+        # to them and an unusable fallback would turn one bad channel row into a 400.
+        'GPT_MODEL': 'gpt-5.6-sol',
         'DEFAULT_REASONING_EFFORT': 'medium',
-        'DEFAULT_VERBOSITY': '2',
+        'DEFAULT_VERBOSITY': 'medium',
         'UTILITY_REASONING_EFFORT': 'low',
         'UTILITY_VERBOSITY': '1',
         'ANALYSIS_REASONING_EFFORT': 'high',

@@ -121,6 +121,46 @@ async def test_release_file_ends_the_pause(monkeypatch, barrier_dir):
     assert not (barrier_dir / f"{POST_ADMISSION}.{key}.release").exists()
 
 
+async def test_two_concurrent_turns_do_not_collide_on_a_seam(monkeypatch, barrier_dir):
+    """T110. Keyed release by `turn_id` — the P2 battery's finding C cannot recur.
+
+    Seam-only keying made two concurrent turns collide on one pair of files: the first to arrive
+    owned the `.waiting` announcement and the release freed BOTH, which is how P2's live battery
+    lost a case and recovered only on timeout.
+
+    THE KEY KEEPS ITS EPOCH COMPONENT AND IT DEFAULTS TO `"0"` (§3.11, frozen). With no fence and
+    no `DEV_TEST_EPOCH_ID`, two concurrent turns produce `<turn_a>.0` and `<turn_b>.0`. A test
+    asserting a two-part `(seam, turn_id)` key would be asserting a contract §3 does not have.
+    """
+    monkeypatch.setenv("DEV_TURN_BARRIERS", POST_ADMISSION)
+    monkeypatch.setenv("DEV_TURN_BARRIERS_DIR", str(barrier_dir))
+    monkeypatch.setenv("DEV_TURN_BARRIERS_TIMEOUT", "60")
+    monkeypatch.delenv("DEV_TEST_EPOCH_ID", raising=False)
+
+    assert dev_barriers.barrier_key(POST_ADMISSION, {"turn_id": "T-A"}) == "T-A.0"
+    assert dev_barriers.barrier_key(POST_ADMISSION, {"turn_id": "T-B"}) == "T-B.0"
+
+    task_a = asyncio.create_task(dev_barriers.post_admission(turn_id="T-A", channel="C1"))
+    task_b = asyncio.create_task(dev_barriers.post_admission(turn_id="T-B", channel="C1"))
+    waiting_a = barrier_dir / f"{POST_ADMISSION}.T-A.0.waiting"
+    waiting_b = barrier_dir / f"{POST_ADMISSION}.T-B.0.waiting"
+    for _ in range(200):
+        if waiting_a.exists() and waiting_b.exists():
+            break
+        await asyncio.sleep(0.02)
+    assert waiting_a.exists() and waiting_b.exists()
+
+    # Releasing ONE frees ONE. Under seam-only keying this release would have freed both.
+    (barrier_dir / f"{POST_ADMISSION}.T-A.0.release").write_text("go", encoding="utf-8")
+    assert await asyncio.wait_for(task_a, timeout=30) is True
+    await asyncio.sleep(0.3)
+    assert not task_b.done()
+    assert waiting_b.exists()
+
+    (barrier_dir / f"{POST_ADMISSION}.T-B.0.release").write_text("go", encoding="utf-8")
+    assert await asyncio.wait_for(task_b, timeout=30) is True
+
+
 async def test_non_serializable_context_still_announces(monkeypatch, barrier_dir):
     monkeypatch.setenv("DEV_TURN_BARRIERS", POST_PARTIAL_POST)
     monkeypatch.setenv("DEV_TURN_BARRIERS_DIR", str(barrier_dir))

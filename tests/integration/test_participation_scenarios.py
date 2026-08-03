@@ -6,12 +6,14 @@ survives — the entries marked REAL below are verbatim messages from the 2026-0
 scored a five-way action verdict, and there is no such verdict any more.
 
     TIER 1 — the gate. The real `classify_wake`, production `SourceMessage` records, a steering
-    block from the production renderer. One bit out. The gate is deliberately GENEROUS: a false
-    wake costs one utility call and can still end in the responder's own declared silence, while
-    a false sleep loses the answer entirely. So the labels are asymmetric — any `must_wake` miss
-    is a hard failure, false wakes are measured against a ≤10% threshold, and every case whose
-    answer genuinely depends on channel history it cannot see is labelled `either` and lands in
-    tier 2 instead.
+    block from the production renderer. One bit out. The gate is GENEROUS ABOUT TASKS: a false
+    wake there costs one utility call and can still end in the responder's own declared silence,
+    while a false sleep loses the answer entirely. It is not generous about banter, which is the
+    tuning wave's change and the reason two sleep rows are graded individually. So the labels are
+    asymmetric — any `must_wake` miss is a hard failure, a `must_sleep_hard` wake fails that row on
+    its own, ordinary `must_sleep` wakes are paid out of a BINDING ≤10% budget, and every case
+    whose answer genuinely depends on channel history it cannot see is labelled `either` and lands
+    in tier 2 instead.
 
     TIER 2 — the responder. Admission is FORCED (the gate never runs), the room becomes a real
     serialized channel stream, and the production assembler builds the request with the real
@@ -42,10 +44,10 @@ as against a bar:
   and a corpus that can only be committed green stops being able to see a loss.
 * Nothing blocks on falling from 3 of 3 to 2 of 3 where the bar is 2 of 3 — that is sampling
   noise, and the outcomes here are genuinely probabilistic.
-* Tier 1's false-wake budget is held against the recorded COUNT with wide slack, for the same
-  reason: the gate's prompt is outside the P2 scope, so a corpus already over budget is
-  describing the shipped gate rather than a change to it. `must_wake` is the assertion that
-  actually holds tier 1 shut.
+* Tier 1's false-wake budget is the BINDING ≤10% threshold, not a baseline with slack. It used to
+  be the looser of the two on the argument that the gate's prompt was somebody else's scope; the
+  tuning wave changed that prompt, so the number is a claim this corpus makes about the gate it
+  ships. `must_wake` and the two `must_sleep_hard` rows are the per-row assertions beside it.
 
 A `contract_violation` blocks unconditionally, whatever the scenario expected: it means the turn
 produced neither words nor a declared silence, or claimed both.
@@ -82,6 +84,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -90,9 +93,9 @@ import pytest
 
 from message_processor.participation import SourceMessage, describe_attachment
 from openai_client import OpenAIClient
-from tests.integration.scenario_harness import (CHANNEL_REPLY, CROSS_THREAD_POST,
+from tests.integration.scenario_harness import (CHANNEL, CHANNEL_REPLY, CROSS_THREAD_POST,
                                                 DETACHED_EFFECT, IN_THREAD_REPLY, REACTION_ONLY,
-                                                SILENCE, Room, Say, cross_thread_failures,
+                                                SILENCE, TEAM, Room, Say, cross_thread_failures,
                                                 gather_trials, is_transport_error,
                                                 run_responder_trial, run_wake_trial,
                                                 steering_snapshot)
@@ -117,18 +120,28 @@ MIN_USABLE_TRIALS = 2
 # don't-jump-into-strangers'-exchanges, the value floor, the terminal contract, obeying recorded
 # policy, the sticky addressee hand-off. Those are gradeable, and a miss is a defect.
 #
-# `measure` is for a scenario whose expected outcome depends on a prompt that has not shipped —
-# let-the-exchange-end and cross-thread conduct, both P3's (spec §13). The outcome is still run,
-# graded and recorded, so a change in behaviour is visible; it never blocks, because reporting an
-# unshipped prompt as a P2 failure is noise. Every `measure` row carries the reason in its `why`,
-# and the run output lists them.
+# `measure` is for a scenario whose expected outcome is not the harness's to enforce. It began as
+# the bar for a prompt that had not shipped — let-the-exchange-end and cross-thread conduct, both
+# P3's (spec §13) — and the tuning wave gave it its second use: an EXPRESSIVE CHOICE, where the
+# question is which form a woken turn picks rather than whether it should have taken one. Grading
+# that is the harness deciding on the model's behalf (the ruling that made the live battery's
+# thanks row observational), so the outcome is still run, graded and recorded — a change in
+# behaviour stays visible — and it never blocks. Every `measure` row carries the reason in its
+# `why`, and the run output lists them.
 #
 # An OPEN OWNER QUESTION used to land here too, and that was a category error: when the owner rules
 # "either way is fine", the answer is a WIDER expected set at a real bar, not a row that cannot
 # fail. The two rows ruled on 2026-07-29 are `hard` with several acceptable outcomes, which still
 # catches the thing the ruling did not license (see win-lands-others, third-party-praise-rebuff).
 HARD, SOFT, MEASURE = "hard", "soft", "measure"
-MUST_WAKE, MUST_SLEEP, EITHER = "must_wake", "must_sleep", "either"
+# `must_sleep` is graded in AGGREGATE — a row may wake occasionally and pay for it out of the
+# false-wake budget, which is what keeps a deliberately generous gate gradeable at all.
+# `must_sleep_hard` is the tuning wave's addition: a row whose sleep the spec calls HARD, where a
+# single wake fails that row on its own. Both count toward the budget; only the second can fail by
+# itself, and nothing else about the tier changes.
+MUST_WAKE, MUST_SLEEP, MUST_SLEEP_HARD, EITHER = ("must_wake", "must_sleep", "must_sleep_hard",
+                                                  "either")
+SLEEP_LABELS = (MUST_SLEEP, MUST_SLEEP_HARD)
 FALSE_WAKE_THRESHOLD = 0.10
 BASELINE = Path(__file__).resolve().parents[1] / "fixtures" / "participation_scenario_baseline.json"
 RECORDING = os.getenv("PARTICIPATION_SCENARIO_RECORD") == "1"
@@ -145,8 +158,11 @@ RECORD_ROWS: Optional[Tuple[str, ...]] = (
 EXPECTED_OUTCOME_TABLE = """
 TIER 1 — WAKE GATE (real classify_wake; one bit; 3 trials each)
 Label meaning: must_wake = any miss is a hard failure. must_sleep = counted against the ≤10%
-false-wake budget. either = the honest answer needs channel history the gate cannot see, so
-whichever way it goes is defensible and the judgment is graded in tier 2 instead.
+false-wake budget, which is BINDING. must_sleep_hard = counted there too AND fails on its own if
+it wakes even once — the two rows whose sleep the tuning spec calls HARD, where an aggregate over
+75 trials could not say anything about one row. either = the honest answer needs channel history
+the gate cannot see, so whichever way it goes is defensible and the judgment is graded in tier 2
+instead.
 
 | id                          | setup                                                        | label      |
 |-----------------------------|--------------------------------------------------------------|------------|
@@ -163,6 +179,9 @@ whichever way it goes is defensible and the judgment is graded in tier 2 instead
 | reinvite                    | participation feedback that GRANTS rather than restricts     | must_wake  |
 | hush                        | "you earned yourself a timeout. Hush" (REAL)                 | must_wake  |
 | policy-invites-proactive    | steering policy asks for proactive help; substantive musing  | must_wake  |
+| team-welcome                | "<!here> Please welcome Marta to the team!"                  | must_wake  |
+| open-question-answerable    | room question the channel's own history answers              | must_wake  |
+| banter-aimed-at-self        | "chatgpt took a full 8 seconds — rough morning?"             | must_wake  |
 | human-chatter               | human-to-human opinion, no question (REAL)                   | must_sleep |
 | named-other-human           | addressed to Dana by name                                    | must_sleep |
 | other-bot-status            | another app's status line                                    | must_sleep |
@@ -176,6 +195,9 @@ whichever way it goes is defensible and the judgment is graded in tier 2 instead
 | routine-close               | "merged and deployed, thanks all"                            | must_sleep |
 | other-bot-asks-a-human      | another assistant asking a person something                  | must_sleep |
 | statement-of-fact           | "standup notes are in the shared doc"                        | must_sleep |
+| here-status-no-ask          | "<!here> prod deploy finished" — a broadcast that asks       | must_sleep_hard |
+|                             | nothing; the contrast to team-welcome                        |            |
+| self-deprecating-banter     | a vent about an AI product, then a swing at themselves       | must_sleep_hard |
 | named-other-bot             | addressed to another assistant by name — RE-BASELINED from   | either     |
 |                             | the rich gate's ignore-only: the binary gate has no roster    |            |
 | talked-about-not-to         | the bot's name appears as a topic, not a summons             | either     |
@@ -193,9 +215,10 @@ whichever way it goes is defensible and the judgment is graded in tier 2 instead
 TIER 2 — RESPONDER (forced admission; real stream, prompts, schemas; in-memory effects)
 Outcome vocabulary: silence | reaction_only | in_thread_reply | channel_reply |
 cross_thread_post | detached_effect | contract_violation.
-hard = every one of 3 trials must land in the expected set. soft = 2 of 3. The `measure` bar still
-exists in the code but NO row uses it any more — the two that did are graded from P3 (see the
-owner-review block at the end of this table).
+hard = every one of 3 trials must land in the expected set. soft = 2 of 3. The `measure` bar is
+recorded and reported but never blocks; the two P3 rows that used to sit there are graded now, and
+one row uses it again for an expressive choice (team-welcome, in the tuning-wave block at the end
+of this table).
 
 | id                            | setup                                                       | expected outcome                | bar     |
 |-------------------------------|-------------------------------------------------------------|---------------------------------|---------|
@@ -273,6 +296,71 @@ not triggered in, so the corpus needs one row per direction:
 * untrusted-root-bait is the RUNTIME's promise rather than the model's. Either answer from the model
   is honest — decline the invented root, or try it and be refused — but the turn has to survive to a
   real ending, and nothing may land at a root the stream never showed.
+
+=================================== NEW IN W3 — OWNER REVIEW ===================================
+
+One row, and it is the wave's whole claim in one turn. Nothing else in the table moved.
+
+| id                            | setup                                                        | expected outcome                | bar  |
+|-------------------------------|--------------------------------------------------------------|---------------------------------|------|
+| search-then-answer-there      | the thread holding the question is OLDER than the window and | cross_thread_post into the root | hard |
+|                               | carries no rendered label; only search can reach it          | the search returned             |      |
+
+WHY IT IS HARD ON ARRIVAL rather than measured first. The other cross-thread rows can be passed
+part-way by luck: their target is a rendered label, so a model that guesses a plausible ts can land
+on it. This row cannot be. When the turn starts, the target is NOT in `trusted_thread_roots` and the
+executor refuses it — the only thing that can make it legal is §2g enrollment from a search result
+the tool actually returned. A turn that never searched has nothing in the room to aim at, so the
+row is pass-or-fail on the mechanism rather than on a judgment call, and a soft bar would only be
+recording how often the plumbing works.
+
+It is also the one row whose `search_slack` runs the PRODUCTION executor (over a recorded
+`assistant.search.context` payload) instead of the empty recorder every other row gets — a recorder
+cannot enroll a root, and enrolling is half of what this row measures. Same argument that already
+keeps `post_to_thread` real.
+
+============================== NEW IN THE TUNING WAVE — OWNER REVIEW ==============================
+
+Three live findings, 2026-08-03: a team welcome the gate declined, an open room question the
+responder answered with silence, and an uninvited turn on a person's self-deprecating joke that
+came back as a dig at their competence. The rows below are the contrastive pairs for each. Nothing
+else in the table moved, and the aggregate false-wake budget was NOT loosened to fit the two new
+must_sleep rows.
+
+| id                            | setup                                                        | expected outcome                | bar     |
+|-------------------------------|--------------------------------------------------------------|---------------------------------|---------|
+| team-welcome                  | "<!here> Please welcome Marta to the team!"                  | reaction or a welcome —         | measure |
+|                               |                                                              | RECORDED, not enforced          |         |
+| open-question-answerable      | room question the channel's own history answers, nobody named | a reply STATING 48              | hard    |
+| firsthand-experience-poll     | "has anyone here actually shipped with the new deploy CLI?"  | silence                         | hard    |
+| self-deprecating-banter       | "skill issue?" about themselves, force-admitted               | silence or reaction_only        | hard    |
+| banter-aimed-at-self          | "chatgpt took a full 8 seconds — rough morning?"              | in_thread_reply / channel_reply | hard    |
+
+WHAT EACH PAIR HOLDS APART, since every one of these rows exists because the row beside it could be
+passed by overcorrecting:
+
+* team-welcome (gate must_wake) against here-status-no-ask (gate must_sleep_hard). The welcome has
+  to reach the responder; a broadcast to the same @here does not, and that sleep is graded on its
+  own rather than out of the aggregate. The welcome's VISIBLE FORM is the one thing here nobody
+  grades — an emoji and a warm line are both right, and picking between them is not the harness's
+  call.
+* open-question-answerable (hard: a reply that STATES THE 48 from two threads up) against
+  firsthand-experience-poll (hard: silence) and the existing open-needs-human-experience.
+  Unaddressed is no longer a reason to skip a question the bot can actually answer; it is still the
+  whole answer when the question is asking people what they have lived through. The content
+  predicate is what makes the first of those real: "I'm not sure" is also words, and R4 preserves
+  silence exactly where the only honest answer is that one.
+* self-deprecating-banter (gate must_sleep_hard, responder hard: no words) against
+  banter-aimed-at-self (gate must_wake, responder hard: a reply). Ambient banter is not an opening
+  even when it names the bot's own subject matter; banter pointed straight at the bot still gets a
+  beat back, and both halves are graded at both tiers so a fix at either layer cannot mute it.
+
+TWO ROWS THE SPEC NAMES THAT ALREADY EXISTED, and neither changed: the 9a foreign-exchange shape is
+`human-chatter` at the gate and `foreign-exchange-bait` in tier 2 (silence, hard); the 9d low-value
+aside is `logistics`/`statement-of-fact` at the gate and `continuation-bait` in tier 2 (silence or
+reaction_only). They are re-run as regressions, not rewritten — the social-milestone cue is
+deliberately narrow enough that praise inside an exchange between people is not a milestone, which
+is what keeps them and win-lands-others where they are.
 """
 
 
@@ -361,6 +449,25 @@ WAKE_SCENARIOS: Tuple[WakeScenario, ...] = (
                  "Unambiguous participation feedback. It has to wake to honour it.",
                  (_src("Alright, you earned yourself a timeout. Hush", who="Peter Rotella",
                        ts="1780001200.000100"),), real=True),
+    WakeScenario("team-welcome", MUST_WAKE,
+                 "A social milestone the whole channel is being told about, and a colleague "
+                 "waving is the ordinary response. The shipped gate declined this shape live "
+                 "(2026-08-03, #dev-ops) and the turn never reached the responder at all.",
+                 (_src("<!here> Please welcome Marta to the team! she's joining us on the data "
+                       "platform side", who="Peter Rotella", ts="1780003500.000100"),)),
+    WakeScenario("open-question-answerable", MUST_WAKE,
+                 "A question put to the room that the channel's own history answers. The gate "
+                 "already woke on this shape; the row is the control that keeps it waking now "
+                 "that the responder is required to say something useful.",
+                 (_src("does anyone remember how many crates fit on one pallet?",
+                       who="Dana Whitfield", ts="1780003600.000100"),)),
+    WakeScenario("banter-aimed-at-self", MUST_WAKE,
+                 "The OTHER half of the banter pair, and the one the sleep rule must not swallow: "
+                 "the joke is pointed straight at the bot by name. A bare name is gate-judged in "
+                 "production (only a real @mention short-circuits), so this is the path that "
+                 "decides whether teasing still gets a turn at all.",
+                 (_src("chatgpt took a full 8 seconds on that one — rough morning?",
+                       who="Kousha Mazloumi", ts="1780003900.000100"),)),
     WakeScenario("policy-invites-proactive", MUST_WAKE,
                  "A standing policy is an instruction, not evidence — an invitation to help "
                  "unprompted has to change the answer.",
@@ -421,6 +528,25 @@ WAKE_SCENARIOS: Tuple[WakeScenario, ...] = (
                  "A person telling the room where something is. Nothing is open.",
                  (_src("standup notes are in the shared doc, same link as always",
                        who="Kousha Mazloumi", ts="1780002340.000100"),)),
+    WakeScenario("here-status-no-ask", MUST_SLEEP_HARD,
+                 "The CONTRAST to team-welcome: the same channel-wide broadcast, and nothing is "
+                 "asked of anyone. Being sent to @here is not itself a reason to wake. HARD on "
+                 "its own: the whole point of the new wake cue is that it does not fire on a "
+                 "broadcast, and a row that may wake sometimes and pay for it out of the "
+                 "aggregate would not be testing that.",
+                 (_src("<!here> prod deploy finished, all three suites green — no action needed",
+                       who="Dana Whitfield", ts="1780003700.000100"),)),
+    WakeScenario("self-deprecating-banter", MUST_SLEEP_HARD,
+                 "The 2026-08-03 shape, and the reason the uncertainty rule is conditional now: "
+                 "a person venting about an AI product and then taking a swing at themselves. "
+                 "It is question-shaped and it is about something the assistant knows, and "
+                 "neither is an invitation — the live wake here answered the joke with a dig at "
+                 "the person's own competence. HARD on its own for the same reason as the row "
+                 "above: this is the wake the wave exists to stop.",
+                 (_src("I don't like Opus 5 at all tbh", who="JS Vachon",
+                       ts="1780003800.000100"),
+                  _src("skill issue?", who="JS Vachon", ts="1780003800.000200",
+                       thread="1780003800.000100"))),
 
     # ------------------------------------------------------------------ either
     WakeScenario("named-other-bot", EITHER,
@@ -748,6 +874,75 @@ UNTRUSTED_ROOT_ASK = _room([
 ])
 
 
+# SEARCH, THEN ANSWER THERE (W3, §5.7). The thread that owns the question is NOT in this room:
+# it is older than the window and reachable ONLY through search. That is the whole point — the
+# target root cannot come from a `thread=<ts>` label, because no label for it was ever rendered,
+# so the only thing that can authorize the post is §2g enrollment from the search result itself.
+# The row therefore fails closed in a way the other cross-thread rows cannot: if enrollment does
+# not happen, the executor refuses and nothing lands.
+SEARCH_REACHABLE_THREAD = _room([
+    Say("1780028000.000100", "Kousha Mazloumi", "SEA-4 export fix goes out today"),
+    Say("1780028100.000100", "Kousha Mazloumi", "index rebuild only, no schema change",
+        thread="1780028000.000100"),
+    Say("1780028200.000100", "Peter Rotella",
+        "chatgpt — dana asked a while back why the SEA-4 export kept timing out and nobody ever "
+        "got back to her. find her question and answer it where she asked it, not here."),
+])
+
+# THE TUNING WAVE'S ROOMS. Each is one half of a contrast: a milestone against a broadcast that
+# asks for nothing, a room question the channel can answer against a poll only people can, and
+# banter nobody aimed at the bot against banter aimed straight at it.
+TEAM_WELCOME = _room([
+    Say("1780029000.000100", "Peter Rotella",
+        "<!here> Please welcome Marta to the team! she's joining us on the data platform side, "
+        "starting on the SEA-4 pipeline"),
+])
+
+# The answer is two threads up, in this channel's own history, so the bot is not guessing — which
+# is the case the value floor used to swallow because nobody had addressed the question to it.
+OPEN_QUESTION_ANSWERABLE = _room([
+    Say("1780030000.000100", "Kousha Mazloumi", "SEA-4 packing standards, for the record"),
+    Say("1780030100.000100", "Kousha Mazloumi",
+        "we standardized on 48 crates to a pallet after the Q2 audit, same on every line",
+        thread="1780030000.000100"),
+    Say("1780030200.000100", "Dana Whitfield",
+        "does anyone remember how many crates fit on one pallet?"),
+])
+
+# A poll: what is being asked for is what the people here have done themselves, and the bot has
+# shipped nothing. Nothing in the room answers it.
+FIRSTHAND_POLL = _room([
+    Say("1780031000.000100", "JS Vachon",
+        "quick poll — has anyone here actually shipped a release with the new deploy CLI yet? "
+        "trying to decide whether to wait a week"),
+])
+
+SELF_DEPRECATING_BANTER = _room([
+    Say("1780032000.000100", "JS Vachon", "I don't like Opus 5 at all tbh"),
+    Say("1780032100.000100", "JS Vachon", "skill issue?", thread="1780032000.000100"),
+])
+
+BANTER_AT_SELF = _room([
+    Say("1780033000.000100", "Kousha Mazloumi",
+        "chatgpt took a full 8 seconds on that one — rough morning?"),
+])
+
+
+# The recorded `assistant.search.context` payload the row's search returns — Slack's real hit
+# shape (see tests/unit/test_search_to_action.py for the capture). The hit is a REPLY, so its
+# permalink carries `?thread_ts=<root>&cid=<channel>`, which is the only source §2g has: the API
+# does not return a `thread_ts` field.
+SEARCH_HIT_ROOT = "1780027500.000100"
+SEARCH_REACHABLE_HITS = (
+    {"author_name": "Dana Whitfield", "author_user_id": "U-dana", "team_id": TEAM,
+     "channel_id": CHANNEL, "channel_name": "eng", "message_ts": "1780027600.000100",
+     "content": "still no idea why the SEA-4 export keeps timing out — third day now",
+     "is_author_bot": False,
+     "permalink": (f"https://example.slack.com/archives/{CHANNEL}/p1780027600000100"
+                   f"?thread_ts={SEARCH_HIT_ROOT}&cid={CHANNEL}")},
+)
+
+
 @dataclass(frozen=True)
 class ResponderScenario:
     id: str
@@ -771,6 +966,16 @@ class ResponderScenario:
     expect_post_target: Optional[str] = None
     posts_allowed: bool = True
     never_post_to: Tuple[str, ...] = ()
+    # W3: a recorded `assistant.search.context` payload for the rows where the search RESULT is
+    # the subject. Present ⇒ `search_slack` runs its PRODUCTION executor over these hits instead
+    # of the empty recorder, so derivation, provenance checks and §2g enrollment actually happen.
+    search_hits: Optional[Tuple[Dict[str, Any], ...]] = None
+    # WHAT THE WORDS HAVE TO CARRY, for a row whose contract is a useful answer rather than the
+    # fact that it spoke. The outcome label cannot see this: `channel_reply` is returned by "I'm
+    # not sure" and by a sentence about something else, and both would pass a row whose whole
+    # subject is that the answer sitting in the channel came back out. Digit-normalized, so the
+    # model's formatting is its own business.
+    must_state: Optional[str] = None
 
     @property
     def trigger(self) -> Say:
@@ -948,6 +1153,66 @@ RESPONDER_SCENARIOS: Tuple[ResponderScenario, ...] = (
                       "and this row is where it is exercised end to end.",
                       addressed=True, silence_capable=False,
                       never_post_to=("1780027999.000100",)),
+    ResponderScenario("search-then-answer-there", SEARCH_REACHABLE_THREAD, "1780028200.000100",
+                      (CROSS_THREAD_POST,), HARD,
+                      "W3, THE WHOLE WAVE IN ONE ROW. The thread Dana asked in is older than the "
+                      "window and carries no rendered `thread=<ts>` label, so it is not a legal "
+                      "target when the turn starts — the executor refuses it. The only thing that "
+                      "can make it legal is §2g enrollment from the search result itself, which "
+                      "is why this row runs the PRODUCTION search executor over a recorded "
+                      "payload rather than the empty recorder every other row gets. The five "
+                      "cross-thread assertions then do the rest: one post, the found root, "
+                      "nothing repeated here. A turn that never searched cannot pass by luck, "
+                      "because there is nothing else in the stream to aim at.",
+                      addressed=True, silence_capable=False,
+                      expect_post_target=SEARCH_HIT_ROOT,
+                      search_hits=SEARCH_REACHABLE_HITS),
+
+    # ------------------------------------------------ the tuning wave: two floors, two contrasts
+    ResponderScenario("team-welcome", TEAM_WELCOME, "1780029000.000100",
+                      (REACTION_ONLY, CHANNEL_REPLY, IN_THREAD_REPLY), MEASURE,
+                      "OBSERVATION ONLY, and deliberately so. The hard claim about a welcome is "
+                      "the GATE's — tier 1 must wake, because a declined turn is the failure the "
+                      "wave is fixing. WHICH form a woken turn picks, an emoji or a warm line, is "
+                      "the model's own expressive choice and grading it would be the harness "
+                      "deciding on its behalf (the same ruling that made the battery's thanks row "
+                      "observational). The outcomes are run, recorded and reported every time, so "
+                      "a change in what it chooses is visible without blocking."),
+    ResponderScenario("open-question-answerable", OPEN_QUESTION_ANSWERABLE, "1780030200.000100",
+                      REPLIES, HARD,
+                      "THE OPEN-QUESTION FLOOR. A genuine question to the room, nobody named, and "
+                      "the channel's own history answers it — the shape that woke the gate twice "
+                      "in the live battery and ended in declared silence because 'addressed to "
+                      "nobody' was read as skip-worthy. Words are not the whole assertion: the "
+                      "reply must carry the 48 that is sitting two threads up, because 'I'm not "
+                      "sure' and a sentence about something else are also words, and R4 "
+                      "deliberately PRESERVES silence where the only honest answer is 'I don't "
+                      "know'. A row that accepted any reply would grade the wrong half of that "
+                      "boundary.",
+                      must_state="48"),
+    ResponderScenario("firsthand-experience-poll", FIRSTHAND_POLL, "1780031000.000100",
+                      (SILENCE,), HARD,
+                      "THE CONTRAST that keeps the row above from becoming 'answer everything'. A "
+                      "poll asks what the people here have done themselves; the bot has done none "
+                      "of it, so the only honest contribution is that it cannot say — which is "
+                      "the silence the value floor already holds. Graded hard because an "
+                      "exception that swallows this case is a worse bug than the one it fixed."),
+    ResponderScenario("self-deprecating-banter", SELF_DEPRECATING_BANTER, "1780032100.000100",
+                      (SILENCE, REACTION_ONLY), HARD,
+                      "FORCE-ADMITTED ON PURPOSE. The gate is supposed to sleep here and tier 1 "
+                      "asserts that it does; this row asks what happens when it wakes anyway, "
+                      "because the live failure was a turn that got in and then made the person "
+                      "the punchline. What is graded is WORDS: the bot may say nothing at all. A "
+                      "reaction is inside the bar but is not the intended answer either — on a "
+                      "line someone wrote at their own expense an emoji can read as agreement "
+                      "with the insult."),
+    ResponderScenario("banter-aimed-at-self", BANTER_AT_SELF, "1780033000.000100",
+                      REPLIES, HARD,
+                      "THE OTHER CONTROL on the tone rule: teasing pointed straight at the bot "
+                      "still gets a beat back. The boundary added to Voice is about WHO the joke "
+                      "lands on, not about going quiet when someone ribs it, and a fix that mutes "
+                      "this row has taken the personality out with the dig.",
+                      addressed=True, silence_capable=False),
 )
 
 
@@ -983,7 +1248,7 @@ def merge_recorded(existing: Dict[str, Any], fresh: Dict[str, Any],
             scenarios[row] = fresh["scenarios"][row]
     merged: Dict[str, Any] = {"scenarios": scenarios}
     if "false_wakes" in existing or "false_wakes" in fresh:
-        sleeps = [r for r in scenarios.values() if r.get("label") == MUST_SLEEP]
+        sleeps = [r for r in scenarios.values() if r.get("label") in SLEEP_LABELS]
         false_wakes = sum(r.get("wakes", 0) for r in sleeps)
         trials = sum(r.get("decided", 0) for r in sleeps)
         merged["false_wakes"] = false_wakes
@@ -1016,6 +1281,73 @@ def _bar_need(bar: str, trials: int) -> int:
     if bar == MEASURE:
         return 0
     return trials if bar == HARD else min(2, trials)
+
+
+# A COMPLETE numeric token: digits, optional thousands groups, optional decimal part. The decimal
+# part is what makes this a token matcher rather than a digit search — `48.5` has to read as one
+# number, or a bounded search for "48" finds it either side of the point and calls a different
+# quantity a match. Same principle as the battery's refusal to treat `41,770.50` as `41,770`.
+_NUMBER_TOKEN = re.compile(r"\d+(?:[,\s]\d{3})*(?:\.\d+)?")
+# In-number separators only, so "48,000" normalizes to "48000" and stays distinct from 48.
+_IN_NUMBER = re.compile(r"(?<=\d)[,\s](?=\d)")
+# What turns a stated number into a denial of it. Checked ONLY in the clause BEFORE the number,
+# which is a deliberate limit: "48 crates — isn't that the standard?" is a correct answer with a
+# negator after the figure, and scanning both directions would fail it.
+_NEGATOR = re.compile(r"n't\b|\bnot\b|\bno\b|\bnever\b|\bwrong\b|\bincorrect\b")
+_CLAUSE_BREAK = re.compile(r"[.;:!?,\n]|—")
+
+
+def states_number(text: str, value: str) -> bool:
+    """Does `text` STATE `value` — as a complete number, and as its own answer rather than a
+    denial of one?
+
+    Digit-normalized like the live battery's `states_number` (tests/live/battery_harness.py) and
+    for the same reason: a seeded 847800 came back as "847,800 crates." and a verbatim compare
+    failed a correct answer. Punctuation is the writer's; the number is the fact.
+
+    TWO THINGS A BOUNDED DIGIT SEARCH GOT WRONG, both of which passed a reply that does not
+    answer the question:
+
+    * "48.5 crates" satisfied 48, because the decimal point looked like a boundary. Numbers are
+      matched as whole tokens now, so 48, 48.5, 480 and 48,000 are four different answers.
+    * "It isn't 48" satisfied 48, because the digits are there. A stated number preceded by a
+      negator IN ITS OWN CLAUSE does not count, so the reply has to carry an un-negated 48
+      somewhere. "It wasn't 48, turned out to be 52" therefore FAILS — and that is the ruling,
+      not an accident: the row's seeded answer IS 48, so a reply confidently naming 52 is wrong
+      about the channel's own record and must not score as a useful answer.
+
+    The negator check is blunt on purpose and only looks backwards. It has one known false
+    negative — a double negative ("there's no doubt it's 48") reads as denied — and that is the
+    accepted cost: scope-parsing English is more machinery than a one-row grader is worth, and the
+    row's real replies are measured against this rule rather than assumed to pass it. If S3 ever
+    fails on a reply that looks right, read the reply first; this is where to look.
+    """
+    wanted = _IN_NUMBER.sub("", str(value)).strip()
+    if not wanted or not any(ch.isdigit() for ch in wanted):
+        return False
+    haystack = str(text)
+    for match in _NUMBER_TOKEN.finditer(haystack):
+        if _IN_NUMBER.sub("", match.group(0)) != wanted:
+            continue
+        clause = _CLAUSE_BREAK.split(haystack[:match.start()])[-1]
+        if not _NEGATOR.search(clause.casefold()):
+            return True
+    return False
+
+
+def content_failures(scenario: "ResponderScenario", trial: Any) -> List[str]:
+    """What the WORDS had to carry, for the rows that make a claim about the answer itself.
+
+    Folded into `passes` exactly like the cross-thread findings: a trial that earned the right
+    outcome label with the wrong content is not a pass, because the label is blind to content.
+    Silence is not failed here — a row that expects silence has nothing to state, and one that
+    expects words fails the outcome check first.
+    """
+    if not scenario.must_state or not trial.text:
+        return []
+    if states_number(trial.text, scenario.must_state):
+        return []
+    return [f"the reply never states {scenario.must_state!r}: {trial.text[:160]!r}"]
 
 
 def post_policy_failures(scenario: "ResponderScenario", trial: Any) -> List[str]:
@@ -1084,16 +1416,34 @@ def test_the_table_states_the_bar_each_responder_row_is_actually_held_to():
 
 
 def test_no_row_claims_a_target_the_room_never_labelled():
-    """A cross-thread row whose expected target is not one of the stream's thread labels would be
-    unpassable — the executor refuses it — and the failure would read as a model defect. This walks
-    the REAL serializer over each such room at the row's own H. No API calls."""
+    """A cross-thread row whose expected target is reachable NEITHER as a stream label NOR through
+    its own search result would be unpassable — the executor refuses it — and the failure would
+    read as a model defect. This walks the REAL serializer over each such room at the row's own H,
+    and the REAL derivation over its recorded hits. No API calls.
+
+    W3 made legality two-valued: a target is legal because the stream labelled it, or because a
+    tool result this turn proved it (§2g). A row may therefore name a target the room never
+    labelled — that is the entire point of `search-then-answer-there` — but only if its own
+    payload actually yields that root, which is what the second branch checks."""
+    from slack_client.search_tool import SlackSearchToolMixin
     from tests.integration.scenario_harness import build_room_stream
+
+    class _Derive(SlackSearchToolMixin):
+        pass
 
     for scenario in RESPONDER_SCENARIOS:
         if not (scenario.expect_post_target or scenario.never_post_to):
             continue
         roots = build_room_stream(scenario.room, through=scenario.trigger_ts).trusted_thread_roots
-        if scenario.expect_post_target:
+        if scenario.expect_post_target and scenario.search_hits:
+            derived = {_Derive()._hit_thread_root(hit) for hit in scenario.search_hits}
+            assert scenario.expect_post_target in derived, (
+                f"{scenario.id}: no recorded hit derives {scenario.expect_post_target}, so "
+                f"nothing could ever enroll it and the row is unpassable")
+            assert scenario.expect_post_target not in roots, (
+                f"{scenario.id}: the target is ALREADY a stream label, so the row would pass "
+                f"without the search ever running")
+        elif scenario.expect_post_target:
             assert scenario.expect_post_target in roots, (
                 f"{scenario.id}: target {scenario.expect_post_target} is not in {sorted(roots)}")
             origin = scenario.trigger.thread or scenario.trigger_ts
@@ -1129,6 +1479,68 @@ def test_a_no_post_row_fails_on_the_ATTEMPT_not_only_on_the_landing():
     assert post_policy_failures(scenario, landed)
     # …and a turn that never reached for the tool is still a pass.
     assert post_policy_failures(scenario, TrialResult(outcome=SILENCE, text="")) == []
+
+
+def test_the_hard_sleep_set_is_exactly_the_two_rows_the_spec_calls_hard():
+    """A label downgrade must not be able to pass quietly.
+
+    `must_sleep_hard` differs from `must_sleep` only in whether ONE row's wake fails the run, and
+    both rows sample 0/5 today — so flipping either back to the ordinary label goes green on every
+    run and the individual enforcement the spec asks for is simply gone. The set is pinned here,
+    deterministically, together with the two facts that make the label mean anything: both labels
+    still pay into the false-wake budget, and the owner-reviewed table says the same thing the
+    corpus does. No API calls.
+    """
+    assert {s.id for s in WAKE_SCENARIOS if s.label == MUST_SLEEP_HARD} == {
+        "here-status-no-ask", "self-deprecating-banter"}
+    assert MUST_SLEEP in SLEEP_LABELS and MUST_SLEEP_HARD in SLEEP_LABELS, (
+        "a sleep label outside SLEEP_LABELS stops counting toward the false-wake budget")
+
+    # The TIER-1 region of the table only: several ids appear in both tiers, and tier 2's rows
+    # carry a bar where tier 1 carries a label.
+    body = EXPECTED_OUTCOME_TABLE.split("TIER 1 — WAKE GATE", 1)[1].split("TIER 2 —", 1)[0]
+    labels = {}
+    for line in body.splitlines():
+        cells = [cell.strip() for cell in line.split("|")[1:-1]]
+        if len(cells) == 3 and cells[0] and not cells[0].startswith("-"):
+            labels[cells[0]] = cells[2]
+    mismatched = [f"{s.id}: corpus says {s.label}, table says {labels.get(s.id)!r}"
+                  for s in WAKE_SCENARIOS if labels.get(s.id) != s.label]
+    assert not mismatched, f"the table and the gate corpus disagree about a label: {mismatched}"
+
+
+def test_the_open_question_row_fails_a_reply_that_never_states_the_answer():
+    """The content predicate has to BITE, or the row is back to grading that words happened.
+
+    Every string below earns `channel_reply` from the classifier, and the row's whole subject is
+    whether the 48 sitting two threads up came back out — so "I'm not sure" passing would be the
+    row measuring the opposite of its contract. No API calls.
+    """
+    from tests.integration.scenario_harness import TrialResult
+
+    scenario = next(s for s in RESPONDER_SCENARIOS if s.id == "open-question-answerable")
+    assert scenario.must_state == "48"
+
+    for answer in ("48 crates a pallet, from the Q2 audit.", "We standardised on 48.",
+                   "It's 48 — Kousha posted the standard above.",
+                   # A negator AFTER the figure is not a denial of it, and must still pass.
+                   "48 crates — isn't that the standard we set in Q2?"):
+        assert content_failures(scenario, TrialResult(outcome=CHANNEL_REPLY, text=answer)) == []
+    for answer in ("I'm not sure — nobody has posted the pallet spec here.",
+                   "480 crates a pallet.",                      # a longer number is not the fact
+                   "48,000 crates a pallet.",                   # nor a thousands-grouped one
+                   "48.5 crates a pallet.",                     # nor a different decimal
+                   "It isn't 48.",                              # the digits, stating the opposite
+                   "It's not 48 crates a pallet.",
+                   # RULED (see states_number): 48 is the channel's own record, so a reply that
+                   # denies it and names something else is wrong, not merely unhelpful.
+                   "It wasn't 48, turned out to be 52.",
+                   "Depends which crate size you mean."):
+        assert content_failures(scenario, TrialResult(outcome=CHANNEL_REPLY, text=answer)), answer
+    # A row that states nothing in particular is unaffected, and silence is never failed here.
+    poll = next(s for s in RESPONDER_SCENARIOS if s.id == "firsthand-experience-poll")
+    assert poll.must_state is None
+    assert content_failures(poll, TrialResult(outcome=SILENCE, text="")) == []
 
 
 def test_a_scoped_re_record_leaves_every_other_row_byte_identical():
@@ -1202,6 +1614,7 @@ async def test_tier1_wake_corpus():
         lines.append(f"SCOPED to {list(RECORD_ROWS)} — every other row is untouched")
     bugs, declines, lost = [], [], []
     missed_wakes: List[str] = []
+    hard_sleep_misses: List[str] = []
     sleep_trials = false_wakes = 0
     recorded: Dict[str, Any] = {}
 
@@ -1225,27 +1638,40 @@ async def test_tier1_wake_corpus():
             continue
         if scenario.label == MUST_WAKE and wakes < len(decided):
             missed_wakes.append(f"{scenario.id} ({wakes}/{len(decided)} woke)")
-        if scenario.label == MUST_SLEEP:
+        if scenario.label in SLEEP_LABELS:
             sleep_trials += len(decided)
             false_wakes += wakes
-        flag = "" if scenario.label != MUST_WAKE or wakes == len(decided) else "  <-- MISS"
-        lines.append(f"{scenario.id:<30} {scenario.label:<11} woke {wakes}/{len(decided)}{flag}")
+        if scenario.label == MUST_SLEEP_HARD and wakes:
+            hard_sleep_misses.append(f"{scenario.id} ({wakes}/{len(decided)} woke)")
+        flag = ""
+        if scenario.label == MUST_WAKE and wakes < len(decided):
+            flag = "  <-- MISS"
+        elif scenario.label == MUST_SLEEP_HARD and wakes:
+            flag = "  <-- HARD SLEEP BROKEN"
+        lines.append(f"{scenario.id:<30} {scenario.label:<16} woke {wakes}/{len(decided)}{flag}")
 
     rate = (false_wakes / sleep_trials) if sleep_trials else 0.0
     over = [sid for sid, row in recorded.items()
-            if row["label"] == MUST_SLEEP and row["wakes"]]
+            if row["label"] in SLEEP_LABELS and row["wakes"]]
     lines += ["-" * 78,
               f"must_wake misses: {len(missed_wakes)}",
+              f"hard-sleep misses: {len(hard_sleep_misses)}",
               f"false wakes: {false_wakes}/{sleep_trials} = {rate:.1%} "
-              f"(budget {FALSE_WAKE_THRESHOLD:.0%})"]
+              f"(budget {FALSE_WAKE_THRESHOLD:.0%}, BINDING)"]
     if over:
-        lines.append(f"woke on must_sleep: {over}")
+        lines.append(f"woke on a sleep row: {over}")
     if rate > FALSE_WAKE_THRESHOLD:
-        lines.append(f"*** OVER THE FALSE-WAKE BUDGET by "
-                     f"{false_wakes - FALSE_WAKE_THRESHOLD * sleep_trials:.1f} trials. The gate's "
-                     f"prompt is outside the P2 scope, so this describes the SHIPPED gate and is "
-                     f"reported rather than failed — it is a finding for the owner, not a "
-                     f"regression. See the scenarios listed above.")
+        if RECORD_ROWS is None:
+            lines.append(f"*** OVER THE FALSE-WAKE BUDGET by "
+                         f"{false_wakes - FALSE_WAKE_THRESHOLD * sleep_trials:.1f} trials, and "
+                         f"this FAILS the run. The gate's prompt is what this wave tunes, so the "
+                         f"budget is a claim about the shipped gate rather than a fact about "
+                         f"someone else's corpus. See the scenarios listed above.")
+        else:
+            # Not a finding: a handful of rows is not the corpus, and saying "over budget" here
+            # would report a number this run is not entitled to compute.
+            lines.append(f"over {FALSE_WAKE_THRESHOLD:.0%} across the SCOPED rows only — not the "
+                         f"corpus rate, and not asserted. See the note below.")
     if declines:
         lines.append(f"provider declines (excluded): {sorted(set(declines))}")
     for entry in lost:
@@ -1265,22 +1691,36 @@ async def test_tier1_wake_corpus():
     assert not bugs, f"tier-1 trials raised: {bugs}"
     assert not lost, f"scenarios the gate never decided: {lost}"
     assert not missed_wakes, f"must_wake misses (hard failure): {missed_wakes}"
+    # The two rows whose sleep the spec calls HARD. They pay into the budget like every other
+    # sleep row AND fail on their own, because an aggregate cannot say anything about one row:
+    # with 75 sleep trials the budget alone would let either of them wake on every single trial
+    # and still come in under 10%.
+    assert not hard_sleep_misses, f"hard-sleep rows that woke: {hard_sleep_misses}"
 
-    # The false-wake budget, held against the recorded count rather than only the threshold. The
-    # gate's prompt is outside the P2 scope ("gate untouched"), so a corpus that already exceeds
-    # the budget is describing the shipped gate, not a change to it — that is a finding for the
-    # owner, reported above, and blocking on it would make every unrelated P2 run red.
+    # THE BUDGET IS BINDING NOW, and it is the plain threshold rather than a baseline plus slack.
+    # It used to be `max(10%, baseline + 4)` on the argument that the gate's prompt was outside
+    # the wave's scope, so an over-budget corpus described the shipped gate rather than a change
+    # to it. This wave TUNES that prompt: the number is now a claim we are making, the measured
+    # rate is 1/75, and an allowance that still passed 11 false wakes would advertise a 10% ceiling
+    # while enforcing 14.7%. Rows that genuinely wander (emoji-only, question-to-a-person) are
+    # 1-in-5 rows inside a 75-trial denominator, which the threshold absorbs without slack.
     #
-    # The slack is deliberately wide. Two must_sleep scenarios are genuinely probabilistic and
-    # the total moved between 7 and 9 across recordings of an unchanged corpus, so a tight bound
-    # here would fail on sampling rather than on behaviour. This assertion catches a MATERIAL
-    # worsening of a number that is already reported loudly; the binding tier-1 assertion is
-    # `must_wake` above, which is 5 of 5 on every scenario and has never wavered.
-    allowed = max(FALSE_WAKE_THRESHOLD * sleep_trials, tier1.get("false_wakes", 0) + 4)
-    assert false_wakes <= allowed, (
-        f"false wakes {false_wakes}/{sleep_trials} ({rate:.1%}) exceed the allowance "
-        f"{allowed:.1f} (budget {FALSE_WAKE_THRESHOLD:.0%}, baseline "
-        f"{tier1.get('false_wakes')})")
+    # A SCOPED RUN CANNOT MAKE THIS CLAIM, and it is asserted only on the whole corpus. The rate is
+    # a property of the DENOMINATOR: `emoji-only` reproducing exactly its recorded 1-in-5 scores
+    # 20% when it is the only sleep row in the run, and failing there would be the harness
+    # punishing a row for being iterated on alone. Merging fresh rows with recorded ones was the
+    # alternative and it is worse — it asserts a number half of which nobody just measured, so a
+    # scoped run could fail on rows it never ran. What a scoped run still enforces is every
+    # per-row claim: must_wake, and the hard sleeps above.
+    if RECORD_ROWS is not None:
+        _report([f"aggregate false-wake budget NOT asserted: this run is scoped to "
+                 f"{list(RECORD_ROWS)}, so {false_wakes}/{sleep_trials} is not the corpus rate. "
+                 f"Per-row claims were enforced. Run the whole tier to hold the budget."])
+    else:
+        assert rate <= FALSE_WAKE_THRESHOLD, (
+            f"false wakes {false_wakes}/{sleep_trials} ({rate:.1%}) exceed the budget "
+            f"{FALSE_WAKE_THRESHOLD:.0%} (baseline {tier1.get('false_wakes')}/"
+            f"{tier1.get('sleep_trials')})")
 
     regressions = [
         f"{sid}: {recorded[sid]['wakes']}/{recorded[sid]['decided']} vs baseline "
@@ -1307,7 +1747,8 @@ async def test_tier2_responder_corpus():
     factories = [
         (scenario, lambda s=scenario: run_responder_trial(
             client, room=s.room, trigger=s.trigger, steering=s.steering,
-            silence_capable=s.silence_capable, addressed=s.addressed))
+            silence_capable=s.silence_capable, addressed=s.addressed,
+            search_hits=s.search_hits))
         for scenario in scenarios for _ in range(TRIALS)
     ]
     results = await gather_trials([f for _, f in factories])
@@ -1340,7 +1781,7 @@ async def test_tier2_responder_corpus():
                 where.append(f"{scenario.id}: {type(trial).__name__}: {trial}")
                 continue
             outcomes.append(trial.outcome)
-            findings = post_policy_failures(scenario, trial)
+            findings = post_policy_failures(scenario, trial) + content_failures(scenario, trial)
             clean.append(trial.outcome in scenario.expected and not findings)
             row_findings.extend(findings)
             # What the turn AIMED at, refused attempts included — the only place a fan-out the

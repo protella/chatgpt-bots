@@ -1246,16 +1246,43 @@ def test_classify_source_missing_is_private_is_not_public(bot):
     assert bot._classify_source_public({"is_channel": True, "is_private": False}, _ctx()) is True
 
 
+# ------------------------------------------------------------------ search, CHANNEL surface
+#
+# THE BACKEND UNDER THESE FIVE CHANGED, AND THE CLAIMS DID NOT (CHANNEL_SEARCH_REBUILD §S1).
+# A channel/MPIM turn no longer calls `assistant.search.context` at all — it runs the bot-token
+# in-channel scan — so each case below now drives the scan through `conversations.history`. Two
+# of them are the same assertion against a different source; three are the same GUARANTEE
+# arriving structurally, which is stated here rather than dropped: the scan reads one channel,
+# the authorized current one, so a "non-deliverable other channel" is not a result it can
+# produce. Every case still runs the REAL executor and the REAL `_delivery_allowed`.
+
+
+def _scan_pages(bot_, messages):
+    """One conversations.history page for the scan to walk."""
+    bot_.app.client.conversations_history.return_value = {"ok": True, "messages": list(messages)}
+
+
+def _scan_msg(ts, text, **extra):
+    msg = {"ts": ts, "text": text, "user": "U_SPEAKER", "team": "T_WORKSPACE"}
+    msg.update(extra)
+    return msg
+
+
+def _scan_ctx(channel_id="C_HERE"):
+    """A channel turn: no action_token (the scan needs none) and a trigger to fence on."""
+    return _ctx(channel_id=channel_id, trigger_ts="9999.000000")
+
+
 @pytest.mark.asyncio
 async def test_search_foreign_team_hit_dropped_even_if_current_channel(bot):
-    """codex r3 #4: a hit whose team_id differs from the bot's is dropped BEFORE the
-    current-channel exemption — a cross-workspace result claiming the current channel id can't
-    ride it."""
-    bot.app.client.api_call.return_value = {"ok": True, "results": {"messages": [
-        {"channel_id": "C_HERE", "team_id": "T_OTHER", "message_ts": "1.1", "content": "foreign"},
-    ]}}
+    """codex r3 #4: a candidate whose team differs from the bot's is dropped BEFORE the
+    current-channel exemption — a cross-workspace message sitting in the current channel (a
+    Slack Connect author) cannot ride it."""
+    _set_infos(bot, {"C_HERE": _INTERNAL_HERE})
+    _member_of(bot, "C_HERE")
+    _scan_pages(bot, [_scan_msg("100.000000", "foreign fact", team="T_OTHER")])
 
-    out = await bot.execute_search_tool(_ctx(channel_id="C_HERE", action_token="tok"), {"query": "x"})
+    out = await bot.execute_search_tool(_scan_ctx(), {"query": "foreign fact"})
 
     assert out["ok"] is True and out["count"] == 0
 
@@ -1273,25 +1300,30 @@ async def test_source_public_memo_keyed_by_team(bot):
 
 
 @pytest.mark.asyncio
-async def test_search_channel_surface_drops_non_deliverable_hits(bot):
-    """Multi-user surface: keep current-channel + public-internal hits; drop the rest SILENTLY
-    (no note, no count of what was removed). Also proves the defensive parse of a string-typed
-    `channel` neither crashes nor false-positives."""
+async def test_search_channel_surface_reaches_only_the_current_channel(bot):
+    """The multi-user guarantee, arriving STRUCTURALLY instead of by filtering.
+
+    The old assistant backend could return another channel's content and had to drop what was
+    not deliverable. The scan cannot: it asks `conversations.history` for the AUTHORIZED current
+    channel and nothing else, so a private conversation elsewhere is not a result that exists to
+    be withheld. What the old test really asserted — a channel audience is never told about a
+    channel it may not see — is proved here by which conversation was read, and by every
+    returned `channel` being the trusted one rather than anything off a payload.
+    """
     _set_infos(bot, {"C_HERE": _INTERNAL_HERE,   # normal internal destination (delivery not locked)
                      "C_PUB": _INTERNAL_HERE,
                      "C_PRIV": {"is_channel": True, "is_private": True, "is_member": True}})
-    bot.app.client.api_call.return_value = {"ok": True, "results": {"messages": [
-        {"channel": "C_HERE", "message_ts": "1.1", "content": "here as a string channel"},
-        {"channel_id": "C_PUB", "message_ts": "1.2", "content": "public elsewhere"},
-        {"channel_id": "C_PRIV", "message_ts": "1.3", "content": "private elsewhere"},
-    ]}}
+    _member_of(bot, "C_HERE")
+    # The payload NAMES another conversation; the result must still be the current one.
+    _scan_pages(bot, [_scan_msg("100.000000", "budget decision", channel="C_PRIV")])
 
-    out = await bot.execute_search_tool(_ctx(channel_id="C_HERE", action_token="tok"), {"query": "x"})
+    out = await bot.execute_search_tool(_scan_ctx(), {"query": "budget decision"})
 
-    kept = {(r["channel"], r["text"]) for r in out["results"]}
-    assert kept == {("C_HERE", "here as a string channel"), ("C_PUB", "public elsewhere")}
-    assert out["count"] == 2
-    assert "note" not in out  # the private hit vanished with no trace of its existence
+    assert [(r["channel"], r["text"]) for r in out["results"]] == [("C_HERE", "budget decision")]
+    read = {call.kwargs.get("channel") for call in
+            bot.app.client.conversations_history.await_args_list}
+    assert read == {"C_HERE"}
+    assert "note" not in out   # nothing anywhere hints that another conversation exists
 
 
 @pytest.mark.asyncio
@@ -1349,21 +1381,28 @@ async def test_lookup_in_channel_resolves_public_internal_match():
 
 @pytest.mark.asyncio
 async def test_search_in_ext_shared_channel_delivers_only_current(bot):
-    """FIX 1: search delegates to the canonical `_delivery_allowed`, so an externally-shared
-    CURRENT channel locks delivery to current-channel hits — a public-internal non-current hit is
-    dropped, closing the internal→external-org leak history and lookup already close."""
+    """FIX 1: an externally-shared CURRENT channel may deliver only its own content, closing the
+    internal→external-org leak that history and lookup close.
+
+    Search still delegates to the canonical `_delivery_allowed` for every candidate, and the
+    scan gives that rule nothing but current-channel candidates to judge — so the guarantee now
+    holds twice over. What is asserted here is that the ext-shared destination does NOT also
+    lock out the channel's own content: an over-strict reading would leave a Slack Connect
+    channel unable to search itself.
+    """
     _set_infos(bot, {"C_HERE": {"is_channel": True, "is_private": False, "is_member": True,
                                 "is_ext_shared": True},
                      "C_PUB": _INTERNAL_HERE})
-    bot.app.client.api_call.return_value = {"ok": True, "results": {"messages": [
-        {"channel_id": "C_HERE", "message_ts": "1.1", "content": "current"},
-        {"channel_id": "C_PUB", "message_ts": "1.2", "content": "public elsewhere"},
-    ]}}
+    _member_of(bot, "C_HERE")
+    _scan_pages(bot, [_scan_msg("100.000000", "current rollout note")])
 
-    out = await bot.execute_search_tool(_ctx(channel_id="C_HERE", action_token="tok"), {"query": "x"})
+    out = await bot.execute_search_tool(_scan_ctx(), {"query": "current rollout note"})
 
     assert [r["channel"] for r in out["results"]] == ["C_HERE"]
     assert out["count"] == 1
+    read = {call.kwargs.get("channel") for call in
+            bot.app.client.conversations_history.await_args_list}
+    assert "C_PUB" not in read
 
 
 def test_classify_source_fails_closed_when_bot_team_unknown():
@@ -1390,33 +1429,40 @@ async def test_dest_forces_current_only_fail_closed_gaps():
 
 @pytest.mark.asyncio
 async def test_search_hit_with_contradictory_team_ids_dropped(bot):
-    """FIX 4: a hit that claims two different workspaces is self-contradictory → dropped, even
-    when its channel id equals the current channel."""
+    """FIX 4: a candidate that claims two different workspaces is self-contradictory → dropped,
+    even though it was read out of the current channel itself."""
     _set_infos(bot, {"C_HERE": _INTERNAL_HERE})
-    bot.app.client.api_call.return_value = {"ok": True, "results": {"messages": [
-        {"channel_id": "C_HERE", "team_id": "T_WORKSPACE",
-         "channel": {"id": "C_HERE", "context_team_id": "T_OTHER"},
-         "message_ts": "1.1", "content": "contradictory"},
-    ]}}
+    _member_of(bot, "C_HERE")
+    _scan_pages(bot, [_scan_msg("100.000000", "contradictory fact",
+                                team="T_WORKSPACE", team_id="T_OTHER")])
 
-    out = await bot.execute_search_tool(_ctx(channel_id="C_HERE", action_token="tok"), {"query": "x"})
+    out = await bot.execute_search_tool(_scan_ctx(), {"query": "contradictory fact"})
 
     assert out["count"] == 0
 
 
 @pytest.mark.asyncio
-async def test_search_skips_non_dict_result_entries(bot):
-    """FIX 5: a malformed hit (a string/None in the results list) is skipped, not crashed on."""
+async def test_search_survives_a_malformed_page_with_honest_coverage(bot):
+    """FIX 5, in the scan's terms: malformed evidence never crashes the tool — AND never comes
+    back looking like an empty channel.
+
+    The old assistant backend received a list of hits and skipped the entries that were not
+    dicts. The scan receives PAGES through the strict pager, whose landed contract is that a
+    page element that is not a message is not a page at all: it raises rather than salvaging the
+    rest, because a page reported as whole when part of it was unreadable is how a certified
+    horizon gets built over records nobody saw. So the honest outcome here is a successful tool
+    call carrying a coverage block that says it did not finish, and a `stopped_reason` naming
+    the phase that failed — never `count: 0` on its own.
+    """
     _set_infos(bot, {"C_HERE": _INTERNAL_HERE})
-    bot.app.client.api_call.return_value = {"ok": True, "results": {"messages": [
-        "garbage",
-        None,
-        {"channel_id": "C_HERE", "message_ts": "1.1", "content": "real"},
-    ]}}
+    _member_of(bot, "C_HERE")
+    _scan_pages(bot, ["garbage", None, _scan_msg("100.000000", "real")])
 
-    out = await bot.execute_search_tool(_ctx(channel_id="C_HERE", action_token="tok"), {"query": "x"})
+    out = await bot.execute_search_tool(_scan_ctx(), {"query": "real"})
 
-    assert out["count"] == 1 and out["results"][0]["text"] == "real"
+    assert out["ok"] is True
+    assert out["coverage"]["complete"] is False
+    assert out["coverage"]["stopped_reason"].startswith("history_error")
 
 
 # --------------------------------------------------------------- resolve_channel_name (id -> name)

@@ -375,8 +375,9 @@ def test_the_binary_prompt_asks_for_a_bit_and_nothing_else():
     # participation feedback wakes the responder — only the responder can record or apply it, so a
     # gate that stays quiet here silently discards the instruction.
     assert "feedback about how it participates" in p
-    # generosity is the design: an uncertain case wakes.
-    assert "When you are unsure, wake it" in p
+    # generosity is the design, and the tuning wave scoped it: a possible task wakes, unaddressed
+    # banter does not.
+    assert "If you cannot tell whether a genuine task or question needs it, wake it" in p
     # and the responder's option to say nothing is named, so a wake is not read as "make it talk"
     assert "say nothing at all" in p
     # no action vocabulary, no placement vocabulary, no staged findings

@@ -283,13 +283,35 @@ def test_the_conduct_paragraph_demands_one_post_in_one_thread():
     assert "never post it there and then repeat it here as well" in CONDUCT
 
 
-def test_the_conduct_paragraph_sources_the_target_from_the_stream_labels_only():
-    """The executor's allowlist is the set of `thread=<ts>` labels the stream rendered, frozen at
-    pin time. A prompt that pointed anywhere else — the coordinates block, a tool result, a ts in
-    somebody's message — would be inviting a call the runtime refuses."""
-    assert "thread=<ts> in a message header" in CONDUCT
-    assert "those labels are the whole list of places you may post" in CONDUCT
+def test_the_prompt_names_exactly_the_two_legal_sources():
+    """T87. EXTENDED from "the stream labels only" (W3, §5.6): the executor's allowlist is now
+    the `thread=<ts>` labels the stream rendered PLUS any thread in this channel a search or
+    history tool returned this turn. Both places the rule is stated have to name those two and
+    nothing else — a prompt pointing anywhere further (the coordinates block, a ts in somebody's
+    message) invites a call the runtime refuses, and one pointing at only the first describes a
+    stricter tool than the model has.
+
+    W3 adds REACH, NOT PERMISSION, so the four clauses the P3b/FXP3 scenario rows measured in are
+    asserted VERBATIM here rather than merely surviving nearby."""
+    both = (CONDUCT, CHANNEL_POST_TO_THREAD_TARGET_DESCRIPTION)
+    for text in both:
+        assert "thread=<ts> in a message header" in text
+        # RETURNED, not "shown": the executor refuses a hit whose workspace provenance is absent
+        # or contradictory even though the model can read it, so "every thread you were shown"
+        # would promise more than the executor grants. The prompt is the weaker claim on purpose.
+        assert "a search or history tool returned to you this turn" in text
+        assert "already shown you this turn" not in text
+        assert "if a target is refused, open it with fetch_thread_messages" in text
+        assert "two are the whole list of places you may post" in text or (
+            "Those two are the only valid targets" in text)
     assert "a timestamp quoted inside somebody's message is not one" in CONDUCT
+    assert "never a ts read out of a message body" in CHANNEL_POST_TO_THREAD_TARGET_DESCRIPTION
+
+    for clause in ("Two cases, and they are the whole list",
+                   "not a loop of yours to close, however well you could settle it",
+                   "When the open question is over there, that is where the answer goes",
+                   "Do not report the post either"):
+        assert clause in CONDUCT
 
 
 def test_the_conduct_paragraph_rules_out_the_origin_thread_as_a_target():
@@ -438,14 +460,26 @@ def test_the_dm_schema_is_untouched_by_the_channel_wording():
 
 
 def test_the_channel_schema_promises_only_what_the_executor_allows():
-    """The DM text says a target may come "from a tool". On a channel turn the allowlist is the
-    stream's own labels and a tool-supplied root is REFUSED, so the DM promise would teach the
-    model that a working tool is broken. NARROWED (plan §1d)."""
+    """The DM text says a target may come "from a tool", flatly. The channel executor is
+    narrower on BOTH sides and the schema has to match it, or the model learns that a working
+    tool is broken.
+
+    W3 widened the allowlist to include a root a search or history tool RETURNED THIS TURN — so
+    the old "the stream's labels and nothing else" is gone. It did NOT widen to every ts a tool
+    ever showed: a hit whose workspace provenance is absent or contradictory is still refused,
+    which is why the channel wording promises a returned thread rather than any seen one, and
+    names the recovery instead of implying there is never a refusal."""
     from slack_client.messaging import SlackMessagingMixin
 
     assert "or from a tool" in SlackMessagingMixin._POST_TO_THREAD_TARGET_DESCRIPTION
-    assert "from a tool" not in CHANNEL_POST_TO_THREAD_TARGET_DESCRIPTION
+    assert "or from a tool" not in CHANNEL_POST_TO_THREAD_TARGET_DESCRIPTION
     assert "this channel's stream labels it" in CHANNEL_POST_TO_THREAD_TARGET_DESCRIPTION
+    assert ("a search or history tool returned to you this turn"
+            in CHANNEL_POST_TO_THREAD_TARGET_DESCRIPTION)
+    # The prompt must not promise more than the executor grants: refusals exist, and the way
+    # through one is named rather than left for the model to discover.
+    assert ("if a target is refused, open it with fetch_thread_messages"
+            in CHANNEL_POST_TO_THREAD_TARGET_DESCRIPTION)
 
 
 def test_the_channel_schema_and_the_conduct_paragraph_agree_about_the_origin():

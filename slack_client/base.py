@@ -140,15 +140,29 @@ class SlackBot(SlackMessageEventsMixin,
             channel_enabled=lambda cfg: bool(config.enable_no_reply_tool),
         )
         if config.enable_search_tool:
-            # BF1: Slack's Data Access API only mints action_token on @mention channel events
-            # and DMs; unmentioned channel-listening turns never carry one, so the search tool
-            # would fail at runtime. The text handler stamps _slack_search_available from the
-            # event's action_token in a COPIED config; hide the schema when it's absent.
-            # Static on the channel surface: the token lives in ToolContext, and the executor
-            # already fails honestly without one.
+            # ONE NAME, TWO BACKENDS, AND THE GATES BELONG TO DIFFERENT ONES.
+            #
+            # DM (assistant.search.context): BF1's gate stands. Slack's Data Access API mints an
+            # action_token only on @mention channel events and DMs, so the text handler stamps
+            # `_slack_search_available` from the event in a COPIED config and the schema is
+            # hidden without it.
+            #
+            # CHANNEL/MPIM (the in-channel scan): STATIC and UNGATED — it runs on the bot token
+            # and needs no action_token at all, which is the point. `enabled` is structurally
+            # ignored on the channel surface and no `channel_enabled` is given, so an ambient
+            # unmentioned turn sees the tool; hiding it there was the first of the two live
+            # defects this backend fixes.
+            #
+            # The explicit timeout is the search budget's backstop: the scan's own absolute
+            # deadline (SEARCH_FETCH_TOTAL_SECONDS) is what stops it, and this bound only exists
+            # so the executor cannot outlive it.
             registry.register(
                 self.get_search_tool_schema(), self.execute_search_tool,
                 enabled=lambda cfg: bool(cfg.get("_slack_search_available")),
+                timeout=config.search_tool_timeout_seconds,
+                # The channel schema describes the channel backend — keyword scan of THIS
+                # channel, `thread_ts` on results, no `scope`. The DM schema is unchanged.
+                channel_schema=self.get_search_tool_channel_schema,
             )
         if config.enable_channel_memory:
             register_memory_tools(registry)  # channel-only; executors refuse DMs
