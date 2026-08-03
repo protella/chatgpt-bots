@@ -458,13 +458,12 @@ def _fixture_channel_settings(now_ts: str) -> Dict[str, Any]:
     `NULL` means INHERIT, and that is the honest baseline: a fenced channel behaves like a channel
     nobody has configured, which is the comparable starting state a battery needs.
 
-    The spec's §7.1d-ter table also listed `enable_web_search`, `enable_mcp` and `image_model` as
-    columns; at HEAD they are NOT in `channel_settings` (`database.py:870`) — they resolve through
-    the thread-config capability profile, which the fence does not overlay. The baseline below is
-    HEAD's actual column list; the capability values enter the hash from the globals a fenced turn
-    really inherits (see `_resolved_profile`), not from the spec's aspiration that the fence turns
-    web search and MCP off. Turning them off is a `.env` decision for the dev bot running the
-    battery, and the hash will report whichever way that went.
+    `enable_web_search`, `enable_mcp` and `image_model` became real columns in the shallow-stream
+    respec's W4, and they are NULL here like every other one: a fenced channel is a channel nobody
+    has configured. They still do not decide the fixture hash — the capability values enter it
+    from the globals a fenced turn really inherits (see `_resolved_profile`), not from the spec's
+    aspiration that the fence turns web search and MCP off. Turning them off is a `.env` decision
+    for the dev bot running the battery, and the hash will report whichever way that went.
     """
     return {
         "response_mode": None,
@@ -476,6 +475,9 @@ def _fixture_channel_settings(now_ts: str) -> Dict[str, Any]:
         "reasoning_effort": None,
         "verbosity": None,
         "ambient_memory": None,
+        "enable_web_search": None,
+        "enable_mcp": None,
+        "image_model": None,
         "updated_ts": now_ts,
         "updated_by": "epoch_fence",
     }

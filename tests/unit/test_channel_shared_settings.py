@@ -139,14 +139,36 @@ def test_channel_modal_offers_shared_selects_and_personal_button():
     assert by_block["channel_model_block"].get("dispatch_action") is True
 
 
-def test_channel_modal_full_ladder_on_56_and_inherit():
+def test_channel_modal_full_ladder_on_56_and_inherit(monkeypatch):
+    """An inheriting channel gets the ladder of the model it will actually run on.
+
+    The workspace default is pinned rather than read from the ambient .env: since the ladder
+    started following the EFFECTIVE model, "inherit shows `max`" is only true while that default
+    is a 5.6 model, and a test that quietly depended on the developer's config would pass here
+    and fail on a workspace running gpt-5.5.
+    """
+    from config import config
     from settings_modal import SettingsModal
+    monkeypatch.setattr(config, "gpt_model", "gpt-5.6-sol")
     modal = SettingsModal.__new__(SettingsModal)
     for cs in ({"model": "gpt-5.6-terra"}, {}, {"model": None}):
         view = modal.build_channel_settings_modal("C1", cs, "tag_only")
         by_block = {b.get("block_id"): b for b in view["blocks"] if b.get("block_id")}
         opts = {o["value"] for o in by_block["channel_effort_block"]["element"]["options"]}
         assert "max" in opts, cs
+
+    # …and on a workspace whose default is gpt-5.5, the same inheriting channel is not offered an
+    # effort that model cannot run. This is the blocker the modal/resolver split produced.
+    monkeypatch.setattr(config, "gpt_model", "gpt-5.5")
+    monkeypatch.setattr(config, "default_reasoning_effort", "max")
+    view = modal.build_channel_settings_modal("C1", {}, "tag_only")
+    by_block = {b.get("block_id"): b for b in view["blocks"] if b.get("block_id")}
+    effort = by_block["channel_effort_block"]["element"]
+    assert "max" not in {o["value"] for o in effort["options"]}
+    # The inherit LABEL is clamped against the same model. Naming the raw global here would tell
+    # the operator the channel inherits `max` while the resolver runs `xhigh` — the modal and the
+    # resolver disagreeing again, just in prose instead of in the option list.
+    assert effort["options"][0]["text"]["text"] == "Use the workspace default (currently: xhigh)"
 
 
 def test_channel_modal_stored_max_survives_model_swap_as_inherit():

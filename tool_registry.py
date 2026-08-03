@@ -510,8 +510,11 @@ class ToolRegistry:
             # must not abort an effect already in flight, or a posted message loses the receipt
             # that makes it ours. Cancellation is the outer finally's job, and it is established
             # there rather than requested here.
-            return await asyncio.wait_for(asyncio.shield(task), timeout=flight.remaining())
+            result = await asyncio.wait_for(asyncio.shield(task), timeout=flight.remaining())
         except asyncio.TimeoutError:
+            # The shielded execution is still running and may yet produce a result — one nothing
+            # will deliver. THE TIMEOUT IS SELECTED HERE, so this is a path that commits nothing:
+            # whatever that call staged describes a result the model is not getting (§2g).
             logger.warning(
                 f"tool '{name}' (call {label}) outran its {flight.timeout:.0f}s bound; the "
                 "turn will settle it before its receipts")
@@ -534,6 +537,45 @@ class ToolRegistry:
             if isinstance(e, StaleSendSuppressed):
                 raise
             return {"ok": False, "error": "execution_error", "message": str(e)[:500]}
+        # THE COMMIT POINT (§2g). This line is reached only when THIS result is the one going to
+        # the model: every other exit above selected something else — a timeout, a cancellation,
+        # an error — and each of them returns without committing. Nothing before here can grant
+        # authority, and nothing after here can take it back, so "the model was shown it" is a
+        # fact about control flow rather than a guess made from a clock while the answer was
+        # still undecided.
+        self._commit_staged_roots(flight, turn, result)
+        return result
+
+    @staticmethod
+    def _commit_staged_roots(flight: Any, turn: Any, result: Any) -> None:
+        """Grant authority to the staged roots whose own field survives into what is delivered.
+
+        Two questions, both answerable only here: WAS this result selected (yes — see the call
+        site), and WHICH OF ITS PARTS reached the model. The second is decided against the
+        SERIALIZED, CLIPPED bytes the loop will hand back, because the tail of a long result is
+        cut off and a root nobody can read is a root nobody was shown.
+
+        Reads the claims off the FLIGHT, so EVERY waiter that selects the real result commits
+        them — including a duplicate that joined a flight whose original waiter was cancelled or
+        timed out. Committing twice is harmless: enrollment is a set, and a root already in it
+        re-enrols to no effect.
+
+        Never raises: a call that returned content must not fail because bookkeeping did.
+        """
+        staged = getattr(flight, "staged_roots", None) if flight is not None else None
+        if not staged:
+            return
+        enroll = getattr(turn, "enroll_discovered_root", None)
+        if enroll is None:
+            return
+        try:
+            clipped = serialize_tool_result(result)
+            for root in staged:
+                if not isinstance(root, StagedRoot) or not _survives_truncation(clipped, root):
+                    continue
+                enroll(channel_id=root.channel_id, root_ts=root.root_ts, source=root.source)
+        except Exception as e:  # noqa: BLE001 — authority is never load-bearing for the answer
+            logger.debug(f"staged roots not committed: {e}")
 
     @staticmethod
     def _abandon(turn: Any, flight: Any) -> None:
@@ -578,12 +620,46 @@ class ToolRegistry:
         finally:
             _adopt_per_call_flags(parent_ctx, call_ctx)
 
+    @staticmethod
+    def _restamp_trusted_roots(ctx: Any) -> None:
+        """§2g. Re-resolve this ROUND's `post_to_thread` allowlist from the turn, ONCE, before
+        any of the round's calls run.
+
+        This is where "per round" is made true. The context is built once per handler request and
+        rides every round by reference, so without this a root a tool result proved in round N
+        would be visible in no round at all. `dispatch_all` runs exactly once per round — for the
+        ordinary round AND for the no-reply terminal round — which makes the timing a property of
+        the code rather than a comment.
+
+        AT THE TOP, never per call: a set refreshed alongside each call would let a search and a
+        post issued in the SAME round authorize each other, which is "authorized because the model
+        named it in the same breath" — the thing `execute_post_to_thread`'s own comment forbids.
+
+        Two things it will not do. It never re-stamps a context with no turn to resolve against —
+        there is nothing to re-read, and a hand-built context's explicit set is its own answer.
+        And it never replaces a set with `None`, because `None` is the widest authorization there
+        is and this is a refresh, not a widening.
+        """
+        turn = getattr(ctx, "turn", None)
+        if turn is None:
+            return
+        try:
+            # Lazy: handlers.text imports this module, so the pair cycles at module scope.
+            from message_processor.handlers.text import _trusted_thread_roots
+            resolved = _trusted_thread_roots(turn)
+            if resolved is None:
+                return
+            ctx.trusted_thread_roots = resolved
+        except Exception as e:  # noqa: BLE001 — a refresh that fails leaves the round's own set
+            logger.debug(f"trusted thread roots not re-stamped for this round: {e}")
+
     async def dispatch_all(self, ctx: ToolContext, calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Run a round's calls in parallel; result order matches ``calls``.
 
         The call's own id rides along, because THIS is the seam a duplicate dispatch would arrive
         at: the loop hands the ids it already has, and the registry decides whether the work has
         been done before."""
+        self._restamp_trusted_roots(ctx)
         return list(await asyncio.gather(
             *(self.dispatch(ctx, c.get("name", ""), c.get("arguments"), c.get("call_id"))
               for c in calls)
@@ -600,3 +676,59 @@ def serialize_tool_result(result: Any) -> str:
     if len(s) > cap:
         s = s[:cap] + " …[truncated]"
     return s
+
+
+@dataclass(frozen=True)
+class StagedRoot:
+    """One root a tool result CLAIMS, before anything has granted it authority.
+
+    `field` is the name of the structured key the root was read from — `thread_ts` for a search
+    hit or a thread fetch, `ts` for a history entry with replies. It is carried because the
+    survival check below is about that FIELD surviving, not about the digits appearing somewhere.
+    """
+
+    channel_id: Any
+    root_ts: Any
+    source: str
+    field: str
+
+
+def stage_discovered_root(ctx: Any, *, channel_id: Any, root_ts: Any, source: str,
+                          field: str) -> None:
+    """An executor CLAIMS a root. It does not get one.
+
+    §2g's authority rule, split in two so that no part of it is decided by a component that
+    cannot know the answer. An executor cannot know whether its result will be the one the model
+    receives — it is still running when that is decided — so it may only say "this result names
+    this root". The registry commits, at the one moment the answer is known.
+
+    The claim is recorded on the FLIGHT — the execution — not on this call's context, because a
+    flight can have more than one waiter and only the first has a context. A context with no
+    flight stages nothing and is not an error: that is a hand-built context outside the registry,
+    and a call the registry never selected a result for is a call that never authorized anything.
+    """
+    staged = getattr(getattr(ctx, "tool_flight", None), "staged_roots", None)
+    if not isinstance(staged, list):
+        return
+    staged.append(StagedRoot(channel_id=channel_id, root_ts=root_ts, source=source, field=field))
+
+
+def _survives_truncation(clipped: str, root: StagedRoot) -> bool:
+    """Did this root's OWN STRUCTURED FIELD reach the model?
+
+    `serialize_tool_result` clips the function output, so the tail of a long result never arrives.
+    The test is that the root's own `"<field>": "<ts>"` pair is present in the clipped bytes — the
+    pair as JSON writes it, not the timestamp on its own.
+
+    THE DIFFERENCE IS NOT COSMETIC. A bare search for the digits accepts a root whose entry was
+    clipped away entirely, as long as some earlier entry happened to CONTAIN those digits — an
+    author id, a quoted timestamp in somebody's message text. That authorizes a thread the model
+    was never shown, sourced from prose, which is the exact thing §2g exists to refuse. A field
+    pair cannot be forged from message text: JSON escapes the quotes inside a string value, so
+    text reading `"thread_ts": "…"` serializes as `\\"thread_ts\\": \\"…\\"` and does not match.
+    """
+    try:
+        pair = json.dumps({root.field: root.root_ts}, ensure_ascii=False, default=str)[1:-1]
+    except Exception:  # noqa: BLE001 — unserializable claim, no authority
+        return False
+    return bool(pair) and pair in clipped

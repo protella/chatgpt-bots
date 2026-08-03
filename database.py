@@ -354,6 +354,39 @@ def _epoch_settings_fields(**fields):
     return {k: v for k, v in fields.items() if v is not _UNSET}
 
 
+def _check_clauses(ddl: str) -> List[str]:
+    """Every `CHECK (...)` clause in a CREATE TABLE statement, each as its own string.
+
+    Parenthesis-balanced rather than regex, because the constraints this reads contain a nested
+    group of their own (`... IN (0, 1)`) and a naive match would stop at the first `)`. Splitting
+    the DDL into per-clause strings is what lets a caller ask which COLUMN a check belongs to;
+    searching the raw text instead conflates a constrained column with the next one declared
+    after it.
+    """
+    clauses: List[str] = []
+    idx = 0
+    while True:
+        idx = ddl.find("CHECK", idx)
+        if idx < 0:
+            return clauses
+        idx += len("CHECK")
+        while idx < len(ddl) and ddl[idx].isspace():
+            idx += 1
+        if idx >= len(ddl) or ddl[idx] != "(":
+            continue                      # the word "CHECK" outside a constraint; keep looking
+        start, depth = idx, 0
+        while idx < len(ddl):
+            if ddl[idx] == "(":
+                depth += 1
+            elif ddl[idx] == ")":
+                depth -= 1
+                if depth == 0:
+                    idx += 1
+                    break
+            idx += 1
+        clauses.append(ddl[start:idx])
+
+
 def _decode_muted_threads(raw) -> List[str]:
     """Parse the channel_settings.muted_threads JSON column into a list of thread ts
     strings. Malformed/absent → empty list (fail open — a bad blob never silences)."""
@@ -414,6 +447,7 @@ _CHANNEL_SETTINGS_STRUCTURAL = (
     "response_mode", "reply_in_channel",
     "participation_level", "model", "reasoning_effort", "verbosity",
     "ambient_memory",
+    "enable_web_search", "enable_mcp", "image_model",
 )
 
 
@@ -421,7 +455,9 @@ def _build_channel_settings_write(channel_id, response_mode=_UNSET,
                                   reply_in_channel=_UNSET, participation_level=_UNSET,
                                   snoozed_until=_UNSET, muted_threads=_UNSET,
                                   model=_UNSET, reasoning_effort=_UNSET, verbosity=_UNSET,
-                                  ambient_memory=_UNSET, updated_by=None):
+                                  ambient_memory=_UNSET,
+                                  enable_web_search=_UNSET, enable_mcp=_UNSET,
+                                  image_model=_UNSET, updated_by=None):
     """Build the atomic upsert for a partial channel_settings write.
 
     Returns ``(sql, params)`` or ``None`` when no field was provided (caller no-ops).
@@ -464,6 +500,17 @@ def _build_channel_settings_write(channel_id, response_mode=_UNSET,
         # F51 opt-out: explicit None → NULL (inherit config.enable_ambient_memory); True/False → 1/0.
         provided["ambient_memory"] = (
             None if ambient_memory is None else (1 if ambient_memory else 0))
+    # The capability tri-states (§6.1): explicit None → NULL (inherit the global default),
+    # True/False → 1/0. Normalizing to exactly 1/0 here is what keeps the column's CHECK
+    # satisfiable — a caller handing us a stray truthy value stores 1, never that value.
+    if enable_web_search is not _UNSET:
+        provided["enable_web_search"] = (
+            None if enable_web_search is None else (1 if enable_web_search else 0))
+    if enable_mcp is not _UNSET:
+        provided["enable_mcp"] = (
+            None if enable_mcp is None else (1 if enable_mcp else 0))
+    if image_model is not _UNSET:
+        provided["image_model"] = image_model
 
     if not provided:
         return None
@@ -983,6 +1030,11 @@ class DatabaseManager(LoggerMixin):
                 reasoning_effort TEXT,
                 verbosity TEXT,
                 ambient_memory INTEGER,
+                enable_web_search INTEGER
+                    CHECK (enable_web_search IS NULL OR enable_web_search IN (0, 1)),
+                enable_mcp INTEGER
+                    CHECK (enable_mcp IS NULL OR enable_mcp IN (0, 1)),
+                image_model TEXT,
                 updated_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_by TEXT
             )
@@ -1599,6 +1651,202 @@ class DatabaseManager(LoggerMixin):
         # a database left on the old names would fail every inventory read after this boot.
         self._migrate_coverage_to_inventory()
 
+        # Also OUTSIDE _migration_step (respec §6.1, REQUIRED-CRITICAL): every channel turn reads
+        # these three columns, and a bot serving traffic without them would run every channel on
+        # the global defaults while the modal cheerfully reported the channel's own settings.
+        self._migrate_channel_capability_columns()
+
+    # ---------------------------------------------------- channel capability columns (respec §6.1)
+
+    _CHANNEL_CAPABILITY_DDL = (
+        ("enable_web_search",
+         "INTEGER CHECK (enable_web_search IS NULL OR enable_web_search IN (0, 1))"),
+        ("enable_mcp",
+         "INTEGER CHECK (enable_mcp IS NULL OR enable_mcp IN (0, 1))"),
+        ("image_model", "TEXT"),
+    )
+
+    # The canonical `channel_settings` shape, in `init_schema` order. The rebuild below recreates
+    # the table from this, so it must stay in step with the CREATE TABLE — which is why the
+    # rebuild refuses to run at all if the live table holds a column this list does not name.
+    _CHANNEL_SETTINGS_COLUMNS = (
+        "channel_id", "response_mode", "directives", "reply_in_channel", "participation_level",
+        "snoozed_until", "muted_threads", "model", "reasoning_effort", "verbosity",
+        "ambient_memory", "enable_web_search", "enable_mcp", "image_model",
+        "updated_ts", "updated_by",
+    )
+
+    def _migrate_channel_capability_columns(self):
+        """Give `channel_settings` the three capability columns, WITH their constraints.
+        FAILS STARTUP.
+
+        `_migration_step` logs and continues, which is the wrong contract here: the capability
+        profile is what a channel turn RUNS on, so a half-migrated schema does not announce
+        itself — it quietly serves every channel the workspace defaults while the settings modal
+        shows, and accepts, per-channel values that go nowhere.
+
+        THREE steps, because "the column exists" and "the column is constrained" are different
+        claims and only the first is fixable with ALTER:
+
+        1. ADD COLUMN for anything missing; the CHECK rides along, which SQLite permits there.
+        2. If a boolean column exists WITHOUT its CHECK — a database built by an intermediate
+           revision, where step 1 sees the name and skips it — REBUILD the table. SQLite cannot
+           attach a constraint to an existing column, and without this §6.1's claim that the
+           storage layer makes `2` unreachable would simply be false for those databases.
+        3. VERIFY, and raise otherwise. This runs regardless of how the earlier steps went, so a
+           later edit that wraps them in a try/except still cannot get past it.
+
+        The read-side validation in `BotConfig._channel_capability_profile` stays either way: it
+        is what covers rows written BEFORE the constraint existed, which SQLite never revalidates.
+        """
+        cursor = self.conn.execute("PRAGMA table_info(channel_settings)")
+        live = [col[1] for col in cursor.fetchall()]
+        existing = set(live)
+
+        # PREFLIGHT, before the first ALTER. A column that ALREADY exists unconstrained is one this
+        # boot will have to rebuild for, and the rebuild refuses a table carrying a column the
+        # canonical list cannot name. Deciding that here is what makes the refusal leave the schema
+        # byte-intact: ADD COLUMN is autocommitted on this connection, so a refusal raised after
+        # one had run would already have rewritten `sqlite_master`, and the operator would be
+        # looking at a table nobody finished migrating. Columns added BELOW carry their CHECK with
+        # them and never trigger a rebuild, so this is the whole of the condition.
+        if any(column in existing for column in self._channel_settings_missing_checks()):
+            self._refuse_unknown_columns(live)
+
+        added = []
+        for column, ddl in self._CHANNEL_CAPABILITY_DDL:
+            if column not in existing:
+                self.conn.execute(
+                    f"ALTER TABLE channel_settings ADD COLUMN {column} {ddl}")
+                added.append(column)
+        if added:
+            self.conn.commit()
+            self.log_info(f"DB: added channel_settings capability columns: {', '.join(added)}")
+
+        if self._channel_settings_missing_checks():
+            self._rebuild_channel_settings_with_checks()
+
+        cursor = self.conn.execute("PRAGMA table_info(channel_settings)")
+        present = {col[1] for col in cursor.fetchall()}
+        missing = [column for column, _ in self._CHANNEL_CAPABILITY_DDL if column not in present]
+        if missing:
+            raise RuntimeError(
+                f"channel_settings is missing the capability column(s) {', '.join(missing)}; "
+                f"refusing to start rather than serve a partial channel capability profile")
+
+    def _refuse_unknown_columns(self, live: List[str]) -> None:
+        """Fail the boot when `channel_settings` carries a column the canonical list cannot name.
+
+        Called TWICE and deliberately so: once as a preflight before any ALTER runs, and once
+        inside the rebuild itself. The preflight is what keeps the refusal byte-intact on a
+        database that also needs columns added; the second call is the rail that cannot be walked
+        past, so no future caller can reach the copy without having been asked this question.
+        Both are cheap and the answer cannot change between them.
+        """
+        unknown = [column for column in live if column not in self._CHANNEL_SETTINGS_COLUMNS]
+        if not unknown:
+            return
+        message = (
+            f"channel_settings carries unrecognised column(s) {', '.join(unknown)}, so it cannot "
+            f"be rebuilt without dropping them; refusing to start rather than drop data or serve "
+            f"an unconstrained capability profile. The table is untouched.")
+        self.log_error(f"DB: {message}")
+        raise RuntimeError(message)
+
+    def _channel_settings_missing_checks(self) -> List[str]:
+        """The boolean capability columns whose CHECK constraint is absent from the live DDL.
+
+        Read off `sqlite_master.sql`, which is the statement the table was actually created with —
+        there is no PRAGMA that reports per-column CHECKs.
+
+        PER CLAUSE, not per DDL. An earlier version searched all the text following the first
+        `CHECK`, which reads as constrained any column merely DECLARED after a constrained one:
+        a table where `enable_web_search` had its check and `enable_mcp` did not answered "both
+        fine" and booted unrepaired, because the string "enable_mcp" appeared downstream in its
+        own plain declaration. Each column now has to be named inside a CHECK clause of its own.
+        """
+        row = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='channel_settings'"
+        ).fetchone()
+        clauses = _check_clauses((row[0] if row else "") or "")
+        return [column for column, spec in self._CHANNEL_CAPABILITY_DDL
+                if "CHECK" in spec and not any(column in clause for clause in clauses)]
+
+    def _rebuild_channel_settings_with_checks(self):
+        """Recreate `channel_settings` so its CHECK constraints exist. FAILS STARTUP.
+
+        The standard SQLite table rebuild, and cheap here: `channel_settings` is a small config
+        table with no foreign keys, no triggers, and no index beyond the primary key's own.
+
+        Columns are copied BY NAME from the canonical list, so a live table carrying a column that
+        list does not know has no safe outcome available here and the boot FAILS. Three options
+        and only one of them is honest: copying the known columns drops the unrecognised one and
+        its data; leaving the table alone and continuing returns a bot serving traffic on an
+        unconstrained table, which is precisely what REQUIRED-CRITICAL and §6.1's storage
+        guarantee forbid; refusing to start leaves the table and every row byte-intact for an
+        operator to look at. Nothing is dropped and nothing is half-migrated — same fail-closed
+        rule the fence's enabled path follows.
+
+        Any stored boolean outside {0, 1} is normalized to NULL on the way across, because the new
+        table's CHECK would otherwise reject the copy and fail the boot: those values are already
+        read as "inherit" by the resolver, so this writes down what the bot was doing anyway.
+        """
+        cursor = self.conn.execute("PRAGMA table_info(channel_settings)")
+        live = [col[1] for col in cursor.fetchall()]
+        self._refuse_unknown_columns(live)
+
+        carried = [column for column in self._CHANNEL_SETTINGS_COLUMNS if column in live]
+        bool_columns = [column for column, spec in self._CHANNEL_CAPABILITY_DDL
+                        if "CHECK" in spec and column in carried]
+        # A boolean outside {0, 1} becomes NULL; everything else copies verbatim.
+        select_list = ", ".join(
+            (f"CASE WHEN {c} IN (0, 1) THEN {c} ELSE NULL END" if c in bool_columns else c)
+            for c in carried)
+
+        rogue = 0
+        for column in bool_columns:
+            rogue += self.conn.execute(
+                f"SELECT COUNT(*) FROM channel_settings "
+                f"WHERE {column} IS NOT NULL AND {column} NOT IN (0, 1)").fetchone()[0]
+
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.conn.execute("""
+                CREATE TABLE channel_settings_new (
+                    channel_id TEXT PRIMARY KEY,
+                    response_mode TEXT DEFAULT 'tag_only',
+                    directives TEXT,
+                    reply_in_channel BOOLEAN DEFAULT 0,
+                    participation_level TEXT,
+                    snoozed_until TEXT,
+                    muted_threads TEXT,
+                    model TEXT,
+                    reasoning_effort TEXT,
+                    verbosity TEXT,
+                    ambient_memory INTEGER,
+                    enable_web_search INTEGER
+                        CHECK (enable_web_search IS NULL OR enable_web_search IN (0, 1)),
+                    enable_mcp INTEGER
+                        CHECK (enable_mcp IS NULL OR enable_mcp IN (0, 1)),
+                    image_model TEXT,
+                    updated_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_by TEXT
+                )
+            """)
+            columns_sql = ", ".join(carried)
+            self.conn.execute(
+                f"INSERT INTO channel_settings_new ({columns_sql}) "
+                f"SELECT {select_list} FROM channel_settings")
+            self.conn.execute("DROP TABLE channel_settings")
+            self.conn.execute("ALTER TABLE channel_settings_new RENAME TO channel_settings")
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+        self.log_info(
+            "DB: rebuilt channel_settings to attach the capability CHECK constraints"
+            + (f"; normalized {rogue} out-of-range boolean value(s) to NULL" if rogue else ""))
+
     # -------------------------------------------------------------- inventory rename (respec §3.5)
 
     def _record_migration_key(self, key: str) -> None:
@@ -2036,7 +2284,8 @@ class DatabaseManager(LoggerMixin):
             return {k: v for k, v in fenced.items() if k != "ambient_memory"}
         cursor = self.conn.execute(
             "SELECT response_mode, reply_in_channel, participation_level, "
-            "snoozed_until, muted_threads, model, reasoning_effort, verbosity, updated_ts, updated_by "
+            "snoozed_until, muted_threads, model, reasoning_effort, verbosity, "
+            "enable_web_search, enable_mcp, image_model, updated_ts, updated_by "
             "FROM channel_settings WHERE channel_id = ?",
             (channel_id,)
         )
@@ -2045,6 +2294,14 @@ class DatabaseManager(LoggerMixin):
             return None
         return {
             "response_mode": row["response_mode"],
+            # The two capability booleans are handed back RAW, not through bool(): the CHECK
+            # constraint arrived after the column, so a legacy row can still hold `2` or `-1`,
+            # and `BotConfig._channel_capability_profile` is the layer that recognises those as
+            # unusable and falls back loudly. Coercing here would make that guard unreachable
+            # and turn a stored `-1` into "web search enabled".
+            "enable_web_search": row["enable_web_search"],
+            "enable_mcp": row["enable_mcp"],
+            "image_model": row["image_model"],
             # NULL reply_in_channel stays None (inherit → resolves to config.reply_in_channel_default
             # at read time). Collapsing NULL to False here erased the inherit distinction.
             "reply_in_channel": (None if row["reply_in_channel"] is None
@@ -2064,7 +2321,9 @@ class DatabaseManager(LoggerMixin):
                              participation_level=_UNSET, snoozed_until=_UNSET,
                              muted_threads=_UNSET,
                              model=_UNSET, reasoning_effort=_UNSET, verbosity=_UNSET,
-                             ambient_memory=_UNSET, updated_by: Optional[str] = None):
+                             ambient_memory=_UNSET,
+                             enable_web_search=_UNSET, enable_mcp=_UNSET, image_model=_UNSET,
+                             updated_by: Optional[str] = None):
         """Upsert per-channel settings (Phase 7; Phase F adds participation_level/snoozed_until).
 
         Atomic partial write: ONLY the explicitly-provided fields are written — omitted fields are
@@ -2082,14 +2341,17 @@ class DatabaseManager(LoggerMixin):
                 response_mode=response_mode, reply_in_channel=reply_in_channel,
                 participation_level=participation_level, snoozed_until=snoozed_until,
                 muted_threads=muted_threads, model=model, reasoning_effort=reasoning_effort,
-                verbosity=verbosity, ambient_memory=ambient_memory, updated_by=updated_by))
+                verbosity=verbosity, ambient_memory=ambient_memory,
+                enable_web_search=enable_web_search, enable_mcp=enable_mcp,
+                image_model=image_model, updated_by=updated_by))
             return
         built = _build_channel_settings_write(
             channel_id, response_mode=response_mode,
             reply_in_channel=reply_in_channel, participation_level=participation_level,
             snoozed_until=snoozed_until, muted_threads=muted_threads, model=model,
             reasoning_effort=reasoning_effort, verbosity=verbosity,
-            ambient_memory=ambient_memory, updated_by=updated_by)
+            ambient_memory=ambient_memory, enable_web_search=enable_web_search,
+            enable_mcp=enable_mcp, image_model=image_model, updated_by=updated_by)
         if built is None:
             return
         sql, params = built
@@ -4006,7 +4268,8 @@ class DatabaseManager(LoggerMixin):
             async with db.execute(
                 "SELECT response_mode, reply_in_channel, participation_level, "
                 "snoozed_until, muted_threads, model, reasoning_effort, verbosity, "
-                "ambient_memory, updated_ts, updated_by "
+                "ambient_memory, enable_web_search, enable_mcp, image_model, "
+                "updated_ts, updated_by "
                 "FROM channel_settings WHERE channel_id = ?",
                 (channel_id,)
             ) as cursor:
@@ -4018,6 +4281,11 @@ class DatabaseManager(LoggerMixin):
                     # F51 opt-out: NULL → None (inherit config.enable_ambient_memory at read time).
                     "ambient_memory": (None if row["ambient_memory"] is None
                                        else bool(row["ambient_memory"])),
+                    # RAW, deliberately — see the sync twin. A legacy pre-CHECK `2` must reach
+                    # the capability resolver as `2` so it can be refused.
+                    "enable_web_search": row["enable_web_search"],
+                    "enable_mcp": row["enable_mcp"],
+                    "image_model": row["image_model"],
                     # NULL stays None (inherit → config.reply_in_channel_default at read time).
                     "reply_in_channel": (None if row["reply_in_channel"] is None
                                          else bool(row["reply_in_channel"])),
@@ -4036,7 +4304,10 @@ class DatabaseManager(LoggerMixin):
                                          participation_level=_UNSET, snoozed_until=_UNSET,
                                          muted_threads=_UNSET,
                                          model=_UNSET, reasoning_effort=_UNSET, verbosity=_UNSET,
-                                         ambient_memory=_UNSET, updated_by: Optional[str] = None):
+                                         ambient_memory=_UNSET,
+                                         enable_web_search=_UNSET, enable_mcp=_UNSET,
+                                         image_model=_UNSET,
+                                         updated_by: Optional[str] = None):
         """Async version of set_channel_settings (Phase F adds participation_level/snoozed_until).
 
         Atomic partial write — ONLY provided fields are written, omitted fields preserved (no
@@ -4052,14 +4323,17 @@ class DatabaseManager(LoggerMixin):
                 response_mode=response_mode, reply_in_channel=reply_in_channel,
                 participation_level=participation_level, snoozed_until=snoozed_until,
                 muted_threads=muted_threads, model=model, reasoning_effort=reasoning_effort,
-                verbosity=verbosity, ambient_memory=ambient_memory, updated_by=updated_by))
+                verbosity=verbosity, ambient_memory=ambient_memory,
+                enable_web_search=enable_web_search, enable_mcp=enable_mcp,
+                image_model=image_model, updated_by=updated_by))
             return
         built = _build_channel_settings_write(
             channel_id, response_mode=response_mode,
             reply_in_channel=reply_in_channel, participation_level=participation_level,
             snoozed_until=snoozed_until, muted_threads=muted_threads, model=model,
             reasoning_effort=reasoning_effort, verbosity=verbosity,
-            ambient_memory=ambient_memory, updated_by=updated_by)
+            ambient_memory=ambient_memory, enable_web_search=enable_web_search,
+            enable_mcp=enable_mcp, image_model=image_model, updated_by=updated_by)
         if built is None:
             return
         sql, params = built
@@ -5797,13 +6071,35 @@ class DatabaseManager(LoggerMixin):
     # known value the first time a blind write lands.
     # =====================================================================================
 
+    # The house busy timeout: how long a stream accessor waits for a locked database before it
+    # gives up. Five seconds is right for a turn-path read that has nothing better to do than
+    # wait — and WRONG for a caller that is already inside a shorter deadline of its own.
+    STREAM_BUSY_TIMEOUT_MS = 5000
+
     @asynccontextmanager
-    async def _stream_conn(self):
-        """Per-call connection with the house pragmas: autocommit, WAL, 5s busy timeout."""
-        async with aiosqlite.connect(self.db_path, isolation_level=None) as db:
+    async def _stream_conn(self, *, busy_timeout_ms: Optional[int] = None):
+        """Per-call connection with the house pragmas: autocommit, WAL, 5s busy timeout.
+
+        `busy_timeout_ms` CAPS THE LOCK WAIT for a caller that is running against a deadline.
+        Cancelling such a read from outside is not enough: `asyncio.wait_for` cancels the
+        coroutine and then waits for it to unwind, and unwinding drains whatever SQLite work is
+        already queued — so a read blocked on a lock can overshoot its caller's deadline by the
+        whole busy timeout (codex verify, P2). The bound has to be inside the connection.
+        Coerced through `int()` because a PRAGMA cannot take a bound parameter.
+        """
+        timeout_ms = (self.STREAM_BUSY_TIMEOUT_MS if busy_timeout_ms is None
+                      else max(0, int(busy_timeout_ms)))
+        # THE CONNECT TIMEOUT AND THE PRAGMA, IN THAT ORDER, AND BOTH ARE NEEDED. `sqlite3`
+        # applies its own 5-second default busy timeout the moment the connection opens, so the
+        # FIRST statement — `journal_mode`, which takes a lock — would wait five seconds on a
+        # locked database however small the PRAGMA that follows it. Measured: capping only the
+        # pragma left a 0.3s-budgeted read blocking for 5.004s. `timeout=` bounds the opening
+        # statements, the PRAGMA bounds every statement after them.
+        async with aiosqlite.connect(self.db_path, isolation_level=None,
+                                     timeout=timeout_ms / 1000.0) as db:
             db.row_factory = aiosqlite.Row
+            await db.execute(f"PRAGMA busy_timeout={timeout_ms}")
             await db.execute("PRAGMA journal_mode=WAL")
-            await db.execute("PRAGMA busy_timeout=5000")
             yield db
 
     # --- bot_meta -----------------------------------------------------------------------
@@ -6697,7 +6993,9 @@ class DatabaseManager(LoggerMixin):
         return {"activity_roots": activity_roots, "receipt_roots": tuple(receipt_roots)}
 
     async def read_channel_sidecars_for_async(self, team_id: str, channel_id: str,
-                                              message_ts: Sequence[str]) -> Dict[str, Any]:
+                                              message_ts: Sequence[str],
+                                              busy_timeout_ms: Optional[int] = None
+                                              ) -> Dict[str, Any]:
         """READ 2. THE RENDER PIN: one transaction, EXACT identities, nothing else.
 
         Replaces the `(floor, high]` window form on the turn path. The window form dragged in
@@ -6714,6 +7012,10 @@ class DatabaseManager(LoggerMixin):
 
         The `IN (...)` lists are CHUNKED at 500 ids per statement inside the one transaction, so
         SQLite's variable limit is never the thing that decides a turn.
+
+        `busy_timeout_ms` is for a caller under a deadline of its own — the search scan reads
+        receipt evidence with whatever is left of its fetch budget, and a five-second lock wait
+        would outlive it. Omitted, the house timeout applies and the turn path is unchanged.
         """
         ids = sorted({str(ts) for ts in (message_ts or ()) if ts})
         payload: Dict[str, Any] = {
@@ -6725,7 +7027,7 @@ class DatabaseManager(LoggerMixin):
         def _chunks() -> List[List[str]]:
             return [ids[i:i + _SIDECAR_ID_CHUNK] for i in range(0, len(ids), _SIDECAR_ID_CHUNK)]
 
-        async with self._stream_conn() as db:
+        async with self._stream_conn(busy_timeout_ms=busy_timeout_ms) as db:
             await db.execute("BEGIN DEFERRED")
             try:
                 async with db.execute(

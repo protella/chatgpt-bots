@@ -12,8 +12,9 @@ from message_processor.routing_facts import POSTURE_THREAD
 from message_processor.stale_send_guard import StaleSendSuppressed
 from message_processor.utilities import effective_request_model
 from message_processor.destination_tools import SET_REPLY_DESTINATION
-from message_processor.turn_runtime import (POST_TO_THREAD_TOOL, TurnEffectsUnsettled,
-                                            await_turn_effects, revoke_turn_effects)
+from message_processor.turn_runtime import (DEST_KIND_POST_TO_THREAD, POST_TO_THREAD_TOOL,
+                                            TurnEffectsUnsettled, await_turn_effects,
+                                            revoke_turn_effects)
 import prompts
 from prompts import (CHANNEL_ACTIVITY_NO_REPLY_SUFFIX, DESTINATION_CONTRACT_SUFFIX,
                      THREAD_ACTIVITY_NO_REPLY_SUFFIX)
@@ -413,7 +414,8 @@ async def _settle_tool_flights(turn: Any) -> None:
 
 
 def _trusted_thread_roots(turn: Any) -> Optional[frozenset]:
-    """The thread roots this turn's SERIALIZED stream showed the model, or None.
+    """The thread roots this turn may post into: what its SERIALIZED stream showed the model,
+    plus what its own tool results have since proved (§2g), or None.
 
     None is not "nothing is allowed" — it is "there is no channel stream to authorize against",
     which is a DM, a background agent's own context, or any turn built without one, and those keep
@@ -425,12 +427,20 @@ def _trusted_thread_roots(turn: Any) -> Optional[frozenset]:
     the widest authorization there is, and a malformed stream is the one thing that must never
     widen anything. Denying every target on a broken stream costs a tool call and an honest error;
     the other way round costs a post into a thread nobody was ever shown.
+
+    The DISCOVERED set unions on top: roots this turn's own search and history results returned,
+    in this channel. They union onto the EMPTY set too, which is correct — a root proved by a
+    tool result was proved by Slack, not by the stream that failed to render.
     """
     stream = getattr(turn, "channel_stream", None) if turn is not None else None
     if stream is None:
         return None
     roots = getattr(stream, "trusted_thread_roots", None)
-    return roots if isinstance(roots, frozenset) else frozenset()
+    base = roots if isinstance(roots, frozenset) else frozenset()
+    # Type-checked on the way out for the same reason the base set is: a turn that cannot say
+    # what its tools proved widens nothing.
+    discovered = getattr(turn, "discovered_thread_roots", None)
+    return base | (discovered if isinstance(discovered, frozenset) else frozenset())
 
 
 def _prompt_tools_available(registry: Any) -> Optional[bool]:
@@ -546,10 +556,16 @@ class TextHandlerMixin:
         gate_woke = meta.get("gate_woke") is True
         request_config["_structural_change_authorized"] = bool(
             meta.get("sender_type") == "human" and (not gate_required or gate_woke))
-        # BF1: Slack's Data Access API mints action_token only on @mention channel events and
-        # DMs; unmentioned channel-listening turns (participation-gated and thread-continuation)
-        # never carry one, so search_slack is dead weight there. Gate its schema on the token's
-        # presence — the runtime token checks in search_tool stay as defense in depth.
+        # BF1, NOW A DM-ONLY FACT. Slack's Data Access API mints action_token on @mention
+        # channel events and DMs, and `assistant.search.context` cannot be called without one —
+        # so this flag hides the DM surface's search schema when the event carried no token, and
+        # the runtime token check in search_tool stays as defense in depth.
+        #
+        # IT SAYS NOTHING ABOUT A CHANNEL TURN ANY MORE. The channel/MPIM surface runs the
+        # in-channel scan on the bot token, needs no action_token, and is registered statically
+        # (slack_client/base.py) — per-request `enabled` gates are structurally ignored there.
+        # An unmentioned, token-less channel turn now searches; "dead weight without a token"
+        # was true of the assistant backend only.
         request_config["_slack_search_available"] = bool(meta.get("action_token"))
         if tools_disabled:
             return None, request_config, False, None
@@ -1356,6 +1372,19 @@ class TextHandlerMixin:
                           "posted": False}
             )
 
+        # Attribution lists only EXTERNAL sources (web_search + MCP servers). Local
+        # context tools (history fetches, reactions, memory ops) are plumbing, not
+        # sources — never shown. Same for code_interpreter: it is the model doing its own
+        # arithmetic, not a place the information came from (visible_attribution_tools).
+        # Filtered into a SEPARATE list — tools_actually_used still feeds the F7 provenance
+        # record, which the model needs in order to answer "how did you get that?".
+        #
+        # HOISTED ABOVE THE WORDS-ELSEWHERE RETURN (§5.4a), matching the streaming twin: it is a
+        # pure filter over two lists neither branch touches, and hoisting it means the ordinary
+        # reply and the cross-thread post build provenance from the SAME inputs.
+        local_names = {c.get("name") for c in local_tool_calls if c.get("name")}
+        tools_actually_used = [t for t in tools_actually_used if t not in local_names]
+
         # Bare empty response with no terminal tool and no reaction (contract violation /
         # glitch): decide the empty outcome HERE, before any assistant-state append or
         # post-response memory cleanup — never persist an empty assistant turn. main.py
@@ -1384,6 +1413,19 @@ class TextHandlerMixin:
                 self.log_info(
                     "Empty reply text after this turn's words landed elsewhere — posting nothing "
                     "here")
+                # §5.4a, the NON-STREAMING twin of the same hole: this path returns before the F7
+                # block below, so without this a cross-thread post made on the non-streaming
+                # route would still be the one reply kind with no "which tools produced this"
+                # record. Same writer, same names-and-gists scope, keyed on the DESTINATION post
+                # rather than the turn's own trigger, and COMMITTED destinations only — an
+                # observed-only surface is one the turn never stood behind.
+                if config.enable_tool_provenance:
+                    provenance = build_provenance(local_tool_calls, tools_actually_used)
+                    for record in turn.committed_destinations:
+                        if record.kind == DEST_KIND_POST_TO_THREAD and record.first_ts:
+                            self._persist_tool_provenance(
+                                record.channel_id, record.first_ts,
+                                f"{record.channel_id}:{record.thread_root_ts}", provenance)
                 return Response(
                     type="text",
                     content="",
@@ -1401,14 +1443,6 @@ class TextHandlerMixin:
                 metadata={"model": thread_config.get("model"), "posted": False}
             )
 
-        # Attribution lists only EXTERNAL sources (web_search + MCP servers). Local
-        # context tools (history fetches, reactions, memory ops) are plumbing, not
-        # sources — never shown. Same for code_interpreter: it is the model doing its own
-        # arithmetic, not a place the information came from (visible_attribution_tools).
-        # Filtered into a SEPARATE list — tools_actually_used still feeds the F7 provenance
-        # record, which the model needs in order to answer "how did you get that?".
-        local_names = {c.get("name") for c in local_tool_calls if c.get("name")}
-        tools_actually_used = [t for t in tools_actually_used if t not in local_names]
         attribution_tools = visible_attribution_tools(tools_actually_used)
 
         # The model may still owe a destination on this path (the non-streaming loop runs the
@@ -2929,33 +2963,13 @@ class TextHandlerMixin:
                                   _reaction_committed(local_tool_calls)}
                 )
 
-            # The turn's words went into ANOTHER thread (post_to_thread), or a picture posted
-            # itself. Empty prose here is the real ending, not a glitch — so tear down the
-            # streaming surface we never committed to and post nothing, rather than reaching the
-            # finalizer, which would apologize for "not generating a response" directly under an
-            # answer the room can already read somewhere else. Only while nothing visible has
-            # streamed: committed words are never retracted.
-            if (turn is not None and getattr(turn, "visible_action_committed", False)
-                    and not (response_text or "").strip() and not visible_content_delivered):
-                self.log_info(
-                    "Streamed turn ended with its words elsewhere — removing the placeholder")
-                await self._cleanup_silent_stream(
-                    client, message.channel_id, native_coord, message_id, current_message_id,
-                    "words-elsewhere", receipts=receipts)
-                return Response(
-                    type="text",
-                    content="",
-                    metadata={"streamed": True, "model": thread_config.get("model"),
-                              "posted": False,
-                              "artifact_containers": artifact_containers,
-                              "sandbox_image_assets": sandbox_assets,
-                              "mounted_digests": mounted_digests,
-                              "response_reaction_committed":
-                                  _reaction_committed(local_tool_calls)}
-                )
-
             # Build list of tools used (unified attribution). EXTERNAL sources only
             # (web_search + MCP) — local context tools are plumbing, never listed.
+            #
+            # HOISTED ABOVE THE WORDS-ELSEWHERE RETURN (§5.4a): it is a pure read of counters
+            # neither branch touches, and building it here means the ordinary reply and the
+            # cross-thread post derive provenance from the SAME two inputs — `local_tool_calls`
+            # and `tools_used` — instead of the early path inventing a reduced version.
             tools_used = []
             if search_counts["web_search"] > 0:
                 tools_used.append("web_search")
@@ -2974,6 +2988,52 @@ class TextHandlerMixin:
             for name in loop_external_used:
                 if name not in tools_used:
                     tools_used.append(name)
+
+            # The turn's words went into ANOTHER thread (post_to_thread), or a picture posted
+            # itself. Empty prose here is the real ending, not a glitch — so tear down the
+            # streaming surface we never committed to and post nothing, rather than reaching the
+            # finalizer, which would apologize for "not generating a response" directly under an
+            # answer the room can already read somewhere else. Only while nothing visible has
+            # streamed: committed words are never retracted.
+            if (turn is not None and getattr(turn, "visible_action_committed", False)
+                    and not (response_text or "").strip() and not visible_content_delivered):
+                self.log_info(
+                    "Streamed turn ended with its words elsewhere — removing the placeholder")
+                # §5.4a: this path returns before the F7 block below, so a cross-thread post was
+                # the ONE reply kind whose "which tools produced this" record was silently
+                # missing — the very reply an operator asking "where did this come from?" asks
+                # about. Keyed on the DESTINATION post, the message the provenance describes,
+                # never on this turn's own trigger.
+                #
+                # COMMITTED destinations only: `turn.destinations` also holds observed-only
+                # records — Slack accepted a surface this turn never stood behind — and writing
+                # those would attribute this turn's tools to a message it did not commit to.
+                #
+                # Names and gists, deliberately not the F12 MCP result digests an ordinary reply
+                # appends: those are built from `mcp_results` in a block this path returns
+                # before, and reaching back for them would mean restructuring the ordinary path
+                # to serve this one.
+                if config.enable_tool_provenance:
+                    provenance = build_provenance(local_tool_calls, tools_used)
+                    for record in turn.committed_destinations:
+                        if record.kind == DEST_KIND_POST_TO_THREAD and record.first_ts:
+                            self._persist_tool_provenance(
+                                record.channel_id, record.first_ts,
+                                f"{record.channel_id}:{record.thread_root_ts}", provenance)
+                await self._cleanup_silent_stream(
+                    client, message.channel_id, native_coord, message_id, current_message_id,
+                    "words-elsewhere", receipts=receipts)
+                return Response(
+                    type="text",
+                    content="",
+                    metadata={"streamed": True, "model": thread_config.get("model"),
+                              "posted": False,
+                              "artifact_containers": artifact_containers,
+                              "sandbox_image_assets": sandbox_assets,
+                              "mounted_digests": mounted_digests,
+                              "response_reaction_committed":
+                                  _reaction_committed(local_tool_calls)}
+                )
 
             # Top-level channel replies stay chrome-free; attribution rides only in threads and
             # DMs. Binding is idempotent: it already happened at the first word of a streamed

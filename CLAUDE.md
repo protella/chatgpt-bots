@@ -10,7 +10,7 @@ stateless: Slack is the source of truth, and context is rebuilt from platform hi
 ## Commands
 
 ```bash
-source venv/bin/activate
+source .venv/bin/activate
 python3 -m pip install --require-hashes -r requirements.txt   # or: make install
 
 python3 slackbot.py                 # run the bot (see "Live dev-bot testing" below)

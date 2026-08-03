@@ -23,9 +23,9 @@ class TestBotConfig:
         assert config.openai_api_key == 'sk-test-key'
         
         # Check model configuration
-        assert config.gpt_model == 'gpt-5'
+        assert config.gpt_model == 'gpt-5.6-sol'
         assert config.default_reasoning_effort == 'medium'
-        assert config.default_verbosity == '2'
+        assert config.default_verbosity == 'medium'
     
     def test_temperature_float_conversion(self, mock_env):
         """Test that temperature is properly converted to float"""
@@ -197,17 +197,40 @@ class TestBotConfig:
         
         with pytest.raises(ValueError, match="OPENAI_KEY is required"):
             config.validate()
-    
+
+    def test_boot_rejects_an_invalid_global_default(self, mock_env, monkeypatch):
+        """T104 (respec §6.2). GPT_MODEL, GPT_IMAGE_MODEL and DEFAULT_VERBOSITY must each be a
+        value the application actually supports.
+
+        This is what makes the channel capability resolver's fallbacks safe: it answers an
+        unusable STORED value with the GLOBAL default, so an unusable global would turn one bad
+        channel row into a request the API refuses. Refusing to boot is the only place that can
+        be ruled out.
+        """
+        good = {"GPT_MODEL": "gpt-5.6-sol", "GPT_IMAGE_MODEL": "gpt-image-2",
+                "DEFAULT_VERBOSITY": "medium"}
+        for var, value in good.items():
+            monkeypatch.setenv(var, value)
+        assert BotConfig().validate() is True
+
+        for var, bad in (("GPT_MODEL", "gpt-4o"),
+                         ("GPT_IMAGE_MODEL", "dall-e-3"),
+                         ("DEFAULT_VERBOSITY", "verbose")):
+            monkeypatch.setenv(var, bad)
+            with pytest.raises(ValueError, match=var):
+                BotConfig().validate()
+            monkeypatch.setenv(var, good[var])
+
     def test_get_thread_config_default(self, mock_env):
         """Test get_thread_config returns default configuration"""
         config = BotConfig()
         thread_config = config.get_thread_config()
         
-        assert thread_config["model"] == 'gpt-5'
+        assert thread_config["model"] == 'gpt-5.6-sol'
         assert thread_config["temperature"] == 0.7
         assert thread_config["max_tokens"] == 4096
         assert thread_config["reasoning_effort"] == 'medium'
-        assert thread_config["verbosity"] == '2'
+        assert thread_config["verbosity"] == 'medium'
         assert thread_config["enable_streaming"] is True
         assert thread_config["image_size"] == "1024x1024"
         assert thread_config["image_quality"] == "auto"
@@ -231,7 +254,7 @@ class TestBotConfig:
         assert thread_config["custom_param"] == "custom_value"
         # Check that non-overridden values remain default
         assert thread_config["reasoning_effort"] == 'medium'
-        assert thread_config["verbosity"] == '2'
+        assert thread_config["verbosity"] == 'medium'
     
     def test_utility_parameters(self, mock_env):
         """Test utility-specific parameters"""
@@ -419,9 +442,9 @@ class TestBotConfig:
         )
         
         # Verify defaults are used
-        assert thread_config["model"] == 'gpt-5'
+        assert thread_config["model"] == 'gpt-5.6-sol'
         assert thread_config["reasoning_effort"] == 'medium'
-        assert thread_config["verbosity"] == '2'
+        assert thread_config["verbosity"] == 'medium'
         
     def test_get_thread_config_priority_order(self, mock_env):
         """Test that override priority is: thread > user > system"""

@@ -109,6 +109,8 @@ ANALYSIS_REASONING_EFFORT = "medium"
 ANALYSIS_VERBOSITY = "medium"
 GPT_IMAGE_MODEL = "gpt-image-2"    # unchanged
 DEFAULT_DETAIL_LEVEL = "auto"      # unchanged — and `auto` IS the max, see below
+TOKEN_CLEANUP_THRESHOLD = "0.5"    # was 0.9 — owner 2026-08-03: start thread compaction at 50%; quality degrades long before the limit
+TOKEN_COMPACTION_TARGET = "0.4"    # was 0.7 — must stay BELOW the threshold or compaction never converges
 ```
 
 **Leave `DEFAULT_DETAIL_LEVEL` at `auto`.** On the 5.6 family `auto` (and an omitted detail) is

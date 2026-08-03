@@ -781,9 +781,9 @@ def test_the_prompt_forbids_the_gate_from_doing_the_responders_job():
 
     assert "You are not the assistant" in p
     assert "You only decide whether the assistant gets a turn" in p
-    # And it is told to prefer waking when unsure — a false wake costs a call and can end in
-    # silence; a false sleep loses the answer.
-    assert "When you are unsure, wake it" in p
+    # And it is told to prefer waking when the doubt is whether a task needs it — a false wake
+    # costs a call and can end in silence; a false sleep loses the answer.
+    assert "If you cannot tell whether a genuine task or question needs it, wake it" in p
 
 
 class TestQueueBatchAndCohortInterop:

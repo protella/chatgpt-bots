@@ -169,6 +169,19 @@ class SlackSettingsHandlersMixin:
         cs['reasoning_effort'] = _sel('channel_effort_block', 'channel_reasoning_effort')
         cs['verbosity'] = _sel('channel_verbosity_block', 'channel_verbosity')
 
+        # The capability controls carry the same rule as the three above — an unsaved choice must
+        # survive the model-change rebuild — but they round-trip through the STORED shape the
+        # builder reads (1/0/NULL), not through the select's own values. A block that isn't on
+        # screen at all leaves the stored value untouched.
+        for block, action, field in (
+                ('channel_web_search_block', 'channel_enable_web_search', 'enable_web_search'),
+                ('channel_mcp_block', 'channel_enable_mcp', 'enable_mcp')):
+            if block in state:
+                val = _sel(block, action)
+                cs[field] = None if val is None else (1 if val == 'on' else 0)
+        if 'channel_image_model_block' in state:
+            cs['image_model'] = _sel('channel_image_model_block', 'channel_image_model')
+
         level = _sel('participation_block', 'participation_level')
         cs['participation_level'] = level
         # Keep response_mode in lockstep with the in-flight level. Without this, moving the control
@@ -460,8 +473,10 @@ class SlackSettingsHandlersMixin:
             # thread-scoped "stop" is guidance-only now (no durable store); channel memory is the
             # only persisted per-channel state, edited via the textarea reconciled below.
 
-            # Shared response settings (model/effort/verbosity): 'inherit' clears to NULL
-            # so the asker's personal preferences apply again.
+            # Shared response settings (model/effort/verbosity): 'inherit' clears to NULL, and on
+            # a channel turn NULL resolves to the WORKSPACE default — not to the asker's personal
+            # preferences, which stopped applying in a channel when the capability keys left the
+            # per-user hierarchy (config.CHANNEL_CAPABILITY_KEYS).
             def _sel(block, action):
                 opt = state.get(block, {}).get(action, {}).get('selected_option') or {}
                 val = opt.get('value', 'inherit')
@@ -470,6 +485,23 @@ class SlackSettingsHandlersMixin:
             channel_model = _sel('channel_model_block', 'channel_model')
             channel_effort = _sel('channel_effort_block', 'channel_reasoning_effort')
             channel_verbosity = _sel('channel_verbosity_block', 'channel_verbosity')
+
+            # The three capability controls (respec §6.3). An ABSENT block and a block sitting on
+            # 'inherit' are DIFFERENT submissions and `_sel` cannot tell them apart — it answers
+            # 'inherit' for both. A modal opened before this release carries none of these blocks,
+            # and its Save must leave the channel's capabilities exactly as they are, so an absent
+            # block omits the argument entirely (_UNSET preserves) while a present one on
+            # 'inherit' passes None (clears to NULL, back to the workspace default).
+            capability_kwargs = {}
+            if 'channel_web_search_block' in state:
+                val = _sel('channel_web_search_block', 'channel_enable_web_search')
+                capability_kwargs['enable_web_search'] = None if val is None else (val == 'on')
+            if 'channel_mcp_block' in state:
+                val = _sel('channel_mcp_block', 'channel_enable_mcp')
+                capability_kwargs['enable_mcp'] = None if val is None else (val == 'on')
+            if 'channel_image_model_block' in state:
+                capability_kwargs['image_model'] = _sel('channel_image_model_block',
+                                                        'channel_image_model')
 
             # Ambient-memory opt-out (F51): the checkbox is only rendered when the global master
             # switch is on, so its block is present only then. Checked → capturing (store None so
@@ -489,10 +521,11 @@ class SlackSettingsHandlersMixin:
                     response_mode=response_mode,          # None → clears override
                     reply_in_channel=reply_in_channel,
                     participation_level=participation_level,  # None → clears override
-                    model=channel_model,                  # None → each person's own setting
+                    model=channel_model,                  # None → the workspace default
                     reasoning_effort=channel_effort,
                     verbosity=channel_verbosity,
                     updated_by=user_id,
+                    **capability_kwargs,
                     **ambient_kwargs,
                 )
                 default_level = MODE_TO_LEVEL.get(getattr(config, 'channel_response_mode', 'tag_only'), 'mentions_only')

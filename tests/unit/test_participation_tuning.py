@@ -23,6 +23,7 @@ import pytest
 
 from config import config
 from prompts import (
+    LOCAL_TOOLS_GUIDANCE,
     SLACK_SYSTEM_PROMPT,
     WAKE_CLASSIFIER_SYSTEM_PROMPT,
     CHANNEL_ACTIVITY_NO_REPLY_SUFFIX,
@@ -56,6 +57,39 @@ def test_c2_truthfulness_sentence_present():
     s = SLACK_SYSTEM_PROMPT
     assert "don't fake familiarity" in s
     assert "a confident wrong guess reads far worse than either" in s
+
+
+def test_the_voice_paragraph_keeps_the_tone_boundary():
+    """The tuning wave's tone rule, pinned as CONTENT rather than as a paragraph.
+
+    Nothing else can catch its deletion. The banter scenarios grade whether the bot SPEAKS, and a
+    reply that makes a coworker the punchline scores exactly like a kind one — the 2026-08-03
+    incident reply would have passed every row in the corpus. So the boundary is pinned here, on
+    its load-bearing nouns rather than its sentences, which leaves the wording free to be edited
+    and still fails if the rule is dropped. Live review stays the behavioural authority.
+    """
+    voice = SLACK_SYSTEM_PROMPT.split("\n\n")[1]
+    assert voice.startswith("Voice:")
+    assert "warmth" in voice and "cruelty" in voice
+    for target in ("competence", "character", "vulnerability"):
+        assert target in voice, f"the tone boundary no longer names {target}"
+    assert "at their own expense" in voice, "the self-deprecation half of the rule is gone"
+    # …and the boundary did not swallow what it qualifies: teasing aimed at the bot still gets a
+    # beat back, which `banter-aimed-at-self` measures at the behavioural level.
+    assert "give it back in kind" in voice and "comeback" in voice
+
+
+def test_the_emoji_bullet_keeps_the_shared_moment_guidance():
+    """Same argument, the reactions ruling. `team-welcome` is a measure row BY DESIGN — the form a
+    welcome takes is the model's call — so deleting this guidance fails nothing in the corpus.
+
+    Pinned to the emoji bullet itself, not to the file: guidance about reactions living in some
+    other bullet is not the contract, and the wording is generic on purpose (no occasion list).
+    """
+    bullet = next(line for line in LOCAL_TOOLS_GUIDANCE.splitlines()
+                  if line.startswith("- Emoji reactions:"))
+    for needle in ("marking a moment", "fitting reaction", "warm line", "not both by default"):
+        assert needle in bullet, f"the reaction guidance no longer says {needle!r}"
 
 
 # =========================================== C1 composition on the real name-mention turn
@@ -139,7 +173,10 @@ def test_search_schema_present_only_with_action_token(mock_env):
 
 @pytest.mark.asyncio
 async def test_search_tool_runtime_still_refuses_without_token():
-    # Defense in depth: even if a schema slips through, the executor refuses tokenless calls.
+    # Defense in depth ON THE DM SURFACE: even if a schema slips through, the assistant-context
+    # executor refuses tokenless calls. The gate is a DM fact now — a CHANNEL turn runs the
+    # bot-token in-channel scan, which needs no action_token and must NOT refuse without one
+    # (CHANNEL_SEARCH_REBUILD §S9), so the surface is stated here rather than defaulted.
     class _Bot(SlackSearchToolMixin):
         def __init__(self):
             self.app = MagicMock()
@@ -147,7 +184,8 @@ async def test_search_tool_runtime_still_refuses_without_token():
         def log_info(self, *a, **k): pass
         log_debug = log_warning = log_error = log_info
 
-    out = await _Bot().execute_search_tool(ToolContext(action_token=None), {"query": "x"})
+    out = await _Bot().execute_search_tool(
+        ToolContext(action_token=None, is_dm=True), {"query": "x"})
     assert out["ok"] is False and out["error"] == "search_unavailable"
 
 
