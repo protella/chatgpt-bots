@@ -92,8 +92,9 @@ class TestPromptRule:
         for retired in ("tools as they are described to it",
                         "genuinely open to the channel at large", "own tools/data sources"):
             assert retired not in p, retired
-        # What replaced it, in one line: generosity, because the responder can still say nothing.
-        assert "When you are unsure, wake it" in p
+        # What replaced it, in one line: generosity, because the responder can still say nothing —
+        # scoped since the tuning wave to the doubt it was written for.
+        assert "If you cannot tell whether a genuine task or question needs it, wake it" in p
 
 
 # ------------------------------------------------------ F14b attachment signals

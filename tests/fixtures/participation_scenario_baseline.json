@@ -1,7 +1,7 @@
 {
   "tier1": {
-    "false_wake_rate": 0.1077,
-    "false_wakes": 7,
+    "false_wake_rate": 0.0133,
+    "false_wakes": 1,
     "scenarios": {
       "asked-own-model": {
         "decided": 5,
@@ -9,6 +9,11 @@
         "wakes": 5
       },
       "asked-own-system-prompt": {
+        "decided": 5,
+        "label": "must_wake",
+        "wakes": 5
+      },
+      "banter-aimed-at-self": {
         "decided": 5,
         "label": "must_wake",
         "wakes": 5
@@ -51,7 +56,7 @@
       "emoji-only": {
         "decided": 5,
         "label": "must_sleep",
-        "wakes": 0
+        "wakes": 1
       },
       "explicit-task": {
         "decided": 5,
@@ -61,12 +66,17 @@
       "file-no-words": {
         "decided": 5,
         "label": "either",
-        "wakes": 1
+        "wakes": 0
+      },
+      "here-status-no-ask": {
+        "decided": 5,
+        "label": "must_sleep_hard",
+        "wakes": 0
       },
       "human-chatter": {
         "decided": 5,
         "label": "must_sleep",
-        "wakes": 2
+        "wakes": 0
       },
       "hush": {
         "decided": 5,
@@ -86,7 +96,7 @@
       "musing": {
         "decided": 5,
         "label": "either",
-        "wakes": 5
+        "wakes": 2
       },
       "name-typo": {
         "decided": 5,
@@ -123,6 +133,11 @@
         "label": "either",
         "wakes": 5
       },
+      "open-question-answerable": {
+        "decided": 5,
+        "label": "must_wake",
+        "wakes": 5
+      },
       "other-bot-asks-a-human": {
         "decided": 5,
         "label": "must_sleep",
@@ -146,7 +161,7 @@
       "question-to-a-person": {
         "decided": 5,
         "label": "must_sleep",
-        "wakes": 5
+        "wakes": 0
       },
       "reinvite": {
         "decided": 5,
@@ -156,6 +171,11 @@
       "routine-close": {
         "decided": 5,
         "label": "must_sleep",
+        "wakes": 0
+      },
+      "self-deprecating-banter": {
+        "decided": 5,
+        "label": "must_sleep_hard",
         "wakes": 0
       },
       "statement-of-fact": {
@@ -173,10 +193,15 @@
         "label": "either",
         "wakes": 5
       },
+      "team-welcome": {
+        "decided": 5,
+        "label": "must_wake",
+        "wakes": 5
+      },
       "thanks-closer": {
         "decided": 5,
         "label": "either",
-        "wakes": 5
+        "wakes": 3
       },
       "thanks-to-other-human": {
         "decided": 5,
@@ -194,7 +219,7 @@
         "wakes": 5
       }
     },
-    "sleep_trials": 65
+    "sleep_trials": 75
   },
   "tier2": {
     "scenarios": {
@@ -207,6 +232,20 @@
           "silence",
           "silence",
           "silence"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "banter-aimed-at-self": {
+        "bar": "hard",
+        "expected": [
+          "in_thread_reply",
+          "channel_reply"
+        ],
+        "outcomes": [
+          "channel_reply",
+          "channel_reply",
+          "channel_reply"
         ],
         "passes": 3,
         "trials": 3
@@ -305,6 +344,19 @@
         "passes": 3,
         "trials": 3
       },
+      "firsthand-experience-poll": {
+        "bar": "hard",
+        "expected": [
+          "silence"
+        ],
+        "outcomes": [
+          "silence",
+          "silence",
+          "silence"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
       "foreign-banter": {
         "bar": "hard",
         "expected": [
@@ -398,6 +450,20 @@
         "passes": 3,
         "trials": 3
       },
+      "open-question-answerable": {
+        "bar": "hard",
+        "expected": [
+          "in_thread_reply",
+          "channel_reply"
+        ],
+        "outcomes": [
+          "channel_reply",
+          "channel_reply",
+          "channel_reply"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
       "other-bot-already-answered": {
         "bar": "hard",
         "expected": [
@@ -452,6 +518,33 @@
         "passes": 3,
         "trials": 3
       },
+      "search-then-answer-there": {
+        "bar": "hard",
+        "expected": [
+          "cross_thread_post"
+        ],
+        "outcomes": [
+          "cross_thread_post",
+          "cross_thread_post",
+          "cross_thread_post"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "self-deprecating-banter": {
+        "bar": "hard",
+        "expected": [
+          "silence",
+          "reaction_only"
+        ],
+        "outcomes": [
+          "silence",
+          "silence",
+          "silence"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
       "strangers-exchange-no-post": {
         "bar": "hard",
         "expected": [
@@ -460,6 +553,21 @@
         ],
         "outcomes": [
           "silence",
+          "reaction_only",
+          "reaction_only"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "team-welcome": {
+        "bar": "measure",
+        "expected": [
+          "reaction_only",
+          "channel_reply",
+          "in_thread_reply"
+        ],
+        "outcomes": [
+          "reaction_only",
           "reaction_only",
           "reaction_only"
         ],

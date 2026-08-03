@@ -540,3 +540,211 @@ async def test_the_versions_hash_material_is_the_pinned_grammar(temp_db):
     polluted.update({"coverage": {"inventory_start_ts": "5.0"}, "window": ("5.0", True),
                      "activity": [{"root_ts": "9.9", "dirty": 1}]})
     assert temp_db._sidecar_versions_hash(polluted) == payload["versions_hash"]
+
+
+# --------------------------------------------------- the capability migration (respec §6.1)
+
+
+def test_the_capability_migration_is_required_critical(tmp_path, monkeypatch):
+    """T109. A database where the `ALTER TABLE` fails FAILS STARTUP.
+
+    `_migration_step` logs and carries on, which is right for a migration whose absence announces
+    itself. This one's does not: without the three columns every channel silently runs on the
+    workspace defaults while the settings modal shows, and accepts, per-channel values that go
+    nowhere. So the migration sits OUTSIDE `_migration_step` and its failure propagates.
+    """
+    import sqlite3
+
+    monkeypatch.setenv("DATABASE_DIR", str(tmp_path))
+    db = DatabaseManager(platform="slack")
+
+    class _RefusingConn:
+        """The real connection, with `ADD COLUMN` broken — a disk that will not take the write."""
+
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, sql, *args, **kwargs):
+            if "ADD COLUMN" in sql:
+                raise sqlite3.OperationalError("disk I/O error")
+            return self._real.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    try:
+        # Reproduce a pre-W4 database: the table is there, the capability columns are not.
+        for column, _ddl in DatabaseManager._CHANNEL_CAPABILITY_DDL:
+            db.conn.execute(f"ALTER TABLE channel_settings DROP COLUMN {column}")
+        db.conn = _RefusingConn(db.conn)
+
+        # Driven through `init_schema`, which is what startup runs — calling the migration
+        # directly would pass even if it were wrapped back up in `_migration_step`, since that
+        # wrapper lives at the call site. Which exception reaches the caller is not the claim;
+        # that one does is. A swallowed failure here is a bot serving a partial profile.
+        with pytest.raises((sqlite3.Error, RuntimeError)):
+            db.init_schema()
+    finally:
+        db.conn.close()
+
+
+def _unconstrained_channel_settings(db, web_search_check=False, omit=()):
+    """A `channel_settings` as an intermediate revision would have left it: the capability
+    columns present, without their CHECK constraints.
+
+    `web_search_check` builds the PARTIALLY constrained variant — enable_web_search constrained,
+    enable_mcp not. That is the state a detector reading the DDL as one blob calls healthy, since
+    the string "enable_mcp" turns up downstream of the first CHECK in its own declaration.
+
+    `omit` leaves capability columns off entirely, which is what makes the migration run its
+    ADD COLUMN step — the MIXED shape, where a boot has both columns to add and an existing
+    unconstrained one to rebuild for.
+    """
+    web_search = ("INTEGER CHECK (enable_web_search IS NULL OR enable_web_search IN (0, 1))"
+                  if web_search_check else "INTEGER")
+    capability = [("enable_web_search", web_search), ("enable_mcp", "INTEGER"),
+                  ("image_model", "TEXT")]
+    declarations = "".join(f"{name} {spec}, " for name, spec in capability if name not in omit)
+    db.conn.execute("DROP TABLE channel_settings")
+    db.conn.execute(f"""
+        CREATE TABLE channel_settings (
+            channel_id TEXT PRIMARY KEY, response_mode TEXT DEFAULT 'tag_only', directives TEXT,
+            reply_in_channel BOOLEAN DEFAULT 0, participation_level TEXT, snoozed_until TEXT,
+            muted_threads TEXT, model TEXT, reasoning_effort TEXT, verbosity TEXT,
+            ambient_memory INTEGER, {declarations}
+            updated_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_by TEXT)
+    """)
+
+
+def test_an_unconstrained_legacy_table_is_rebuilt_with_its_checks(tmp_path, monkeypatch):
+    """SQLite cannot attach a constraint to an existing column, so a database whose capability
+    columns were added without one is REBUILT — otherwise §6.1's claim that the storage layer
+    makes `2` unreachable is simply false for those databases, and the ADD COLUMN step skips
+    them forever because the names are already there.
+
+    Rows survive the rebuild; a stored value outside {0, 1} normalizes to NULL, which is what the
+    resolver already reads it as and the only way the new table's CHECK can accept the copy.
+    """
+    import sqlite3
+
+    monkeypatch.setenv("DATABASE_DIR", str(tmp_path))
+    db = DatabaseManager(platform="slack")
+    try:
+        _unconstrained_channel_settings(db)
+        db.conn.execute("INSERT INTO channel_settings (channel_id, enable_web_search, enable_mcp, "
+                        "model, participation_level) VALUES ('C1', 2, 0, 'gpt-5.5', 'on')")
+        db.conn.execute("INSERT INTO channel_settings (channel_id, enable_web_search) "
+                        "VALUES ('C2', 1)")
+        assert db._channel_settings_missing_checks() == ["enable_web_search", "enable_mcp"]
+
+        db._migrate_channel_capability_columns()
+
+        assert db._channel_settings_missing_checks() == []
+        row = db.get_channel_settings("C1")
+        assert row["enable_web_search"] is None      # the unusable 2, written down as inherit
+        assert (row["enable_mcp"], row["model"]) == (0, "gpt-5.5")
+        assert row["participation_level"] == "on"    # untouched columns rode across
+        assert db.get_channel_settings("C2")["enable_web_search"] == 1
+        with pytest.raises(sqlite3.IntegrityError):
+            db.conn.execute("INSERT INTO channel_settings (channel_id, enable_web_search) "
+                            "VALUES ('C9', 2)")
+        db._migrate_channel_capability_columns()     # idempotent: nothing left to rebuild
+    finally:
+        db.conn.close()
+
+
+def test_a_partially_constrained_table_is_still_rebuilt(tmp_path, monkeypatch):
+    """One column constrained and the other not is the state a whole-DDL search misses, because
+    the unconstrained column's own declaration sits after the constrained one's CHECK and reads
+    as if it were inside it. Detection is per clause, so the rebuild still fires — and BOTH
+    columns come out constrained, which is the half the all-or-nothing case never probes.
+    """
+    import sqlite3
+
+    monkeypatch.setenv("DATABASE_DIR", str(tmp_path))
+    db = DatabaseManager(platform="slack")
+    try:
+        _unconstrained_channel_settings(db, web_search_check=True)
+        db.conn.execute("INSERT INTO channel_settings (channel_id, enable_mcp, verbosity) "
+                        "VALUES ('C1', 1, 'high')")
+        assert db._channel_settings_missing_checks() == ["enable_mcp"]
+
+        db._migrate_channel_capability_columns()
+
+        assert db._channel_settings_missing_checks() == []
+        row = db.get_channel_settings("C1")
+        assert (row["enable_mcp"], row["verbosity"]) == (1, "high")
+        for column in ("enable_web_search", "enable_mcp"):
+            with pytest.raises(sqlite3.IntegrityError):
+                db.conn.execute(
+                    f"INSERT INTO channel_settings (channel_id, {column}) VALUES (?, 2)",
+                    (f"C_{column}",))
+    finally:
+        db.conn.close()
+
+
+def test_an_unrecognised_column_fails_startup_with_the_data_intact(tmp_path, monkeypatch):
+    """The rebuild copies BY NAME from a canonical column list, so a column that list does not
+    know has no safe outcome: copying drops it and its data, continuing serves traffic on an
+    unconstrained table. Both are refused — the boot FAILS, loudly, and the table is left exactly
+    as it was for an operator to look at.
+    """
+    monkeypatch.setenv("DATABASE_DIR", str(tmp_path))
+    db = DatabaseManager(platform="slack")
+    try:
+        _unconstrained_channel_settings(db)
+        db.conn.execute("ALTER TABLE channel_settings ADD COLUMN someone_elses_column TEXT")
+        db.conn.execute("INSERT INTO channel_settings (channel_id, someone_elses_column, model) "
+                        "VALUES ('C1', 'precious', 'gpt-5.5')")
+        before = db.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'channel_settings'").fetchone()[0]
+        errors = []
+        db.log_error = lambda msg, *a, **k: errors.append(msg)
+
+        with pytest.raises(RuntimeError, match="someone_elses_column"):
+            db._migrate_channel_capability_columns()
+
+        assert any("someone_elses_column" in msg for msg in errors)
+        # Nothing was dropped and nothing was half-migrated: same DDL, same row.
+        assert db.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'channel_settings'").fetchone()[0] == before
+        survivor = db.conn.execute(
+            "SELECT someone_elses_column, model FROM channel_settings "
+            "WHERE channel_id = 'C1'").fetchone()
+        assert (survivor["someone_elses_column"], survivor["model"]) == ("precious", "gpt-5.5")
+    finally:
+        db.conn.close()
+
+
+def test_an_unknown_column_is_refused_before_any_alter_runs(tmp_path, monkeypatch):
+    """The MIXED shape: an unrecognised column, one capability column already present and
+    unconstrained, and the other two absent entirely.
+
+    That combination is the one where the refusal can arrive too late. ADD COLUMN is autocommitted
+    on this connection, so adding the two missing columns first and only then discovering the
+    rebuild cannot proceed would leave `sqlite_master` rewritten — a half-migrated table under a
+    failed boot, which is not what "the table is untouched" promises. The unknown-column condition
+    is therefore settled BEFORE the first ALTER whenever an existing column will force a rebuild.
+    """
+    monkeypatch.setenv("DATABASE_DIR", str(tmp_path))
+    db = DatabaseManager(platform="slack")
+    try:
+        _unconstrained_channel_settings(db, omit=("enable_mcp", "image_model"))
+        db.conn.execute("ALTER TABLE channel_settings ADD COLUMN someone_elses_column TEXT")
+        db.conn.execute("INSERT INTO channel_settings (channel_id, someone_elses_column, "
+                        "enable_web_search) VALUES ('C1', 'precious', 1)")
+        before = db.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'channel_settings'").fetchone()[0]
+        assert "enable_mcp" not in before          # the ALTER really would have had work to do
+
+        with pytest.raises(RuntimeError, match="someone_elses_column"):
+            db._migrate_channel_capability_columns()
+
+        assert db.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'channel_settings'").fetchone()[0] == before
+        survivor = db.conn.execute(
+            "SELECT someone_elses_column, enable_web_search FROM channel_settings "
+            "WHERE channel_id = 'C1'").fetchone()
+        assert (survivor["someone_elses_column"], survivor["enable_web_search"]) == ("precious", 1)
+    finally:
+        db.conn.close()

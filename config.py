@@ -131,10 +131,45 @@ MODEL_KNOWLEDGE_CUTOFFS = {
 # The full user-selectable model set (order = modal display order)
 SUPPORTED_CHAT_MODELS = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"]
 
+# The image models a channel or a person may select. Promoted here from the literal that used to
+# live inside the personal modal so the modal's option list and the channel resolver's allowlist
+# are the same object and cannot drift apart. Deliberately NOT a schema CHECK on
+# `channel_settings.image_model`: the lineup changes, and a constraint would turn adding a model
+# into a migration.
+SUPPORTED_IMAGE_MODELS = ("gpt-image-2", "gpt-image-1")
+
+# The verbosity vocabulary, for the same reason: the channel modal's option list, the channel
+# resolver's allowlist and the boot check on DEFAULT_VERBOSITY are one list.
+SUPPORTED_VERBOSITIES = ("low", "medium", "high")
+
 # Reasoning-effort ladders per model family (verified live 2026-07-09:
 # `max` returns 200 on ALL three 5.6 tiers; `minimal` 400s on all of them)
 GPT56_EFFORTS = ["none", "low", "medium", "high", "xhigh", "max"]
 GPT55_EFFORTS = ["none", "low", "medium", "high", "xhigh"]
+
+
+def effective_channel_model(stored: Optional[str], fallback: str) -> str:
+    """The chat model a channel ACTUALLY runs on: the stored one when it is still selectable,
+    the workspace default otherwise.
+
+    ONE definition, called by both the capability resolver and the settings modal. They used to
+    each decide this for themselves, and the modal's version read the raw stored value — so a
+    channel inheriting the model (or holding a retired one) was offered the 5.6 effort ladder
+    even on a workspace running gpt-5.5, and the resolver then refused the `max` the modal had
+    just presented as a choice. What the modal shows and what the turn runs must be one answer.
+    """
+    return stored if stored in SUPPORTED_CHAT_MODELS else fallback
+
+
+def effort_ladder(model: str) -> List[str]:
+    """The reasoning efforts `model` accepts.
+
+    Keyed on the 5.6 family carrying `max`, so an unrecognised model gets the conservative
+    ladder. The resolver and the modal share it for the same reason they share
+    `effective_channel_model`: two spellings of this test disagreed about anything that was
+    neither 5.5 nor 5.6.
+    """
+    return GPT56_EFFORTS if (model or "").startswith("gpt-5.6") else GPT55_EFFORTS
 
 
 def clamp_effort(model: str, effort: Optional[str]) -> str:
@@ -186,6 +221,16 @@ def dev_epoch_fence_requested() -> bool:
     frozen at import time would answer for the wrong one.
     """
     return (os.getenv(DEV_EPOCH_FENCE_ENV) or "").strip().lower() not in _DEV_EPOCH_FENCE_OFF
+
+
+# "this column is NULL" as a value distinct from every value a column could legally hold, so the
+# capability resolver can tell "inherit" from "stored something unusable" without a second lookup.
+_UNSET_SETTING = object()
+
+# (channel_id, column) pairs already reported by `_warn_unusable_channel_setting`. Process-local
+# and never cleared: the resolver runs on every channel turn, and one bad row would otherwise
+# write the same warning until someone fixed it.
+_REPORTED_UNUSABLE_CHANNEL_SETTINGS: set = set()
 
 
 CHANNEL_CAPABILITY_KEYS = (
@@ -778,6 +823,37 @@ class BotConfig:
     search_channel_types: list = field(default_factory=lambda: _env_list(
         "SEARCH_CHANNEL_TYPES", ["public_channel", "private_channel"]))
 
+    # --- In-channel keyword scan (CHANNEL_SEARCH_REBUILD §S5) ---
+    # The CHANNEL/MPIM backend walks conversations.history + conversations.replies on the BOT
+    # token instead of the assistant index. EVERY default below is an existing tuned value,
+    # named beside it — none of these numbers were invented for this feature.
+    # HISTORY_PAGE_CEILING: pages of conversations.history one scan may walk.
+    search_history_page_ceiling: int = field(default_factory=lambda: max(1, int(
+        os.getenv("SEARCH_HISTORY_PAGE_CEILING", "50"))))
+    # Same provenance (HISTORY_PAGE_CEILING), but a SEPARATE, GLOBAL budget: reply pages are
+    # counted across every root the scan visits, so a hundred live threads cannot each spend a
+    # full ceiling.
+    search_reply_page_ceiling: int = field(default_factory=lambda: max(1, int(
+        os.getenv("SEARCH_REPLY_PAGE_CEILING", "50"))))
+    # history_tool._MAX_THREAD_PAGES: the per-thread cap, so ONE pathological thread cannot eat
+    # the global reply budget by itself.
+    search_reply_per_thread_page_ceiling: int = field(default_factory=lambda: max(1, int(
+        os.getenv("SEARCH_REPLY_PER_THREAD_PAGE_CEILING", "10"))))
+    # HISTORY_PAGE_SIZE: Slack's documented ceiling for a well-behaved page.
+    search_history_page_size: int = field(default_factory=lambda: max(1, min(200, int(
+        os.getenv("SEARCH_HISTORY_PAGE_SIZE", "200")))))
+    # REPLY_FETCH_CONCURRENCY: concurrent conversations.replies fetches, as the stream builder.
+    search_reply_fetch_concurrency: int = field(default_factory=lambda: max(1, int(
+        os.getenv("SEARCH_REPLY_FETCH_CONCURRENCY", "4"))))
+    # The history tool's sub-budget (_USER_CONVOS_TIME_BUDGET_S): ONE absolute deadline shared by
+    # every history page, reply page and permalink call the scan makes.
+    search_fetch_total_seconds: float = field(default_factory=lambda: float(
+        os.getenv("SEARCH_FETCH_TOTAL_SECONDS", "8")))
+    # TOOL_CALL_TIMEOUT: the executor's own bound, registered explicitly so the fetch budget is
+    # always the thing that stops the scan — the outer timeout is the backstop, never the plan.
+    search_tool_timeout_seconds: float = field(default_factory=lambda: float(
+        os.getenv("SEARCH_TOOL_TIMEOUT_SECONDS", "20")))
+
     # --- Document architecture (Phase D2) ---
     # Native file input: PDFs within the API limits ride the attach turn as an input_file
     # content part (base64 per-request — never the OpenAI Files API), so the model sees
@@ -998,6 +1074,16 @@ class BotConfig:
                 f"ceiling={self.channel_window_ceiling}): a ceiling at or below the target "
                 "re-anchors on every new root, which throws away the cached prefix the "
                 "hysteresis exists to protect.")
+        # The in-channel scan's fetch budget must expire INSIDE the tool timeout. Equal values
+        # are rejected too: at equality the outer timeout can fire first, and a scan killed from
+        # outside returns no honest coverage block at all — the one failure mode the coverage
+        # block exists to prevent.
+        if not (0 < self.search_fetch_total_seconds < self.search_tool_timeout_seconds):
+            raise ValueError(
+                "SEARCH_FETCH_TOTAL_SECONDS must be positive and strictly below "
+                f"SEARCH_TOOL_TIMEOUT_SECONDS (got fetch={self.search_fetch_total_seconds}, "
+                f"tool={self.search_tool_timeout_seconds}): the scan has to run out of fetch "
+                "budget while it can still report what it covered.")
 
     def is_long_context(self, tokens: int) -> bool:
         """True when an input of `tokens` crosses OpenAI's long-context billing tier
@@ -1025,13 +1111,32 @@ class BotConfig:
         return int(self.gpt5_max_tokens * self.token_buffer_percentage)
     
     def validate(self) -> bool:
-        """Validate required configuration"""
+        """Validate required configuration.
+
+        The three allowlist checks are what make the channel capability resolver's fallbacks
+        safe: `_channel_capability_profile` answers an unusable stored value with the GLOBAL
+        default, so an unusable global would turn one bad row into a turn that 400s. Refusing to
+        boot is the only place that can be ruled out — by the time a turn is composing a request
+        there is nothing left to fall back to.
+        """
         if not self.slack_bot_token:
             raise ValueError("SLACK_BOT_TOKEN is required")
         if not self.slack_app_token:
             raise ValueError("SLACK_APP_TOKEN is required")
         if not self.openai_api_key:
             raise ValueError("OPENAI_KEY is required")
+        if self.gpt_model not in SUPPORTED_CHAT_MODELS:
+            raise ValueError(
+                f"GPT_MODEL {self.gpt_model!r} is not a supported model; "
+                f"choose one of {', '.join(SUPPORTED_CHAT_MODELS)}")
+        if self.image_model not in SUPPORTED_IMAGE_MODELS:
+            raise ValueError(
+                f"GPT_IMAGE_MODEL {self.image_model!r} is not a supported image model; "
+                f"choose one of {', '.join(SUPPORTED_IMAGE_MODELS)}")
+        if self.default_verbosity not in SUPPORTED_VERBOSITIES:
+            raise ValueError(
+                f"DEFAULT_VERBOSITY {self.default_verbosity!r} is not a supported verbosity; "
+                f"choose one of {', '.join(SUPPORTED_VERBOSITIES)}")
         return True
     
     def _default_thread_config(self) -> Dict[str, Any]:
@@ -1134,15 +1239,44 @@ class BotConfig:
         return {k: channel_settings[k] for k in self._CHANNEL_OVERRIDE_KEYS
                 if channel_settings.get(k)}
 
-    def _channel_capability_profile(self,
-                                    channel_settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    # The `channel_settings` columns the capability profile resolves from. `enable_code_interpreter`
+    # is a capability KEY but has no column: nothing sets it per channel, so it stays global.
+    _CHANNEL_CAPABILITY_COLUMNS = ("model", "reasoning_effort", "verbosity",
+                                   "enable_web_search", "enable_mcp", "image_model")
+
+    def _warn_unusable_channel_setting(self, channel_id: Optional[str], column: str,
+                                       stored: Any, used: Any) -> None:
+        """ONE warning per (channel, column) per process.
+
+        The resolver runs on every channel turn, so a single bad row would otherwise write the
+        same line forever. Bounded by a process-local set — deliberately not a cache of the
+        RESOLUTION, only of the fact that it was reported, so a row that gets fixed resolves
+        correctly on the very next turn and merely stays quiet about the old value.
+        """
+        key = (channel_id, column)
+        if key in _REPORTED_UNUSABLE_CHANNEL_SETTINGS:
+            return
+        _REPORTED_UNUSABLE_CHANNEL_SETTINGS.add(key)
+        logging.getLogger("bot.config").warning(
+            f"channel {channel_id} stored {column} {stored!r} is not supported; using {used!r}")
+
+    def _channel_capability_profile(self, channel_settings: Optional[Dict[str, Any]],
+                                    channel_id: Optional[str] = None) -> Dict[str, Any]:
         """The capability values a CHANNEL turn runs on: channel settings, else global defaults.
 
         `is not None` rather than truthiness, so a channel that explicitly turned something off
-        keeps it off. Only model/effort/verbosity have channel_settings columns today; the rest
-        resolve to global defaults until the P4 settings modal gives them channel storage. They
-        are written explicitly rather than left absent so the resolution is what the request
-        carries, not what each reader happens to fall back to."""
+        keeps it off — an explicit `0` for web search is a decision, and truthiness would read it
+        as "unset" and hand the channel back a capability it switched off.
+
+        A stored value that is not in its allowlist falls back to the GLOBAL default and says so
+        once (`_warn_unusable_channel_setting`). Two layers guard the two booleans — the column's
+        CHECK constraint makes `2`/`-1` unstorable, and this validation catches the legacy row
+        written before that constraint existed, where `bool(2)` would silently mean "enabled".
+
+        The globals are always safe fallback targets: `validate()` refuses to boot on a GPT_MODEL,
+        GPT_IMAGE_MODEL or DEFAULT_VERBOSITY outside its allowlist. So a turn never 400s over a
+        settings value, however old the row is.
+        """
         profile: Dict[str, Any] = {
             "enable_web_search": self.enable_web_search,
             "enable_mcp": self.mcp_enabled_default,
@@ -1152,16 +1286,78 @@ class BotConfig:
             "reasoning_effort": self.default_reasoning_effort,
             "verbosity": self.default_verbosity,
         }
-        if channel_settings:
-            for key in self._CHANNEL_OVERRIDE_KEYS:
-                if channel_settings.get(key) is not None:
-                    profile[key] = channel_settings[key]
+        if not channel_settings:
+            return profile
+
+        # The columns this profile consults, read once, through the declared tuple rather than by
+        # reaching into the row ad hoc — so `_CHANNEL_CAPABILITY_COLUMNS` is the statement of what
+        # a channel can override, not documentation sitting next to code that ignores it. A column
+        # dropped from the tuple stops being consulted everywhere at once.
+        stored_row = {column: channel_settings.get(column)
+                      for column in self._CHANNEL_CAPABILITY_COLUMNS}
+
+        def _stored(column: str) -> Any:
+            value = stored_row[column]
+            return _UNSET_SETTING if value is None else value
+
+        def _resolve(column: str, allowed, fallback: Any) -> Any:
+            stored = _stored(column)
+            if stored is _UNSET_SETTING:
+                return fallback
+            if stored in allowed:
+                return stored
+            self._warn_unusable_channel_setting(channel_id, column, stored, fallback)
+            return fallback
+
+        # The MODEL first: the legal effort ladder depends on it (GPT56_EFFORTS carries `max`,
+        # GPT55_EFFORTS does not), so an effort can only be judged once the model is known.
+        # Resolved through the shared `effective_channel_model` rather than a private copy of the
+        # rule — the settings modal renders its ladder from the same call, and the two disagreeing
+        # is how the modal came to offer an effort the resolver would refuse.
+        stored_model = _stored("model")
+        model = effective_channel_model(
+            None if stored_model is _UNSET_SETTING else stored_model, self.gpt_model)
+        if stored_model is not _UNSET_SETTING and model != stored_model:
+            self._warn_unusable_channel_setting(channel_id, "model", stored_model, model)
+        profile["model"] = model
+        profile["verbosity"] = _resolve("verbosity", SUPPORTED_VERBOSITIES,
+                                        self.default_verbosity)
+        profile["image_model"] = _resolve("image_model", SUPPORTED_IMAGE_MODELS,
+                                          self.image_model)
+
+        # The two booleans are tri-state INTEGERs. `in (0, 1)` rather than `bool()`: a legacy `-1`
+        # would otherwise turn web search ON for a channel that never asked for it.
+        for column, default in (("enable_web_search", self.enable_web_search),
+                                ("enable_mcp", self.mcp_enabled_default)):
+            stored = _stored(column)
+            if stored is _UNSET_SETTING:
+                profile[column] = default
+            elif stored in (0, 1):
+                profile[column] = bool(stored)
+            else:
+                self._warn_unusable_channel_setting(channel_id, column, stored, default)
+                profile[column] = default
+
+        # THE EFFORT RULE. `clamp_effort` answers an unrecognised effort with the literal
+        # "medium", which is not necessarily what the operator configured — so the fallback is the
+        # global default CLAMPED AGAINST THE RESOLVED MODEL, never a literal.
+        ladder = effort_ladder(model)
+        effort = _stored("reasoning_effort")
+        if effort is not _UNSET_SETTING and effort in ladder:
+            profile["reasoning_effort"] = effort
+        else:
+            fallback = clamp_effort(model, self.default_reasoning_effort)
+            if effort is not _UNSET_SETTING:
+                self._warn_unusable_channel_setting(channel_id, "reasoning_effort", effort,
+                                                    fallback)
+            profile["reasoning_effort"] = fallback
         return profile
 
     def _compose_thread_config(self, user_prefs: Optional[Dict[str, Any]],
                                overrides: Optional[Dict[str, Any]],
                                channel_settings: Optional[Dict[str, Any]] = None,
-                               channel_turn: bool = False) -> Dict[str, Any]:
+                               channel_turn: bool = False,
+                               channel_id: Optional[str] = None) -> Dict[str, Any]:
         """Compose the config hierarchy:
         defaults <- user prefs <- channel shared settings <- thread overrides.
 
@@ -1174,7 +1370,11 @@ class BotConfig:
         stripped from the requester's prefs AND from the thread overrides, then resolved from
         the channel. Two people asking the same channel the same question must get the same
         machine — otherwise the shared stream's answers depend on who spoke last. Cosmetic
-        image prefs (size/quality/background/…) stay user-scoped."""
+        image prefs (size/quality/background/…) stay user-scoped.
+
+        `channel_id` is carried only so an unusable stored value can be reported against the
+        channel it came from — a warning that named the column but not the room would leave an
+        operator with nothing to go fix."""
         config = self._default_thread_config()
         if user_prefs:
             mapped = self._map_user_prefs(user_prefs)
@@ -1182,7 +1382,7 @@ class BotConfig:
                 mapped = {k: v for k, v in mapped.items() if k not in CHANNEL_CAPABILITY_KEYS}
             config.update(mapped)
         if channel_turn:
-            config.update(self._channel_capability_profile(channel_settings))
+            config.update(self._channel_capability_profile(channel_settings, channel_id))
         else:
             config.update(self._map_channel_settings(channel_settings))
         if overrides:
@@ -1218,7 +1418,8 @@ class BotConfig:
                 channel_settings = db.get_channel_settings(channel_id)
             except Exception as e:
                 logging.getLogger("bot.config").warning(f"Error fetching channel settings: {e}")
-        return self._compose_thread_config(user_prefs, overrides, channel_settings, channel_turn)
+        return self._compose_thread_config(user_prefs, overrides, channel_settings,
+                                           channel_turn, channel_id)
 
     async def get_thread_config_async(self, overrides: Optional[Dict[str, Any]] = None,
                                       user_id: Optional[str] = None, db = None,
@@ -1238,7 +1439,8 @@ class BotConfig:
                 channel_settings = await db.get_channel_settings_async(channel_id)
             except Exception as e:
                 logging.getLogger("bot.config").warning(f"Error fetching channel settings: {e}")
-        return self._compose_thread_config(user_prefs, overrides, channel_settings, channel_turn)
+        return self._compose_thread_config(user_prefs, overrides, channel_settings,
+                                           channel_turn, channel_id)
 
 
 # Global config instance

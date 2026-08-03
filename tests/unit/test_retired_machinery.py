@@ -731,3 +731,46 @@ def test_no_compaction_table_survives_a_boot(tmp_path, monkeypatch):
     assert not (tables & _COMPACTION_TABLES), sorted(tables & _COMPACTION_TABLES)
     # And the ones that must still be there, so this cannot pass by creating no schema at all.
     assert {"channel_thread_activity", "channel_coverage", "outbound_receipts"} <= tables
+
+
+# --------------------------------------------------------------------------- the live-test skill
+
+_SKILL = ROOT / ".claude" / "skills" / "live-bot-test" / "SKILL.md"
+
+# What the skill must NOT still describe. Both were retired: the pulse in P2 (the module is gone —
+# see `test_the_channel_pulse_module_is_gone`), and the rich gate's verdict call with it. A skill
+# is not documentation housekeeping — harness accuracy is first-class (owner rule, P1), and a
+# skill describing retired machinery sends the next live pass down a path that no longer exists.
+_RETIRED_IN_THE_SKILL = (
+    "ChannelPulse", "channel_pulse", "classify_participation", "classifier",
+    # Retired MECHANISM VOCABULARY, not just retired symbols. §7.1b's "keep the contamination
+    # traps verbatim" protects the LESSONS — residue accumulates, a restart brings it back, vary
+    # the wording — not a description of a ring buffer that no longer exists or of a rich gate
+    # that now returns one bit. A run book that describes machinery the reader cannot find sends
+    # the next live pass looking for it.
+    "channel ring", "verdict reason",
+)
+
+# What it must name instead, and BOTH paths are the operative requirement (§7.1b): the durable
+# harness AND the capped unit path. A version asserting only the second would pass on a skill that
+# never pointed at the harness at all.
+_REQUIRED_IN_THE_SKILL = ("stream_render", "tests/live/", "tests/unit/")
+
+
+def test_the_live_test_skill_matches_the_shipped_architecture():
+    """T115. §7.1b — the skill is updated in W5, and this is what "updated" means."""
+    text = _SKILL.read_text(encoding="utf-8")
+    lowered = text.lower()
+
+    still_there = [name for name in _RETIRED_IN_THE_SKILL if name.lower() in lowered]
+    assert not still_there, f"{_SKILL.name} still describes retired machinery: {still_there}"
+
+    missing = [name for name in _REQUIRED_IN_THE_SKILL if name not in text]
+    assert not missing, f"{_SKILL.name} never names: {missing}"
+
+    # The standing rules §7.1b keeps: the bot token cannot trigger the bot, so seeds post as the
+    # user; and the authorized channel with prod hands-off.
+    assert "SLACK_TEST_USER_TOKEN" in text
+    assert "DEV_TREAT_BOT_IDS_AS_HUMAN" in text
+    assert "C0BKX77NU66" in text
+    assert "Contamination" in text

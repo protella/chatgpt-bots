@@ -139,7 +139,9 @@ class SettingsModal(LoggerMixin):
         from message_processor.channel_steering import POLICY_MAX_CHARS
         from message_processor.participation import MODE_TO_LEVEL, VALID_LEVELS
 
-        from config import SUPPORTED_CHAT_MODELS, GPT56_EFFORTS, GPT55_EFFORTS
+        from config import (SUPPORTED_CHAT_MODELS, SUPPORTED_IMAGE_MODELS,
+                            SUPPORTED_VERBOSITIES, clamp_effort, effective_channel_model,
+                            effort_ladder)
 
         cs = current_settings or {}
 
@@ -164,28 +166,71 @@ class SettingsModal(LoggerMixin):
             return {"type": "static_select", "action_id": action_id,
                     "options": options, "initial_option": initial}
 
+        # Every one of the six capability controls inherits from the BOT'S CONFIGURATION, not from
+        # the asker: on a channel turn the capability keys leave the per-user hierarchy entirely
+        # (config.CHANNEL_CAPABILITY_KEYS), so an "each person's own setting" label described a
+        # fallback that cannot happen here. The placeholder names the value the channel is
+        # actually running on, which is the only way to read a select sitting on "inherit".
+        def _workspace_default(current) -> str:
+            return f"Use the workspace default (currently: {current})"
+
+        def _tri_state(value):
+            """A stored capability tri-state as the select's value: 1 → on, 0 → off, NULL → inherit.
+
+            Anything else can only be a legacy row written before the column's CHECK existed. It
+            renders as inherit because that is what the resolver does with it — showing it as ON
+            would tell the operator the channel is running a setting it is not.
+            """
+            if value in (0, 1):
+                return "on" if value else "off"
+            return None
+
         model_element = _select(
             "channel_model",
             [(m, m) for m in SUPPORTED_CHAT_MODELS],
             cs.get("model"),
-            f"Use each person's own setting (default: {config.gpt_model})",
+            _workspace_default(config.gpt_model),
         )
-        # Effort ladder follows the selected channel model (gpt-5.5 has no `max`).
-        # 'Inherit' shows the full 5.6 ladder — the effective model varies per asker
-        # and compose-time clamping adjusts anything a model doesn't support.
-        selected_channel_model = cs.get("model") or ""
-        effort_ladder = GPT55_EFFORTS if selected_channel_model.startswith("gpt-5.5") else GPT56_EFFORTS
+        # The effort ladder follows the model this channel will ACTUALLY run on, which is the
+        # stored one only while it is still selectable — otherwise the workspace default. Reading
+        # the raw stored value instead offered the full 5.6 ladder to a channel that inherits its
+        # model, so on a workspace running gpt-5.5 the modal presented `max` and the resolver then
+        # refused it. Same call as the resolver makes, so the two cannot drift apart again.
+        #
+        # The inherit label is clamped against that same model for the same reason: the workspace
+        # default effort is not necessarily one this channel's model accepts, and naming a value
+        # the channel cannot run is the disagreement in a different place.
+        effective_model = effective_channel_model(cs.get("model"), config.gpt_model)
         effort_element = _select(
             "channel_reasoning_effort",
-            [(e, e) for e in effort_ladder],
+            [(e, e) for e in effort_ladder(effective_model)],
             cs.get("reasoning_effort"),
-            "Use each person's own setting",
+            _workspace_default(clamp_effort(effective_model, config.default_reasoning_effort)),
         )
         verbosity_element = _select(
             "channel_verbosity",
-            [(v, v) for v in ("low", "medium", "high")],
+            [(v, v) for v in SUPPORTED_VERBOSITIES],
             cs.get("verbosity"),
-            "Use each person's own setting",
+            _workspace_default(config.default_verbosity),
+        )
+        on_off = [("on", "On"), ("off", "Off")]
+        web_search_element = _select(
+            "channel_enable_web_search",
+            on_off,
+            _tri_state(cs.get("enable_web_search")),
+            _workspace_default("on" if config.enable_web_search else "off"),
+        )
+        mcp_element = _select(
+            "channel_enable_mcp",
+            on_off,
+            _tri_state(cs.get("enable_mcp")),
+            _workspace_default("on" if config.mcp_enabled_default else "off"),
+        )
+        image_model_element = _select(
+            "channel_image_model",
+            [(m, m) for m in SUPPORTED_IMAGE_MODELS],
+            cs.get("image_model"),
+            _workspace_default(config.image_model),
         )
 
         # Phase F: one Participation select replaces the old response-mode select.
@@ -273,9 +318,11 @@ class SettingsModal(LoggerMixin):
                       "text": "'Inherit' follows the workspace default. 'Reply at channel level' lets me answer a top-level message in the channel — I still judge per message whether a thread fits better. 'Threads only' always routes replies into a thread."}},
             {"type": "divider"},
             {"type": "section", "text": {"type": "mrkdwn",
-             "text": "*Shared response settings* — apply to everyone in this channel. "
-                     "Anything left on \"each person's own setting\" falls back to the "
-                     "asker's personal preferences."}},
+             "text": "*Shared response settings*\n"
+                     "These apply to everyone in this channel — in a channel I run on the "
+                     "channel's settings, never on whoever happened to ask. 'Use the workspace "
+                     "default' falls back to the bot's configuration, not to anyone's personal "
+                     "preferences."}},
             {"type": "input", "block_id": "channel_model_block", "dispatch_action": True,
              "element": model_element,
              "label": {"type": "plain_text", "text": "Model"}},
@@ -283,10 +330,19 @@ class SettingsModal(LoggerMixin):
              "element": effort_element,
              "label": {"type": "plain_text", "text": "Reasoning effort"},
              "hint": {"type": "plain_text",
-                      "text": "Efforts a model doesn't support are adjusted automatically (e.g. max → xhigh on gpt-5.5)."}},
+                      "text": "Only the efforts this channel's model accepts are listed. If a saved effort stops being legal — after a model change — the channel falls back to the workspace default, not to a nearby setting."}},
             {"type": "input", "block_id": "channel_verbosity_block",
              "element": verbosity_element,
              "label": {"type": "plain_text", "text": "Verbosity"}},
+            {"type": "input", "block_id": "channel_web_search_block",
+             "element": web_search_element,
+             "label": {"type": "plain_text", "text": "Web search"}},
+            {"type": "input", "block_id": "channel_mcp_block",
+             "element": mcp_element,
+             "label": {"type": "plain_text", "text": "MCP servers"}},
+            {"type": "input", "block_id": "channel_image_model_block",
+             "element": image_model_element,
+             "label": {"type": "plain_text", "text": "Image model"}},
         ]
 
         # Channel-memory editor + read-only workspace-shared list. On a fresh open we derive the
@@ -832,7 +888,10 @@ class SettingsModal(LoggerMixin):
 
         # Image model — coerce a stale stored/config value (e.g. a retired gpt-image-1-mini)
         # to a live option so views.open doesn't reject the block. Also feeds is_image_v2 below.
-        image_model_choices = {'gpt-image-2', 'gpt-image-1'}
+        # The allowlist is the module constant the channel resolver validates against, so the
+        # personal picker and the channel profile can never disagree about what exists.
+        from config import SUPPORTED_IMAGE_MODELS
+        image_model_choices = set(SUPPORTED_IMAGE_MODELS)
         selected_image_model = self._coerce_choice(
             settings.get('image_model', config.image_model), image_model_choices,
             config.image_model if config.image_model in image_model_choices else 'gpt-image-2')
@@ -848,9 +907,13 @@ class SettingsModal(LoggerMixin):
                     "text": {"type": "plain_text", "text": self._get_image_model_display_name(selected_image_model)},
                     "value": selected_image_model
                 },
+                # Built from the same constant the coercion above validates against. A hard-coded
+                # list would let a newly supported model become a legal `initial_option` that is
+                # absent from `options`, and Slack rejects the whole view for that.
                 "options": [
-                    {"text": {"type": "plain_text", "text": "GPT Image 2"}, "value": "gpt-image-2"},
-                    {"text": {"type": "plain_text", "text": "GPT Image 1"}, "value": "gpt-image-1"}
+                    {"text": {"type": "plain_text",
+                              "text": self._get_image_model_display_name(m)}, "value": m}
+                    for m in SUPPORTED_IMAGE_MODELS
                 ]
             }
         })

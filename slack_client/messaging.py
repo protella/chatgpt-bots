@@ -2561,16 +2561,19 @@ class SlackMessagingMixin:
         # EMPTY set, and an empty set still enforces, the same as a turn whose stream genuinely
         # rendered no thread. Either way there is no thread to post into.
         #
-        # EXTENSION POINT (W3): when a turn can PIN a root it reached another way — a search
-        # result Slack actually returned this turn — that root joins this set at pin time. It must
-        # never be widened here, at the moment of posting, because then "authorized" would mean
-        # "the model named it".
+        # W3 widened WHERE the set comes from and changed nothing here. A root a search or
+        # history result returned this turn joins it at the moment that tool result was produced
+        # — upstream of this check, from the result's own contents, before the model had said
+        # anything about it — and is carried in on `trusted_thread_roots` like any other member.
+        # It is still never widened HERE, at the moment of posting, because then "authorized"
+        # would mean "the model named it".
         trusted = getattr(ctx, "trusted_thread_roots", None)
         if trusted is not None and target not in trusted:
             return {"ok": False, "error": "unknown_thread",
                     "message": ("That thread isn't one of the threads in front of you. Use a "
                                 "thread's root ts exactly as it appears in this channel's stream, "
-                                "or answer here instead.")}
+                                "or open it first with fetch_thread_messages, or answer here "
+                                "instead.")}
         turn = getattr(ctx, "turn", None)
         lease = getattr(turn, "send_lease", None) if turn is not None else None
         from message_processor.turn_runtime import (DEST_KIND_POST_TO_THREAD, EffectRevoked,

@@ -7,6 +7,7 @@ DM turns are untouched, and that is asserted explicitly.
 """
 import pytest
 
+import config as config_module
 from config import BotConfig, CHANNEL_CAPABILITY_KEYS, clamp_effort
 from slack_client.utilities import is_dm_conversation
 
@@ -172,12 +173,18 @@ def test_unset_channel_columns_fall_through_to_globals(cfg):
 
 
 def test_explicit_falsy_channel_value_survives(cfg):
-    """`is not None`, not truthiness — a deliberately empty setting is still a decision."""
-    profile = cfg._channel_capability_profile({"model": "gpt-5.5", "verbosity": "",
+    """`is not None`, not truthiness — a deliberately OFF setting is still a decision.
+
+    Read against a boolean rather than a vocabulary column: respec §6.2 gave `verbosity` an
+    allowlist, so an empty string there is no longer an explicit decision but an unusable value
+    that falls back. `enable_web_search = 0` is the case the rule exists for — truthiness would
+    read the 0 as "unset" and hand the channel back the capability it switched off.
+    """
+    profile = cfg._channel_capability_profile({"model": "gpt-5.5", "enable_web_search": 0,
                                                "reasoning_effort": None})
-    assert profile["verbosity"] == ""
+    assert profile["enable_web_search"] is False
     assert profile["model"] == "gpt-5.5"
-    assert profile["reasoning_effort"] == cfg.default_reasoning_effort
+    assert profile["reasoning_effort"] == clamp_effort("gpt-5.5", cfg.default_reasoning_effort)
 
 
 def test_globally_disabled_capability_stays_off_for_an_eager_requester(cfg, monkeypatch):
@@ -208,9 +215,22 @@ def test_custom_instructions_are_not_a_capability(cfg):
     assert got["custom_instructions"] == "be terse"
 
 
-def test_effort_is_clamped_against_the_channel_model(cfg):
+def test_effort_is_clamped_against_the_channel_model(cfg, monkeypatch):
+    """The effort a channel runs on is always legal for the model that channel resolved to.
+
+    respec §6.2: a stored effort outside the resolved model's ladder is not silently nudged to
+    the nearest legal rung — it is refused, and the GLOBAL default takes its place, clamped
+    against that same model. Nudging would leave the resolver claiming an effort the settings
+    modal already renders as "inherit"; falling back makes the two agree.
+    """
     db = _db({"model": "gpt-5.5", "reasoning_effort": "max"})
     got = cfg.get_thread_config(user_id="U_ALICE", db=db, channel_id="C1", channel_turn=True)
+    assert got["reasoning_effort"] == clamp_effort("gpt-5.5", cfg.default_reasoning_effort)
+
+    # And the fallback itself is clamped, never a literal: a global default of `max` is not a
+    # thing gpt-5.5 accepts either.
+    monkeypatch.setattr(cfg, "default_reasoning_effort", "max")
+    got = cfg.get_thread_config(user_id="U_ALICE", db=db, channel_id="C2", channel_turn=True)
     assert got["reasoning_effort"] == "xhigh"
 
 
@@ -259,3 +279,117 @@ def test_is_dm_conversation_truth_table(channel_id, channel_type, expected):
 def test_is_dm_conversation_defaults_to_prefix_only():
     assert is_dm_conversation("C0123") is False
     assert is_dm_conversation("D0123") is True
+
+
+# ------------------------------------------------- W4: the three new capability columns (§6.1/6.2)
+
+
+@pytest.fixture
+def quiet_reporter(monkeypatch):
+    """A fresh warned-set per test.
+
+    `_REPORTED_UNUSABLE_CHANNEL_SETTINGS` is process-local and never cleared in production — one
+    bad row must not write the same warning on every turn forever. A test that counts warnings
+    therefore has to start from empty, or the count depends on which test ran first.
+    """
+    monkeypatch.setattr(config_module, "_REPORTED_UNUSABLE_CHANNEL_SETTINGS", set())
+
+
+def test_the_resolver_honours_the_three_new_columns(cfg, quiet_reporter, monkeypatch):
+    """T102. Each new column overrides its global default; an explicit False stays False; NULL
+    inherits; and a value outside the column's allowlist resolves to the global default rather
+    than to whatever `bool()` would have made of it."""
+    profile = cfg._channel_capability_profile(
+        {"enable_web_search": 0, "enable_mcp": 1, "image_model": "gpt-image-1",
+         "verbosity": "high"})
+    assert profile["enable_web_search"] is False
+    assert profile["enable_mcp"] is True
+    assert profile["image_model"] == "gpt-image-1"
+    assert profile["verbosity"] == "high"
+
+    # NULL is inherit, for all three.
+    inherited = cfg._channel_capability_profile(
+        {"enable_web_search": None, "enable_mcp": None, "image_model": None})
+    assert inherited["enable_web_search"] == cfg.enable_web_search
+    assert inherited["enable_mcp"] == cfg.mcp_enabled_default
+    assert inherited["image_model"] == cfg.image_model
+
+    # Verbosity is a vocabulary, not free text.
+    assert cfg._channel_capability_profile({"verbosity": "chatty"})["verbosity"] == \
+        cfg.default_verbosity
+
+    # `2` and `-1` are reachable only on a row written before the CHECK constraint existed.
+    # `bool(2)` and `bool(-1)` are both True, which would switch a capability ON for a channel
+    # that never asked — so the resolver refuses the value outright.
+    #
+    # Read against globals that are OFF, deliberately. With them on, "resolves to the global
+    # default" and "resolves to True" name the same value, and no assertion here could tell a
+    # working resolver from one that just called `bool()` on whatever was stored.
+    monkeypatch.setattr(cfg, "enable_web_search", False)
+    monkeypatch.setattr(cfg, "mcp_enabled_default", False)
+    for rogue in (2, -1):
+        got = cfg._channel_capability_profile({"enable_web_search": rogue, "enable_mcp": rogue})
+        assert got["enable_web_search"] is False
+        assert got["enable_mcp"] is False
+
+
+def test_an_illegal_stored_value_falls_back_loudly(cfg, quiet_reporter, caplog):
+    """T106. An unlisted model / image model / effort resolves to the global default and says so,
+    naming the channel — and the turn still runs, because every fallback target is a value
+    `validate()` already vouched for at boot."""
+    with caplog.at_level("WARNING", logger="bot.config"):
+        profile = cfg._channel_capability_profile(
+            {"model": "gpt-4o", "image_model": "gpt-image-9", "reasoning_effort": "ludicrous"},
+            "C0BKX77NU66")
+
+    assert profile["model"] == cfg.gpt_model
+    assert profile["image_model"] == cfg.image_model
+    assert profile["reasoning_effort"] == clamp_effort(cfg.gpt_model,
+                                                       cfg.default_reasoning_effort)
+    warned = "\n".join(r.getMessage() for r in caplog.records if r.levelname == "WARNING")
+    assert "C0BKX77NU66" in warned
+    for column in ("model", "image_model", "reasoning_effort"):
+        assert column in warned
+
+
+def test_the_invalid_value_warning_fires_once(cfg, quiet_reporter, caplog):
+    """T105. Ten consecutive resolutions of the same bad row log ONE warning, not ten — the
+    resolver runs on every channel turn, and an unbounded warning would fill the log forever."""
+    with caplog.at_level("WARNING", logger="bot.config"):
+        for _ in range(10):
+            cfg._channel_capability_profile({"image_model": "gpt-image-9"}, "C1")
+    bad_image = [r for r in caplog.records
+                 if r.levelname == "WARNING" and "image_model" in r.getMessage()]
+    assert len(bad_image) == 1
+
+    # …and it is bounded per (channel, column), not globally: another channel with the same bad
+    # value is a different operator with a different row to go fix.
+    with caplog.at_level("WARNING", logger="bot.config"):
+        cfg._channel_capability_profile({"image_model": "gpt-image-9"}, "C2")
+    assert len([r for r in caplog.records
+                if r.levelname == "WARNING" and "image_model" in r.getMessage()]) == 2
+
+
+def test_the_tri_state_checks_reject_out_of_range(tmp_path, monkeypatch):
+    """T103. Against real SQLite: the two boolean columns accept NULL, 0 and 1 and nothing else.
+    Without the CHECK, SQLite would happily store `2` in an INTEGER column."""
+    import sqlite3
+
+    from database import DatabaseManager
+
+    monkeypatch.setenv("DATABASE_DIR", str(tmp_path))
+    db = DatabaseManager(platform="tristate")
+    try:
+        for column in ("enable_web_search", "enable_mcp"):
+            for legal in (None, 0, 1):
+                db.conn.execute(
+                    f"INSERT INTO channel_settings (channel_id, {column}) VALUES (?, ?) "
+                    f"ON CONFLICT(channel_id) DO UPDATE SET {column} = excluded.{column}",
+                    (f"C_{column}", legal))
+            for rogue in (2, -1):
+                with pytest.raises(sqlite3.IntegrityError):
+                    db.conn.execute(
+                        f"INSERT INTO channel_settings (channel_id, {column}) VALUES (?, ?)",
+                        (f"C_rogue_{column}_{rogue}", rogue))
+    finally:
+        db.conn.close()

@@ -1,6 +1,6 @@
 ---
 name: live-bot-test
-description: Drive the dev Slack bot end-to-end against real Slack. Use when verifying bot behavior live — participation/wake decisions, reactions, streaming, image and file paths — or when a unit test passes but the real path is suspect. Covers the user-token harness, the classifier probe, and the contamination traps.
+description: Drive the dev Slack bot end-to-end against real Slack. Use when verifying bot behavior live — participation/wake decisions, reactions, streaming, image and file paths — or when a unit test passes but the real path is suspect. Covers the user-token harness, the durable live battery, and the contamination traps.
 ---
 
 # Live dev-bot testing
@@ -27,7 +27,7 @@ Every unit test passed; calling the text handler directly sails straight past th
 Messages posted with the user token still carry a `bot_id`/`app_id` in Slack's record, which used
 to make `classify_sender` label the test user `[bot]` and invalidate any sender-sensitive test.
 `DEV_TREAT_BOT_IDS_AS_HUMAN` in `.env` (empty in prod) fixes that — harness posts now classify as
-`[human]`, and verdict reasons come back naming the human.
+`[human]`, and the ledger records the sender that way too.
 
 Residual, dev-only: `get_thread_history` gates mention cleaning on raw `is_bot = bool(msg.get("bot_id"))`
 and does not consult the carve-out, so a harness post keeps `<@U…>` raw instead of rendering the
@@ -35,19 +35,19 @@ display name in rebuilt history. Author-name prefixes are unaffected. Prod can't
 
 ## Contamination — the standing trap
 
-Repeated live runs poison the channel ring: the bot's own prior answers become "evidence" that the
-next similar question is for it, and a restart backfills that residue right back in. This retired
-the previous test channel. Space runs out, vary the wording, and read the verdict *reasons*, not
-just the outcomes.
+Repeated live runs poison the channel window: the bot's own prior answers become "evidence" that
+the next similar question is for it, and since the stream rebuilds from Slack every turn, a
+restart brings that residue straight back. This retired the previous test channel. Space runs
+out, vary the wording, and read the ledger evidence, not just the outcomes.
 
-## Prefer a clean probe for classifier work
+## Read the turn off its `stream_render` row
 
-For participation/attribution behavior, skip live entirely — call the real utility model with a
-hand-built input:
+One row per channel turn in `logs/participation.jsonl`, and the primary evidence for what the bot
+could see: `H` (pinned at admission, never refreshed), `periphery_floor_ts` and `root_count` for
+the window, `origin_count` for the origin block, `reselected` for the re-anchor.
 
-```python
-OpenAIClient().classify_participation(text, signals=...)   # signals["channel_addressee_tail"]
-                                                           # built from a freshly-seeded ChannelPulse
-```
+## Use the durable harness, not an ad-hoc script
 
-That isolates the exact scenario, free of `bot_id` artifacts and ring contamination.
+`tests/live/` is the battery — `python3 -m tests.live.run_battery`, run book at
+`tests/live/README.md`, whose `DEV_TREAT_BOT_IDS_AS_HUMAN` prerequisite must be set before the
+bot starts. Network-free tests: `tests/unit/test_battery_harness.py`, inside the capped gate.

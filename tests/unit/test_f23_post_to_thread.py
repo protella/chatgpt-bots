@@ -190,6 +190,37 @@ async def test_an_untrusted_target_is_refused_before_anything_is_sent(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_an_invented_root_is_still_refused(monkeypatch):
+    """T86. The bait case, unchanged by W3 — now with a POPULATED discovered set present.
+
+    Widening the allowlist from tool results is the one thing that could have turned "the model
+    named a ts" into an authorization, so the refusal is re-proved in the state where it would
+    have: a turn that really did discover a root this turn, asked to post at a different one it
+    made up."""
+    monkeypatch.setattr(config, "enable_post_to_thread_tool", True)
+    from message_processor.handlers.text import _trusted_thread_roots
+    from tests.unit import channel_turn_harness as h
+
+    turn = TurnRuntime()
+    h.pin_channel_turn(turn, stream=_stream_with_two_threads(), channel_id="C1")
+    assert turn.enroll_discovered_root(channel_id="C1", root_ts="40.0",
+                                       source="search_slack") is True
+    trusted = _trusted_thread_roots(turn)
+    assert trusted == frozenset({"10.0", "20.0", "40.0"}), "the discovered root really is in"
+
+    host = _light_host()
+    out = await host.execute_post_to_thread(
+        _ctx(thread="10.0", trigger="10.0", trusted=trusted, turn=turn),
+        {"thread_ts": "99.9", "text": "hello"})
+
+    assert out["ok"] is False and out["error"] == "unknown_thread"
+    host.send_message.assert_not_awaited()
+    assert turn.destinations == [] and turn.visible_action_committed is False
+    # The refusal now names the way through, so a model that guessed can recover by opening it.
+    assert "fetch_thread_messages" in out["message"]
+
+
+@pytest.mark.asyncio
 async def test_a_trusted_target_is_authorized_and_posted(monkeypatch):
     monkeypatch.setattr(config, "enable_post_to_thread_tool", True)
     host = _light_host()

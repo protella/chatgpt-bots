@@ -48,6 +48,10 @@ UTILITY_MODEL=gpt-5.6-luna       # was gpt-5-mini
 UTILITY_REASONING_EFFORT=low     # was minimal ("minimal" is rejected by 5.6 models); "low" on
                                  # Luna is adaptive — zero reasoning tokens on trivial verdicts,
                                  # a few dozen only when a judgment needs them
+DEFAULT_REASONING_EFFORT=medium  # was low in the old example — medium is the intended default
+TOKEN_CLEANUP_THRESHOLD=0.5      # was 0.9 — thread compaction now triggers at half the budget
+TOKEN_COMPACTION_TARGET=0.4      # was 0.7 — must stay BELOW the threshold or compaction
+                                 # never converges
 ```
 
 Delete (no longer used):
@@ -137,6 +141,28 @@ destructive step. Watch for these lines, in order:
 From then on the database backs itself up nightly (7-day retention) as part of the scheduled
 cleanup, which it never did before. The three `pre-v3-*` backups are **exempt from that
 retention** — they're your rollback path, so nothing deletes them but you.
+
+### 🔎 Changed - Search that actually finds what the room said
+
+`search_slack` in a channel now reads the channel itself — its history and the replies inside
+its threads — instead of asking Slack's assistant index, which routinely came back empty for
+messages sitting right there in the room (and wasn't available at all unless the bot had been
+@-mentioned). Ask about a decision buried a hundred messages back and it finds the words, in
+threads included, on every kind of turn. Searches are keyword matches ("Kestwood quote", not a
+paraphrase of the question), results say honestly how much of the channel was read before any
+budget ran out, and reach is exactly what everyone in that room can already see — never other
+channels, never anything posted after the message being answered. DM search is unchanged.
+
+### 🗣️ Changed - Warmer in the room's moments, quieter in its banter
+
+The bot now weighs *what kind* of moment it's reading. A welcome, a send-off, news the whole
+room is marking — it joins in the way a teammate would, usually one fitting reaction or a short
+warm line. A genuine question put to the room no longer gets ignored just because nobody tagged
+it: if it can actually answer, it answers briefly. In the other direction: someone venting,
+riffing, or being hard on themselves is not an invitation — it stays out of human banter unless
+the banter is aimed at it, and a channel-wide ping that only reports status wakes nobody. And a
+standing rule whenever it does speak: jokes land on tools, situations, or itself — never on a
+coworker.
 
 ### 🧵 Changed - A channel is one conversation now, not a stack of keyholes
 

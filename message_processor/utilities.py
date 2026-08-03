@@ -39,10 +39,11 @@ def reach_tools_for() -> Tuple[str, ...]:
     TAKES NO ARGUMENTS: neither switch is per-channel, and accepting a thread_config would invite
     a caller to think one of them were. Neither is in CHANNEL_CAPABILITY_KEYS.
 
-    `search_slack` is registered but per-turn HIDDEN when no action token is present. This tuple
-    deliberately follows REGISTRATION, not that visibility: the guidance it feeds is
-    pre-breakpoint and channel-stable, so keying it to a per-turn token would fork the cached
-    prefix on every unmentioned turn.
+    `search_slack` is per-turn hidden on the DM surface when no action token is present; on a
+    CHANNEL it is static and ungated, because the channel backend is a bot-token scan of the
+    current channel and needs no token. This tuple follows REGISTRATION either way: the guidance
+    it feeds is pre-breakpoint and channel-stable, so keying it to a per-turn token would fork
+    the cached prefix on every unmentioned turn.
     """
     out = []
     if config.enable_search_tool:

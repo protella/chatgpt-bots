@@ -38,7 +38,7 @@ import asyncio
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 from base_client import Message
 from config import config
@@ -287,8 +287,130 @@ def _real_post_to_thread(sink, transport: FakeTransport):
     return run
 
 
+def _hit_root(hit: Dict[str, Any]) -> Optional[str]:
+    """The thread root a recorded hit belongs to, read off its permalink.
+
+    FIXTURE PLUMBING, AND ONLY THAT. Production stopped deriving roots from permalinks when the
+    channel surface moved to the in-channel scan — the scan reads `thread_ts` off the message.
+    But the recorded `assistant.search.context` payload has no `thread_ts` key (the live API
+    never sent one), so the permalink is where THIS FILE learns which thread the fixture is
+    describing, in order to build a Slack world that contains it. Nothing under test parses it.
+    """
+    from urllib.parse import parse_qs, urlsplit
+
+    permalink = hit.get("permalink")
+    if not isinstance(permalink, str) or not permalink:
+        return None
+    roots = parse_qs(urlsplit(permalink).query).get("thread_ts") or []
+    return roots[0] if len(roots) == 1 else None
+
+
+def _search_world(hits: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]],
+                                                           Dict[str, List[Dict[str, Any]]]]:
+    """The row's recorded hits → the `conversations.history` / `conversations.replies` pages the
+    in-channel scan actually reads.
+
+    ONE MESSAGE PER HIT, TRANSLATED, NOTHING INVENTED BEYOND THE THREAD THAT HOLDS IT. A hit
+    inside a thread needs a reply-bearing ROOT for the scan to discover it — that is the whole
+    mechanism the row measures, history → reply-bearing root → replies — so the root is
+    synthesized as a bare, textless message carrying `reply_count`/`latest_reply`. Its own words
+    are not in the fixture and are not invented here: an empty root scores against nothing and
+    exists purely to be walked through.
+
+    The rendered window's own messages are deliberately NOT added to the history page. The
+    fixture is the row's statement about what search can reach; padding it with content the row
+    never recorded would change what the model gets back.
+    """
+    history: List[Dict[str, Any]] = []
+    replies: Dict[str, List[Dict[str, Any]]] = {}
+    for hit in hits:
+        ts = hit.get("message_ts")
+        message: Dict[str, Any] = {"ts": ts, "text": hit.get("content", ""),
+                                   "user": hit.get("author_user_id"), "team": hit.get("team_id")}
+        root = _hit_root(hit)
+        if root and root != ts:
+            message["thread_ts"] = root
+            root_message = {"ts": root, "text": "", "user": hit.get("author_user_id"),
+                            "team": hit.get("team_id"), "thread_ts": root,
+                            "reply_count": 1, "latest_reply": ts}
+            history.append(root_message)
+            replies.setdefault(root, []).extend([root_message, message])
+        else:
+            # A top-level hit is reachable from the history walk on its own.
+            history.append(message)
+    return history, replies
+
+
+def _real_search_slack(sink, hits: Sequence[Dict[str, Any]]):
+    """The PRODUCTION `execute_search_tool` over a Slack world built from the row's recorded hits.
+
+    Same argument as `post_to_thread` keeping its real executor: a recorder cannot ENROLL a
+    discovered root, and enrolling is half of what a search-to-action row measures. The recorded
+    empty result the other rows get is honest for them — the harness has no index — but a row
+    whose whole subject is "the tool returned a thread you could not otherwise reach" has to run
+    the real matching, the real provenance checks and the real enrollment, or it grades a
+    mechanism that never ran.
+
+    THE BACKEND UNDER IT CHANGED AND THE ROW'S SUBJECT DID NOT (CHANNEL_SEARCH_REBUILD §S1). A
+    channel turn no longer calls `assistant.search.context`; it runs the bot-token in-channel
+    scan. So what is substituted is no longer one API call but the two READ methods that scan
+    walks — plus the two the channel-read gate consults, because the gate is production code and
+    this world has to satisfy it rather than step around it. A world still serving the retired
+    index made every `search_slack` in this row come back `not_accessible`: `users_conversations`
+    did not exist on the fake client, the membership walk swallowed the AttributeError and
+    reported `requester_membership_unverified`, and the turn was measured against a tool that
+    could not run.
+
+    `hits` stay in the shape Slack's index returned (see tests/unit/test_search_to_action.py for
+    the capture) — the row records them, `_search_world` translates them.
+    """
+    from slack_client.history_tool import SlackHistoryToolMixin
+    from slack_client.search_tool import SlackSearchToolMixin
+
+    class Host(SlackSearchToolMixin, SlackHistoryToolMixin, _SchemaHost):
+        pass
+
+    history_page, reply_pages = _search_world(hits)
+    permalinks = {h.get("message_ts"): h.get("permalink") for h in hits if h.get("permalink")}
+
+    async def _history(**kwargs):
+        return {"ok": True, "messages": list(history_page)}
+
+    async def _replies(**kwargs):
+        return {"ok": True, "messages": list(reply_pages.get(kwargs.get("ts"), []))}
+
+    async def _permalink(channel=None, message_ts=None):
+        return {"ok": True, "permalink": permalinks.get(message_ts)}
+
+    # The channel-read gate's two lookups, answered as this room actually is: the requester is in
+    # the channel and so is the bot. The REAL gate then runs and allows — the same way the unit
+    # fixtures satisfy it — rather than being stubbed out of the path.
+    async def _user_convos(**kwargs):
+        return {"ok": True, "channels": [{"id": CHANNEL, "name": "eng"}]}
+
+    async def _channel_info(**kwargs):
+        return {"ok": True, "channel": {"is_channel": True, "is_private": False,
+                                        "is_member": True}}
+
+    host = Host()
+    host.self_team_id = TEAM
+    host.app = SimpleNamespace(client=SimpleNamespace(
+        conversations_history=_history, conversations_replies=_replies,
+        chat_getPermalink=_permalink, users_conversations=_user_convos,
+        conversations_info=_channel_info))
+    host.resolve_usernames = AsyncMock(return_value={})
+
+    async def run(ctx, args):
+        result = await host.execute_search_tool(ctx, args)
+        sink.append({"name": "search_slack", "arguments": args, "result": result})
+        return result
+
+    return run
+
+
 def recording_registry(sink: List[Dict[str, Any]],
-                       transport: Optional[FakeTransport] = None) -> ToolRegistry:
+                       transport: Optional[FakeTransport] = None,
+                       search_hits: Optional[Sequence[Dict[str, Any]]] = None) -> ToolRegistry:
     """The production channel tool surface with its effects redirected into `sink`.
 
     Schemas, gates and registration order come from `SlackBot._build_tool_registry` — the model
@@ -308,6 +430,8 @@ def recording_registry(sink: List[Dict[str, Any]],
             executor = _passthrough(sink, name, tool["executor"])
         elif name == "post_to_thread" and transport is not None:
             executor = _real_post_to_thread(sink, transport)
+        elif name == "search_slack" and search_hits is not None:
+            executor = _real_search_slack(sink, search_hits)
         else:
             executor = _recorder(sink, name)
         out._tools[name] = dict(tool, executor=executor)
@@ -468,6 +592,7 @@ async def run_responder_trial(openai_client: Any, *, room: Room, trigger: Say,
                               web_search: bool = False,
                               code_interpreter: bool = False,
                               wake_source: Optional[str] = "channel_activity",
+                              search_hits: Optional[Sequence[Dict[str, Any]]] = None,
                               model: Optional[str] = None) -> TrialResult:
     """One responder turn, graded on what it did.
 
@@ -477,7 +602,7 @@ async def run_responder_trial(openai_client: Any, *, room: Room, trigger: Say,
     """
     sink: List[Dict[str, Any]] = []
     transport = FakeTransport()
-    registry = recording_registry(sink, transport)
+    registry = recording_registry(sink, transport, search_hits=search_hits)
     client = platform_client(registry)
     host = processor_host()
 
@@ -542,6 +667,11 @@ async def run_responder_trial(openai_client: Any, *, room: Room, trigger: Say,
     trusted = _trusted_thread_roots(turn)
     tool_ctx = ToolContext(channel_id=CHANNEL, thread_ts=origin_thread, trigger_ts=trigger.ts,
                            user_id=trigger_id, client=client, db=None, is_dm=False,
+                           # BF1: Slack mints an action_token on @mention channel events, and
+                           # `execute_search_tool` degrades to `search_unavailable` without one.
+                           # A scenario that omitted it graded the model on a search tool that
+                           # could never run — which read as the model declining to act.
+                           action_token="scenario-action-token",
                            turn=turn, message=message, thread_config=request_config,
                            canonical_files=ctx.canonical_files,
                            requester_is_human=(trigger.kind == "human"),
@@ -562,7 +692,13 @@ async def run_responder_trial(openai_client: Any, *, room: Room, trigger: Say,
                        silence_reason=result.get("silence_reason"),
                        destination=turn.reply_destination, calls=sink, detail=detail,
                        posts=list(transport.posts), post_attempts=_post_attempts(sink),
-                       trusted_roots=trusted)
+                       # Read AFTER the turn, not before it. W3 made the allowlist grow during a
+                       # turn — a root a search result proved is enrolled mid-loop and re-stamped
+                       # at the next round boundary — so the set pinned at the start is no longer
+                       # the set that authorized anything. `trusted` above is what the FIRST
+                       # round saw; this is what was in force by the end, which is the question
+                       # "could the room reach that thread?" actually asks.
+                       trusted_roots=_trusted_thread_roots(turn))
 
 
 # --------------------------------------------------------------------------- running trials

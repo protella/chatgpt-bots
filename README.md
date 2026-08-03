@@ -23,9 +23,16 @@ Slack history on demand, never mirrored into the database.
 - **Deep research** — for questions that deserve more than a quick lookup, the bot detaches a
   background job, posts a live status card while it works, and delivers a sourced report minutes
   later. You can keep chatting the whole time
-- **On-demand context** — fetches older history, searches the workspace (permission-scoped), links to
+- **On-demand context** — fetches older history, searches (see below), links to
   earlier messages ("link me to where we decided X"), and looks up channel info, pins, reactions, and
   people. All fetched live when needed, never stored
+- **Search, split by surface** — in a DM the bot searches the workspace through Slack's own index
+  (permission-scoped). In a channel it runs a keyword scan of *that channel* instead — history plus
+  the replies inside its threads — which works on every turn, mentioned or not, and reports how much
+  of the channel it managed to read so a partial answer never reads as "nothing was found". One
+  limitation is structural: a recent reply under a thread whose root is older than the scanned span
+  is only reachable if someone also posted it to the channel, because Slack offers no per-channel
+  index of replies
 - **Reactions** — the bot can answer with an emoji when words would be noise, and reacts like a
   colleague (a laugh, a 👍 on good news)
 - **Time awareness** — every message it reads is stamped with when it was said, so "last night" and
@@ -123,8 +130,9 @@ paste it. Then:
    assistant view is enabled (the pasted manifest's `agent_view` block sets it up, but confirm the
    toggle is on). **Recommended:** it gives the bot a dedicated assistant split-view with the
    suggested-prompt chips, and it's what makes Slack mint the per-message `action_token` that powers
-   `search_slack`. With it off, workspace search degrades to "unavailable" and the bot falls back to
-   reading history directly.
+   *workspace* search in DMs. With it off, DM search degrades to "unavailable" and the bot falls
+   back to reading history directly. Channel search is unaffected — it runs on the bot token and
+   needs no `action_token`.
 
 The manifest is the authoritative scope list. What each group buys you:
 

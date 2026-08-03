@@ -51,13 +51,22 @@ P3 added the other half of that sentence: what the turn has CAUSED.
 import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from config import config
 from logger import setup_logger
 from message_processor import outbound_receipts, participation_telemetry
+from slack_client.normalizer import TimestampError, parse_ts
 
 logger = setup_logger(name="slack_bot.TurnRuntime")
+
+# §2g. The ONLY tools whose results may widen this turn's post_to_thread targets. Every one of
+# them returns content Slack authorized under the same both-members rule the read itself ran
+# through, so the root it names is one the room genuinely holds. A name outside this set enrolls
+# nothing — not because those tools are untrusted, but because a root they mention was never the
+# thing they were asked for, and "the model saw a ts somewhere" is precisely what may not
+# authorize a post.
+DISCOVERY_SOURCES = frozenset({"fetch_thread_messages", "fetch_channel_history", "search_slack"})
 
 # How long a straggling tool flight gets to unwind AFTER it has been cancelled. Cancellation is
 # established, not requested: the turn waits for the CancelledError to actually land, because the
@@ -213,10 +222,22 @@ class ToolFlight:
     # nothing happened and the key is cleared so a fresh call may try again; after it, the key
     # stays owned forever — a duplicate must never relaunch an effect already issued.
     launched: bool = False
+    # §2g. Thread roots THIS EXECUTION's result claims, staged by the executor and committed by
+    # whichever waiter selects the flight's real result for the model.
+    #
+    # ON THE FLIGHT RATHER THAN THE PER-CALL CONTEXT, and that is the whole point: one flight can
+    # have SEVERAL waiters (a duplicate dispatch of the same call id joins it instead of running
+    # the work again), and only the waiter that CREATED it has a per-call context. Staging held
+    # per-context meant that if the original waiter was cancelled and a duplicate received the
+    # completed result, the model was shown a result that granted nothing. The work is one
+    # execution, so its claims are one list. Sibling isolation is unaffected — different calls
+    # are different flights.
+    staged_roots: List[Any] = field(default_factory=list, repr=False)
 
     def mark_launched(self) -> None:
         """Called by the executor ATOMICALLY immediately before the side-effect request."""
         self.launched = True
+
 
     def remaining(self) -> float:
         return max(0.0, self.deadline - time.monotonic())
@@ -403,6 +424,10 @@ class TurnRuntime:
     # roster's tail: people who may not have spoken inside the window but are plainly part of the
     # conversation this turn is in.
     channel_origin_participants: Optional[Dict[str, str]] = field(default=None, repr=False)
+    # §2g. Roots this turn's TOOL RESULTS proved exist, in THIS channel. Turn-local, never
+    # persisted, monotone within the turn. Separate from the stream's own labels so the two
+    # sources stay distinguishable in telemetry and in the failure message.
+    _discovered_roots: Set[str] = field(default_factory=set, repr=False)
     # Did a stream build actually happen? Distinguishes "channel turn that rendered the room"
     # from one that failed closed before the fetch — a distinction turn_outcome reports.
     stream_build_present: bool = False
@@ -433,6 +458,56 @@ class TurnRuntime:
     # still running cannot post anything this turn will never account for. Never interrupts a
     # lease already held.
     effects_revoked: bool = False
+
+    # --- discovered thread roots (§2g) -------------------------------------------------------
+
+    def _own_channel_id(self) -> Optional[str]:
+        """THIS turn's channel, or None when it has no channel identity at all (a DM, a
+        background agent, a bare TurnRuntime in a test). Read off the pins rather than stored
+        separately, so it cannot disagree with the stream the turn is answering from."""
+        for holder, attr in ((getattr(self, "channel_turn_context", None), "channel_id"),
+                             (getattr(getattr(self, "channel_stream", None), "pinned", None),
+                              "channel_id")):
+            value = getattr(holder, attr, None) if holder is not None else None
+            if isinstance(value, str) and value:
+                return value
+        return None
+
+    def enroll_discovered_root(self, *, channel_id: str, root_ts: str, source: str) -> bool:
+        """Enroll ONE root, from ONE tool result. Returns True when it was newly enrolled.
+
+        Refuses — returning False, logging at DEBUG, never raising — when the channel is not
+        this turn's channel, when the ts does not parse, or when `source` is not one of the
+        three enrolling tools. Refusing is always safe: the model gets `unknown_thread` and an
+        honest message, which is a tool call, not a wrong post.
+
+        A non-`str` ts is refused before it is parsed. `parse_ts` stringifies whatever it is
+        given, so a float would slip through as a plausible ts read out of a JSON number, and a
+        root is a Slack ts — a string — or it is not a root.
+        """
+        if source not in DISCOVERY_SOURCES:
+            logger.debug(f"discovered root refused: {source!r} is not an enrolling tool")
+            return False
+        own = self._own_channel_id()
+        if not own or not isinstance(channel_id, str) or channel_id != own:
+            logger.debug(f"discovered root refused: {channel_id!r} is not this turn's channel")
+            return False
+        if not isinstance(root_ts, str):
+            logger.debug(f"discovered root refused: {root_ts!r} is not a timestamp")
+            return False
+        try:
+            parse_ts(root_ts)
+        except TimestampError:
+            logger.debug(f"discovered root refused: {root_ts!r} does not parse")
+            return False
+        if root_ts in self._discovered_roots:
+            return False
+        self._discovered_roots.add(root_ts)
+        return True
+
+    @property
+    def discovered_thread_roots(self) -> frozenset:
+        return frozenset(self._discovered_roots)
 
     # --- destination records ---------------------------------------------------------------
 

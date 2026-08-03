@@ -11,6 +11,7 @@ from config import config
 from slack_client.formatting.blocks import extract_supplementary_text
 from slack_client.normalizer import ORIGIN_HISTORY, normalize_slack_message
 from slack_client.utilities import is_dm_conversation
+from tool_registry import stage_discovered_root
 
 
 # Safety ceiling on how many conversations_replies pages a single thread fetch will
@@ -1009,6 +1010,38 @@ class SlackHistoryToolMixin:
             self.log_warning(f"history_tool: pins failed for {channel_id}: {err}")
             return {"ok": False, "error": err, "message": f"Could not fetch pins: {err}"}
 
+    def _enroll_history_roots(self, ctx: Any, name: str, result: Any) -> None:
+        """§2g. The roots THIS read proved exist, enrolled where the result is PRODUCED rather
+        than where it is consumed — so a result the model never mentions has still widened
+        nothing until the tool actually returned it.
+
+        `ok: False` claims nothing: a refusal proves no thread. IT STAGES; IT DOES NOT ENROL —
+        whether this result is the one the model receives is decided by the registry, after this
+        executor returns, and `ToolRegistry` commits only the claims whose own structured field
+        survives into the delivered, clipped payload. A ctx with no staging area claims nothing
+        and is not an error (a DM, a background agent, a hand-built context).
+        """
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            return
+        channel = result.get("channel")
+        if name == "fetch_thread_messages":
+            if result.get("thread_ts"):
+                stage_discovered_root(ctx, channel_id=channel, root_ts=result.get("thread_ts"),
+                                      source=name, field="thread_ts")
+            return
+        for entry in (result.get("messages") or ()):
+            if not isinstance(entry, dict):
+                continue
+            replies = entry.get("reply_count")
+            # The LITERAL predicate, not a truthiness test: `0`, `False`, `"3"` and a malformed
+            # value must never authorize a target, and `bool` is excluded explicitly because
+            # `True` is an `int` in Python. The landed tool only emits the key when Slack's value
+            # is truthy — this does not rely on that.
+            if isinstance(replies, int) and not isinstance(replies, bool) and replies > 0:
+                if entry.get("ts"):
+                    stage_discovered_root(ctx, channel_id=channel, root_ts=entry.get("ts"),
+                                          source=name, field="ts")
+
     async def dispatch_history_tool_call(self, name: str, arguments: Any, ctx: Any = None) -> Dict[str, Any]:
         """Route a model function-call (name + args) to its executor.
 
@@ -1043,13 +1076,18 @@ class SlackHistoryToolMixin:
             return self._delivery_redirect(channel_id, reason, name)
 
         if name == "fetch_channel_history":
-            return await self.fetch_history_tool(channel_id, args.get("limit"), ctx=ctx)
+            result = await self.fetch_history_tool(channel_id, args.get("limit"), ctx=ctx)
+            self._enroll_history_roots(ctx, name, result)
+            return result
         if name == "fetch_thread_messages":
             thread_ts = args.get("thread_ts") or getattr(ctx, "thread_ts", None)
             if not thread_ts:
                 return {"ok": False, "error": "bad_arguments",
                         "message": "No thread here — pass thread_ts or use fetch_channel_history."}
-            return await self.fetch_history_tool(channel_id, args.get("limit"), thread_ts, ctx=ctx)
+            result = await self.fetch_history_tool(channel_id, args.get("limit"), thread_ts,
+                                                   ctx=ctx)
+            self._enroll_history_roots(ctx, name, result)
+            return result
         if name == "get_message_permalink":
             return await self.get_message_permalink_tool(channel_id, args.get("message_ts"), ctx=ctx)
         if name == "fetch_channel_info":
