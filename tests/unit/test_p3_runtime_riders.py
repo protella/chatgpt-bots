@@ -144,9 +144,10 @@ CONDUCT = "[Closing a loop you were part of is legitimate. Post ONCE, in THAT th
 @pytest.mark.parametrize("silence_capable", [True, False])
 def test_the_conduct_paragraph_reaches_addressed_and_silence_capable_channel_turns(
         silence_capable):
-    """The case it is about — "answer that over in the other thread" — arrives ADDRESSED as often
-    as not, and the restraint suffixes never reach an addressed turn. So this paragraph is keyed to
-    the TOOL being exposed, not to a posture."""
+    """A turn that lands work in another thread arrives ADDRESSED as often as not — somebody is
+    usually talking to the bot when the thing that was owed elsewhere becomes answerable — and the
+    restraint suffixes never reach an addressed turn. So this paragraph is keyed to the TOOL being
+    exposed, not to a posture."""
     with patch.object(prompts, "CHANNEL_CROSS_THREAD_CONDUCT_SUFFIX", CONDUCT):
         contract = _materialize(SURFACE_CHANNEL, silence_capable=silence_capable)
 

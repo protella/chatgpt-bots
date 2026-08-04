@@ -437,6 +437,19 @@
         "passes": 3,
         "trials": 3
       },
+      "news-settles-buried-loop": {
+        "bar": "hard",
+        "expected": [
+          "cross_thread_post"
+        ],
+        "outcomes": [
+          "channel_reply",
+          "cross_thread_post",
+          "cross_thread_post"
+        ],
+        "passes": 2,
+        "trials": 3
+      },
       "open-needs-human-experience": {
         "bar": "soft",
         "expected": [
@@ -473,6 +486,46 @@
           "silence",
           "silence",
           "silence"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "others-obligation-no-post": {
+        "bar": "hard",
+        "expected": [
+          "silence",
+          "reaction_only"
+        ],
+        "outcomes": [
+          "reaction_only",
+          "reaction_only",
+          "reaction_only"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "owed-answer-elsewhere": {
+        "bar": "hard",
+        "expected": [
+          "cross_thread_post"
+        ],
+        "outcomes": [
+          "cross_thread_post",
+          "cross_thread_post",
+          "cross_thread_post"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "own-answer-now-wrong": {
+        "bar": "hard",
+        "expected": [
+          "cross_thread_post"
+        ],
+        "outcomes": [
+          "cross_thread_post",
+          "cross_thread_post",
+          "cross_thread_post"
         ],
         "passes": 3,
         "trials": 3

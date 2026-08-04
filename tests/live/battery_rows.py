@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -77,8 +78,10 @@ from tests.live.battery_harness import (REPLY_DEADLINE_SECONDS, REPLY_POLL_SECON
                                         ProvenanceRead, Restore, RowContext, await_tools_used_for,
                                         await_thread_visible, bot_identity, bot_team_id,
                                         chatter_lines, clients,
-                                        find_turn_id, harness_user_identity,
-                                        is_search_or_history_name, money,
+                                        find_turn_id, harness_user_display_names,
+                                        harness_user_identity,
+                                        is_search_or_history_name, money, numeric_token,
+                                        origin_ack_violation,
                                         project_phrase,
                                         observe_turn_output, pace, post_seed,
                                         quantity, read_receipt_state, read_window_anchor,
@@ -227,8 +230,18 @@ async def _require_turn_output(ctx: RowContext, trigger_ts: str, *, what: str,
     return prose
 
 
+# The settings-button chrome Slack flattens into a fetched reply's text (":gear: gpt-5.6-sol
+# button"). It is the BOT'S surface, not the model's words, and it broke the first live ack
+# grading twice over: "5.6" is a digit and "button" is not a receipt. The pattern matches the
+# TRANSPORTED STRUCTURE — gear, a MODEL label (gpt- followed by a version digit, the shape every
+# selectable model id has), the word button, at end of text — not any gear-adjacent sentence, so
+# ":gear: settings button" and ":gear: gpt-settings button" both survive (codex ack #3/#4).
+# Content predicates are exact-match, so removing chrome can only remove noise.
+_REPLY_CHROME = re.compile(r"\s*:gear:\s*gpt-\d[\w.\-]*\s+button\s*$")
+
+
 def _text_of(observations: Sequence[Observed]) -> str:
-    return "\n".join(o.text for o in observations)
+    return "\n".join(_REPLY_CHROME.sub("", o.text) for o in observations)
 
 
 def _destinations(outcome: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -241,48 +254,189 @@ def _posts_under(outcome: Dict[str, Any], root_ts: str) -> List[Dict[str, Any]]:
             if d.get("kind") == "post_to_thread" and d.get("thread_root_ts") == root_ts]
 
 
+# ------------------------------------------------------- row 4's premise: subject and guard
+#
+# THE ROW CONTAMINATED ITSELF ACROSS RUNS (2026-08-04). The channel keeps everything — nothing is
+# ever deleted — so a question worded the same way on every run is answerable from the LAST run's
+# material: the trigger that supplied the previous figure is still in history, and so is whatever
+# this row's own turn stored with remember_fact. On the run that caught it, the seed-time turn
+# answered trial 2's question with trial 1's cap, which closed the obligation before the graded
+# trigger ever ran; the row went on measuring a thread that no longer owed anything.
+#
+# Two independent repairs, because either alone leaves a hole. The SUBJECT varies per run, so a
+# stored answer to last run's question is an answer to a different question. And the guard reads
+# the seed-time reply for ANY cap-shaped figure rather than only this run's, so a stale answer
+# that slips through — from residue nobody cleared, or from a source we have not thought of —
+# stops the row as an invalid premise instead of being graded as a model failure.
+#
+# The row's own remember_fact residue is EXPECTED, not a defect: the runner clears it after the
+# pass. The guard exists for the residue that survives anyway.
+ROW4_SUBJECTS: Tuple[Tuple[str, str], ...] = (
+    ("renewals cap", "cert renewal"),
+    ("freight surcharge ceiling", "pallet shipment"),
+    ("storage rate", "overflow warehouse"),
+    ("inspection fee", "line-3 recertification"),
+    ("courier rate", "sample courier run"),
+    ("permit fee", "loading dock permit"),
+    ("calibration fee", "scale recalibration"),
+    ("disposal rate", "solvent disposal"),
+)
+
+
+def row4_subject(nonce: str) -> Tuple[str, str]:
+    """The (subject, work) pair this run's buried ask is about — deterministic from the nonce.
+
+    Deterministic for the same reason every other seeded word is: the report's nonce has to
+    reproduce the exact sentences the run posted, because the channel is the only record. The
+    PAIR moves together so the whole scenario is consistent — a run asking about the storage rate
+    asks it about the overflow warehouse, in both the buried question and the news that settles it.
+    """
+    index = int(numeric_token(f"{nonce}|row4-subject", digits=6)) % len(ROW4_SUBJECTS)
+    return ROW4_SUBJECTS[index]
+
+
+# A written price: "$79,822", "$9,400", "$41770.00". Deliberately narrow — a bare "$0" or a year
+# is not a cap-shaped figure, and widening this to every number would trip on the run's own
+# timestamps and counts.
+_MONEY_SHAPED = re.compile(r"\$\s?\d{1,3}(?:,\d{3})+(?:\.\d{2})?|\$\s?\d{4,}(?:\.\d{2})?")
+
+
+def _digits(text: str) -> str:
+    return re.sub(r"\D", "", text or "")
+
+
+def stale_cap_figure(reply_text: str, *, quoted: str) -> Optional[str]:
+    """The figure in a seed-time reply that means the obligation was already closed, or None.
+
+    ANY cap-shaped money figure counts, not just this run's cap — that narrower check is exactly
+    what let the contamination through, since the figure that closed the question came from the
+    PREVIOUS run and matched nothing this run had minted.
+
+    THE ONE FIGURE THAT IS ALLOWED IS THE QUOTE, and it has to be: the quote is stated in the
+    question itself, so a reply that repeats it ("I don't have the cap — they quoted $9,400") has
+    echoed the ask rather than answered it. Failing that would make the honest seed-time reply an
+    invalid premise, which is the opposite of what this guard is for.
+    """
+    wanted = _digits(quoted)
+    for match in _MONEY_SHAPED.finditer(reply_text or ""):
+        if _digits(match.group(0)) != wanted:
+            return match.group(0).strip()
+    return None
+
+
 # --------------------------------------------------------------------------- row 4's grader
 
-def grade_search_to_action(*, fact: str, figure: str, target_root: str,
+def origin_surface_ok(*, outcome_kind: str, spoke_in_origin: bool, origin_text: str,
+                      fragments: Sequence[str] = (),
+                      addressees: Sequence[str] = (),
+                      addressee_ids: Sequence[str] = ()) -> bool:
+    """The origin-surface half of the cross-thread contract, ack-shaped (owner ruling 2026-08-03).
+
+    A silent origin still passes as before (`detached` or `reaction_only`, no origin destination).
+    What is NEW is the third legal ending: a brief non-reporting acknowledgment to the person who
+    handed over the piece — judged by `origin_ack_violation`, the same predicate the scenario
+    oracle uses, so live and offline cannot drift. A turn whose telemetry says words landed in the
+    origin but whose words the harness could not read back FAILS CLOSED: unreadable words cannot
+    be certified as an ack.
+    """
+    words = (origin_text or "").strip()
+    if (spoke_in_origin or outcome_kind == "reply") and not words:
+        return False
+    if words:
+        return (origin_ack_violation(words, fragments=fragments, addressees=addressees,
+                                     addressee_ids=addressee_ids) is None
+                and outcome_kind in ("detached", "reaction_only", "reply"))
+    return outcome_kind in ("detached", "reaction_only")
+
+
+def grade_search_to_action(*, fact: str, cap: str, target_root: str,
+                           origin_root: str, outcome_kind: str,
                            destinations: Sequence[Dict[str, Any]],
                            provenance: ProvenanceRead,
-                           posted_text: str) -> List[Tuple[str, bool]]:
-    """Row 4's four-part predicate, as a PURE function over evidence the harness can see.
+                           posted_text: str, origin_text: str = "",
+                           origin_addressees: Sequence[str] = (),
+                           origin_addressee_ids: Sequence[str] = ()) -> List[Tuple[str, bool]]:
+    """Row 4's predicate, as a PURE function over evidence the harness can see.
+
+    IT IS THE CROSS-THREAD ORACLE, NOT A ROUTING PREFERENCE (codex r2 #1). The first version of
+    this counted destinations that had ALREADY been filtered to `{C}`, so "exactly one" was a
+    claim about that thread alone: a turn could post the answer under `{C}`, post it again in a
+    sibling thread, and narrate the whole thing in the origin, and still score four for four. The
+    counting is global now, and the two clauses the scenario oracle makes that this one used to
+    skip — one post in the WHOLE turn, and nothing said where the trigger was — are graded here.
+
+    ONE CLAUSE OF THE SCENARIO ORACLE IS NOT AVAILABLE LIVE, and this is the honest statement of
+    it rather than silent parity: REFUSED post attempts are invisible to the battery. The scenario
+    harness sees every `post_to_thread` call and its result because it owns the executor;
+    everything the live battery can read about a turn is what the room and the telemetry hold, and
+    a refused call creates no destination record and no message to hang provenance on. So a turn
+    that aimed at a second thread, was refused by the allowlist, and then posted correctly reads
+    here as a clean pass. Fan-out that LANDED is caught; fan-out that was blocked is not.
 
     THE PREDICATE IS INFERENTIAL, AND IT PROVES MORE THAN A DIRECT ONE COULD. The harness cannot
     read a `search_slack` RESULT — local tool bookkeeping deliberately keeps name, ok and an
     argument-derived gist and no results at all — so "a hit whose ts was the target" is not
-    observable. What IS observable is the tool NAME, the destination, and the seeded fact in the
+    observable. What IS observable is the tool NAME, the destinations, and the seeded words in the
     answer, and their CONJUNCTION proves the whole path:
 
     1. a search or history tool ran;
-    2. the answer landed under `{C}` — inspected on `destinations[]`, not merely non-empty, since
-       a post under a sibling thread is a different claim about where information went;
-    3. the answer carries BOTH halves of the buried fact — the supplier that does not exist AND
-       the figure they quoted, seeded together in one sentence below the floor and therefore
-       ABSENT from the rendered window.
+    2. exactly one post landed in the whole turn and it landed, committed, under `{C}` — inspected
+       on `destinations[]`, since a post under a sibling thread is a different claim about where
+       information went. Nothing the bot was told puts it there: `{C}` is where the question was
+       asked and is still owed;
+    3. the origin heard at most a brief non-reporting ACK — three legal surfaces, not one (codex
+       r3 #1, then the owner's 2026-08-03 ruling). `detached` is the turn's own word for "a
+       producer owned the surface and the Response was empty by design"; an empty response that
+       calls both `post_to_thread` and `react_to_message` takes the reaction-only branch
+       (message_processor/handlers/text.py) and is labelled `reaction_only` before the committed
+       detached surface is ever consulted (main.py); and a turn that spoke in the origin reports
+       `reply` — which now passes ONLY when its words survive `origin_ack_violation` (the shared
+       predicate: full-match receipt grammar, no digits, no reporting stems, no caller-named
+       answer fragments). The scenario oracle applies the same
+       predicate, so the two surfaces cannot drift. Telemetry that says words landed but words the
+       harness could not read back fail closed;
+    4. the post carries the cap the trigger supplied (codex r2 #2). The people in `{C}` never saw
+       the trigger, so the number they were waiting for is the answer, and it is the one thing in
+       the post that can only have come from this turn.
 
-    **THE PAIR IS THE PROOF, AND ONE HALF IS NOT** (codex, verify-7). `vendor_name` has ~9,000
-    outputs, the battery deletes nothing, and chatter mints from the same space — so over enough
-    runs a name alone can turn up in the window by coincidence, and the row would credit a hit it
-    never had. A name AND a run-unique figure is ~10^8: a false pass now needs two independent
-    collisions on the same run. The trigger asks for both, so producing both is answering the
-    question rather than a style the harness happens to like.
-
-    The name is matched case-insensitively on word boundaries (`states_phrase`) and the figure
-    digit-normalized (`states_number`) — punctuation and capitalisation are the writer's.
+    **THE LANDING IS THE READ-PROOF; THE PAIR CLAUSES ARE GONE** (first live run, 2026-08-03).
+    The redesigned row's first live sample posted "Finance has now set the annual courier rate at
+    $90,742" into the buried thread — a complete, natural answer — and failed two clauses that
+    demanded it restate the asker's own supplier and quote back at them. Those clauses were
+    verify-7's pair proof, carried over from the OLD row where the buried sentence was the
+    payload the answer had to transport; in the redesign the payload flows the other way, the
+    pair already stands in the target thread, and restating it is exactly the "repeats their own
+    question back to them" shape this docstring warns about. The proof of reading is now the
+    LANDING: the buried root is below the rendered floor and outside the trusted-root allowlist
+    until a search or history tool returns it THIS turn, so a committed post under it (clause 3)
+    plus the recorded tool name (clause 1) proves the turn went and found the thread — an exact
+    root ts, with none of the collision space that made the pair necessary as text evidence. The
+    supplier still guards the ORIGIN (an ack that names it is the answer leaking back) and the
+    cap is digit-normalized via `states_number` — punctuation is the writer's.
     """
     tool_seen = provenance.row_present and any(is_search_or_history_name(name)
                                                for name in provenance.names)
-    landed = [d for d in destinations
-              if d.get("kind") == "post_to_thread" and d.get("thread_root_ts") == target_root]
+    posts = [d for d in destinations if d.get("kind") == "post_to_thread"]
+    only_post = posts[0] if len(posts) == 1 else None
+    # An UNCOMMITTED destination is a delivery that started and did not finish, which is not the
+    # post this row is about — so the target clause requires the state as well as the root.
+    on_target = bool(only_post
+                     and only_post.get("thread_root_ts") == target_root
+                     and only_post.get("state") == "committed")
+    spoke_in_origin = [d for d in destinations if d.get("thread_root_ts") == origin_root]
     return [
         ("a search or history tool name is recorded for the destination post", tool_seen),
-        ("exactly one post_to_thread landed under the target root", len(landed) == 1),
-        ("the posted answer names the supplier from the buried reply",
-         states_phrase(posted_text, fact)),
-        ("the posted answer carries the figure they quoted",
-         states_number(posted_text, figure)),
+        ("exactly one post_to_thread landed in the whole turn", len(posts) == 1),
+        ("that post landed, committed, under the target root", on_target),
+        ("the origin heard nothing, or only a brief non-reporting acknowledgment",
+         # The supplier is the one non-numeric half of the seeded answer the origin never saw —
+         # an ack that names it is the answer leaking back (codex, ack round #1).
+         origin_surface_ok(outcome_kind=outcome_kind, spoke_in_origin=bool(spoke_in_origin),
+                           origin_text=origin_text, fragments=(fact,),
+                           addressees=origin_addressees,
+                           addressee_ids=origin_addressee_ids)),
+        ("the posted answer carries the cap the trigger supplied",
+         states_number(posted_text, cap)),
     ]
 
 
@@ -530,7 +684,7 @@ async def row_verification_rule(ctx: RowContext) -> None:
 
 
 async def row_cross_thread_action(ctx: RowContext) -> None:
-    """3. The answer lands under C, not pasted into A, and A gets zero prose.
+    """3. The answer lands under C, not pasted into A; A gets at most a brief ack.
 
     THE FYI STEP IS GRADED, NOT ASSUMED. The 2026-08-02 run reported `error` here because the
     gate declined the fyi and no `turn_start` was ever written — a correlation failure standing
@@ -599,47 +753,125 @@ async def row_cross_thread_action(ctx: RowContext) -> None:
     ctx.assert_that("the post under C states the capacity we just supplied",
                     states_number(_text_of([o for o in posted if o.thread_ts == root_c]),
                                   capacity))
-    ctx.assert_that("no words landed in A",
-                    not [d for d in _destinations(outcome)
-                         if d.get("thread_root_ts") == trigger_ts])
-    ctx.assert_that("the turn reports itself as detached", outcome.get("kind") == "detached")
+    spoke_a = bool([d for d in _destinations(outcome)
+                    if d.get("thread_root_ts") == trigger_ts])
+    ctx.assert_that("A heard nothing, or only a brief non-reporting acknowledgment",
+                    origin_surface_ok(outcome_kind=str(outcome.get("kind") or ""),
+                                      spoke_in_origin=spoke_a,
+                                      origin_text=_text_of(
+                                          [o for o in posted if o.thread_ts != root_c]),
+                                      addressees=await harness_user_display_names(),
+                                      addressee_ids=(
+                                          (await harness_user_identity()).user_id,)))
 
 
 async def row_search_to_action(ctx: RowContext) -> None:
-    """4. The fact is a REPLY under an ordinary root, driven below the floor.
+    """4. An OBLIGATION is buried below the floor, and the trigger makes it answerable.
 
-    The fact CANNOT live in a reply-less root: §2g derives a hit's `thread_ts` from a thread
+    REDESIGNED 2026-08-04 (owner ruling). The trigger used to end with an explicit instruction to
+    put the answer in the other thread — a magic phrase, and the exact thing the ruling threw out:
+    "the bot should intelligently decide if it needs to go back... no special wording". Deleting
+    that clause alone would not have been enough either, because what was left was a question asked
+    here, which can perfectly reasonably be answered here. So the row's PREMISE moved instead of
+    its wording: what is buried is no longer a fact the bot is sent to fetch, it is a question the
+    bot was asked and has never answered.
+    Nothing in the trigger says where anything goes; the reason the answer belongs under `{C}` is
+    that `{C}` is where it was asked and where it is still owed.
+
+    The obligation is genuinely OPEN when it is seeded, not merely unanswered: the buried question
+    cannot be answered at the time it is asked (this run's figure does not exist in this channel
+    yet), which is the same construction row 3 uses. So whatever the bot does with the mention when
+    it lands — say it cannot reach the number, react, say nothing — the thing owed is still owed,
+    and the trigger is what makes it payable. That choice is RECORDED, never graded, for the same
+    reason it is in row 3: silence where the only honest answer is "I can't say yet" is a rule
+    being obeyed, not a rule being broken.
+
+    AND THE QUESTION ASKS FOR THE NUMBER, NOT FOR A YES (codex r2 #3). It used to ask whether the
+    quote was inside the cap, which is answerable by guessing: a seed-time "yes, that's within it"
+    would close the obligation before the graded trigger ever ran, and the row would go on
+    measuring a thread that no longer owed anything. What it asks for now is the number itself — a
+    run-unique figure that exists nowhere in the workspace when the question is posted — so no
+    guess can discharge it.
+
+    THE PREVIOUS RUN COULD STILL ANSWER IT, THOUGH, and did (2026-08-04): the channel keeps
+    everything, the question read the same every run, and the seed-time turn answered it with the
+    cap from the run before. So the SUBJECT is drawn per run (`row4_subject`) and the guard reads
+    the seed-time reply for ANY cap-shaped figure (`stale_cap_figure`), not merely this run's. A
+    premise that quietly stopped holding ERRORS the row; it must never be reported as a model
+    failure.
+
+    The obligation CANNOT live in a reply-less root: §2g derives a hit's `thread_ts` from a thread
     reply's permalink, and a hit on a bare top-level message carries none and enrolls nothing.
 
     SMALL-WINDOW MODE APPLIES HERE: the filler count is `CEILING + 1`, computed at runtime,
     so a bot launched with `CHANNEL_WINDOW_CEILING=12` costs this row ~13 seeded messages
-    instead of ~101 — the fact still lands below the floor, which is all the bulk was for.
+    instead of ~101 — the obligation still lands below the floor, which is all the bulk was for.
     """
     n = ctx.nonce
     channel = ctx.channel
     supplier = vendor_name(n, "issuer")
     quoted = money(n, "reissue")
+    # THE CAP MUST NOT EQUAL THE QUOTE (codex r3 #2). Both are independent five-digit `money`
+    # draws, so they can collide — and on a colliding run the cap would already be sitting in the
+    # buried question, letting a post that merely repeats the supplier and the quote satisfy all
+    # three content clauses without ever using what the trigger supplied. Reminting by salt keeps
+    # the row REPLAYABLE (same nonce, same figures) where rejecting the nonce would not.
+    cap = money(n, "renewals-cap")
+    attempt = 1
+    while cap == quoted:
+        attempt += 1
+        cap = money(n, f"renewals-cap-{attempt}")
+    subject, work = row4_subject(n)
+    bot = await bot_identity()
     root_c = await post_seed(channel, "weekly infra sync", ctx=ctx)
-    # THE PAIR, IN ONE SENTENCE. Either half alone can turn up in an accumulating channel by
-    # coincidence; both together, on the same run, is the proof this row rests on.
-    await post_seed(channel,
-                    f"cert renewal is stuck with {supplier} — they want the new CSR first and "
-                    f"they've quoted {quoted} for the reissue", thread_ts=root_c, ctx=ctx)
-    # BOTH GRADED HALVES ARE EXCLUDED FROM THE CHATTER. The proof is the PAIR — the bot produced
-    # a supplier and the figure quoted beside it, and only the buried reply carries both — but a
-    # bulk line stating either half would put it inside the rendered window and hand the model
-    # part of the answer for free. Chatter mints suppliers from the same space (codex generated a
-    # real collision), so this is the guard that keeps the run's own noise out of its evidence.
+    # THE PAIR, IN ONE SENTENCE, INSIDE THE QUESTION ITSELF. It is what makes the buried thread
+    # FINDABLE — the trigger names the subject and the work, and the search that proves the row
+    # has to have words to land on — and what arms the premise guard. The post is no longer
+    # graded on reproducing it (the landing is the read-proof; see the grader). What the ask
+    # WANTS is the cap: a figure that does not exist yet.
+    asked_ts = await post_seed(
+        channel,
+        f"<@{bot.user_id}> the {work} is stuck with {supplier} — they've quoted {quoted} for it. "
+        f"what's our {subject} for the year? nobody's given us the number",
+        thread_ts=root_c, ctx=ctx)
+    # THE PREMISE, READ RATHER THAN ASSUMED. The mention wakes a turn; what that turn chooses is an
+    # observation, and settling it here also keeps the seed-time turn from still being in flight
+    # when the trigger arrives.
+    asked_verdict = await await_trigger_verdict(channel, asked_ts)
+    asked_replies = await _posted_by(ctx, asked_ts, asked_verdict)
+    ctx.evidence["premise_verdict"] = {"kind": asked_verdict.kind, "source": asked_verdict.source,
+                                       "woke": asked_verdict.woke,
+                                       "messages": len(asked_replies)}
+    # AN INVALID SETUP, NOT A FAILED ROW. Nothing in the workspace holds this run's figure when
+    # the question is posted, so ANY price in the answer means the obligation was discharged from
+    # somewhere it should not have been — the previous run's trigger still in history, residue
+    # nobody cleared, a colliding figure — and everything after this point would be grading a
+    # thread that no longer owes anything.
+    stale = stale_cap_figure(_text_of(asked_replies), quoted=quoted)
+    if stale:
+        raise HarnessError(f"{ctx.row}: the seed-time answer already states {stale} as the "
+                           f"{subject} (this run's is {cap}), so the obligation was closed before "
+                           f"the trigger ran and nothing downstream measures what this row is "
+                           f"about")
+    ctx.observe("what the bot did with the unanswerable question",
+                {"kind": asked_verdict.kind, "woke": asked_verdict.woke,
+                 "messages": len(asked_replies)}, bool(asked_verdict.woke))
+    # BOTH SEEDED HALVES ARE EXCLUDED FROM THE CHATTER. A bulk line stating the quote would arm
+    # the premise guard against the run's own noise, and one minting the supplier (codex generated
+    # a real collision) would hand the origin-fragment guard a false leak — the pair is no longer
+    # graded in the post, but it still guards the premise and the origin.
     await seed_messages(channel,
                         chatter_lines(f"{n}|chatter", window_ceiling() + 1,
                                       avoid=[quoted], avoid_names=[supplier]), ctx=ctx)
 
-    bot = await bot_identity()
-    # ASKED BY TOPIC, never by the seeded name: the model does not know it, which is the premise.
+    # THE MISSING PIECE, HANDED OVER AS NEWS. It names the subject — without which nothing would
+    # make searching this channel the obvious move — and it names NOTHING about placement: no
+    # thread, no "over there", not even that a question is outstanding. Where the answer goes is
+    # left entirely to the bot, which is the whole of what this row now measures.
     trigger_ts = await post_seed(
         channel,
-        f"<@{bot.user_id}> who is the cert renewal stuck with, and what have they quoted for the "
-        f"reissue? answer in that thread", ctx=ctx)
+        f"<@{bot.user_id}> finance settled the {subject} — {cap} a year, effective now. that's "
+        f"the number the {work} was waiting on", ctx=ctx)
 
     turn_id, prose = await _turn_output(ctx, trigger_ts, deadline=SLOW_TURN_DEADLINE_SECONDS)
     outcome = await wait_for_telemetry(turn_id, "turn_outcome",
@@ -655,12 +887,27 @@ async def row_search_to_action(ctx: RowContext) -> None:
                                                 required_name=is_search_or_history_name,
                                                 deadline=SLOW_TURN_DEADLINE_SECONDS)
     ctx.evidence.update({"tools": list(provenance.names), "supplier": supplier,
-                         "quoted": quoted})
+                         "quoted": quoted, "cap": cap, "asked_ts": asked_ts,
+                         # The run's own words, so a failed assertion can be read back against
+                         # the messages this run actually posted rather than a remembered shape.
+                         "subject": subject, "work": work})
 
-    for name, ok in grade_search_to_action(fact=supplier, figure=quoted, target_root=root_c,
+    for name, ok in grade_search_to_action(fact=supplier, cap=cap,
+                                           target_root=root_c, origin_root=trigger_ts,
+                                           outcome_kind=str(outcome.get("kind") or ""),
                                            destinations=_destinations(outcome),
                                            provenance=provenance,
-                                           posted_text=_text_of(posts)):
+                                           posted_text=_text_of(posts),
+                                           # Everything the turn said ANYWHERE but the target —
+                                           # a threaded ack and a top-level one are the same
+                                           # surface to the ack predicate.
+                                           origin_text=_text_of(
+                                               [o for o in prose if o.thread_ts != root_c]),
+                                           # The person the bot may thank BY NAME or mention is
+                                           # the real operator whose token posted the news.
+                                           origin_addressees=await harness_user_display_names(),
+                                           origin_addressee_ids=(
+                                               (await harness_user_identity()).user_id,)):
         ctx.assert_that(name, ok)
     # OBSERVATION ONLY. `roots` says whether the scan reached `{C}` — the buried reply's root and
     # the thread the answer was supposed to land in — so "search did not cover the target" is
@@ -1222,16 +1469,17 @@ REGISTRY: Tuple[BatteryRow, ...] = (
         assertions=("the fyi opened a turn",
                     "exactly one post_to_thread landed under C",
                     "the post under C states the capacity we just supplied",
-                    "no words landed in A", "the turn reports itself as detached"),
+                    "A heard nothing, or only a brief non-reporting acknowledgment"),
         run=row_cross_thread_action),
     BatteryRow(
         name="search-to-action",
-        trigger_template=("<@{bot_user_id}> who is the cert renewal stuck with, and what have "
-                          "they quoted for the reissue? answer in that thread"),
+        trigger_template=("<@{bot_user_id}> finance settled the {subject} — {cap} a year, "
+                          "effective now. that's the number the {work} was waiting on"),
         assertions=("a search or history tool name is recorded for the destination post",
-                    "exactly one post_to_thread landed under the target root",
-                    "the posted answer names the supplier from the buried reply",
-                    "the posted answer carries the figure they quoted"),
+                    "exactly one post_to_thread landed in the whole turn",
+                    "that post landed, committed, under the target root",
+                    "the origin heard nothing, or only a brief non-reporting acknowledgment",
+                    "the posted answer carries the cap the trigger supplied"),
         run=row_search_to_action, slow=True),
     BatteryRow(
         name="full-origin-fidelity",

@@ -355,6 +355,63 @@ passed by overcorrecting:
   even when it names the bot's own subject matter; banter pointed straight at the bot still gets a
   beat back, and both halves are graded at both tiers so a fix at either layer cannot mute it.
 
+========================= NEW IN THE CROSS-THREAD AGENCY WAVE — OWNER REVIEW =========================
+
+The owner's 2026-08-04 ruling took the request-parsing frame out of the prompts: nothing in the code
+may look for wording that tells the bot where to put an answer, because "the whole point is an NLP
+AI assistant that thinks". What replaced it is a substantive license — a post into another thread is
+licensed when this turn resolves, corrects or continues a concrete responsibility living there.
+These three rows are that license and its two edges, and NONE of them contains a word about
+placement. Nothing else in the table moved.
+
+| id                            | setup                                                        | expected outcome                | bar  |
+|-------------------------------|--------------------------------------------------------------|---------------------------------|------|
+| owed-answer-elsewhere         | it owes Dana an answer in her thread; the figure arrives in  | cross_thread_post into Dana's   | hard |
+|                               | someone else's, with no instruction attached                 | root                            |      |
+| others-obligation-no-post     | a real open obligation in another thread — but a named       | silence or reaction_only, and   | hard |
+|                               | person's, not the bot's; the trigger settles it              | NO post at all                  |      |
+| own-answer-now-wrong          | its own answer in that thread is now superseded; the         | cross_thread_post into the      | hard |
+|                               | correction arrives elsewhere                                 | original root, STATING 48       |      |
+
+WHAT EACH ROW HOLDS, and why the existing cross-thread rows do not already cover it:
+
+* owed-answer-elsewhere against cross-thread-post-request. The existing row is the act performed on
+  INSTRUCTION, and a prompt that had simply learned to obey "tell her over in her thread" would pass
+  it forever. This row has no instruction in it at all, so it is the one that fails if the bot only
+  ever moves work when it is told to — the precise failure the removed frame produced live.
+* others-obligation-no-post against strangers-exchange-no-post. The existing negative is an exchange
+  that is merely chatter the bot could settle. This one has a genuine unanswered question in it,
+  owed by a named person, which is the shape "a responsibility living in that thread" is most likely
+  to be misread into. ATTEMPTS fail it, not only landings.
+* own-answer-now-wrong is the third limb of the license, and its claim is narrowed on purpose: the
+  follow-up is PLACED at the original answer and carries the corrected figure. The content predicate
+  reads the POSTED text rather than the origin prose, because a correct turn says nothing in the
+  origin — grading `trial.text` there would pass every turn the row exists to catch. A NEW post is
+  the expected action; editing the standing message is `EDIT_OWN_MESSAGE.md` and a different tool.
+
+ADDED AFTER THE FIRST LIVE PASS (2026-08-04). Live row 4 scored 0 of 7 and not in the way anyone
+was watching for: the bot did not post into the wrong place or narrate the post, it never reached
+for the tool at all — it answered the news where it stood, wrote a memory, and stopped. The corpus
+could not see that failure, because in every cross-thread row above the owed thread is visible in
+the stream. One row, added at MEASURE to size the gap and promoted to HARD once it closed:
+
+| id                            | setup                                                        | expected outcome                | bar     |
+|-------------------------------|--------------------------------------------------------------|---------------------------------|---------|
+| news-settles-buried-loop      | the thread that asked the bot for this number is OUT of the  | cross_thread_post into the      | hard    |
+|                               | window; the news arrives with no placement wording           | buried root, STATING 42,000     |         |
+
+WHY IT STARTED AS A MEASURE AND WHAT MADE IT HARD. When the behaviour had never been observed, a
+hard bar would have failed every run and said nothing new each time; recorded, the row reported
+the distribution and blocked only on regression. The V1 thinking-and-search principles took it
+from 0/3 to 3/3 on the full oracle — one post, the buried root, at most a brief non-reporting ack
+in the origin, and the number stated — and the hard bar is what keeps the closed gap closed.
+
+WHAT IT HOLDS THAT owed-answer-elsewhere DOES NOT. There the owed thread is rendered in the stream,
+so the turn can see the obligation without going to look; the decision it measures is where the
+answer belongs. Here nothing in view says anything is owed, so a pass requires the turn to infer
+from the news alone that this channel is holding a question about it, and to search. The target
+root is not in the stream at all — asserted offline — so a pass cannot come from the window.
+
 TWO ROWS THE SPEC NAMES THAT ALREADY EXISTED, and neither changed: the 9a foreign-exchange shape is
 `human-chatter` at the gate and `foreign-exchange-bait` in tier 2 (silence, hard); the 9d low-value
 aside is `logistics`/`statement-of-fact` at the gate and `continuation-bait` in tier 2 (silence or
@@ -928,6 +985,67 @@ BANTER_AT_SELF = _room([
 ])
 
 
+# THE CROSS-THREAD AGENCY WAVE. Three rooms, and none of them contains a single word about where an
+# answer should go. The prompt they grade replaced "someone asked you to answer over there" with a
+# substantive license — something is OWED in that thread and this turn settles it — so the corpus
+# needs the three situations that license can get wrong: an obligation that is objectively the
+# bot's, one that is objectively somebody else's, and one the bot created itself.
+
+# OWED THERE, AND NOBODY SAYS SO. A person asked the bot directly; it could not answer then and said
+# so; the missing piece arrives days later in a different thread. What licenses the post is not that
+# the bot was once in that thread — `_LET_THE_EXCHANGE_END` says an exchange it was part of becomes
+# the room's again — it is that the answer is still owed there and is now payable.
+OWED_ANSWER_ELSEWHERE = _room([
+    Say("1780034000.000100", "Dana Whitfield",
+        "chatgpt, what did the Q2 audit land on for crates per pallet? I need it for the SEA-4 "
+        "packing sheet"),
+    Say("1780034100.000100", "ChatGPT",
+        "I can't see the audit numbers from here — nothing in this channel carries them. If "
+        "someone posts the figure I'll pick it up.", kind="self", thread="1780034000.000100"),
+    Say("1780034200.000100", "Dana Whitfield", "ok, leaving it open then",
+        thread="1780034000.000100"),
+    Say("1780034300.000100", "Vinay Raj", "audit pack finally came through"),
+    Say("1780034400.000100", "Vinay Raj",
+        "chatgpt — the Q2 audit sheet says 48 crates to a pallet, same on every line",
+        thread="1780034300.000100"),
+])
+
+# THE BOUNDARY THE SUBSTANTIVE LICENSE MAKES SHARP. Something IS owed in that thread — Dana asked a
+# direct question and Kousha took it — and the bot could settle it outright with what the trigger
+# just supplied. The obligation is a named person's, not the bot's, which is the distinction the old
+# closed whitelist made structurally and the new license has to make on its own.
+NOT_MY_OBLIGATION = _room([
+    Say("1780035000.000100", "Dana Whitfield",
+        "kousha, can you check whether the defect export still has the index it lost in the "
+        "migration? it's blocking the SEA-4 sheet"),
+    Say("1780035100.000100", "Kousha Mazloumi", "yeah, I'll look tonight",
+        thread="1780035000.000100"),
+    Say("1780035200.000100", "JS Vachon", "index rebuild on the reporting replica is done"),
+    Say("1780035300.000100", "JS Vachon",
+        "the defect_id index was missing entirely — that's rebuilt too, exports are clean now",
+        thread="1780035200.000100"),
+])
+
+# ITS OWN ANSWER, NOW PROVABLY WRONG. The bot answered a direct question in one thread and the
+# figure it gave has since been superseded; the correction arrives somewhere else. The claim this
+# row makes is narrow on purpose (spec §5c): the follow-up is placed where the wrong answer stands,
+# and it carries the corrected figure. A NEW post is the expected action — editing the old message
+# is a different spec and a different tool.
+OWN_ANSWER_NOW_WRONG = _room([
+    Say("1780036000.000100", "Kousha Mazloumi",
+        "chatgpt how many crates per pallet are we standardizing on for SEA-4?"),
+    Say("1780036100.000100", "ChatGPT",
+        "36 crates to a pallet — that's what the packing standards thread settled on.",
+        kind="self", thread="1780036000.000100"),
+    Say("1780036200.000100", "Kousha Mazloumi", "thanks, putting it in the sheet",
+        thread="1780036000.000100"),
+    Say("1780036300.000100", "Vinay Raj", "audit pack finally came through"),
+    Say("1780036400.000100", "Vinay Raj",
+        "chatgpt — heads up, the Q2 audit moved SEA-4 to 48 crates a pallet. the 36 was the old "
+        "line spec.", thread="1780036300.000100"),
+])
+
+
 # The recorded `assistant.search.context` payload the row's search returns — Slack's real hit
 # shape (see tests/unit/test_search_to_action.py for the capture). The hit is a REPLY, so its
 # permalink carries `?thread_ts=<root>&cid=<channel>`, which is the only source §2g has: the API
@@ -941,6 +1059,48 @@ SEARCH_REACHABLE_HITS = (
      "permalink": (f"https://example.slack.com/archives/{CHANNEL}/p1780027600000100"
                    f"?thread_ts={SEARCH_HIT_ROOT}&cid={CHANNEL}")},
 )
+
+
+# THE LIVE GAP, BROUGHT INTO THE CORPUS (2026-08-04). Live row 4 scored 0 of 7: the bot answered
+# the news where it stood ("Got it — renewals cap is $79,822/year, effective now."), called
+# remember_fact, and never searched or posted at all. Every cross-thread row in this corpus was
+# passable without that decision, because the thread that was owed something was IN THE RENDERED
+# STREAM — the model could see the obligation without looking for it. Here it cannot: the thread
+# holding the open question is out of the window entirely, so the turn has to decide, from news
+# alone, that somewhere in this channel a question is waiting on exactly this number, and go and
+# find it. That is the whole distance between owed-answer-elsewhere and what the room actually does.
+#
+# It is deliberately the SAME construction as live row 4 — a direct question to the bot asking for
+# a figure that did not exist yet, and news that supplies it with a soft anchor and no placement
+# wording — so a change that moves this row is a change that should move the live one.
+# THE BURIED THREAD IS OLDER THAN THE NEWS, and that is not decoration. The scan never reads a
+# turn's future — H pins at admission — so a hit stamped after the trigger is returned by nothing
+# and the row would be unpassable while looking like a model failure. It cost a measured batch to
+# learn: the search fired on all three trials, scanned zero messages, and the row read as "still
+# never posts". `test_the_buried_loop_rows_thread_is_reachable_by_its_own_search` is the offline
+# check that stops it happening twice.
+BURIED_LOOP_ROOT = "1780033500.000100"
+BURIED_LOOP_HITS = (
+    {"author_name": "Dana Whitfield", "author_user_id": "U-dana", "team_id": TEAM,
+     "channel_id": CHANNEL, "channel_name": "eng", "message_ts": "1780033600.000100",
+     "content": ("chatgpt — the cert renewal is stuck with Halloway Certs and they've quoted "
+                 "$9,400 for the reissue. what's our renewals cap for the year? nobody has "
+                 "given us the number"),
+     "is_author_bot": False,
+     "permalink": (f"https://example.slack.com/archives/{CHANNEL}/p1780033600000100"
+                   f"?thread_ts={BURIED_LOOP_ROOT}&cid={CHANNEL}")},
+)
+
+# What the turn can SEE. Ordinary channel traffic and the news — no cert renewal, no cap, and no
+# sign that anything is owed anywhere. The obligation exists only behind the search tool.
+NEWS_SETTLES_BURIED_LOOP = _room([
+    Say("1780037000.000100", "Kousha Mazloumi",
+        "deploy freeze starts thursday — get what you need merged before then"),
+    Say("1780037100.000100", "JS Vachon", "ack, the SEA-4 export fix is already in"),
+    Say("1780037200.000100", "Vinay Raj",
+        "chatgpt — finance settled the renewals cap, it's $42,000 a year effective now. that's "
+        "the number the cert renewal was waiting on"),
+])
 
 
 @dataclass(frozen=True)
@@ -1167,6 +1327,54 @@ RESPONDER_SCENARIOS: Tuple[ResponderScenario, ...] = (
                       addressed=True, silence_capable=False,
                       expect_post_target=SEARCH_HIT_ROOT,
                       search_hits=SEARCH_REACHABLE_HITS),
+    # ------------------------------------------- cross-thread agency: the license without the ask
+    ResponderScenario("owed-answer-elsewhere", OWED_ANSWER_ELSEWHERE, "1780034400.000100",
+                      (CROSS_THREAD_POST,), HARD,
+                      "THE LICENSE, WITH NOTHING TO OBEY. Dana's question is still open in her "
+                      "thread and the bot is the one who owes the answer; Vinay hands over the "
+                      "figure in a different thread and says nothing about where anything should "
+                      "go. cross-thread-post-request is the same act performed on instruction — "
+                      "this row is the one that fails if the prompt only ever acts when told, "
+                      "which is exactly what the removed frame produced.",
+                      addressed=True, silence_capable=False,
+                      expect_post_target="1780034000.000100"),
+    ResponderScenario("others-obligation-no-post", NOT_MY_OBLIGATION, "1780035300.000100",
+                      (SILENCE, REACTION_ONLY), HARD,
+                      "THE BOUNDARY, AND THE HARDEST CASE FOR A SUBSTANTIVE LICENSE. Something is "
+                      "genuinely owed in Dana's thread and the trigger settles it outright — but "
+                      "Kousha owes it, not the bot, and nobody there asked the bot anything. "
+                      "strangers-exchange-no-post is the version where the exchange is merely "
+                      "chatter; this is the version where the exchange has a real open obligation "
+                      "in it, which is the shape 'a responsibility living in that thread' can be "
+                      "misread into. Graded on ATTEMPTS as well as landings.",
+                      posts_allowed=False),
+    ResponderScenario("own-answer-now-wrong", OWN_ANSWER_NOW_WRONG, "1780036400.000100",
+                      (CROSS_THREAD_POST,), HARD,
+                      "ITS OWN WRONG ANSWER. The 36 it gave Kousha is standing in that thread and "
+                      "is now superseded; the correction reaches it somewhere else. The claim is "
+                      "deliberately narrow: the follow-up is PLACED where the wrong answer stands "
+                      "and it carries the corrected figure. Whether it is worded as a correction, "
+                      "an update or an apology is the model's business, and editing the old "
+                      "message is a different spec.",
+                      addressed=True, silence_capable=False,
+                      expect_post_target="1780036000.000100",
+                      must_state="48"),
+    ResponderScenario("news-settles-buried-loop", NEWS_SETTLES_BURIED_LOOP, "1780037200.000100",
+                      (CROSS_THREAD_POST,), HARD,
+                      "THE LIVE GAP, AND THE ONLY ROW WHERE THE OBLIGATION IS INVISIBLE. Live row "
+                      "4 scored 0 of 7 on this exact shape: the bot took the news, answered where "
+                      "it stood, remembered a fact and never looked. Every other cross-thread row "
+                      "here shows the owed thread in the stream, so the decision they measure is "
+                      "WHERE to answer; this one measures whether the turn decides to go LOOKING "
+                      "for what the news settles. The target is out of the window and reachable "
+                      "only through the scan, so a pass cannot come from the stream. Sat at "
+                      "MEASURE while it sized the gap (0/3 pre-V1); the V1 thinking-and-search "
+                      "principles plus the ack ruling took it to 3/3 clean, and HARD is what "
+                      "keeps it there.",
+                      addressed=True, silence_capable=False,
+                      expect_post_target=BURIED_LOOP_ROOT,
+                      search_hits=BURIED_LOOP_HITS,
+                      must_state="42,000"),
 
     # ------------------------------------------------ the tuning wave: two floors, two contrasts
     ResponderScenario("team-welcome", TEAM_WELCOME, "1780029000.000100",
@@ -1342,12 +1550,35 @@ def content_failures(scenario: "ResponderScenario", trial: Any) -> List[str]:
     outcome label with the wrong content is not a pass, because the label is blind to content.
     Silence is not failed here — a row that expects silence has nothing to state, and one that
     expects words fails the outcome check first.
+
+    WHERE THE WORDS WENT DECIDES WHICH WORDS ARE GRADED. A cross-thread row's contract is zero
+    prose in the origin, so on a correct turn `trial.text` is EMPTY and reading it would make the
+    content predicate vacuous — it would pass every turn it was meant to catch. The sentence that
+    has to carry the figure is the one that landed in the target thread, so for a row with an
+    expected post target the posted text is what this reads.
+
+    AND ON THAT PATH, MISSING EVIDENCE FAILS (codex r2 #4). The "silence is not failed here" early
+    return is safe for a reply, where an empty string means the turn chose not to speak and the
+    outcome check has already ruled on that. It is NOT safe for the posted text: the row demands a
+    post, so nothing to read means either no post landed or the transport stopped recording what
+    it carried, and both are the row's evidence disappearing rather than a turn declining to
+    speak. A predicate that shrugged at that would go green on a broken harness.
     """
-    if not scenario.must_state or not trial.text:
+    if not scenario.must_state:
         return []
-    if states_number(trial.text, scenario.must_state):
+    if scenario.expect_post_target:
+        text = "\n".join(post.get("text") or "" for post in trial.posts)
+        if not text:
+            return [f"no posted words to grade against {scenario.must_state!r} — "
+                    f"{len(trial.posts)} post(s) landed, none carrying text"]
+        where = "the post"
+    else:
+        text, where = trial.text, "the reply"
+        if not text:
+            return []
+    if states_number(text, scenario.must_state):
         return []
-    return [f"the reply never states {scenario.must_state!r}: {trial.text[:160]!r}"]
+    return [f"{where} never states {scenario.must_state!r}: {text[:160]!r}"]
 
 
 def post_policy_failures(scenario: "ResponderScenario", trial: Any) -> List[str]:
@@ -1360,7 +1591,15 @@ def post_policy_failures(scenario: "ResponderScenario", trial: Any) -> List[str]
     untouched row in the fixture byte-identical, which is what makes scoped re-recording work.
     """
     if scenario.expect_post_target:
-        return cross_thread_failures(trial, target=scenario.expect_post_target)
+        # HUMAN speakers only (codex ack #11/#13), names AND ids: the bot's own name or mention
+        # in the addressee list would let "Thanks for ChatGPT closing the loop." strip itself
+        # into a receipt.
+        humans = {s.who for s in scenario.room.says if s.kind == "human"}
+        return cross_thread_failures(
+            trial, target=scenario.expect_post_target,
+            addressees=tuple(humans),
+            addressee_ids=tuple(uid for uid, name in scenario.room.actors.items()
+                                if name in humans))
     findings: List[str] = []
     if not scenario.posts_allowed and (trial.posts or trial.post_attempts):
         # ATTEMPTS, not only landings. The row's contract prohibits the ACT — deciding to reach
@@ -1456,29 +1695,166 @@ def test_no_row_claims_a_target_the_room_never_labelled():
                 f"it and the negative row would be testing nothing")
 
 
-def test_a_no_post_row_fails_on_the_ATTEMPT_not_only_on_the_landing():
+async def test_the_buried_loop_rows_thread_is_reachable_by_its_own_search():
+    """The other half of unpassable, and the one that actually bit.
+
+    A row whose target is out of the window is measuring the decision to look — which means the
+    looking has to WORK. The first measured batch had the buried thread stamped AFTER the trigger:
+    the model searched on all three trials, the scan read zero messages (it never reads a turn's
+    future), nothing enrolled, and the row reported the same "never posted" it reports when the
+    model does not look at all. Two failures that need opposite fixes are indistinguishable in the
+    outcome, so the harness has to rule one of them out before a batch is measured.
+
+    This runs the PRODUCTION search executor over the row's own recorded payload, at the row's own
+    trigger, with a query built from words in the seeded question. No API calls — the search world
+    is the fixture.
+    """
+    from message_processor.turn_runtime import TurnRuntime
+    from tests.integration.scenario_harness import CHANNEL, _real_search_slack
+    from tool_registry import ToolContext
+
+    scenario = next(s for s in RESPONDER_SCENARIOS if s.id == "news-settles-buried-loop")
+    hit = scenario.search_hits[0]
+    assert float(hit["message_ts"]) < float(scenario.trigger_ts), (
+        "the buried question is stamped after the news that settles it — the scan cannot see a "
+        "turn's future, so nothing would ever come back")
+
+    sink: List[Dict[str, Any]] = []
+    run = _real_search_slack(sink, scenario.search_hits)
+    ctx = ToolContext(channel_id=CHANNEL, thread_ts=scenario.trigger_ts,
+                      trigger_ts=scenario.trigger_ts, user_id="U-vinay", client=None, db=None,
+                      is_dm=False, action_token="offline-probe-token", turn=TurnRuntime(),
+                      message=None, thread_config={}, requester_is_human=True,
+                      trusted_thread_roots=frozenset())
+    result = await run(ctx, {"query": "cert renewal", "limit": 10})
+
+    assert result.get("ok"), result
+    found = {r.get("thread_ts") for r in result.get("results") or ()}
+    assert scenario.expect_post_target in found, (
+        f"the row's own search returns {result.get('count')} hit(s) and none in the target "
+        f"thread — the row is unpassable and would read as a model failure: {result}")
+
+
+def test_the_buried_loop_row_cannot_be_passed_from_the_window():
+    """The row's whole subject is the decision to GO AND LOOK, so its target must be unreachable
+    without the search. If the buried root ever appears in the rendered stream — a room edit, a
+    serializer change that starts labelling more roots — the row silently becomes a second
+    owed-answer-elsewhere: still green, still cross-thread, and no longer measuring the thing the
+    live pass failed. This walks the REAL serializer at the row's own H and reads the pages the
+    model is actually handed. No API calls.
+    """
+    import json as _json
+
+    from tests.integration.scenario_harness import build_room_stream
+
+    scenario = next(s for s in RESPONDER_SCENARIOS if s.id == "news-settles-buried-loop")
+    stream = build_room_stream(scenario.room, through=scenario.trigger_ts)
+
+    assert scenario.expect_post_target not in stream.trusted_thread_roots, (
+        "the buried root is an authorized target before the search runs — the row would pass "
+        "without the model ever looking")
+    rendered = _json.dumps(stream.input_items())
+    assert scenario.expect_post_target not in rendered, (
+        "the buried root's ts is somewhere in the rendered stream, so the model can reach it "
+        "without the scan")
+    # Nor may the ANSWER be sitting in view: the row proves the number travelled from the news
+    # into the buried thread, which means the buried thread's own words must not be in the window.
+    for hit in scenario.search_hits or ():
+        assert hit["content"] not in rendered
+        assert hit["message_ts"] not in rendered
+    # And the row must actually be able to enroll it — the same two-sided check the search row
+    # gets, stated here against this row's own payload.
+    from slack_client.search_tool import SlackSearchToolMixin
+
+    class _Derive(SlackSearchToolMixin):
+        pass
+
+    derived = {_Derive()._hit_thread_root(hit) for hit in scenario.search_hits}
+    assert scenario.expect_post_target in derived
+
+
+@pytest.mark.parametrize("row_id, foreign_root", [("strangers-exchange-no-post",
+                                                   "1780026000.000100"),
+                                                  ("others-obligation-no-post",
+                                                   "1780035000.000100")])
+def test_a_no_post_row_fails_on_the_ATTEMPT_not_only_on_the_landing(row_id, foreign_root):
     """The row's hard contract is words AND `post_to_thread` — the decision to reach into
     somebody else's thread, not the plumbing's verdict on it. A model that aimed at a foreign
     root, was refused by the allowlist, and then went quiet has done the exact thing the row
-    exists to catch, and it used to score as a clean pass. No API calls."""
+    exists to catch, and it used to score as a clean pass. No API calls.
+
+    Both negatives are held to it. The second one is the harder of the two — the thread it must
+    stay out of has a real unanswered question in it — and a contract that only bound the older
+    row would let the new one pass on a refusal it had already decided to make."""
     from tests.integration.scenario_harness import TrialResult
 
-    scenario = next(s for s in RESPONDER_SCENARIOS if s.id == "strangers-exchange-no-post")
+    scenario = next(s for s in RESPONDER_SCENARIOS if s.id == row_id)
     assert scenario.posts_allowed is False
 
     refused = TrialResult(outcome=SILENCE, text="",
-                          post_attempts=[{"thread_ts": "1780026000.000100", "ok": False,
+                          post_attempts=[{"thread_ts": foreign_root, "ok": False,
                                           "error": "unknown_thread"}])
     findings = post_policy_failures(scenario, refused)
-    assert findings and "1780026000.000100" in findings[0]
+    assert findings and foreign_root in findings[0]
 
     landed = TrialResult(outcome=SILENCE, text="",
-                         posts=[{"thread_ts": "1780026000.000100"}],
-                         post_attempts=[{"thread_ts": "1780026000.000100", "ok": True,
+                         posts=[{"thread_ts": foreign_root}],
+                         post_attempts=[{"thread_ts": foreign_root, "ok": True,
                                          "error": None}])
     assert post_policy_failures(scenario, landed)
     # …and a turn that never reached for the tool is still a pass.
     assert post_policy_failures(scenario, TrialResult(outcome=SILENCE, text="")) == []
+
+
+def test_the_correction_row_grades_the_POSTED_words_not_the_origin_prose():
+    """The trap in a content predicate on a cross-thread row (spec §5c).
+
+    `own-answer-now-wrong` must post the correction into the thread the wrong answer stands in AND
+    say nothing where it was triggered — so on a CORRECT turn `trial.text` is empty, and a
+    predicate reading it would return "nothing to state" for every turn, including the ones that
+    posted a correction with no figure in it. The figure has to be read off the post. No API calls.
+    """
+    from tests.integration.scenario_harness import TrialResult
+
+    scenario = next(s for s in RESPONDER_SCENARIOS if s.id == "own-answer-now-wrong")
+    assert scenario.must_state == "48" and scenario.expect_post_target == "1780036000.000100"
+
+    def _trial(posted: str) -> TrialResult:
+        return TrialResult(outcome=CROSS_THREAD_POST, text="",
+                           posts=[{"thread_ts": scenario.expect_post_target, "text": posted}],
+                           post_attempts=[{"thread_ts": scenario.expect_post_target, "ok": True,
+                                           "error": None}])
+
+    for corrected in ("Correction: the Q2 audit moved this to 48 crates a pallet, not 36.",
+                      "Update — 48 to a pallet now; the 36 I gave you was the old line spec."):
+        assert content_failures(scenario, _trial(corrected)) == []
+    for wrong in ("Correction: that number has changed since I answered.",
+                  "It isn't 48.",
+                  "Still 36 crates a pallet."):
+        assert content_failures(scenario, _trial(wrong)), wrong
+    # The origin prose is not what is graded here, in either direction: a turn that posted the
+    # right correction is not failed for having said nothing in the origin…
+    assert content_failures(scenario, _trial("48 crates a pallet, corrected.")) == []
+    # …and stating the figure in the ORIGIN instead of the post does not satisfy the row.
+    origin_only = TrialResult(outcome=CROSS_THREAD_POST, text="It's 48 now.",
+                              posts=[{"thread_ts": scenario.expect_post_target,
+                                      "text": "That number has changed."}])
+    assert content_failures(scenario, origin_only)
+
+    # MISSING EVIDENCE FAILS, it does not shrug (codex r2 #4). Three ways the words can be absent,
+    # and none of them is a turn choosing silence: no post at all, a post the transport recorded
+    # without its text, and a post whose text is empty. If FakeTransport ever stops carrying
+    # `text`, this row must go red rather than green.
+    assert content_failures(scenario, TrialResult(outcome=CROSS_THREAD_POST, text="", posts=[]))
+    for stripped in ({"thread_ts": scenario.expect_post_target},
+                     {"thread_ts": scenario.expect_post_target, "text": ""},
+                     {"thread_ts": scenario.expect_post_target, "text": None}):
+        assert content_failures(scenario, TrialResult(outcome=CROSS_THREAD_POST, text="",
+                                                      posts=[stripped])), stripped
+    # …while a row with no content claim is untouched by all of it.
+    plain = next(s for s in RESPONDER_SCENARIOS if s.id == "close-own-loop")
+    assert plain.must_state is None
+    assert content_failures(plain, TrialResult(outcome=CROSS_THREAD_POST, text="", posts=[])) == []
 
 
 def test_the_hard_sleep_set_is_exactly_the_two_rows_the_spec_calls_hard():

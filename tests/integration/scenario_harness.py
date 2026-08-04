@@ -48,6 +48,7 @@ from message_processor.channel_steering import render_snapshot
 from message_processor.channel_stream import ReceiptRec
 from message_processor.routing_facts import stamp_routing_facts
 from message_processor.turn_runtime import DESTINATION_CHANNEL, TurnRuntime
+from tests.live.battery_harness import origin_ack_violation
 from tests.unit.channel_turn_harness import (build_stream, normalized, sidecars, thread_config)
 from tool_registry import SURFACE_CHANNEL, ToolContext, ToolRegistry
 
@@ -230,11 +231,17 @@ class FakeTransport:
     `mark_destination_committed`. What is gone is the socket.
 
     `posts` is what the room would actually be able to read afterwards, one entry per accepted post
-    with the thread it landed in — so a fan-out and a wrong target are different findings.
+    with the thread it landed in AND the words it carried — so a fan-out and a wrong target are
+    different findings, and a row whose contract is about what the answer SAYS has something to
+    read. That last part is load-bearing now (`content_failures`, test_participation_scenarios.py):
+    a correct cross-thread turn leaves the origin silent, so the posted text is the only text such
+    a row can be graded on, and dropping `text` from these entries fails those rows rather than
+    quietly passing them.
 
     The one thing it does NOT reproduce is Slack's formatting pass: the real `Delivery.text` is the
-    formatted string Slack accepted, and this reports the source markdown. Nothing here grades text,
-    only where it went, so the difference is deliberate rather than overlooked.
+    formatted string Slack accepted, and this reports the source markdown. What is graded is
+    whether a stated figure came back out, which survives the difference — nothing here depends on
+    Slack's own rendering of it.
     """
 
     name = "Slack"
@@ -499,6 +506,12 @@ class TrialResult:
     # accepted it); `post_attempts` is every target the model aimed at, refused ones included, so a
     # fan-out that the executor blocked is still visible; `trusted_roots` is the allowlist that was
     # actually in force, which is what makes a pass mean something.
+    #
+    # EACH `posts` ENTRY CARRIES ITS `text`, and that is load-bearing rather than incidental: a row
+    # whose contract is about what the answer SAYS cannot read `text` on the trial, because a
+    # correct cross-thread turn leaves the origin empty by design. `content_failures` in
+    # test_participation_scenarios.py reads the posted words instead, so the transport must keep
+    # them (it does — `FakeTransport.send_message` records the source markdown it was handed).
     posts: List[Dict[str, Any]] = field(default_factory=list)
     post_attempts: List[Dict[str, Any]] = field(default_factory=list)
     trusted_roots: Optional[frozenset] = None
@@ -515,16 +528,22 @@ def _post_attempts(calls) -> List[Dict[str, Any]]:
             for c in calls if c["name"] == "post_to_thread"]
 
 
-def cross_thread_failures(result: TrialResult, *, target: str) -> List[str]:
+def cross_thread_failures(result: TrialResult, *, target: str,
+                          addressees: Sequence[str] = (),
+                          addressee_ids: Sequence[str] = ()) -> List[str]:
     """The five things one correct cross-thread turn has to satisfy, each as its own finding.
 
     Every one of them is a way a turn can post into the right thread and still be wrong, and none
     of them is visible in the OUTCOME LABEL — `cross_thread_post` is returned by a turn that posted
     into a stranger's thread, posted twice, or pasted the answer in both places.
 
-    "Zero origin prose" is prose, not every surface: a REACTION in the origin thread is allowed
-    (the conduct paragraph offers it as the ending), and the owner's 2026-07-29 ruling permits
-    reactions generally. What may not happen is WORDS in the thread the turn started in.
+    The origin clause is ACK-SHAPED, not zero-prose (owner ruling 2026-08-03): a reaction was
+    always allowed, and a brief human acknowledgment to the person who handed over the piece
+    ("Got it — thanks.") now is too — the measured trials showed exactly that shape, and the owner
+    called it the model being a teammate. What may not happen is the POST leaking back into the
+    origin: reporting it, pointing at it, or restating any figure of the answer here.
+    `origin_ack_violation` (tests/live/battery_harness.py) is the single deterministic statement
+    of that line, shared with live battery row 4 so the two surfaces cannot drift.
     """
     failures: List[str] = []
     # 0. The pass must not be vacuous. If authorization was never in force — no stream, or a
@@ -551,9 +570,13 @@ def cross_thread_failures(result: TrialResult, *, target: str) -> List[str]:
     refused = [(a["thread_ts"], a["error"]) for a in result.post_attempts if not a["ok"]]
     if refused:
         failures.append(f"the executor refused: {refused}")
-    # 5. Nothing was said in the origin.
+    # 5. The origin heard at most a brief non-reporting acknowledgment. The room's cast are
+    #    addressees — "Thanks, Vinay." is address, not content (a real trial wrote exactly that).
     if result.text:
-        failures.append(f"origin prose was delivered: {result.text[:120]!r}")
+        why = origin_ack_violation(result.text, addressees=addressees,
+                                   addressee_ids=addressee_ids)
+        if why:
+            failures.append(f"origin words beyond a brief ack — {why}: {result.text[:120]!r}")
     return failures
 
 
