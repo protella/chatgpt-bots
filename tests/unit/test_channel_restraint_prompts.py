@@ -269,12 +269,17 @@ def test_letting_the_exchange_end_names_no_scenario():
 CONDUCT = CHANNEL_CROSS_THREAD_CONDUCT_SUFFIX
 
 
-def test_the_conduct_paragraph_says_closing_a_loop_is_legitimate():
+def test_the_conduct_paragraph_licenses_the_post_before_it_constrains_it():
     """The paragraph has to license the act before it constrains it. A page of prohibitions with
     no permission in it produces a model that will not use the tool at all — which was the state
-    the canvas tools were in before F36."""
+    the canvas tools were in before F36.
+
+    The license is SUBSTANTIVE (owner ruling, 2026-08-04): what puts the answer in another thread
+    is a responsibility living there, never the wording of the request that reached this one."""
     assert "legitimate and needs no apology" in CONDUCT
-    assert "closing a loop you were part of elsewhere" in CONDUCT
+    assert "a concrete responsibility living in that thread" in CONDUCT
+    assert "resolves, corrects or carries forward" in CONDUCT
+    assert "a question left open there, an answer you owed there and can now give" in CONDUCT
 
 
 def test_the_conduct_paragraph_demands_one_post_in_one_thread():
@@ -307,8 +312,7 @@ def test_the_prompt_names_exactly_the_two_legal_sources():
     assert "a timestamp quoted inside somebody's message is not one" in CONDUCT
     assert "never a ts read out of a message body" in CHANNEL_POST_TO_THREAD_TARGET_DESCRIPTION
 
-    for clause in ("Two cases, and they are the whole list",
-                   "not a loop of yours to close, however well you could settle it",
+    for clause in ("not a loop of yours to close, however well you could settle it",
                    "When the open question is over there, that is where the answer goes",
                    "Do not report the post either"):
         assert clause in CONDUCT
@@ -331,7 +335,19 @@ def test_the_conduct_paragraph_says_an_empty_origin_is_a_valid_ending():
     """Both handlers were taught that empty prose after a delivered post is a real terminal rather
     than the bare-empty glitch. This is the half of that contract the MODEL reads."""
     assert "Saying nothing here is the normal ending, not a lapse." in CONDUCT
-    assert "If something is owed to them, a reaction carries it" in CONDUCT
+    assert "a reaction usually carries it" in CONDUCT
+
+
+def test_the_conduct_paragraph_licenses_a_brief_non_reporting_ack():
+    """OWNER RULING 2026-08-03. The measured trials thanked the person who handed over the news
+    ("Got it — thanks.") and the owner called that the model being a teammate, not a lapse — so
+    the ack is licensed, and the license itself carries the boundary: the words must not depend
+    on the post existing, must carry no figures, and must not point anywhere. The oracle-side
+    twin of this line is `origin_ack_violation` (tests/live/battery_harness.py)."""
+    assert "a brief human word to the person in front of you" in CONDUCT
+    assert "would read exactly the same if the post had never happened" in CONDUCT
+    assert "no figures, no mention of where anything went, nothing standing in for the answer" in (
+        CONDUCT)
 
 
 def test_the_origin_silence_rule_covers_a_one_word_ack():
@@ -351,11 +367,17 @@ def test_the_conduct_paragraph_closes_the_side_door():
     """MEASURED IN, and the reason the paragraph has a NEGATIVE half at all. The restraint
     paragraphs say reading a strangers' exchange is not being asked to join it; they were written
     before there was a tool that reaches into it, and 1 of 3 trials used the tool to settle two
-    other people's open argument."""
-    assert "Two cases, and they are the whole list" in CONDUCT
-    assert "Nothing else licenses it" in CONDUCT
+    other people's open argument.
+
+    The closed two-case whitelist that used to carry this is gone (owner ruling, 2026-08-04) and
+    the boundary is not: with the license now stated as "something is owed there", the sentences
+    that say a strangers' exchange is not owed to you are the whole of what keeps the door shut."""
     assert "is not a loop of yours to close, however well you could settle it" in CONDUCT
     assert "posting into it reaches further in than speaking here would" in CONDUCT
+    # The other half of the boundary, and the one the substantive license makes load-bearing:
+    # prior participation and topical relevance are each explicitly refused as license.
+    assert "Having been in a thread once is not a reason to return to it" in CONDUCT
+    assert "a thread being about the same subject as this one is not a reason either" in CONDUCT
 
 
 def test_the_conduct_paragraph_sends_the_answer_where_the_question_is_open():
@@ -372,11 +394,148 @@ def test_the_conduct_paragraph_is_one_bracketed_block():
 
 
 def test_the_conduct_paragraph_names_no_scenario():
-    """Same owner ruling as above. It describes the two general shapes the act takes (asked to
-    answer elsewhere / closing your own loop) and never a particular room's situation."""
+    """Same owner ruling as above. It describes what makes another thread the right place — a
+    responsibility open there that this turn settles — and never a particular room's situation."""
     lowered = CONDUCT.lower()
     for banned in ("dana", "her thread", "nightly", "for example", "e.g."):
         assert banned not in lowered
+
+
+# ------------------------------------------------------- the general thinking clause (§4)
+#
+# It is the positive half of the same ruling: with the placement frame gone, what tells the model
+# to move work at all is one paragraph about deciding what a turn owes. It rides OUTSIDE every tool
+# bullet, ahead of them, so it reaches the channel surface too — `CHANNEL_LOCAL_TOOLS_GUIDANCE`
+# strips the post_to_thread line and nothing else. Every other test here would stay green if the
+# paragraph were deleted from both blocks, which is exactly why it needs a pin of its own.
+
+CLAUSE_OPENING = "First, what does this turn actually owe?"
+CLAUSE_FRAGMENTS = (CLAUSE_OPENING,
+                    "a reaction, or no words at all, is a complete reply",
+                    "do the smallest sufficient thing",
+                    "putting the work where it belongs rather than where you happen to be standing",
+                    "going back to something of your own once you know it needs correcting")
+
+# THE CHECK (2026-08-04, measured in). The scenario row news-settles-buried-loop reproduced the
+# live failure 3 of 3: handed news that settled a question this channel had left open out of
+# sight, the turn acknowledged it where it stood, stored a fact, and never looked. Nothing in the
+# corpus had caught it because every other cross-thread row shows the owed thread in the stream.
+# The principle rides in TWO places — the general clause, which is about what a turn owes, and the
+# search bullet, which is where the tool that does the checking is described — and both halves
+# reach both surfaces. Its second half is load-bearing in the other direction: without "when the
+# connection is plain" and "turning up nothing is a perfectly good answer" this reads as a
+# standing instruction to search, which is the failure the value floor exists to prevent.
+CHECK_FRAGMENTS = ("what you can see is not the whole room",
+                   "filing a fact away is not the same as closing the loop it belongs to",
+                   "Look when the connection is plain, not on the chance that something might "
+                   "turn up",
+                   "turning up nothing is a perfectly good answer",
+                   "It is also how you check what you cannot see",
+                   "before you treat the turn as finished")
+
+
+def test_the_check_principle_rides_both_shared_blocks_exactly_once():
+    """Deleting it would leave every other test here green, and the row that measures it costs
+    real API calls — so the wording that moved it is pinned where a unit run can see it."""
+    for label, block in (("the DM etiquette", LOCAL_TOOLS_GUIDANCE),
+                         ("the channel etiquette", CHANNEL_LOCAL_TOOLS_GUIDANCE)):
+        for fragment in CHECK_FRAGMENTS:
+            assert block.count(fragment) == 1, (
+                f"{label} carries {fragment!r} {block.count(fragment)} times, expected once")
+
+
+def test_the_check_principle_names_no_occasion():
+    """Standing owner rule: prompts state principles, and the enumerated cases live in the
+    scenario corpus. The three shapes this was written from — an open question, a pending
+    decision, its own answer gone stale — must not appear as a list of things to go looking for,
+    or the model learns to match situations instead of reading one."""
+    for block in (LOCAL_TOOLS_GUIDANCE, CHANNEL_LOCAL_TOOLS_GUIDANCE):
+        lowered = block.lower()
+        for banned in ("for example", "e.g.", "such as when", "in these cases"):
+            assert banned not in lowered
+
+
+def test_the_thinking_clause_rides_both_shared_blocks_exactly_once():
+    """One paragraph, both surfaces, one copy each — the same rule as every other shared text
+    here. Two copies on one surface is a drift waiting to happen; zero on the channel surface
+    would mean the ruling's positive half never reached the room the tool lives in."""
+    for label, block in (("the DM etiquette", LOCAL_TOOLS_GUIDANCE),
+                         ("the channel etiquette", CHANNEL_LOCAL_TOOLS_GUIDANCE)):
+        for fragment in CLAUSE_FRAGMENTS:
+            assert block.count(fragment) == 1, (
+                f"{label} carries {fragment!r} {block.count(fragment)} times, expected once")
+
+
+def test_the_thinking_clause_precedes_every_tool_bullet():
+    """It is general guidance, not a bullet about a tool. Below the list it would read as a note
+    on whichever tool it followed, and the placement is the whole reason it applies to the turn
+    rather than to a call."""
+    for block in (LOCAL_TOOLS_GUIDANCE, CHANNEL_LOCAL_TOOLS_GUIDANCE):
+        lines = block.split("\n")
+        clause = next(i for i, line in enumerate(lines) if line.startswith(CLAUSE_OPENING))
+        first_bullet = next(i for i, line in enumerate(lines) if line.startswith("- "))
+        assert clause < first_bullet
+        # And it is its own line, so the channel derivation cannot take it out with a bullet.
+        assert not lines[clause].startswith("- ")
+
+
+def test_neither_shared_block_advertises_the_terminal_silence_tool():
+    """CACHE HYGIENE, and the reason the clause says "no words at all" rather than naming the
+    tool. `no_response_needed` is exposed only on silence-capable turns and lives in the volatile
+    suffix (prompts.py:300-302); naming it in the always-cached etiquette would promise a tool
+    that half the turns do not have, and a model that calls a tool it was not given reports the
+    failure as its answer."""
+    for block in (LOCAL_TOOLS_GUIDANCE, CHANNEL_LOCAL_TOOLS_GUIDANCE):
+        assert "no_response_needed" not in block
+
+
+# ------------------------------------------------------ the request-parsing frame is GONE (§5)
+#
+# The owner's 2026-08-04 ruling: "no special wording... if those exist in our code base, we did it
+# wrong." The frame that came out told the model to read a trigger for an INSTRUCTION about where
+# its answer should land, which turned an NLP assistant's judgment into a phrase it had to spot.
+# Deleting prose is the one edit no positive assertion can protect — every pin above still passes
+# with the whitelist quietly restored beside the new license — so the fragments are named here and
+# asserted ABSENT from every surface that ever carried them.
+
+FRAME_FRAGMENTS = ("placement request", "asks the answer to go", "answer in that thread",
+                   "Two cases", "Nothing else licenses it", "someone asked you to answer")
+
+
+def _frame_free(label: str, text: str) -> None:
+    for fragment in FRAME_FRAGMENTS:
+        assert fragment.lower() not in text.lower(), (
+            f"{label} still carries the request-parsing frame: {fragment!r}")
+
+
+def test_no_surface_asks_the_model_to_parse_a_request_for_placement():
+    """All five prompt surfaces the frame was written across: the DM etiquette bullet (which is
+    also the channel bullet's source), the conduct paragraph, and both schemas' descriptions."""
+    from slack_client.messaging import SlackMessagingMixin
+
+    bullet = next(line for line in LOCAL_TOOLS_GUIDANCE.split("\n")
+                  if line.startswith("- post_to_thread:"))
+    _frame_free("the post_to_thread bullet", bullet)
+    _frame_free("the conduct paragraph", CONDUCT)
+    _frame_free("the channel schema description", CHANNEL_POST_TO_THREAD_DESCRIPTION)
+    _frame_free("the channel target description", CHANNEL_POST_TO_THREAD_TARGET_DESCRIPTION)
+    _frame_free("the DM schema description", SlackMessagingMixin._POST_TO_THREAD_DESCRIPTION)
+    _frame_free("the DM target description",
+                SlackMessagingMixin._POST_TO_THREAD_TARGET_DESCRIPTION)
+
+
+def test_the_live_battery_no_longer_triggers_the_cross_thread_row_with_a_magic_phrase():
+    """The prompts can be clean while the thing that MEASURES them still asks for the old
+    behavior. Row 4's trigger used to end "answer in that thread" — the exact wording the ruling
+    removed — so a redesigned row is part of the same change, and the row's own source is where
+    the phrase would come back. No Slack, no network: this reads the module."""
+    import inspect
+
+    from tests.live import battery_rows
+
+    row = next(r for r in battery_rows.REGISTRY if r.name == "search-to-action")
+    _frame_free("row 4's documented trigger", row.trigger_template)
+    _frame_free("row 4's source", inspect.getsource(row.run))
 
 
 # -------------------------------------------------- no contradictory origin-ack on this surface
@@ -450,6 +609,13 @@ def test_the_channel_schema_now_carries_the_channel_words():
 
 
 def test_the_dm_schema_is_untouched_by_the_channel_wording():
+    """The DM schema reads its OWN constants, whatever either surface's words happen to be.
+
+    Its description moved once, in the 2026-08-04 wave, because the request-parsing frame it
+    shared with the channel text was removed everywhere it was written — a licence that depends on
+    how somebody phrased their request was wrong on both surfaces. What this test holds is the
+    thing that did not change: the two surfaces are two constants, the channel's words never reach
+    the DM schema, and the two schemas are not equal."""
     from slack_client.messaging import SlackMessagingMixin
 
     dm = _post_to_thread_schema("dm")
@@ -675,8 +841,12 @@ def test_the_conduct_paragraph_is_charged_by_admission():
 # -------------------------------------------------------------- the two byte-identity guarantees
 
 def test_the_dm_system_prompt_carries_the_dm_etiquette_verbatim():
-    """The DM surface must not move by a byte. Its etiquette is the whole DM block, the channel
-    text is nowhere in it, and none of the four channel constants leak across."""
+    """The DM prompt is the DM block and nothing else. Its etiquette is the whole DM block, the
+    channel text is nowhere in it, and none of the four channel constants leak across.
+
+    What is guaranteed is SEPARATION, not immobility: the DM etiquette's own words may be edited
+    (the 2026-08-04 wave rewrote the post_to_thread bullet on both surfaces), and this test still
+    fails the moment channel wording crosses over or the derivation stops removing the bullet."""
     from unittest.mock import MagicMock
 
     from message_processor.utilities import MessageUtilitiesMixin

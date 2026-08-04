@@ -39,6 +39,7 @@ import os
 import re
 import sqlite3
 import time
+import unicodedata
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -358,6 +359,27 @@ async def bot_team_id() -> str:
     if not team:
         raise HarnessProtocolError("auth.test returned no team_id")
     return str(team)
+
+
+_harness_user_names: Optional[Tuple[str, ...]] = None
+
+
+async def harness_user_display_names() -> Tuple[str, ...]:
+    """Every name Slack knows the harness operator by — real name, display name, handle.
+
+    The ack predicate treats an addressee's name as ADDRESS (like a mention), and live the person
+    the bot thanks is the real operator, so a "Thanks, Peter." must be gradable. Cached per run.
+    """
+    global _harness_user_names
+    if _harness_user_names is None:
+        ident = await harness_user_identity()
+        data = await _call(clients().bot, "users_info", user=ident.user_id)
+        user = data.get("user") or {}
+        profile = user.get("profile") or {}
+        _harness_user_names = tuple({n for n in (user.get("real_name"), user.get("name"),
+                                                 profile.get("display_name"),
+                                                 profile.get("real_name")) if n})
+    return _harness_user_names
 
 
 async def harness_user_identity() -> PartyIdentity:
@@ -1904,6 +1926,243 @@ def states_phrase(text: str, phrase: str) -> bool:
         return False
     haystack = " ".join(str(text).split()).casefold()
     return re.search(rf"(?<!\w){re.escape(needle)}(?!\w)", haystack) is not None
+
+
+# The ack predicate is STRICT BY DESIGN (codex, ack rounds #1/#2). No deterministic check can
+# decide "would these words read the same if the post never happened", so the two error directions
+# are priced differently: a false FAILURE surfaces in a recording run and gets reviewed; a false
+# PASS is a reporting regression the oracle exists to catch and nobody ever sees. So the words
+# must FULL-MATCH a receipt grammar — every word accounted for by a receipt phrase, not merely one
+# receipt word present somewhere ("Got it — I put it where it belongs." contains a receipt and is
+# a report). "Thanks for answering!" and a plain-text "Thanks, Priya!" failing here is the strict
+# side of that trade, accepted on purpose; a @-mention form of the same ack passes (mentions are
+# address, not content). No length limit: the grammar bounds what the words can SAY, and
+# `_receipt_shape` bounds how much of it there is — one phrase, or a pair of two different ones
+# (codex ack #3/#4 — repetition of receipt phrases is not an acknowledgment either).
+_ACK_PHRASES = tuple(p.split() for p in (
+    "thank you so much", "thanks so much", "thanks a lot", "thank you", "thanks", "thx", "ty",
+    "cheers", "much appreciated", "appreciate it", "appreciate that", "appreciated",
+    "got it", "noted", "good to know", "great", "perfect", "nice", "nice one", "awesome",
+    "sweet", "roger that", "roger", "finally", "glad to hear it", "glad to hear", "love it",
+    "ok", "okay", "makes sense", "that helps",
+    "thanks for the update", "thanks for the heads up", "thanks for letting me know",
+))
+# The stem list survives as the reason-giver and the belt: a stem names WHY the words failed
+# ("it reports the post") where the grammar can only say they are not a receipt. It stays words a
+# NEWS-directed ack has no need of — "thanks for the update" is grammar, so "update" is no stem.
+_ACK_REPORTING = re.compile(
+    r"\b(post\w*|thread\w*|repl(?:y|ies|ied)|answer\w*|done|sent|sorted|handled|forwarded|"
+    r"shared|passed|updated|filed|took care|taken care|will do|on it)\b"
+    r"|over there|in there|with them|archives/",
+    re.IGNORECASE)
+# Real Slack ids are uppercase alphanumeric; the scenario corpus mints readable synthetic ids
+# ("U-tessa"), and the predicate has to recognize its callers' own mentions (codex ack #14).
+_SLACK_MENTION = re.compile(r"<@([A-Z][A-Za-z0-9\-]*)>")
+_VOCATIVE_AFTER = re.compile(r"\s*(?:[.,;:!?…\-—]|$)")
+_VOCATIVE_BEFORE = re.compile(r"(?:^|[.,;:!?…\-—])\s*$")
+
+
+def _tail_is_receipt_phrase(before: str) -> bool:
+    """Do the words since the last punctuation form a complete plain receipt phrase? The seam
+    allowance that keeps the measured "thanks <@U…> — got it" legal: a mention directly after a
+    finished receipt phrase, with punctuation following, is address between units."""
+    segment = re.split(r"[.,;:!?…\-—]", before)[-1]
+    return tuple(w.casefold() for w in _WORD.findall(segment)) in _ACK_PHRASE_SET
+
+
+def _strip_address_mentions(text: str,
+                            addressee_ids: Sequence[str]) -> Tuple[str, Optional[str]]:
+    """Remove mentions that are ADDRESS; name the violation when one is CONTENT (codex ack #13).
+
+    The mention path must obey the same structural rules as plain names: removal only at a
+    vocative boundary (start-or-punctuation before, punctuation-or-end after) or at a unit seam
+    (directly after a complete receipt phrase, punctuation after) — so
+    "Thanks for <@U…> closing the loop." and "Thanks for checking <@U…>." keep their mentions
+    and fail, while "Thanks, <@U…>!" and "thanks <@U…> — got it" strip. When the caller vouches
+    ids, a mention of anyone else — the bot itself included — is a violation outright.
+    """
+    while True:
+        m = _SLACK_MENTION.search(text)
+        if m is None:
+            return text, None
+        if addressee_ids and m.group(1) not in addressee_ids:
+            return text, f"it mentions <@{m.group(1)}>, who is not the person being answered"
+        before, after = text[:m.start()], text[m.end():]
+        if _VOCATIVE_AFTER.match(after) is None or not (
+                _VOCATIVE_BEFORE.search(before) or _tail_is_receipt_phrase(before)):
+            return text, "a mention sits inside the words rather than addressing anyone"
+        text = before + " " + after
+# Slack transports emoji in message text as colon-codes (`:wave:`, `:+1:`). A code is only safe
+# to treat as emoji when its ALIAS is one this predicate can vouch for as a receipt — a colon
+# wrapper is just text, and `:done:` / `:posted:` / `:90742:` would otherwise launder the exact
+# content every other check exists to catch (codex ack #4). Unknown aliases FAIL, per the
+# strictness doctrine; workspace-custom receipt emoji can be added here when they earn it.
+_SLACK_EMOJI_CODE = re.compile(r":([a-z0-9_+\-]+):")
+# ONE mapping, alias → rendered base character, and both vouched sets derive from it (codex ack
+# #6): the same acknowledgment must grade the same whether Slack hands the oracle `:hearts:` or
+# `♥️`, or the two surfaces drift. The parity test walks every entry in both representations.
+_ACK_EMOJI = {
+    "+1": "👍", "thumbsup": "👍",
+    "wave": "👋",
+    "pray": "🙏",
+    "raised_hands": "🙌",
+    "tada": "🎉",
+    "clap": "👏",
+    "heart": "❤", "hearts": "♥",
+    "heavy_check_mark": "✔", "white_check_mark": "✅",
+    "ballot_box_with_check": "☑",
+    "100": "💯",
+    "muscle": "💪",
+    "handshake": "🤝",
+    "saluting_face": "🫡", "salute": "🫡",
+    "bow": "🙇",
+    "fire": "🔥",
+    "rocket": "🚀",
+    "ok_hand": "👌",
+    "ok": "🆗",  # Slack's :ok: renders 🆗, not 👌 (codex ack #7's external golden)
+}
+_ACK_EMOJI_ALIASES = frozenset(_ACK_EMOJI)
+# A receipt is at most a couple of emoji beside (or instead of) the words — a wall of :wave: is
+# noise wearing an emoji's clothes.
+ACK_MAX_EMOJI = 3
+# The rendered-emoji twin, derived from the SAME mapping, base forms only (VS16 stripped before
+# matching). Unicode category So is NOT an emoji test (codex ack #5): ℗, ⌘ and ♩ are So and
+# acknowledge nothing, so any So character OUTSIDE this set fails — which also makes a
+# multi-person ZWJ cluster (👨‍👩‍👧‍👦) a strict-side rejection rather than a miscounted "four
+# emoji". Skin-tone modifiers are category Sk and ride along untouched.
+_ACK_EMOJI_CHARS = frozenset(_ACK_EMOJI.values())
+_VS16 = "️"
+_WORD = re.compile(r"[^\W\d_]+", re.UNICODE)
+
+_ACK_PHRASE_SET = frozenset(tuple(p) for p in _ACK_PHRASES)
+
+# Gratitude heads that can take a "for <reason>" tail — and the reason is a VOUCHED SET, not
+# free prose (codex ack #10 closed the argument: the ruled boundary is EVENT-DEPENDENCE, and no
+# grammatical screen — actor pronouns, stems, length — can prove a tail does not depend on the
+# post having happened; "thanks for successful placement" needs no pronoun and no stem). The set
+# holds the measured reasons (real trials: "closing the loop", "checking") plus their near
+# neighbors, all acts OF THE INTERLOCUTOR that stand whether or not any post landed; it grows
+# the way the phrase list does — when a real ack is measured, not speculatively.
+_ACK_GRATITUDE_HEADS = (("thanks",), ("thank", "you"), ("thx",), ("ty",))
+_ACK_REASONS = frozenset(tuple(p.split()) for p in (
+    "checking", "confirming", "clarifying", "closing the loop", "flagging this", "flagging it",
+    "flagging that", "following up", "the follow up", "the update", "the heads up",
+    "the quick turnaround", "the context", "the clarification", "the info", "the information",
+    "the detail", "the details", "tracking that down", "digging that up",
+))
+
+
+def _is_gratitude_with_reason(seg: Tuple[str, ...]) -> bool:
+    for head in _ACK_GRATITUDE_HEADS:
+        h = len(head)
+        if seg[:h] == head and len(seg) > h + 1 and seg[h] == "for" and (
+                seg[h + 1:] in _ACK_REASONS):
+            return True
+    return False
+
+
+def _receipt_shape(tokens: List[str]) -> bool:
+    """Is the WHOLE token list one receipt unit, or a receipt phrase followed by a different unit?
+
+    A unit is a receipt phrase, or a gratitude head with a "for"-tail (see above). The pair is a
+    literal structure, not a count (codex ack #4): the measured maximum is the complementary pair
+    ("Got it — thanks.", "Got it — thanks for closing the loop."), and "thanks thanks" is
+    repetition, not a receipt. Every word must earn its place — one receipt word amid free prose
+    is exactly the false pass codex's round-2 counterexamples demonstrated."""
+    t = tuple(tokens)
+    if t in _ACK_PHRASE_SET or _is_gratitude_with_reason(t):
+        return True
+    for i in range(1, len(t)):
+        head, tail = t[:i], t[i:]
+        if head in _ACK_PHRASE_SET and head != tail and (
+                tail in _ACK_PHRASE_SET or _is_gratitude_with_reason(tail)):
+            return True
+    return False
+
+
+def origin_ack_violation(text: str, *, fragments: Sequence[str] = (),
+                         addressees: Sequence[str] = (),
+                         addressee_ids: Sequence[str] = ()) -> Optional[str]:
+    """Why origin words are NOT the brief non-reporting acknowledgment the owner allowed — or None.
+
+    OWNER RULING 2026-08-03: on a cross-thread turn the origin may get a short human
+    acknowledgment to the person who handed over the piece ("Got it — thanks.", "👍") — words that
+    would read exactly the same if the post had never happened. What stays prohibited is the post
+    leaking back: reporting it, pointing at it, or restating any part of the answer here. The
+    deterministic checks, strict by design (see the note above the grammars):
+
+    - DIGITS: every figure the harnesses seed is numeric, and an ack has no business carrying ANY
+      number — a digit in the origin is content that belongs only in the target thread.
+    - ANSWER FRAGMENTS: the caller names the non-numeric halves of its seeded answer (a supplier
+      the origin never saw), and naming one here is the answer leaking, not gratitude.
+    - ADDRESSEES: the caller may name the people in the room, and their names are ADDRESS, the
+      same rule as @-mentions (measured in: a real trial wrote "Thanks, Tessa." and the grammar
+      called a person's name free prose). Stripped word-bounded, full names and their word parts,
+      before the grammar and only for the grammar — a name is never a stem, a digit, or content.
+    - REPORTING STEMS: post/thread/reply/answer*/done/sent/sorted/"with them"/… — the measured
+      "Done." regression fails by name, and first-person past action fails with it. Checked
+      before the grammar so the finding names the offence.
+    - EMOJI, VOUCHED ONLY: a Slack `:code:` counts as emoji only when its alias is in
+      `_ACK_EMOJI_ALIASES` — `:done:` and `:90742:` are text in a colon costume and fail
+      (codex ack #4) — and a rendered symbol only when it is in `_ACK_EMOJI_CHARS`, because
+      category So is not an emoji test (codex ack #5: ⌘ acknowledges nothing). At most
+      `ACK_MAX_EMOJI` emoji, codes and rendered combined.
+    - RECEIPT GRAMMAR, FULL-MATCH AND SHAPED: every word — in any script, via Unicode word
+      extraction — must form ONE receipt phrase or a pair of two DIFFERENT ones ("Got it —
+      thanks."); "thanks thanks" is repetition. A wordless line passes only when an actual emoji
+      is there to do the acknowledging — never bare punctuation or a bare mention (codex ack #3:
+      "..." acknowledges nothing).
+    """
+    words = (text or "").strip()
+    if not words:
+        return None
+    # Mentions and vouched emoji codes come out before the digit check: an ADDRESS-position
+    # <@U123ABCDE> is address, `:+1:` is an emoji, and neither one's digits are the answer's. An
+    # UNKNOWN alias, an unvouched id, or a mention sitting inside a clause never gets that pass —
+    # each fails here, before it can launder anything.
+    stripped, mention_violation = _strip_address_mentions(words, addressee_ids)
+    if mention_violation:
+        return mention_violation
+    aliases = _SLACK_EMOJI_CODE.findall(stripped)
+    unknown = [a for a in aliases if a not in _ACK_EMOJI_ALIASES]
+    if unknown:
+        return f"it carries an emoji code I cannot vouch for (:{unknown[0]}:)"
+    stripped = _SLACK_EMOJI_CODE.sub(" ", stripped)
+    if re.search(r"\d", stripped):
+        return "it carries a figure, and content belongs only in the target thread"
+    for fragment in fragments:
+        if states_phrase(stripped, fragment):
+            return f"it carries part of the answer ({fragment!r})"
+    hit = _ACK_REPORTING.search(stripped)
+    if hit:
+        return f"it reports the post ({hit.group(0)!r})"
+    symbols = [ch for ch in words.replace(_VS16, "") if unicodedata.category(ch) == "So"]
+    unvouched_symbols = [ch for ch in symbols if ch not in _ACK_EMOJI_CHARS]
+    if unvouched_symbols:
+        return f"it carries a symbol I cannot vouch for ({unvouched_symbols[0]!r})"
+    emoji_count = len(aliases) + len(symbols)
+    if emoji_count > ACK_MAX_EMOJI:
+        return f"{emoji_count} emoji is a pile, not an acknowledgment"
+    # VOCATIVE POSITIONS ONLY (codex ack #11/#12): a name is stripped only with a vocative
+    # boundary on BOTH sides — start-or-punctuation before it, punctuation-or-end after it — so
+    # "Thanks, Tessa." and "Tessa, thanks." strip while a name inside a clause never does:
+    # "Thanks for ChatGPT closing the loop." and "Thanks for checking Tessa." both keep the name
+    # and die in the grammar. The comma-less "Thanks Tessa." failing too is the strict side.
+    for name in addressees:
+        for part in (str(name), *str(name).split()):
+            stripped = re.sub(
+                rf"(^|[.,;:!?…\-—]\s*){re.escape(part)}(?=\s*(?:[.,;:!?…\-—]|$))", r"\1",
+                stripped, flags=re.IGNORECASE)
+    tokens = [w.casefold() for w in _WORD.findall(stripped)]
+    if tokens:
+        if not _receipt_shape(tokens):
+            return ("its words do not full-match the receipt grammar — the license is for "
+                    "acknowledgments only")
+        return None
+    if not emoji_count:
+        return ("it has no words and no emoji — punctuation or a bare mention acknowledges "
+                "nothing")
+    return None
 
 
 async def pace(seconds: float) -> None:
