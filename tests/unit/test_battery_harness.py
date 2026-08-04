@@ -1502,6 +1502,11 @@ async def test_every_buried_fact_row_keeps_both_halves_out_of_its_chatter(clock,
     monkeypatch.setattr(rows, "observe_turn_output", _output)
     monkeypatch.setattr(rows, "bot_identity", lambda: _returns(OURS))
     monkeypatch.setattr(rows, "find_turn_id", lambda *a, **k: _returns("T-1"))
+    # search-to-action seeds its buried obligation as a MENTION and reads the verdict that mention
+    # earns before it buries it, exactly as the cross-thread row reads its premise.
+    monkeypatch.setattr(rows, "await_trigger_verdict", lambda *a, **k: _returns(
+        bh.TriggerVerdict(kind="in_thread_reply", woke=True, turn_id="T-0",
+                          source="turn_outcome")))
     monkeypatch.setattr(rows, "await_tools_used_for",
                         lambda *a, **k: _returns(bh.ProvenanceRead(True, ("search_slack",))))
     monkeypatch.setattr(rows, "wait_for_telemetry", lambda *a, **k: _returns(
@@ -1684,9 +1689,9 @@ async def test_cross_thread_action_grades_the_answer_that_landed(clock, monkeypa
 
     dodged = dict((await _run("I don't know the pallet size, sorry.")).assertions)
     assert dodged["the post under C states the capacity we just supplied"] is False
-    # The three older assertions still hold in BOTH runs, which is exactly why this one was needed.
+    # The older assertions still hold in BOTH runs, which is exactly why this one was needed.
     assert dodged["exactly one post_to_thread landed under C"] is True
-    assert dodged["the turn reports itself as detached"] is True
+    assert dodged["A heard nothing, or only a brief non-reporting acknowledgment"] is True
 
     # AND THE INDEPENDENCE ITSELF: a premise the gate DECLINED, followed by a woken fyi. Every
     # graded claim the row owns still has to run, and the choice has to reach the report.
@@ -1699,8 +1704,7 @@ async def test_cross_thread_action_grades_the_answer_that_landed(clock, monkeypa
         assert set(graded) == {"the fyi opened a turn",
                                "exactly one post_to_thread landed under C",
                                "the post under C states the capacity we just supplied",
-                               "no words landed in A",
-                               "the turn reports itself as detached"}, (
+                               "A heard nothing, or only a brief non-reporting acknowledgment"}, (
             f"the row stopped short after a {premise.kind} premise: {sorted(graded)}")
         assert all(graded.values()), graded
         recorded = [value for name, value, _ in ctx.observations
@@ -1793,62 +1797,357 @@ def test_the_row_registry_is_complete_and_unique():
     }
 
 
+def test_row_four_varies_its_subject_per_run():
+    """THE CROSS-RUN CONTAMINATION (2026-08-04). The channel deletes nothing, so a question worded
+    identically every run is answerable from the last run's material — which is exactly what
+    happened: the seed-time turn answered one trial's question with the previous trial's figure.
+
+    Two properties make the fix real. The draw is DETERMINISTIC, or the report's nonce stops
+    reproducing the sentences the run posted and a failure cannot be read back. And it genuinely
+    VARIES across nonces, or the repair is a comment. Nothing here touches Slack."""
+    assert rows.row4_subject("n-1") == rows.row4_subject("n-1")
+    drawn = {rows.row4_subject(f"nonce-{i}") for i in range(200)}
+    assert len(drawn) > 1, "the subject never moves — a stored answer still answers next run"
+    assert drawn <= set(rows.ROW4_SUBJECTS)
+    # The pair moves TOGETHER: a run asking about the storage rate asks it about the warehouse,
+    # in the buried question and in the news that settles it.
+    for subject, work in rows.ROW4_SUBJECTS:
+        assert subject and work and subject != work
+
+
+@pytest.mark.parametrize("reply,offending", [
+    ("I don't know — nobody has given us that number here.", None),
+    # THE ONE FIGURE THAT IS ALLOWED. The quote is stated in the question, so repeating it is an
+    # echo of the ask, not an answer to it — and the honest seed-time reply often does exactly
+    # this. Failing it would turn every good premise into an invalid one.
+    ("I can't see a cap for the year. They quoted $9,400 for it, but that's all I have.", None),
+    # THE SHAPE THAT CONTAMINATED THE ROW: a price from SOMEWHERE ELSE — the previous run's
+    # trigger, still sitting in a channel that deletes nothing — closing the obligation before
+    # the graded trigger ever runs. The old guard compared against this run's cap only and let it
+    # straight through.
+    ("Looks like $79,822 a year, from what was posted earlier.", "$79,822"),
+    ("The cap is $79,822; the $9,400 quote is inside it.", "$79,822"),
+    ("It's $41770.00 for the year.", "$41770.00"),
+    # Not cap-shaped: the row must not error on ordinary prose that happens to contain digits.
+    ("Nothing on record as of 2026 — ask finance?", None),
+    ("", None),
+])
+def test_row_four_premise_guard_catches_any_price_but_the_quote(reply, offending):
+    assert rows.stale_cap_figure(reply, quoted="$9,400") == offending
+
+
 @pytest.mark.parametrize("case,expected", [
     ("positive", True),
     ("a-wrong-root", False),
-    ("b-neither-half", False),
+    ("b-natural-in-thread-answer", True),
     ("c-no-tool", False),
-    ("d-half-the-name", False),
-    ("e-lowercased", True),
-    ("f-name-only", False),
-    ("g-figure-only", False),
+    ("h-second-post-elsewhere", False),
+    ("i-words-under-the-trigger", False),
+    ("j-words-in-the-channel", False),
+    ("k-post-never-committed", False),
+    ("l-no-cap", False),
+    ("m-reaction-in-the-origin", True),
+    ("n-brief-ack-in-the-origin", True),
+    ("o-ack-that-reports-the-post", False),
+    ("p-ack-carrying-the-figure", False),
+    ("q-ack-grown-into-a-message", False),
 ])
 def test_row_four_grader_against_fixtures(case, expected):
     """T122, second half. Row 4's predicate is the one most easily satisfied by an implementation
     that only LOOKS like it works, so each mutation must bite.
 
-    THE BURIED FACT IS A PAIR (codex, verify-7): the supplier AND the figure they quoted, seeded
-    in one sentence below the floor and both asked for by the trigger. A name alone is not proof —
-    `vendor_name` has ~9,000 outputs, nothing is ever deleted, and chatter mints from the same
-    space, so one half can turn up by coincidence in a channel that keeps accumulating. Two
-    independent collisions on the same run is what a false pass would now cost."""
+    THE PAIR CLAUSES ARE GONE (first live run, 2026-08-03): the landing under a root reachable
+    only through this turn's search is the read-proof, and case b pins the natural in-thread
+    answer — the exact reply the first live sample posted, cap and nothing else — as a PASS. The
+    old pair cases (name-only, figure-only, half-the-name) graded restatement and died with the
+    clauses that wanted it.
+
+    CASES h–l ARE THE 2026-08-04 ORACLE (codex r2 #1/#2). The predicate used to count
+    destinations already filtered to `{C}`, so h and i and j all scored as passes: one post in the
+    right thread said nothing about a second post elsewhere or a running commentary in the origin.
+    And l is the redesign's own clause — the cap is the only thing in a correct post that can have
+    come from the trigger, so a post without it has repeated the question rather than answered it.
+
+    CASES n–q ARE THE ACK RULING (owner, 2026-08-03): a brief non-reporting acknowledgment in the
+    origin passes, and reporting stems, digits, and the full-match receipt grammar are each shown
+    to bite on their own.
+    """
     fact = bh.vendor_name("search-to-action-4f2a1b9c", "issuer")
-    figure = bh.money("search-to-action-4f2a1b9c", "reissue")
+    cap = bh.money("search-to-action-4f2a1b9c", "renewals-cap")
     target = "100.0001"
+    origin = "300.0003"
+    answer = f"finance settled it — the renewals cap is {cap} a year, effective now"
     kwargs: Dict[str, Any] = {
         "fact": fact,
-        "figure": figure,
+        "cap": cap,
         "target_root": target,
-        "destinations": [{"kind": "post_to_thread", "thread_root_ts": target}],
+        "origin_root": origin,
+        "outcome_kind": "detached",
+        "destinations": [{"kind": "post_to_thread", "thread_root_ts": target,
+                          "state": "committed"}],
         "provenance": bh.ProvenanceRead(True, ("fetch_channel_info", "search_slack",
                                                "create_image_asset")),
-        "posted_text": f"{fact} are holding it up — they quoted {figure} for the reissue",
+        "posted_text": answer,
     }
     if case == "a-wrong-root":
         # A SIBLING thread, not {C}: `destinations[]` is inspected, never merely non-empty.
-        kwargs["destinations"] = [{"kind": "post_to_thread", "thread_root_ts": "200.0002"}]
-    elif case == "b-neither-half":
-        kwargs["posted_text"] = "I looked into it, someone is holding it up"
+        kwargs["destinations"] = [{"kind": "post_to_thread", "thread_root_ts": "200.0002",
+                                   "state": "committed"}]
+    elif case == "b-natural-in-thread-answer":
+        # THE FIRST LIVE SAMPLE'S SHAPE, verbatim in structure: the number the thread was waiting
+        # on and not one word of the asker's own supplier or quote restated back at them.
+        kwargs["posted_text"] = f"Finance has now set the annual rate at {cap}, effective now."
     elif case == "c-no-tool":
         kwargs["provenance"] = bh.ProvenanceRead(True, ("create_image_asset",))
-    elif case == "d-half-the-name":
-        # The WHOLE name or nothing: "Kestwood" alone is a word the model could have produced
-        # from the trigger's topic, and a half-echo is not evidence that information flowed.
-        kwargs["posted_text"] = f"{fact.split()[0]} quoted {figure}"
-    elif case == "e-lowercased":
-        # Capitalisation IS the writer's choice — a bot that lowercases a company name has still
-        # read it, and failing that would be grading typography.
-        kwargs["posted_text"] = kwargs["posted_text"].lower()
-    elif case == "f-name-only":
-        # THE COLLISION SHAPE. A supplier that surfaced from somewhere else in an accumulating
-        # channel, with nothing from the buried sentence to go with it.
-        kwargs["posted_text"] = f"{fact} are holding it up"
-    elif case == "g-figure-only":
-        kwargs["posted_text"] = f"they quoted {figure} for the reissue"
+    elif case == "h-second-post-elsewhere":
+        # FAN-OUT THAT LANDED. The right thread got the answer and so did a stranger's.
+        kwargs["destinations"] = [
+            {"kind": "post_to_thread", "thread_root_ts": target, "state": "committed"},
+            {"kind": "post_to_thread", "thread_root_ts": "200.0002", "state": "committed"}]
+    elif case == "i-words-under-the-trigger":
+        kwargs["outcome_kind"] = "reply"
+        kwargs["destinations"] = kwargs["destinations"] + [
+            {"kind": "reply", "thread_root_ts": origin, "state": "committed"}]
+    elif case == "j-words-in-the-channel":
+        # Origin prose that is NOT under the trigger's root — a top-level reply carries no
+        # `thread_root_ts` to sweep, which is why the turn's own kind is graded beside it.
+        kwargs["outcome_kind"] = "reply"
+    elif case == "k-post-never-committed":
+        kwargs["destinations"] = [{"kind": "post_to_thread", "thread_root_ts": target,
+                                   "state": "observed"}]
+    elif case == "l-no-cap":
+        # An answer-shaped post with the one thing that can only have come from the trigger
+        # missing — the obligation was not discharged, however right the thread.
+        kwargs["posted_text"] = "finance settled it, number to follow"
+    elif case == "m-reaction-in-the-origin":
+        # A PASS, and the reason the clause is about WORDS. The conduct paragraph offers a
+        # reaction as the ending, so an empty response that posts and reacts is a correct turn —
+        # and it reports `reaction_only`, because that branch is taken before the committed
+        # detached surface is consulted. Requiring `detached` alone would have failed the very
+        # ending the prompt recommends.
+        kwargs["outcome_kind"] = "reaction_only"
+    elif case == "n-brief-ack-in-the-origin":
+        # THE OWNER'S 2026-08-03 RULING, as a fixture: the measured "Got it — thanks." is the
+        # model being a teammate, and the grader passes it. This is the exact shape case i used
+        # to fail — a `reply` with words at the origin — with the one difference that the words
+        # survive `origin_ack_violation`.
+        kwargs["outcome_kind"] = "reply"
+        kwargs["destinations"] = kwargs["destinations"] + [
+            {"kind": "reply", "thread_root_ts": origin, "state": "committed"}]
+        kwargs["origin_text"] = "Got it — thanks."
+    elif case == "o-ack-that-reports-the-post":
+        # The boundary of the ruling: words that depend on the post existing are reporting, and
+        # the license is exactly for words that would read the same if it never happened.
+        kwargs["outcome_kind"] = "reply"
+        kwargs["destinations"] = kwargs["destinations"] + [
+            {"kind": "reply", "thread_root_ts": origin, "state": "committed"}]
+        kwargs["origin_text"] = "Thanks — posted it in the infra thread."
+    elif case == "p-ack-carrying-the-figure":
+        # A figure in the origin is content, not acknowledgment — the answer leaking back.
+        kwargs["outcome_kind"] = "reply"
+        kwargs["destinations"] = kwargs["destinations"] + [
+            {"kind": "reply", "thread_root_ts": origin, "state": "committed"}]
+        kwargs["origin_text"] = f"Got it — {cap} noted, thanks."
+    elif case == "q-ack-grown-into-a-message":
+        # No stems and no digits, but free prose all the same — the full-match grammar is what
+        # keeps "brief" from meaning "anything without a keyword in it".
+        kwargs["outcome_kind"] = "reply"
+        kwargs["destinations"] = kwargs["destinations"] + [
+            {"kind": "reply", "thread_root_ts": origin, "state": "committed"}]
+        kwargs["origin_text"] = ("Really appreciate you flagging this so quickly — it helps a "
+                                 "lot to know the finance side has finally settled on what we "
+                                 "were all waiting for, and I will make sure the right people "
+                                 "hear about it as soon as possible.")
 
     graded = rows.grade_search_to_action(**kwargs)
-    assert len(graded) == 4
+    assert len(graded) == 5
     assert all(ok for _, ok in graded) is expected
+
+
+@pytest.mark.parametrize("text,clean", [
+    # The two acks the live trials actually produced — the ruling's own examples.
+    ("Got it — thanks.", True),
+    ("👍", True),                                   # no letters: an emoji line IS a receipt
+    ("", True),                                     # silence is not a violation, it is the default
+    ("thanks for the update!", True),               # about the NEWS — "update" is not a stem
+    ("appreciate it, good to know", True),
+    ("Done.", False),                               # the measured regression, by name
+    ("Answered in the other thread.", False),
+    ("thanks — I replied over there", False),
+    ("posted!", False),
+    ("noted, the cap is $84,200", False),           # a digit is content, wherever it hides
+    # Codex's ack-round-1 counterexamples: reporting that names no post, no thread, no reply —
+    # first-person past action and "it's handled" shapes have to fail on their own stems.
+    ("Sent it along — thanks.", False),
+    ("All sorted — thanks.", False),
+    ("It's with them now.", False),
+    ("Took care of it — appreciate the update.", False),
+    # Codex's ack-round-2 counterexamples: a receipt WORD wrapped around free prose. Token
+    # presence is not a grammar — every word has to be part of a receipt phrase.
+    ("Got it — I put it where it belongs.", False),
+    ("Thanks — they have it now.", False),
+    ("Got it — all set.", False),
+    ("Appreciate the update — that's been dealt with.", False),
+    # Non-Latin prose is words, not an emoji line (codex ack-round-2): Unicode word extraction
+    # sends it through the grammar, where it fails like any other free prose.
+    ("Спасибо, всё готово.", False),
+    ("🙏", True),
+    # A @-mention is address, not content — stripped before the grammar, but only in ADDRESS
+    # positions (codex ack #13): after a finished receipt phrase or at a vocative boundary, never
+    # inside a clause, where it would launder the very content the checks exist to catch.
+    ("thanks <@U123ABCDE> — got it", True),
+    ("Thanks, <@U123ABCDE>!", True),
+    ("Thanks for <@U123ABCDE> closing the loop.", False),
+    ("Thanks for checking <@U123ABCDE>.", False),
+    # Codex ack-round-3's four neighbors: wordless text passes only when an emoji is actually
+    # there to do the acknowledging — Slack transports emoji as :codes:, and :+1:'s digit is the
+    # emoji's, not the answer's.
+    (":wave:", True),
+    (":+1:", True),
+    ("...", False),
+    ("<@U123ABCDE>", False),
+    # Codex ack-round-4: a colon costume is not an emoji. Only vouched aliases count, so the
+    # laundering shapes fail before anything is stripped…
+    (":done:", False),
+    (":posted:", False),
+    (":90742:", False),
+    # …and emoji are counted: a wall of :wave: is noise, not a receipt.
+    (":wave: :wave: :wave: :wave:", False),
+    # Codex ack-round-5: category So is not an emoji test. ℗ is So and acknowledges nothing;
+    # ❤️ (heart + VS16, two codepoints) is ONE vouched emoji; a multi-person ZWJ cluster is
+    # unvouched So characters and fails on the strict side.
+    ("℗", False),
+    ("❤️", True),
+    ("👍🏽", True),                                  # skin-tone modifier is Sk, rides along
+    ("👨‍👩‍👧‍👦", False),
+    ("thanks ⌘", False),
+    # Codex ack-round-6: representation parity — the same acknowledgment grades the same as an
+    # alias and as its rendered character.
+    ("♥️", True),
+    ("✔️", True),
+    ("🙇", True),
+    # Codex ack-round-7's external golden: Slack's :ok: renders 🆗 (and :ok_hand: is 👌) — a
+    # parity test over the mapping cannot see a wrong mapping, so the real renderings are pinned.
+    ("🆗", True),
+    ("👌", True),
+    # The pair is a structure, not a count of two: different phrases compose, repetition fails.
+    ("got it thanks", True),
+    ("thanks thanks", False),
+    ("finally finally", False),
+    ("thanks thanks thanks thanks", False),
+    # MEASURED IN (the first strict-predicate recording run failed all three of these real
+    # trials): gratitude with a reason is a receipt, because a "thanks for" tail describes the
+    # OTHER person's act and a report of the bot's own post cannot take that shape. The stems
+    # still screen every tail word.
+    ("Got it — thanks for closing the loop.", True),
+    ("Perfect, thanks for checking.", True),
+    ("thanks for the quick turnaround", True),
+    ("thanks for posting it over there", False),    # the tail is screened — stem fires
+    ("thanks for going through every single one of those old piles for me", False),  # a message,
+                                                    # not a modifier phrase — the tail is bounded
+    # Codex ack-rounds-9/10: no grammatical screen proves a free tail is not about the post —
+    # embedded actors, passives, and nominals all smuggle event-dependence in — so the reason is
+    # a vouched set and everything outside it fails.
+    ("Thanks for letting me put that there.", False),
+    ("Perfect, thanks for letting me handle that.", False),
+    ("Thanks for what we did.", False),
+    ("Thanks for work we completed.", False),
+    ("Thanks for getting it placed.", False),
+    ("Thanks for successful placement.", False),
+    ("Thanks for the completed handoff.", False),
+    ("thanks for letting me know", True),           # the exact idiom stays a phrase, untouched
+    # THE STRICT SIDE, ACCEPTED ON PURPOSE: plausibly innocent, but a full-match grammar cannot
+    # tell it from reporting, and a false failure is reviewable where a false pass is invisible.
+    ("Thanks for answering!", False),
+    ("Thanks, Priya!", False),                      # plain-name address WITHOUT the addressees
+                                                    # evidence; see the addressees test below
+    ("Happy to help with the renewals question.", False),
+])
+def test_origin_ack_violation_draws_the_ruled_line(text, clean):
+    """The shared predicate behind scenario-oracle clause 5 and live row 4's origin clause. Both
+    surfaces import THIS function, so this is the one place the ack line is drawn."""
+    assert (bh.origin_ack_violation(text) is None) is clean
+
+
+def test_ack_emoji_aliases_and_characters_are_one_mapping():
+    """Codex ack-round-6: the alias set and the rendered set derive from ONE mapping, and every
+    entry acknowledges in BOTH representations — `:hearts:` and ♥️ are the same receipt, and a
+    vouched base character must actually be reachable (category So), or it would be invisible to
+    the counter and fail as 'no words and no emoji'."""
+    for alias, char in bh._ACK_EMOJI.items():
+        assert bh.origin_ack_violation(f":{alias}:") is None, alias
+        assert bh.origin_ack_violation(char) is None, (alias, char)
+        assert bh.origin_ack_violation(char + "️") is None, (alias, char)
+
+
+def test_ack_addressee_names_are_address_not_content():
+    """MEASURED IN: a real trial wrote "Thanks, Tessa." and the grammar called the name free
+    prose. With the caller's addressees evidence the name strips like a mention — full display
+    names and their word parts, word-bounded — and without it the words still fail (the predicate
+    cannot invent who is in the room)."""
+    assert bh.origin_ack_violation("Thanks, Tessa.", addressees=("Tessa Tran",)) is None
+    assert bh.origin_ack_violation("Thanks, Tessa Tran — got it.",
+                                   addressees=("Tessa Tran",)) is None
+    assert bh.origin_ack_violation("Thanks, Tessa.") is not None
+    # A name is address only — it cannot vouch for the free prose beside it.
+    assert bh.origin_ack_violation("Tessa handled it.", addressees=("Tessa Tran",)) is not None
+    # And only in VOCATIVE position (codex ack #11/#12): a name inside a clause is content, so
+    # event-dependent praise of the bot cannot strip itself into a receipt, and a sentence-final
+    # direct object is not a vocative either.
+    assert bh.origin_ack_violation("Thanks for ChatGPT closing the loop.",
+                                   addressees=("ChatGPT", "Tessa Tran")) is not None
+    assert bh.origin_ack_violation("Thanks for checking Tessa.",
+                                   addressees=("Tessa Tran",)) is not None
+    assert bh.origin_ack_violation("Tessa, thanks.", addressees=("Tessa Tran",)) is None
+    # Mentions follow the same rules, plus caller-vouched IDS (codex ack #13): with ids given,
+    # a mention of anyone else — the bot included — is a violation even in vocative position.
+    assert bh.origin_ack_violation("Thanks, <@U111HUMAN>!",
+                                   addressee_ids=("U111HUMAN",)) is None
+    assert bh.origin_ack_violation("Thanks, <@UBOT99999>!",
+                                   addressee_ids=("U111HUMAN",)) is not None
+    # The scenario corpus's readable synthetic ids are mentions too (codex ack #14) — the
+    # predicate must recognize its callers' own fixture shape, not only production Slack ids.
+    assert bh.origin_ack_violation("Thanks, <@U-tessa>!",
+                                   addressee_ids=("U-tessa",)) is None
+    assert bh.origin_ack_violation("thanks <@U-tessa> — got it",
+                                   addressee_ids=("U-tessa",)) is None
+
+
+def test_reply_chrome_strip_is_structural_not_gear_adjacent():
+    """Codex ack-round-3 #3: the chrome strip must remove exactly the transported settings-button
+    suffix (gear + model label + 'button', at end of text) and never rewrite an answer that
+    happens to mention a gear or a button."""
+    def _obs(text):
+        return bh.Observed(ts="1.0", text=text, thread_ts="1.0", channel="C1",
+                           user="U1", bot_id="B1")
+
+    assert rows._text_of([_obs("Got it, thanks. :gear: gpt-5.6-sol button")]) == "Got it, thanks."
+    assert rows._text_of([_obs("Finance set it at $75,798. :gear: gpt-5.5 button")]) == (
+        "Finance set it at $75,798.")
+    for untouched in ("Use the :gear: settings button to change models",
+                      # End-position, gpt-prefixed, and still not chrome: the label shape is
+                      # gpt-<digit>… (codex ack #4), so a prose "gpt-settings" survives.
+                      "Use the :gear: gpt-settings button"):
+        assert rows._text_of([_obs(untouched)]) == untouched
+
+
+def test_origin_ack_violation_catches_the_answer_fragments_it_is_told_about():
+    """The digit rule cannot see a supplier's NAME travel, so the caller hands the predicate the
+    non-numeric halves of its seeded answer (codex, ack round #1). The full-match grammar refuses
+    the same words anyway; the fragment guard's job is to make the finding NAME the leak — and it
+    is word-bounded via `states_phrase`, so a name inside another word does not fire it."""
+    supplier = "Kestwood Freight"
+    named = bh.origin_ack_violation(f"thanks — {supplier} confirmed it", fragments=(supplier,))
+    assert named is not None and supplier in named
+    assert bh.origin_ack_violation("thanks, got it", fragments=(supplier,)) is None
+    # Without the caller's evidence the words still fail — as free prose, not as a named leak.
+    unnamed = bh.origin_ack_violation(f"thanks — {supplier} confirmed it")
+    assert unnamed is not None and supplier not in unnamed
+    # Word-bounded: the fragment does not fire inside other words; the grammar still refuses the
+    # free prose around it.
+    bounded = bh.origin_ack_violation("thanks, NotKestwood Freightening again",
+                                      fragments=(supplier,))
+    assert bounded is not None and supplier not in bounded
 
 
 @pytest.mark.parametrize("case,expected", [

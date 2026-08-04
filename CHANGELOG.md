@@ -183,6 +183,13 @@ what it already said, even across restarts. Every such cross-thread post also re
 tools produced it (visible via the tool-usage record), no matter how the turn ends — even one
 that errors out after posting.
 
+It also decides this on its own — no special wording required. What sends an answer to
+another thread is that the thread is owed it: an open question there, an answer promised
+there, an earlier answer of its own that's now wrong. When news lands that settles something
+the channel was still holding open — even in a thread too old to be on screen — it goes and
+finds that thread and closes the loop there. The thread it was standing in gets at most a
+brief acknowledgment ("Got it — thanks."), never a report of the post.
+
 ### 🔧 Fixed - Streamed replies now credit their tools
 
 A reply streamed natively into Slack that used web search, the sandbox, or an MCP server was

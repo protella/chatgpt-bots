@@ -2467,9 +2467,10 @@ class SlackMessagingMixin:
     # the words changes nothing anywhere.
     _POST_TO_THREAD_DESCRIPTION = (
         "Post a reply into a DIFFERENT thread in THIS channel. Use when a reply "
-        "belongs somewhere other than the current conversation — someone asked you to "
-        "answer a message over in another thread, or you're closing a loop you were "
-        "part of elsewhere. Acknowledge briefly in the current thread rather than "
+        "belongs somewhere other than the current conversation — because that thread "
+        "holds something this turn settles: a question left open there, an answer you "
+        "owed there, an earlier answer of yours that is now wrong. "
+        "Acknowledge briefly in the current thread rather than "
         "duplicating the whole answer in both places. Only targets threads in the "
         "current channel; there is no way to post to another channel."
     )
