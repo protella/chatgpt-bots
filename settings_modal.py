@@ -244,13 +244,13 @@ class SettingsModal(LoggerMixin):
         # collapse into `on`. The labels below therefore describe WHEN I wake, never how chatty I am.
         global_default_level = MODE_TO_LEVEL.get((global_default_mode or "tag_only").lower(), "mentions_only")
         mode_options = [
-            {"text": {"type": "plain_text", "text": f"Use default (inherit — currently: {global_default_level})"},
+            {"text": {"type": "plain_text", "text": f"Use default (currently: {global_default_level})"},
              "value": "inherit"},
-            {"text": {"type": "plain_text", "text": "Mentions only — @mentions always reach me; name-drops are judged"},
+            {"text": {"type": "plain_text", "text": "Mentions only"},
              "value": "mentions_only"},
-            {"text": {"type": "plain_text", "text": "On — I read the channel and judge when to answer (recommended)"},
+            {"text": {"type": "plain_text", "text": "On — joins in when it can help (recommended)"},
              "value": "on"},
-            {"text": {"type": "plain_text", "text": "Off — never respond here, even when @mentioned"},
+            {"text": {"type": "plain_text", "text": "Off — never responds here"},
              "value": "off"},
         ]
         current_level = cs.get("participation_level")
@@ -290,8 +290,7 @@ class SettingsModal(LoggerMixin):
 
         blocks = [
             {"type": "section", "text": {"type": "mrkdwn",
-             "text": f"*Channel settings* for <#{channel_id}>\nHow I participate in this channel. "
-                     f"Global defaults come from the bot's configuration; these override them here."},
+             "text": f"*Channel settings* for <#{channel_id}>"},
              "accessory": {"type": "button", "action_id": "open_user_settings_push",
                            "text": {"type": "plain_text", "text": "👤 My personal settings"}}},
             {"type": "input", "block_id": "participation_block",
@@ -299,30 +298,22 @@ class SettingsModal(LoggerMixin):
                          "options": mode_options, "initial_option": initial_mode_option},
              "label": {"type": "plain_text", "text": "Participation"},
              "hint": {"type": "plain_text",
-                      "text": "Whether I wake up here, not how talkative I am. 'Mentions only' answers a real "
-                              "@mention every time and weighs a bare name-drop before replying; 'On' also weighs "
-                              "ordinary channel messages. 'Off' silences me completely — even @mentions go "
-                              "unanswered, so this button is the only way back. 'Inherit' uses the global default "
-                              f"({global_default_level})."}},
+                      "text": "'Off' ignores even @mentions — reopen this menu to turn me back on."}},
             {"type": "input", "block_id": "policy_block", "optional": True,
              "element": {"type": "plain_text_input", "action_id": "standing_policy", "multiline": True,
                          "initial_value": policy_value or "", "max_length": POLICY_MAX_CHARS,
                          "placeholder": {"type": "plain_text",
                                          "text": "e.g. Only jump in on deploy failures; otherwise stay quiet."}},
              "label": {"type": "plain_text", "text": "Standing channel policy"},
-             "hint": {"type": "plain_text", "text": "Standing instructions for how I behave in this channel. Saving REPLACES the whole policy; empty it to clear."}},
+             "hint": {"type": "plain_text", "text": "Saving replaces the whole policy; empty it to clear."}},
             {"type": "input", "block_id": "reply_in_channel_block", "optional": True,
              "element": reply_element,
              "label": {"type": "plain_text", "text": "Reply placement"},
              "hint": {"type": "plain_text",
-                      "text": "'Inherit' follows the workspace default. 'Reply at channel level' lets me answer a top-level message in the channel — I still judge per message whether a thread fits better. 'Threads only' always routes replies into a thread."}},
+                      "text": "'Reply at channel level' still lets me pick a thread when one fits better."}},
             {"type": "divider"},
             {"type": "section", "text": {"type": "mrkdwn",
-             "text": "*Shared response settings*\n"
-                     "These apply to everyone in this channel — in a channel I run on the "
-                     "channel's settings, never on whoever happened to ask. 'Use the workspace "
-                     "default' falls back to the bot's configuration, not to anyone's personal "
-                     "preferences."}},
+             "text": "*Shared response settings*\nThese apply to everyone in this channel."}},
             {"type": "input", "block_id": "channel_model_block", "dispatch_action": True,
              "element": model_element,
              "label": {"type": "plain_text", "text": "Model"}},
@@ -330,7 +321,7 @@ class SettingsModal(LoggerMixin):
              "element": effort_element,
              "label": {"type": "plain_text", "text": "Reasoning effort"},
              "hint": {"type": "plain_text",
-                      "text": "Only the efforts this channel's model accepts are listed. If a saved effort stops being legal — after a model change — the channel falls back to the workspace default, not to a nearby setting."}},
+                      "text": "Only efforts this channel's model supports are listed."}},
             {"type": "input", "block_id": "channel_verbosity_block",
              "element": verbosity_element,
              "label": {"type": "plain_text", "text": "Verbosity"}},
@@ -451,8 +442,7 @@ class SettingsModal(LoggerMixin):
              "element": memory_input,
              "label": {"type": "plain_text", "text": "Channel memory"},
              "hint": {"type": "plain_text",
-                      "text": "One note per line. Edit or delete lines and Save; "
-                              "blank it out to forget everything here."}},
+                      "text": "One note per line; blank it out to forget everything."}},
         ]
         if hidden_count > 0:
             blocks.append({"type": "context", "elements": [
