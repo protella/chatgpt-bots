@@ -23,6 +23,7 @@ read back with `chat.getPermalink`. What the live API actually returns is writte
 fixture, because it decides which of §2g's two derivation sources ever fires.
 """
 import asyncio
+import json
 from types import SimpleNamespace
 from typing import Any, List
 from unittest.mock import AsyncMock, MagicMock
@@ -788,11 +789,21 @@ def _handler_host(loop_result, db, *, streaming=True):
     host.handler = method.__get__(host)
     for cls, name in ((MessageUtilitiesMixin, "_persist_tool_provenance"),
                       (MessageUtilitiesMixin, "_schedule_async_call"),
-                      (MessageUtilitiesMixin, "drain_background_tasks")):
+                      (MessageUtilitiesMixin, "drain_background_tasks"),
+                      # THE DESTINATION WRITER ITSELF. It is a real method on the handler mixin,
+                      # and a MagicMock host answers an unbound name with a mock that records the
+                      # call and writes nothing — so leaving it out would let a hoist that never
+                      # reaches the database pass this file.
+                      (TextHandlerMixin, "_persist_destination_provenance")):
         setattr(host, name, getattr(cls, name).__get__(host))
     host._background_tasks = set()
     host.db = db
-    host._is_reaction_only = MagicMock(return_value=False)
+    # THE REAL PREDICATE, not a False stub. It is a static function of two values the loop
+    # result already carries, and stubbing it to False deleted a whole ENDING from this harness:
+    # a turn that posted cross-thread AND reacted took the words-elsewhere branch here and the
+    # reaction-only branch in production, which is exactly the divergence that let a live
+    # destination post ship with no provenance row while this file stayed green.
+    host._is_reaction_only = TextHandlerMixin._is_reaction_only
     host.mcp_manager = MagicMock()
 
     async def _passthru(m, *a, **k):
@@ -1030,3 +1041,495 @@ async def test_a_broken_stream_still_denies_all_but_the_discovered_set():
                             trusted_thread_roots=trusted, turn=turn),
             {"thread_ts": target, "text": "hello"})
         assert out["ok"] is expected
+
+
+# =============================================== 4. §5.4a — DOES THE POST CARRY ITS PROVENANCE?
+#
+# The live probe (2026-08-03, post 1785799391.210679) found a cross-thread destination post with
+# NO `message_tool_usage` row, while in-place replies from the same period all had theirs. The
+# cause was PLACEMENT, not reach: §5.4a's write sat inside the words-elsewhere branch, which is
+# the LAST of five ways a turn can end, and the probe's turn also reacted — so it returned three
+# branches earlier and the write never ran. The test above never caught it because its loop
+# result contains no `react_to_message`, so it takes the one ending the write did cover.
+#
+# These drive the REAL handler with the REAL writer over a REAL database, and the fire-and-forget
+# write is DRAINED before the rows are read — the same registry production's shutdown drains.
+
+def _reacted(*extra):
+    """A tool-call list that ends the turn on `_is_reaction_only`: the react tool committed and
+    the model returned no text."""
+    return [{"name": "search_slack", "ok": True, "gist": "cert renewal"},
+            {"name": "post_to_thread", "ok": True, "gist": OLD_ROOT},
+            *extra,
+            {"name": "react_to_message", "ok": True, "gist": ""}]
+
+
+_ENDINGS = {
+    # ending id -> (loop result overrides, tool_context overrides)
+    "words-elsewhere": ({}, {}),
+    "reacted": ({"local_tool_calls": _reacted()}, {}),
+    "no_reply": ({"terminal_action": "no_reply", "silence_reason": "answered_elsewhere"}, {}),
+    "background_job": ({}, {"background_job_started": True}),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [True, False], ids=["streaming", "non-streaming"])
+@pytest.mark.parametrize("ending", sorted(_ENDINGS), ids=sorted(_ENDINGS))
+async def test_a_cross_thread_post_carries_provenance_out_of_every_ending(temp_db, monkeypatch,
+                                                                          streaming, ending):
+    """§5.4a, HELD ON EVERY ENDING RATHER THAN ON ONE.
+
+    A turn whose words went into another thread can finish four different ways — it can simply
+    have nothing left to say, it can react, it can declare `no_response_needed`, or it can start
+    a background job — and the destination post is the same message with the same provenance in
+    all four. Three of them used to return before the write. The row is keyed on the DESTINATION
+    post and names the tools that produced it, `search_slack` included.
+    """
+    monkeypatch.setattr(config, "enable_post_to_thread_tool", True)
+    monkeypatch.setattr(config, "enable_tool_provenance", True)
+    monkeypatch.setattr(config, "enable_tool_result_memory", False)
+
+    loop_overrides, ctx_overrides = _ENDINGS[ending]
+    loop_result = {"text": "", "tools_used": [], "local_tool_calls": [
+        {"name": "search_slack", "ok": True, "gist": "cert renewal"},
+        {"name": "post_to_thread", "ok": True, "gist": OLD_ROOT},
+    ]}
+    loop_result.update(loop_overrides)
+
+    turn = _turn()
+    turn.visible_action_committed = True
+    turn.mark_destination_committed(channel_id=CHANNEL, first_ts="9100.0",
+                                    kind=DEST_KIND_POST_TO_THREAD, thread_root_ts=OLD_ROOT,
+                                    text="answered over there")
+    # An observed-only surface is one the turn never stood behind — it must get NO row on any
+    # ending, or this turn's tools would be attributed to a message it did not commit to.
+    turn.note_destination_observed(channel_id=CHANNEL, first_ts="9200.0",
+                                   kind=DEST_KIND_POST_TO_THREAD, thread_root_ts=OLD_ROOT)
+
+    host = _handler_host(loop_result, temp_db, streaming=streaming)
+    host._build_tool_context = MagicMock(return_value=SimpleNamespace(
+        background_job_started=ctx_overrides.get("background_job_started", False),
+        sandbox_image_assets=[], mounted_files=[]))
+
+    response = await _drive_handler(host, turn, streaming=streaming)
+    assert response.metadata["posted"] is False
+    # EACH CASE REALLY TAKES ITS OWN BRANCH. Without this the parametrization would be theatre:
+    # four fixtures that all fall through to the same ending prove the write covers one path
+    # four times. The metadata is how each branch announces itself.
+    metadata = response.metadata
+    if ending == "reacted":
+        assert metadata.get("reaction_only") is True
+    elif ending == "no_reply":
+        assert metadata.get("terminal_action") == "no_reply"
+    elif ending == "background_job":
+        assert metadata.get("background_job_started") is True
+    else:
+        assert not metadata.get("reaction_only")
+        assert not metadata.get("background_job_started")
+        assert metadata.get("terminal_action") is None
+        # POSITIVELY the words-elsewhere branch, not merely "none of the others" — the bare-empty
+        # fallback and the empty-with-artifacts branch also return empty text with `posted:
+        # False`, and a matrix that could not tell them apart would report coverage of an ending
+        # it never reached. `response_reaction_committed` is emitted by the words-elsewhere
+        # return and by neither of those two.
+        assert "response_reaction_committed" in metadata
+        assert "sandbox_image_assets" in metadata and "mounted_digests" in metadata
+    await host.drain_background_tasks()
+
+    rows = await temp_db.get_thread_tool_usage_async(f"{CHANNEL}:{OLD_ROOT}")
+    assert "9100.0" in rows, (
+        f"the {ending} ending returned before the destination post's provenance was written")
+    assert {"tool_name": "search_slack", "gist": "cert renewal"} in rows["9100.0"]
+    assert {"tool_name": "post_to_thread", "gist": OLD_ROOT} in rows["9100.0"]
+    assert "9200.0" not in rows, "an observed-only surface is not this turn's word"
+    assert "9000.0" not in rows, "keyed on the destination post, never on the turn's trigger"
+
+
+@pytest.mark.asyncio
+async def test_an_in_place_streamed_reply_still_carries_its_own_provenance(temp_db, monkeypatch):
+    """THE OTHER SHAPE, and the guard on the hoist that fixed the first one.
+
+    Moving the destination write — and the attribution list it reads — above the ending cascade
+    must not disturb the row an ordinary reply has always had. This drives the REAL streaming
+    handler over a fake Slack that actually accepts chunks, so the row is keyed on the ts Slack
+    handed back for the first delivered part, exactly as production keys it, and it names the
+    same `search_slack` the cross-thread case does.
+
+    The scaffolding is `test_reply_surface`'s, which already drives this handler end to end;
+    what changes here is that the writer and the database are the real ones.
+    """
+    from message_processor.utilities import MessageUtilitiesMixin
+    from tests.unit.test_reply_surface import (FakeOpenAI, FakeSlack, _message, _processor,
+                                               _run, _thread_state, _thread_turn)
+
+    monkeypatch.setattr(config, "enable_tool_provenance", True)
+    monkeypatch.setattr(config, "enable_tool_result_memory", False)
+
+    class _ToolLoopOpenAI(FakeOpenAI):
+        """The tools variant of the same fake: it streams, then reports the loop's own record."""
+
+        async def create_streaming_response_with_tool_loop(self, stream_callback=None, **kw):
+            await self._run(stream_callback, **kw)
+            return {"text": "".join(self.chunks), "tools_used": ["web_search"],
+                    "local_tool_calls": [{"name": "search_slack", "ok": True,
+                                          "gist": "cert renewal"}]}
+
+    processor = _processor(_ToolLoopOpenAI(["the cert renewal is with Kestwood"]))
+    processor.db = temp_db
+    # The real writer and the real scheduler, over the real database — `_processor` mocks both
+    # out, and a mocked writer is exactly how a missing row passes for a present one.
+    processor._persist_tool_provenance = (
+        MessageUtilitiesMixin._persist_tool_provenance.__get__(processor))
+    processor._schedule_async_call = (
+        MessageUtilitiesMixin._schedule_async_call.__get__(processor))
+    processor._build_tools_array = MagicMock(return_value=[{"type": "function", "name": "t"}])
+    processor._materialize_request_tools = MagicMock(return_value=(MagicMock(), {}, False, ""))
+    processor._build_tool_context = MagicMock(return_value=SimpleNamespace(
+        background_job_started=False, sandbox_image_assets=[], mounted_files=[]))
+
+    slack = FakeSlack()
+    message = _message(channel="C1", thread="10.0")
+    response = await _run(processor, slack, message, _thread_state(), _thread_turn(message))
+
+    assert (response.content or "") == "" or response.metadata.get("streamed")
+    delivered = slack.posts
+    assert delivered, "nothing was delivered, so this test proves nothing about the row"
+    await MessageUtilitiesMixin.drain_background_tasks(processor)
+
+    rows = await temp_db.get_thread_tool_usage_async("C1:10.0")
+    assert delivered[0] in rows, "the in-place reply lost its own provenance row"
+    assert {"tool_name": "search_slack", "gist": "cert renewal"} in rows[delivered[0]]
+
+
+# --------------------------------------------- the exit-path amendment (codex final round #1)
+
+class _ScriptedResponses:
+    """The Responses API, scripted — and the ONLY thing faked beneath the real tool loop.
+
+    Each step is either `(function_call items, result)` for a round the model "made", or an
+    exception the round raises. Everything above it is production: the loop that walks the
+    rounds, the registry that dispatches them, the executors that run, the turn that accrues.
+    """
+
+    def __init__(self, steps):
+        self.steps = list(steps)
+        self.rounds = 0
+
+    async def __call__(self, client, *, messages=None, tools=None, return_metadata=False,
+                       function_call_sink=None, tool_choice=None, **params):
+        step = self.steps[min(self.rounds, len(self.steps) - 1)]
+        self.rounds += 1
+        if isinstance(step, BaseException):
+            raise step
+        sink_items, result = step
+        if function_call_sink is not None:
+            function_call_sink.extend(sink_items)
+        return result
+
+
+def _call_item(call_id, name, **arguments):
+    return {"type": "function_call", "call_id": call_id, "name": name,
+            "arguments": json.dumps(arguments)}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["raises", "cancelled"])
+async def test_a_post_that_landed_keeps_its_provenance_when_a_later_round_fails(
+        temp_db, monkeypatch, how):
+    """THE EXIT-PATH GUARANTEE, AS ONE CONTINUOUS LIFECYCLE (codex round-2 #2).
+
+    The REAL handler runs the REAL tool loop, which walks three rounds against a scripted
+    Responses API: round one searches (and reports a `web_search` alongside it), round two posts
+    into the thread that search proved, round three falls over. Nothing about the turn is
+    preloaded — the destination commits because `execute_post_to_thread` really ran, and the
+    turn accrues its provenance because production propagated `turn` into the ToolContext and
+    the loop wrote its records down as they happened. Remove any link in that chain and this
+    fails, which is the point: the earlier version handed the handler a turn that a test had
+    filled in, so it could not see a propagation defect at all.
+
+    BOTH HALVES OF THE RECORD ARE ASSERTED. The local calls (`search_slack`, `post_to_thread`)
+    and the EXTERNAL name (`web_search`) that the same rounds produced — the second is what
+    codex round-2 #1 was about, and it is only in the row because the turn owns it: the
+    handler enters its `finally` with an empty attribution list, exactly as it does live.
+    """
+    monkeypatch.setattr(config, "enable_post_to_thread_tool", True)
+    monkeypatch.setattr(config, "enable_tool_provenance", True)
+    monkeypatch.setattr(config, "enable_tool_result_memory", False)
+
+    from message_processor.handlers.text import TextHandlerMixin
+    from openai_client.api import responses as responses_api
+    from openai_client.api.tool_loop import create_text_response_with_tool_loop
+    from tool_registry import ToolRegistry
+
+    poster = _post_host()
+    search = _search_host([reply_hit()])
+    registry = ToolRegistry()
+    registry.register({"type": "function", "name": "search_slack", "parameters": {}},
+                      search.execute_search_tool)
+    registry.register({"type": "function", "name": "post_to_thread", "parameters": {}},
+                      poster.execute_post_to_thread)
+
+    failure = (RuntimeError("the next round fell over") if how == "raises"
+               else asyncio.CancelledError())
+    scripted = _ScriptedResponses([
+        # Round 1 — the search that proves the thread, beside a hosted web_search.
+        ([_call_item("s1", "search_slack", query="cert renewal")],
+         {"text": "", "tools_used": ["web_search"]}),
+        # Round 2 — the post, now that the root is enrolled and re-stamped for this round.
+        ([_call_item("p1", "post_to_thread", thread_ts=OLD_ROOT, text="answered over there")],
+         {"text": "", "tools_used": []}),
+        # Round 3 — and the turn dies with the post already in the room.
+        failure,
+    ])
+    monkeypatch.setattr(responses_api, "create_text_response_with_tools", scripted)
+
+    turn = _turn()
+    host = _handler_host({}, temp_db, streaming=False)
+    # The REAL loop, over the scripted API. `openai_client` is only a carrier for it here.
+    host.openai_client = SimpleNamespace(
+        create_text_response_with_tool_loop=create_text_response_with_tool_loop.__get__(
+            SimpleNamespace(log_info=lambda *a, **k: None, log_warning=lambda *a, **k: None,
+                            log_debug=lambda *a, **k: None, log_error=lambda *a, **k: None)))
+    host._materialize_request_tools = MagicMock(
+        return_value=(registry, {"model": "m"}, True, None))
+    # THE PROPAGATION UNDER TEST: production builds the ToolContext, and it is production that
+    # puts `turn` on it. A test-built context would hide exactly the defect codex named.
+    host._build_tool_context = TextHandlerMixin._build_tool_context.__get__(host)
+    host._current_image_urls = MagicMock(return_value=[])
+    host._is_context_length_error = MagicMock(return_value=False)
+    host._channel_request_too_large = MagicMock(return_value=False)
+
+    with pytest.raises((RuntimeError, asyncio.CancelledError)):
+        await _drive_handler(host, turn, streaming=False)
+
+    assert scripted.rounds >= 3, "the loop did not reach the failing round"
+    assert [c["name"] for c in turn.provenance_tool_calls] == ["search_slack", "post_to_thread"]
+    # The loop merges every round's used-tool names into one list — local names included, which
+    # the write filters back out — so the claim here is that the EXTERNAL one survived.
+    assert "web_search" in turn.provenance_external_tools
+    committed = turn.committed_destinations
+    assert len(committed) == 1 and committed[0].first_ts, (
+        "the post did not really commit — nothing here would mean anything")
+    destination_ts = committed[0].first_ts
+
+    await host.drain_background_tasks()
+    rows = await temp_db.get_thread_tool_usage_async(f"{CHANNEL}:{OLD_ROOT}")
+    assert destination_ts in rows, (
+        "the post landed and the turn kept the record; the failing round dropped it anyway")
+    names = {entry["tool_name"] for entry in rows[destination_ts]}
+    assert {"search_slack", "post_to_thread"} <= names, f"row names {sorted(names)}"
+    assert "web_search" in names, (
+        "the external name was not turn-owned — the finally had an empty attribution list")
+
+
+class _ScriptedStream:
+    """The STREAMING Responses API, scripted — the only thing faked beneath the real loop.
+
+    Each step is `(chunks, tool events, function_call items)` or an exception. The tool events
+    are `(tool_type, status)` pairs delivered through the handler's own `tool_callback`, which
+    is where hosted-tool accounting lives — so a scripted `web_search` is counted by production
+    code, not by the test.
+    """
+
+    def __init__(self, steps):
+        self.steps = list(steps)
+        self.rounds = 0
+
+    async def __call__(self, client, *, messages=None, tools=None, stream_callback=None,
+                       tool_callback=None, function_call_sink=None, tool_choice=None, **params):
+        step = self.steps[min(self.rounds, len(self.steps) - 1)]
+        self.rounds += 1
+        if isinstance(step, BaseException):
+            raise step
+        chunks, events, sink_items = step
+        for tool_type, status in events:
+            if tool_callback is not None:
+                await tool_callback(tool_type, status)
+        for chunk in chunks:
+            if stream_callback is not None:
+                await stream_callback(chunk)
+        if function_call_sink is not None:
+            function_call_sink.extend(sink_items)
+        return "".join(chunks)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["raises", "cancelled"])
+@pytest.mark.parametrize("mcp_label", [None, "context7"], ids=["generic-mcp", "labelled-mcp"])
+async def test_a_streamed_post_keeps_its_provenance_when_a_later_round_fails(
+        temp_db, monkeypatch, mcp_label, how):
+    """THE STREAMING TWIN OF THE SAME GUARANTEE (codex round-3 #2), and it binds three things
+    the non-streaming test cannot reach: the streaming handler's own `finally`, the hosted-tool
+    accounting that used to sit BELOW the native-stream early return, and the generic-MCP mirror.
+
+    One shape: a preamble that commits visible text (so the stream owns the surface), then a
+    round that runs a hosted `web_search` AND an MCP call, then the `post_to_thread` into the
+    thread a search proved, then the failure (which for the cancelled case IS the third round's
+    exit rather than a round of its own). The destination row must name the local calls AND both
+    hosted tools.
+    """
+    monkeypatch.setattr(config, "enable_post_to_thread_tool", True)
+    monkeypatch.setattr(config, "enable_tool_provenance", True)
+    monkeypatch.setattr(config, "enable_tool_result_memory", False)
+
+    from message_processor.handlers.text import TextHandlerMixin
+    from message_processor.utilities import MessageUtilitiesMixin
+    from openai_client.api import responses as responses_api
+    from openai_client.api.tool_loop import (create_streaming_response_with_tool_loop,
+                                             create_text_response_with_tool_loop)
+    from tests.unit.test_reply_surface import (FakeSlack, _message, _processor, _thread_state,
+                                               _thread_turn)
+    from tool_registry import ToolRegistry
+
+    poster = _post_host()
+    search = _search_host([reply_hit()])
+    registry = ToolRegistry()
+    registry.register({"type": "function", "name": "search_slack", "parameters": {}},
+                      search.execute_search_tool)
+    registry.register({"type": "function", "name": "post_to_thread", "parameters": {}},
+                      poster.execute_post_to_thread)
+
+    mcp_event = f"mcp:{mcp_label}" if mcp_label else "mcp"
+    expected_mcp = f"MCP ({mcp_label})" if mcp_label else "MCP"
+    scripted = _ScriptedStream([
+        # 1 — a preamble AND the search that proves the thread. The preamble commits visible
+        #     text, which is what makes the NATIVE stream own the surface from here on.
+        (["Looking that up. "], [], [_call_item("s1", "search_slack", query="cert renewal")]),
+        # 2 — hosted tools while the native stream is running (every one of these events takes
+        #     the early-return path that used to skip the accounting), plus the post into the
+        #     root round 1 enrolled.
+        ([], [("web_search", "started"), (mcp_event, "calling")],
+         [_call_item("p1", "post_to_thread", thread_ts=OLD_ROOT, text="answered over there")]),
+        # 3 — and the turn dies with the post already in the room. TWO WAYS OUT, and they are
+        #     not the same path: a plain exception is CAUGHT and retried on the non-streaming
+        #     handler (whose own finally would then cover for this one), while a cancellation is
+        #     not caught at all and leaves straight through the `finally` under test. Only the
+        #     second can show that the streaming twin's write exists.
+        (RuntimeError("the next round fell over") if how == "raises"
+         else asyncio.CancelledError()),
+    ])
+    monkeypatch.setattr(responses_api, "create_streaming_response_with_tools", scripted)
+    # THE FALLBACK IS PART OF THE SHAPE. A streamed round that raises does not end the turn — the
+    # handler retries on the non-streaming path, which here meets the same failure. That is the
+    # live sequence codex named, and it is what leaves the exception to propagate through the
+    # `finally` under test.
+    monkeypatch.setattr(responses_api, "create_text_response_with_tools",
+                        _ScriptedResponses([RuntimeError("the fallback fell over too")]))
+
+    processor = _processor(MagicMock())
+    processor.db = temp_db
+    loop_host = SimpleNamespace(log_info=lambda *a, **k: None, log_warning=lambda *a, **k: None,
+                                log_debug=lambda *a, **k: None, log_error=lambda *a, **k: None)
+    processor.openai_client = SimpleNamespace(
+        create_streaming_response_with_tool_loop=(
+            create_streaming_response_with_tool_loop.__get__(loop_host)),
+        create_text_response_with_tool_loop=(
+            create_text_response_with_tool_loop.__get__(loop_host)))
+    processor._persist_tool_provenance = (
+        MessageUtilitiesMixin._persist_tool_provenance.__get__(processor))
+    processor._schedule_async_call = (
+        MessageUtilitiesMixin._schedule_async_call.__get__(processor))
+    processor._build_tools_array = MagicMock(return_value=[{"type": "function", "name": "t"}])
+    processor._materialize_request_tools = MagicMock(
+        return_value=(registry, {"model": "m"}, True, None))
+    # Production builds the ToolContext — including the `turn` the whole mechanism rides on.
+    processor._build_tool_context = TextHandlerMixin._build_tool_context.__get__(processor)
+    processor._current_image_urls = MagicMock(return_value=[])
+    processor._is_context_length_error = MagicMock(return_value=False)
+    processor._channel_request_too_large = MagicMock(return_value=False)
+    processor._prepare_sandbox_tools = AsyncMock(return_value=None)
+
+    # NATIVE, deliberately: hole 1a only exists once the native stream owns the message.
+    slack = FakeSlack(native=True)
+    # The trigger has to be NEWER than the seeded thread: the scan only reads messages strictly
+    # older than the message it is answering (§S3), and this file's fixtures live at 1000.x.
+    message = _message(channel=CHANNEL, thread="10.0", ts="9000.0")
+    turn = _thread_turn(message)
+    from tests.unit.test_reply_surface import _pin_channel
+    _pin_channel(processor, message, turn)
+
+    # The streamed round fails; on the `raises` path the handler falls back to the non-streaming
+    # one, which fails too, and on the `cancelled` path nothing catches it at all. Either way the
+    # exception leaves through the `finally` under test.
+    with pytest.raises((RuntimeError, asyncio.CancelledError)):
+        await processor._handle_streaming_text_response(
+            "hi", _thread_state(channel=CHANNEL), slack, message, None, None, turn=turn)
+
+    assert scripted.rounds >= 3, "the loop did not reach the failing round"
+    committed = [r for r in turn.committed_destinations if r.first_ts]
+    assert committed, "the post did not really commit — nothing here would mean anything"
+    destination_ts = committed[0].first_ts
+    assert "web_search" in turn.provenance_external_tools, (
+        "the hosted tool was not counted — the native early return swallowed the accounting")
+    assert expected_mcp in turn.provenance_external_tools
+
+    await MessageUtilitiesMixin.drain_background_tasks(processor)
+    rows = await temp_db.get_thread_tool_usage_async(f"{CHANNEL}:{OLD_ROOT}")
+    assert destination_ts in rows, "the streaming finally did not write the destination row"
+    names = {entry["tool_name"] for entry in rows[destination_ts]}
+    assert {"search_slack", "post_to_thread", "web_search", expected_mcp} <= names, (
+        f"row names {sorted(names)}")
+
+
+@pytest.mark.asyncio
+async def test_one_turn_that_replies_here_and_posts_there_writes_two_rows(temp_db, monkeypatch):
+    """TWO DESTINATIONS, TWO KEYS, ONE TURN (codex final round #2b).
+
+    A turn can answer in place AND carry the answer into another thread. Those are two messages
+    and two provenance rows: the in-place reply's, keyed on the delivered ts by the ordinary F7
+    write, and the destination post's, keyed on its own ts by §5.4a. Collapsing them — or letting
+    one key win — would attribute a message's tools to a different message.
+    """
+    from message_processor.utilities import MessageUtilitiesMixin
+    from tests.unit.test_reply_surface import (FakeOpenAI, FakeSlack, _message, _processor,
+                                               _run, _thread_state, _thread_turn)
+
+    monkeypatch.setattr(config, "enable_tool_provenance", True)
+    monkeypatch.setattr(config, "enable_tool_result_memory", False)
+    monkeypatch.setattr(config, "enable_post_to_thread_tool", True)
+
+    class _ToolLoopOpenAI(FakeOpenAI):
+        async def create_streaming_response_with_tool_loop(self, stream_callback=None, **kw):
+            await self._run(stream_callback, **kw)
+            return {"text": "".join(self.chunks), "tools_used": [],
+                    "local_tool_calls": [{"name": "search_slack", "ok": True,
+                                          "gist": "cert renewal"},
+                                         {"name": "post_to_thread", "ok": True,
+                                          "gist": OLD_ROOT}]}
+
+    processor = _processor(_ToolLoopOpenAI(["here is the short version"]))
+    processor.db = temp_db
+    processor._persist_tool_provenance = (
+        MessageUtilitiesMixin._persist_tool_provenance.__get__(processor))
+    processor._schedule_async_call = (
+        MessageUtilitiesMixin._schedule_async_call.__get__(processor))
+    processor._build_tools_array = MagicMock(return_value=[{"type": "function", "name": "t"}])
+    processor._materialize_request_tools = MagicMock(return_value=(MagicMock(), {}, False, ""))
+    processor._build_tool_context = MagicMock(return_value=SimpleNamespace(
+        background_job_started=False, sandbox_image_assets=[], mounted_files=[]))
+
+    slack = FakeSlack()
+    message = _message(channel=CHANNEL, thread="10.0")
+    turn = _thread_turn(message)
+    # The cross-thread post already landed this turn, exactly as `execute_post_to_thread` records
+    # it — and the turn ALSO speaks in place, which is what makes this two rows rather than one.
+    turn.visible_action_committed = True
+    turn.mark_destination_committed(channel_id=CHANNEL, first_ts="9100.0",
+                                    kind=DEST_KIND_POST_TO_THREAD, thread_root_ts=OLD_ROOT,
+                                    text="answered over there")
+
+    await _run(processor, slack, message, _thread_state(), turn)
+    await MessageUtilitiesMixin.drain_background_tasks(processor)
+
+    in_place = await temp_db.get_thread_tool_usage_async(f"{CHANNEL}:10.0")
+    detached = await temp_db.get_thread_tool_usage_async(f"{CHANNEL}:{OLD_ROOT}")
+    assert slack.posts, "nothing was delivered in place, so there is no second key to compare"
+    reply_ts = slack.posts[0]
+    assert reply_ts in in_place, "the in-place reply lost its own provenance row"
+    assert "9100.0" in detached, "the cross-thread post lost its provenance row"
+    assert reply_ts != "9100.0"
+    for row in (in_place[reply_ts], detached["9100.0"]):
+        assert any(entry["tool_name"] == "search_slack" for entry in row)
+    # The two keys are separate rows under separate threads — neither borrowed the other's ts.
+    assert "9100.0" not in in_place and reply_ts not in detached

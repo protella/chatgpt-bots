@@ -337,14 +337,13 @@ def test_the_channel_copy_no_longer_claims_personal_fallback():
     rendered = json.dumps(_capability_modal().build_channel_settings_modal("C1", None, "tag_only"))
     assert "asker's personal preferences" not in rendered
     assert "each person's own setting" not in rendered
-    assert ("in a channel I run on the channel's settings, never on whoever happened to ask"
-            in rendered)
+    assert "These apply to everyone in this channel" in rendered
     assert "Use the workspace default (currently:" in rendered
     # The effort hint described the nearest-rung nudge the owner's ruling removed. An illegal
-    # stored effort is refused and the channel takes the workspace default — the hint has to say
-    # what actually happens, or the modal is back to disagreeing with the resolver in prose.
+    # stored effort is refused and the channel takes the workspace default — the hint must not
+    # claim otherwise (it now says nothing about fallback at all).
     assert "max → xhigh" not in rendered
-    assert "falls back to the workspace default, not to a nearby setting" in rendered
+    assert "to a nearby setting" not in rendered
 
 
 @pytest.mark.asyncio

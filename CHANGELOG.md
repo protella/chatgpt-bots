@@ -179,7 +179,16 @@ stateless: the view is rebuilt from Slack on every turn, and nothing new is stor
 When something said in one thread is really an answer for another, the bot can now post
 directly into that other thread instead of talking about it from the wrong one. Replies land
 under the right root, and its own posts are tracked with receipts so it never loses track of
-what it already said, even across restarts.
+what it already said, even across restarts. Every such cross-thread post also records which
+tools produced it (visible via the tool-usage record), no matter how the turn ends — even one
+that errors out after posting.
+
+### 🔧 Fixed - Streamed replies now credit their tools
+
+A reply streamed natively into Slack that used web search, the sandbox, or an MCP server was
+silently omitting its "_Tools Used:_" attribution line. Streamed and non-streamed replies now
+report their tools the same way. The channel-settings modal also lost its wall of text: short
+labels, one-line hints.
 
 ### 🗜️ Changed - Busy channels just work now
 

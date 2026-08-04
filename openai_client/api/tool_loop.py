@@ -35,6 +35,24 @@ def _function_calls(sink: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [e for e in sink if e.get("type", "function_call") == "function_call"]
 
 
+def _note_turn_tool_call(tool_context: Any, record: Dict[str, Any]) -> None:
+    """Mirror one dispatched call onto the TURN (§5.4a amendment), if there is a turn to tell.
+
+    The loop's accumulator is only readable by a caller the loop RETURNS to. A cross-thread post
+    commits mid-loop and cannot be retracted, so the record of the tools that produced it must
+    not depend on a later round succeeding. Best-effort: a context with no turn — a background
+    job, a hand-built context in a test — records nothing and is not an error, and bookkeeping
+    never breaks a round.
+    """
+    note = getattr(getattr(tool_context, "turn", None), "note_tool_call", None)
+    if note is None:
+        return
+    try:
+        note(record)
+    except Exception:  # noqa: BLE001 — a ledger write never fails a tool round
+        pass
+
+
 async def _run_tool_round(
     self,
     registry: ToolRegistry,
@@ -81,8 +99,14 @@ async def _run_tool_round(
         result = overrides[oid] if oid in overrides else dispatched_by_id.get(oid)
         ok = _call_ok(result)
         # F7: capture a short arg-derived gist alongside name/ok (provenance; no results).
-        local_tool_calls.append({"name": call.get("name"), "ok": ok,
-                                 "gist": gist_from_arguments(call.get("arguments"))})
+        # WRITTEN DOWN TWICE, ON PURPOSE (§5.4a amendment): this accumulator only reaches the
+        # handler if the loop RETURNS, and a cross-thread post that already landed cannot have
+        # its provenance depend on that. `_note_turn_tool_call` puts the same record on the turn,
+        # which outlives the loop.
+        record = {"name": call.get("name"), "ok": ok,
+                  "gist": gist_from_arguments(call.get("arguments"))}
+        local_tool_calls.append(record)
+        _note_turn_tool_call(tool_context, record)
         self.log_info(f"Local tool '{call.get('name')}' -> {'ok' if ok else 'error'}")
         result_by_id[id(call)] = result
         await _notify(f"local:{call.get('name')}", "completed")
@@ -139,10 +163,26 @@ def _replay_round_items(sink: List[Dict[str, Any]], input_items: List[Dict[str, 
             input_items.append({"role": "user", "content": content})
 
 
-def _merge_used(tools_used_all: List[str], round_used: List[str]) -> None:
+def _merge_used(tools_used_all: List[str], round_used: List[str],
+                tool_context: Any = None) -> None:
+    """Merge a round's used-tool names into the loop's accumulator AND onto the turn.
+
+    THE TURN IS THE COPY THAT SURVIVES (§5.4a exit-path amendment, codex round-2 #1). This
+    accumulator is a local of a loop that has to RETURN for anyone to read it, so a round that
+    fails after a cross-thread post has already landed takes the external names with it — the
+    same way it used to take the local call records. Every merge point routes through here, so
+    mirroring it once covers all of them.
+    """
     for name in round_used:
         if name not in tools_used_all:
             tools_used_all.append(name)
+    note = getattr(getattr(tool_context, "turn", None), "note_external_tools", None)
+    if note is None:
+        return
+    try:
+        note(list(round_used or ()))
+    except Exception:  # noqa: BLE001 — a ledger write never fails a round
+        pass
 
 
 def _replay_committed_text(input_items: List[Dict[str, Any]], text: str) -> None:
@@ -395,14 +435,19 @@ async def _handle_no_reply_terminal(
             # A refused terminal is an executed call like any other and belongs in the record;
             # an ACCEPTED one is the turn's ending, not one of its actions, and stays out.
             if not ok:
-                local_tool_calls.append({"name": call.get("name"), "ok": False,
-                                         "gist": gist_from_arguments(call.get("arguments"))})
+                refused = {"name": call.get("name"), "ok": False,
+                           "gist": gist_from_arguments(call.get("arguments"))}
+                local_tool_calls.append(refused)
+                _note_turn_tool_call(tool_context, refused)
         else:
-            local_tool_calls.append({"name": call.get("name"), "ok": ok,
-                                     "gist": gist_from_arguments(call.get("arguments"))})
+            record = {"name": call.get("name"), "ok": ok,
+                      "gist": gist_from_arguments(call.get("arguments"))}
+            local_tool_calls.append(record)
+            _note_turn_tool_call(tool_context, record)
             self.log_info(f"Local tool '{call.get('name')}' -> {'ok' if ok else 'error'}")
         await _notify(f"local:{call.get('name')}", "completed")
-    _merge_used(tools_used_all, [c.get("name") for c in exec_calls if c.get("name")])
+    _merge_used(tools_used_all, [c.get("name") for c in exec_calls if c.get("name")],
+                tool_context)
 
     if not _call_ok(terminal_result):
         # The executor refused (an owed-words route, the tool switched off). The turn is NOT
@@ -504,7 +549,7 @@ async def create_text_response_with_tool_loop(
             tool_choice=tool_choice,
             **params,
         )
-        _merge_used(tools_used_all, result.get("tools_used") or [])
+        _merge_used(tools_used_all, result.get("tools_used") or [], tool_context)
 
         calls = _function_calls(sink)
         if not calls or tool_choice == "none":
@@ -557,7 +602,8 @@ async def create_text_response_with_tool_loop(
                 self, registry, tool_context, sink, input_items, local_tool_calls,
                 result_overrides={**suppressed,
                                   **_terminal_overrides(calls, terminal_call, terminal_result)})
-            _merge_used(tools_used_all, [c.get("name") for c in calls if c.get("name")])
+            _merge_used(tools_used_all, [c.get("name") for c in calls if c.get("name")],
+                        tool_context)
             if _capped():
                 self.log_warning(
                     f"Tool loop cap hit ({rounds} rounds / {total_calls} calls) — forcing final answer")
@@ -568,7 +614,8 @@ async def create_text_response_with_tool_loop(
         _charge(calls, suppressed)
         await _run_tool_round(self, registry, tool_context, sink, input_items, local_tool_calls,
                               result_overrides=suppressed or None)
-        _merge_used(tools_used_all, [c.get("name") for c in calls if c.get("name")])
+        _merge_used(tools_used_all, [c.get("name") for c in calls if c.get("name")],
+                        tool_context)
 
         if _capped():
             self.log_warning(
@@ -760,7 +807,8 @@ async def create_streaming_response_with_tool_loop(
                 self, registry, tool_context, sink, input_items, local_tool_calls, tool_callback,
                 result_overrides={**suppressed,
                                   **_terminal_overrides(calls, terminal_call, terminal_result)})
-            _merge_used(tools_used_all, [c.get("name") for c in calls if c.get("name")])
+            _merge_used(tools_used_all, [c.get("name") for c in calls if c.get("name")],
+                        tool_context)
             if _capped():
                 self.log_warning(
                     f"Tool loop cap hit ({budget['rounds']} rounds / "
@@ -780,7 +828,8 @@ async def create_streaming_response_with_tool_loop(
             self, registry, tool_context, sink, input_items, local_tool_calls, tool_callback,
             result_overrides=suppressed or None,
         )
-        _merge_used(tools_used_all, [c.get("name") for c in calls if c.get("name")])
+        _merge_used(tools_used_all, [c.get("name") for c in calls if c.get("name")],
+                        tool_context)
 
         if _capped():
             self.log_warning(

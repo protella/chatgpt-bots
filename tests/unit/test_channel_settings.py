@@ -212,7 +212,7 @@ async def test_userless_event_never_onboards():
 # --------------------------------------------------------------------------- off gates @mentions
 
 async def test_off_level_drops_app_mention():
-    """The modal promises "Off — never respond here, even when @mentioned": an explicit
+    """The modal promises "Off — never responds here" (even @mentions, per the hint): an explicit
     @mention wake in a participation-off channel must be dropped before dispatch
     (otherwise off collapses into mentions_only)."""
     bot = _make_bot()
