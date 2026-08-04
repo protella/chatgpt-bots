@@ -438,6 +438,21 @@ class TurnRuntime:
     # WHERE this turn's own words landed. Appended at the first Slack-accepted surface, marked
     # committed when that surface reaches its final text.
     destinations: List[DestinationRecord] = field(default_factory=list)
+    # §5.4a exit-path amendment. THE PROVENANCE INPUTS THE TURN OWNS, accrued as tools run
+    # rather than handed over when the loop returns.
+    #
+    # The loop's own `local_tool_calls` accumulator is a LOCAL of a function that must return
+    # for anyone to see it — so a later Responses round that fails, a cancellation, or a settle
+    # failure takes the whole record with it, including the calls that already had effects. A
+    # cross-thread post commits mid-loop and is not retractable; the record of what produced it
+    # cannot be, either. Same shape as the loop's entries ({name, ok, gist}), recorded at the
+    # same moment, so the two lists union cleanly.
+    provenance_tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+    # The SAME rule for the other half of the inputs (codex final-round-2 #1). External usage —
+    # web_search, the sandbox, MCP servers — is counted in a loop accumulator and in the
+    # streaming handler's own callback closure, and both are as lost to a failed round as the
+    # local records were. Names only; these carry no arguments and so no gist.
+    provenance_external_tools: List[str] = field(default_factory=list)
     # Per-attempt API records for W3a's `model_response`. The carrier is the turn itself: the
     # request wrappers reach it through the same explicit threading everything else uses.
     model_attempts: List[ModelAttempt] = field(default_factory=list)
@@ -550,6 +565,31 @@ class TurnRuntime:
         if text is not None:
             record.text = text
             record.chars = len(text)
+
+    def note_tool_call(self, record: Dict[str, Any]) -> None:
+        """Record one dispatched local tool call on the TURN, as it happens (§5.4a amendment).
+
+        Called by the tool loop at the same moment it appends to its own accumulator, so the two
+        records are the same fact written down twice — once where the handler can read it on a
+        clean return, and once where it survives a round that never returns at all.
+
+        Never raises and never rejects: this is a ledger, and a turn that could not write down
+        what it just did is worse off than one that wrote down something odd.
+        """
+        if isinstance(record, dict) and record.get("name"):
+            self.provenance_tool_calls.append(dict(record))
+
+    def note_external_tools(self, names: Any) -> None:
+        """Record external/server-side tool usage on the TURN, as it happens.
+
+        Deduped and order-preserving, so the list reads the way the attribution line does. A
+        name the loop or the stream callback has already reported is not repeated.
+        """
+        if isinstance(names, str):
+            names = [names]
+        for name in (names or ()):
+            if name and name not in self.provenance_external_tools:
+                self.provenance_external_tools.append(str(name))
 
     @property
     def committed_destinations(self) -> List[DestinationRecord]:

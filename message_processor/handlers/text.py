@@ -252,6 +252,23 @@ def _claims_work(tool_type: str, status: str) -> bool:
     return status == "calling" and (tool_type == "mcp" or tool_type.startswith("mcp:"))
 
 
+def _note_turn_external(turn: Any, name: str) -> None:
+    """Mirror one external/hosted tool use onto the TURN as it happens (§5.4a amendment).
+
+    The streaming handler counts hosted tools in a callback closure and renders the attribution
+    list from those counters only on a clean return. A turn that posted cross-thread and then
+    failed keeps neither — so the name is written down here, where it is first known. Never
+    raises: bookkeeping does not get to break a stream.
+    """
+    note = getattr(turn, "note_external_tools", None)
+    if note is None:
+        return
+    try:
+        note([name])
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _reaction_committed(local_tool_calls: Optional[List[dict]]) -> bool:
     """Did the model deliberately react as its response? A no_reply turn is allowed exactly
     one sibling: react_to_message. That reaction IS an answer, so a turn ending this way has
@@ -855,6 +872,83 @@ class TextHandlerMixin:
             return False
         return _reaction_committed(local_tool_calls)
 
+    def _persist_destination_provenance(self, turn: Optional[Any],
+                                        local_tool_calls: Optional[List[dict]],
+                                        external_names: Optional[List[str]]) -> None:
+        """§5.4a. The "which tools produced this" row for a post the turn's words went INTO.
+
+        CALLED TWICE ON A CLEAN TURN, AND THAT IS THE DESIGN. Once before the ending cascade,
+        where the handler's own attribution list is complete, and once from the `finally` that
+        covers every other way out. The two writes union-merge in the database
+        (`save_tool_usage_async`, atomic under BEGIN IMMEDIATE) so the second can neither drop a
+        tool the first recorded nor overwrite a gist — it costs one extra scheduled write on a
+        turn that posted cross-thread, which is a small price for a guarantee that does not
+        depend on which branch the turn happens to end on.
+
+        THE PLACEMENT IS THE ORIGINAL FIX. The write used to live inside the words-elsewhere
+        branch, the LAST of five ways a turn can end, so it only ever ran for a cross-thread post
+        made by a turn that did nothing else terminal. A turn that also reacted, declared
+        `no_response_needed`, or started a background job returned earlier and its destination
+        post got no row at all. Measured live: a cross-thread post whose turn also reacted (probe
+        post 1785799391.210679) had no `message_tool_usage` row, while in-place replies from the
+        same period all had theirs.
+
+        Keyed on the DESTINATION post — the message the provenance actually describes — never on
+        the turn's own trigger, and COMMITTED destinations only: `turn.destinations` also holds
+        surfaces Slack accepted that the turn never stood behind, and attributing this turn's
+        tools to one of those would credit a message it did not commit to.
+
+        Names and gists, deliberately not the F12 MCP result digests an ordinary reply appends:
+        those are built later, on a path the early endings return before, and reaching for them
+        here would mean restructuring the ordinary path to serve this one.
+
+        THE INPUTS COME FROM THE TURN, not from the loop (§5.4a exit-path amendment). The
+        loop's `local_tool_calls` is a local of a function that has to RETURN for anyone to read
+        it, and a destination commits mid-loop: a later round that fails, a cancellation, or a
+        settle failure would take the record of what produced an already-landed post with it.
+        The turn accrues the same records as they happen (`note_tool_call`), so this reads them
+        wherever it is called from — including a `finally` on a path that has no loop result at
+        all. A passed-in list still wins nothing and loses nothing: the two are unioned.
+
+        A no-op for every turn that posted nowhere else, which is nearly all of them.
+        """
+        if not config.enable_tool_provenance or turn is None:
+            return
+        records = [record for record in getattr(turn, "committed_destinations", ())
+                   if record.kind == DEST_KIND_POST_TO_THREAD and record.first_ts]
+        if not records:
+            return
+        # UNION, dedup by (name, gist), turn-owned records first — they are the ones that exist
+        # on every path. A clean return supplies the same entries a second time and adds nothing;
+        # a failed round supplies none and the turn's are the whole record.
+        merged: List[dict] = []
+        seen = set()
+        for call in [*(getattr(turn, "provenance_tool_calls", None) or []),
+                     *(local_tool_calls or [])]:
+            key = (call.get("name"), call.get("gist"))
+            if call.get("name") and key not in seen:
+                seen.add(key)
+                merged.append(call)
+        # EXTERNAL NAMES: the caller's list when it has one, the TURN's accrual when it does not.
+        # A clean exit hands over a complete, correctly-grouped list (one "MCP (a, b)" rather
+        # than one entry per server) and that is what should land. A failed round hands over
+        # nothing — `tools_actually_used` is still `[]`, and the streaming twin may have no
+        # `tools_used` at all — and then the turn's own record is the only account of the
+        # web_search or MCP call that helped produce a post already sitting in the room
+        # (codex round-2 #1). Not unioned: on the clean path that would add a second, redundant
+        # spelling of the same MCP usage to the row.
+        external = list(external_names or []) or list(
+            getattr(turn, "provenance_external_tools", None) or [])
+        # Filtered here rather than at every call site: local executions are already carried
+        # above, and the handlers reach this point with their lists filtered at different places.
+        local_names = {c.get("name") for c in merged if c.get("name")}
+        provenance = build_provenance(
+            merged, [name for name in external if name not in local_names])
+        for record in records:
+            self._persist_tool_provenance(
+                record.channel_id, record.first_ts,
+                f"{record.channel_id}:{record.thread_root_ts}", provenance)
+
     async def _handle_text_response(self, user_content: Any, thread_state, client: BaseClient,
                               message: Message, thinking_id: Optional[str] = None,
                               attachment_urls: Optional[List[str]] = None,
@@ -1282,6 +1376,13 @@ class TextHandlerMixin:
                 )
             raise
         finally:
+            # §5.4a EXIT-PATH GUARANTEE. A destination commits INSIDE the loop above, and this
+            # `finally` is the only thing that runs whichever way that loop leaves — returned,
+            # raised, retried, cancelled. The inputs are the turn's own accrued records, so this
+            # writes the same row on a failed round that a clean one would (the success path
+            # calls it again below with the handler's fully-built attribution list; the two
+            # union-merge in the DB, so the duplicate costs nothing and loses nothing).
+            self._persist_destination_provenance(turn, local_tool_calls, tools_actually_used)
             # Cancel progress updater when API call completes
             if progress_task and not progress_task.done():
                 progress_task.cancel()
@@ -1308,6 +1409,12 @@ class TextHandlerMixin:
         # Feed any mcp_list_tools discovery payloads into the informational cache
         for _label, _tools_payload in mcp_discovered.items():
             self.mcp_manager.cache_discovered_tools_payload(_label, _tools_payload)
+
+        # §5.4a — BEFORE THE ENDING CASCADE, because every branch below it is a way for this turn
+        # to end and a cross-thread post has to carry its provenance out of ALL of them. See
+        # `_persist_destination_provenance`: sitting inside the last branch is what left a
+        # reacting turn's destination post with no record.
+        self._persist_destination_provenance(turn, local_tool_calls, tools_actually_used)
 
         # F30.1: a start_background_job call succeeded this turn. The live status card the job
         # posts IS the acknowledgment, so DROP the model's ack reply — nothing posts, no footer,
@@ -1413,19 +1520,9 @@ class TextHandlerMixin:
                 self.log_info(
                     "Empty reply text after this turn's words landed elsewhere — posting nothing "
                     "here")
-                # §5.4a, the NON-STREAMING twin of the same hole: this path returns before the F7
-                # block below, so without this a cross-thread post made on the non-streaming
-                # route would still be the one reply kind with no "which tools produced this"
-                # record. Same writer, same names-and-gists scope, keyed on the DESTINATION post
-                # rather than the turn's own trigger, and COMMITTED destinations only — an
-                # observed-only surface is one the turn never stood behind.
-                if config.enable_tool_provenance:
-                    provenance = build_provenance(local_tool_calls, tools_actually_used)
-                    for record in turn.committed_destinations:
-                        if record.kind == DEST_KIND_POST_TO_THREAD and record.first_ts:
-                            self._persist_tool_provenance(
-                                record.channel_id, record.first_ts,
-                                f"{record.channel_id}:{record.thread_root_ts}", provenance)
+                # §5.4a's write is NOT here any more. It ran only for a turn that ended on this
+                # exact branch, and a cross-thread post can end a turn four other ways; it now
+                # runs once, above the whole cascade.
                 return Response(
                     type="text",
                     content="",
@@ -1824,6 +1921,42 @@ class TextHandlerMixin:
         # work belonged in start_background_job. Logged so we can see whether the guidance holds.
         sandbox_call_started: List[float] = []
 
+        def _account_hosted_tool(tool_type: str, status: str) -> None:
+            """Count one hosted-tool event and put its name on the turn. NO rendering, no I/O.
+
+            Split out of the status blocks below so it can run for a native-streamed turn too,
+            and so the counters cannot be incremented twice: everything below now renders from
+            these numbers rather than adding to them.
+
+            The turn mirror is §5.4a's other half — `search_counts` and `mcp_servers_used` live
+            in this closure, and a round that fails after a cross-thread post has landed takes
+            them with it unless the turn wrote them down as they happened.
+            """
+            if status == "started":
+                if tool_type == "web_search":
+                    tool_states["web_search"] = True
+                    search_counts["web_search"] += 1
+                    _note_turn_external(turn, "web_search")
+                elif tool_type == "code_interpreter":
+                    if not tool_states["code_interpreter"]:
+                        tool_states["code_interpreter"] = True
+                        search_counts["code_interpreter"] += 1
+                        _note_turn_external(turn, "code_interpreter")
+                elif tool_type == "file_search":
+                    tool_states["file_search"] = True
+                    search_counts["file_search"] += 1
+            if tool_type == "mcp" or tool_type.startswith("mcp:"):
+                label = tool_type[4:] if tool_type.startswith("mcp:") else ""
+                if label:
+                    mcp_servers_used.add(label)
+                if status == "calling":
+                    search_counts["mcp"] += 1
+                    # THE GENERIC CASE COUNTS TOO (codex round-3 #1b). An unlabeled MCP event
+                    # reports itself as plain "MCP" on a clean exit — `search_counts["mcp"] > 0`
+                    # with no server names — so the turn has to be able to say the same thing on
+                    # an exceptional one. Mirroring only the labelled form lost it.
+                    _note_turn_external(turn, f"MCP ({label})" if label else "MCP")
+
         # Define tool event callback
         async def tool_callback(tool_type: str, status: str):
             """Handle tool events for status updates"""
@@ -1866,6 +1999,15 @@ class TextHandlerMixin:
                     and buffer.get_complete_text().strip()):
                 pending_segment_break = True
 
+            # HOSTED-TOOL ACCOUNTING, AND IT RUNS BEFORE THE NATIVE EARLY RETURN BELOW
+            # (codex round-3 #1a). What follows that return is STATUS RENDERING, which a started
+            # native stream genuinely cannot do — its placeholder is gone. Counting is not
+            # rendering: a preamble that starts the stream followed by a web_search, a sandbox
+            # run or an MCP call a round later used those tools, and both the reply's
+            # attribution line and a cross-thread post's provenance read these counters. Skipping
+            # them for native turns lost the tool from every account of the turn.
+            _account_hosted_tool(tool_type, status)
+
             # Native mode: once the stream owns the visible message the placeholder is
             # gone — status edits would hit a deleted ts. Log tool activity instead.
             if native_coord is not None and native_coord.started and not native_coord.failed:
@@ -1897,10 +2039,7 @@ class TextHandlerMixin:
 
                 # Tool just started - update status with appropriate emoji
                 if tool_type == "web_search":
-                    if not tool_states["web_search"]:
-                        tool_states["web_search"] = True
-                    search_counts["web_search"] += 1
-                    # Show search count consistently for all searches
+                    # Counted by `_account_hosted_tool` above; this renders from that count.
                     status_msg = f"{config.web_search_emoji} Searching the web (query {search_counts['web_search']})..."
                     try:
                         # Use update_message_streaming for consistency with streaming flow
@@ -1914,19 +2053,12 @@ class TextHandlerMixin:
                 elif tool_type == "code_interpreter":
                     # F32: the sandbox can churn for a while on a real dataset — say so, or
                     # the user watches a silent spinner and assumes we hung.
-                    if not tool_states["code_interpreter"]:
-                        tool_states["code_interpreter"] = True
-                        search_counts["code_interpreter"] += 1
                     status_msg = f"{config.code_interpreter_emoji} Analyzing the data..."
                     try:
                         await stream_status_update(status_msg)
                     except Exception as e:
                         self.log_debug(f"Code interpreter status update failed: {e}")
                 elif tool_type == "file_search":
-                    if not tool_states["file_search"]:
-                        tool_states["file_search"] = True
-                    search_counts["file_search"] += 1
-                    # Show search count consistently for all searches
                     status_msg = f"{config.web_search_emoji} Searching files (query {search_counts['file_search']})..."
                     try:
                         result = await stream_status_update(status_msg)
@@ -1966,11 +2098,8 @@ class TextHandlerMixin:
             elif tool_type == "mcp" or tool_type.startswith("mcp:"):
                 # MCP has its own status values (not "started")
                 # tool_type can be "mcp" or "mcp:server_label" (e.g., "mcp:context7")
-                server_label = None
-                if tool_type.startswith("mcp:"):
-                    server_label = tool_type[4:]  # Extract server name after "mcp:"
-                    if server_label:
-                        mcp_servers_used.add(server_label)
+                # Recorded by `_account_hosted_tool` above; read here for the status line.
+                server_label = tool_type[4:] if tool_type.startswith("mcp:") else None
 
                 if progress_task and not progress_task.done():
                     progress_task.cancel()
@@ -1985,7 +2114,6 @@ class TextHandlerMixin:
                     # Discovery status message suppressed per user preference (logging only)
                     self.log_info("MCP tool discovery started (status message suppressed)")
                 elif status == "calling":
-                    search_counts["mcp"] += 1
                     # Build status message with server name if available
                     server_suffix = f" ({server_label})" if server_label else ""
                     call_suffix = f" (call {search_counts['mcp']})" if search_counts['mcp'] > 1 else ""
@@ -2889,6 +3017,38 @@ class TextHandlerMixin:
                 progress_task.cancel()
                 self.log_debug("Cancelled progress updater after API call completed")
 
+            # Build list of tools used (unified attribution). EXTERNAL sources only
+            # (web_search + MCP) — local context tools are plumbing, never listed.
+            #
+            # HOISTED ABOVE THE WHOLE ENDING CASCADE, not merely above the words-elsewhere
+            # return: it is a pure read of counters no branch below touches, and the destination
+            # provenance write on the next line needs it. Building it here means the ordinary
+            # reply and the cross-thread post derive provenance from the SAME two inputs —
+            # `local_tool_calls` and `tools_used` — on every ending.
+            tools_used = []
+            if search_counts["web_search"] > 0:
+                tools_used.append("web_search")
+            # F32: streamed turns rebuild attribution from these counters (the streaming API
+            # helper returns text only), so without this a streamed analysis publishes a chart
+            # with no "Used Tools: code_interpreter" note, while the non-streaming path shows it.
+            if search_counts["code_interpreter"] > 0:
+                tools_used.append("code_interpreter")
+            if mcp_servers_used:
+                # Group MCP servers under a single MCP label
+                mcp_list = ", ".join(sorted(mcp_servers_used))
+                tools_used.append(f"MCP ({mcp_list})")
+            elif search_counts["mcp"] > 0:
+                # Fallback to generic "MCP" if server names weren't tracked
+                tools_used.append("MCP")
+            for name in loop_external_used:
+                if name not in tools_used:
+                    tools_used.append(name)
+
+            # §5.4a — BEFORE THE ENDING CASCADE, for the reason written on
+            # `_persist_destination_provenance`: a cross-thread post has to carry its provenance
+            # out of every one of the endings below, and it used to reach only the last of them.
+            self._persist_destination_provenance(turn, local_tool_calls, tools_used)
+
             # F2: honored no_reply outcome — the loop deemed silence valid because NO
             # visible text had streamed yet (a committed reply would have been rejected and
             # completed instead). Abandon any empty native stream / delete the placeholder
@@ -2963,32 +3123,6 @@ class TextHandlerMixin:
                                   _reaction_committed(local_tool_calls)}
                 )
 
-            # Build list of tools used (unified attribution). EXTERNAL sources only
-            # (web_search + MCP) — local context tools are plumbing, never listed.
-            #
-            # HOISTED ABOVE THE WORDS-ELSEWHERE RETURN (§5.4a): it is a pure read of counters
-            # neither branch touches, and building it here means the ordinary reply and the
-            # cross-thread post derive provenance from the SAME two inputs — `local_tool_calls`
-            # and `tools_used` — instead of the early path inventing a reduced version.
-            tools_used = []
-            if search_counts["web_search"] > 0:
-                tools_used.append("web_search")
-            # F32: streamed turns rebuild attribution from these counters (the streaming API
-            # helper returns text only), so without this a streamed analysis publishes a chart
-            # with no "Used Tools: code_interpreter" note, while the non-streaming path shows it.
-            if search_counts["code_interpreter"] > 0:
-                tools_used.append("code_interpreter")
-            if mcp_servers_used:
-                # Group MCP servers under a single MCP label
-                mcp_list = ", ".join(sorted(mcp_servers_used))
-                tools_used.append(f"MCP ({mcp_list})")
-            elif search_counts["mcp"] > 0:
-                # Fallback to generic "MCP" if server names weren't tracked
-                tools_used.append("MCP")
-            for name in loop_external_used:
-                if name not in tools_used:
-                    tools_used.append(name)
-
             # The turn's words went into ANOTHER thread (post_to_thread), or a picture posted
             # itself. Empty prose here is the real ending, not a glitch — so tear down the
             # streaming surface we never committed to and post nothing, rather than reaching the
@@ -2999,27 +3133,9 @@ class TextHandlerMixin:
                     and not (response_text or "").strip() and not visible_content_delivered):
                 self.log_info(
                     "Streamed turn ended with its words elsewhere — removing the placeholder")
-                # §5.4a: this path returns before the F7 block below, so a cross-thread post was
-                # the ONE reply kind whose "which tools produced this" record was silently
-                # missing — the very reply an operator asking "where did this come from?" asks
-                # about. Keyed on the DESTINATION post, the message the provenance describes,
-                # never on this turn's own trigger.
-                #
-                # COMMITTED destinations only: `turn.destinations` also holds observed-only
-                # records — Slack accepted a surface this turn never stood behind — and writing
-                # those would attribute this turn's tools to a message it did not commit to.
-                #
-                # Names and gists, deliberately not the F12 MCP result digests an ordinary reply
-                # appends: those are built from `mcp_results` in a block this path returns
-                # before, and reaching back for them would mean restructuring the ordinary path
-                # to serve this one.
-                if config.enable_tool_provenance:
-                    provenance = build_provenance(local_tool_calls, tools_used)
-                    for record in turn.committed_destinations:
-                        if record.kind == DEST_KIND_POST_TO_THREAD and record.first_ts:
-                            self._persist_tool_provenance(
-                                record.channel_id, record.first_ts,
-                                f"{record.channel_id}:{record.thread_root_ts}", provenance)
+                # §5.4a's write is NOT here any more. This branch is one of five endings a
+                # cross-thread post can take, and the write only ever reached this one; it now
+                # runs once, above the whole cascade.
                 await self._cleanup_silent_stream(
                     client, message.channel_id, native_coord, message_id, current_message_id,
                     "words-elsewhere", receipts=receipts)
@@ -3741,6 +3857,18 @@ class TextHandlerMixin:
                 # One snapshot per responder turn — the fallback must not re-read the table.
                 channel_steering_text=channel_steering_text,
             )
+        finally:
+            # §5.4a EXIT-PATH GUARANTEE, the streaming twin. This `finally` covers the whole
+            # body: a destination commits inside the loop, and every other way out of this
+            # method — a raise, a cancellation, the non-streaming fallback, a StaleSendSuppressed
+            # — leaves that post landed with nothing written about it. The inputs are the turn's
+            # own accrued records, so this does not need the loop to have returned; on the clean
+            # path the call above already wrote the same row and the two union-merge.
+            #
+            # `local_tool_calls` is rebound by the loop on success and is `[]` before it, so it
+            # is read defensively here rather than assumed.
+            self._persist_destination_provenance(
+                turn, locals().get("local_tool_calls"), locals().get("tools_used"))
 
     @staticmethod
     def _as_mcp_exclusion_set(value) -> set:
