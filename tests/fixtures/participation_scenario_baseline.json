@@ -1,4 +1,35 @@
 {
+  "reconsider": {
+    "scenarios": {
+      "reconsider-raced-answered": {
+        "bar": "measure",
+        "expected": [
+          "skip"
+        ],
+        "outcomes": [
+          "skip",
+          "skip",
+          "skip"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "reconsider-raced-unrelated": {
+        "bar": "measure",
+        "expected": [
+          "post",
+          "force_post"
+        ],
+        "outcomes": [
+          "post",
+          "post",
+          "post"
+        ],
+        "passes": 3,
+        "trials": 3
+      }
+    }
+  },
   "tier1": {
     "false_wake_rate": 0.0133,
     "false_wakes": 1,

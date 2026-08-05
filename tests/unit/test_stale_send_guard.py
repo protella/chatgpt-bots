@@ -561,7 +561,7 @@ def test_the_new_kind_is_in_the_vocabulary_and_the_contract_moved():
     # v8 = the single-stream events on top of the binary gate. The version moves whenever the
     # ledger's field set or event cardinality changes, and this assertion exists so a field change
     # cannot ship without someone bumping it deliberately.
-    assert pt.CONTRACT_VERSION == 8
+    assert pt.CONTRACT_VERSION == 9
     assert pt.GATE_CONTRACT == "binary-v1"
 
 
@@ -939,6 +939,7 @@ async def test_a_committed_split_still_posts_its_remaining_chunks_and_notice():
 # --------------------------------------------------------------- the sweep, as a real check
 
 DELIVERY_FILES = ["main.py", "message_processor/base.py", "message_processor/handlers/text.py",
+                  "message_processor/reconsideration.py",
                   "slack_client/messaging.py", "streaming/native_sink.py", "tool_registry.py"]
 
 # Functions that MUTATE Slack. A call to one of these without a lease cannot be refused, so on
@@ -1000,15 +1001,23 @@ def _propagating_functions(sources):
     propagating = {key for key, body in bodies.items()
                    if ("send_lease" in body or ".authorize(" in body)
                    and key not in lease_parameterized}
+    # The reconsideration runner is a seed by CONTRACT rather than by lease access: it rethrows
+    # the newest suppression on skip/fuse/error endings, and its `deliver` parameter is, by the
+    # §4b closure contract, a lease-handing send under another name. Without these two names the
+    # runner's own re-race handler — the one place that deliberately catches a suppression to
+    # begin the next pass — would sit outside the sweep entirely.
+    propagating |= {key for key, body in bodies.items()
+                    if key[0].endswith("reconsideration.py")
+                    and ("rearm_after_reconsideration" in body or "deliver(" in body)}
     changed = True
     while changed:
         changed = False
-        names = {key[1] for key in propagating}
+        names = {key[1] for key in propagating} | {"deliver"}
         for key, called in calls.items():
             if key not in propagating and (called & names):
                 propagating.add(key)
                 changed = True
-    return {key[1] for key in propagating}
+    return {key[1] for key in propagating} | {"deliver"}
 
 
 # Identifiers that hold a lease, for the positional-argument check.
@@ -1083,10 +1092,22 @@ def test_no_delivery_boundary_can_swallow_a_suppression():
                 # place that legitimately CONSUMES the suppression — the terminal handler, which
                 # records it in the ledger. Verified by looking for that record, not by
                 # exempting a line number.
+                #
+                # Two INTENTIONAL consumers joined with stale reconsideration
+                # (STALE_RECONSIDERATION §4b), both accounted rather than swallowed:
+                # * a delivery site may hand the suppression to the runner
+                #   (`intercept_stale_send`), which either delivers, rethrows it marked, or
+                #   returns the accounted delivery_failed ending — never silence;
+                # * the runner's own re-race handler captures the fresh suppression and
+                #   `continue`s the loop as the next pass, whose first act is emitting that
+                #   suppression's stale_send row. Recognized ONLY inside reconsideration.py.
                 records = ("stale_send(" in handler_body
-                           or "finish_attempt(" in handler_body)
+                           or "finish_attempt(" in handler_body
+                           or "intercept_stale_send(" in handler_body)
+                rerace = (name.endswith("reconsideration.py")
+                          and any(isinstance(n, ast.Continue) for n in ast.walk(handler)))
                 if label == "StaleSendSuppressed":
-                    if not (reraises or records):
+                    if not (reraises or records or rerace):
                         gaps.append(f"{name}:{handler.lineno} except StaleSendSuppressed "
                                     f"neither re-raises nor records it")
                     shadowed = True      # either way it consumed the exception deliberately
@@ -1409,3 +1430,276 @@ async def test_an_ordinary_callback_error_is_still_swallowed(with_tools):
 
     assert text == "hello", "the stream completed; the callback's failure was its own"
     assert any("callback error" in line for line in host.logged["warning"])
+
+
+# ================================== reconsideration (§4a): rearm and force reopen a refusal
+#
+# A suppression is no longer always terminal: the reconsideration runner may REARM the lease
+# (the conversation was reviewed through per-scope timestamps computed by trusted snapshot
+# code) or FORCE it (the model's recorded judgment to deliver without another check). Both are
+# bound to the exact exception this lease last raised — token identity plus evidence — and
+# every precondition failure leaves the lease untouched and raises ValueError: fail closed.
+
+def _suppressed_lease():
+    """A two-scope lease (top-level message from U1) suppressed by the same sender's
+    top-level fast-follow at 101.0 — evidence in the TOP scope."""
+    marks = ConversationWatermarks()
+    lease = marks.begin_turn(_msg("100.0"))
+    marks.begin_turn(_msg("101.0"))
+    with pytest.raises(StaleSendSuppressed) as caught:
+        lease.authorize("final_post")
+    return marks, lease, caught.value
+
+
+def _review(lease, value):
+    """A reviewed-through map covering every one of the lease's scopes with one value."""
+    return {scope: value for scope in lease.scopes}
+
+
+THREAD_SCOPE = ("thread", "C1", "100.0")
+TOP_SCOPE = ("top", "C1", "U1")
+
+
+# ------------------------------------------------------------- the rearm precondition matrix
+
+def test_rearm_refuses_an_exception_whose_evidence_does_not_match():
+    marks, lease, exc = _suppressed_lease()
+    wrong = StaleSendSuppressed(scope=exc.scope, last_seen_ts=exc.last_seen_ts,
+                                observed_latest_ts="999.0", surface="final_post",
+                                lease_token=lease._token)
+    with pytest.raises(ValueError):
+        lease.rearm_after_reconsideration(_review(lease, "999.0"), wrong)
+    assert lease.state == SUPPRESSED and lease._reviewed_through == {}
+
+
+def test_a_same_evidence_exception_from_another_lease_never_rearms():
+    """The token is the identity, not the evidence. Two leases admitted on the same message
+    are suppressed by the same fast-follow with byte-identical scope and timestamp — and one
+    lease's exception must still be worthless to the other."""
+    marks = ConversationWatermarks()
+    ours = marks.begin_turn(_msg("100.0"))
+    twin = marks.begin_turn(_msg("100.0"))
+    marks.begin_turn(_msg("101.0"))
+    with pytest.raises(StaleSendSuppressed) as theirs:
+        twin.authorize("final_post")
+    with pytest.raises(StaleSendSuppressed) as mine:
+        ours.authorize("final_post")
+    assert (theirs.value.scope, theirs.value.observed_latest_ts) == \
+        (mine.value.scope, mine.value.observed_latest_ts), "the evidence really is identical"
+
+    with pytest.raises(ValueError):
+        ours.rearm_after_reconsideration(_review(ours, "101.0"), theirs.value)
+    assert ours.state == SUPPRESSED and ours._reviewed_through == {}
+    ours.rearm_after_reconsideration(_review(ours, "101.0"), mine.value)
+    assert ours.state == PENDING
+
+
+def test_rearm_requires_a_suppressed_lease():
+    marks = ConversationWatermarks()
+    lease = marks.begin_turn(_msg("100.0"))
+    exc = StaleSendSuppressed(scope=TOP_SCOPE, last_seen_ts="100.0",
+                              observed_latest_ts="101.0", surface="final_post",
+                              lease_token=lease._token)
+    with pytest.raises(ValueError):
+        lease.rearm_after_reconsideration(_review(lease, "101.0"), exc)   # still PENDING
+    lease.authorize("final_post")
+    lease.commit()
+    with pytest.raises(ValueError):
+        lease.rearm_after_reconsideration(_review(lease, "101.0"), exc)   # COMMITTED
+    assert lease._reviewed_through == {}
+
+
+def test_rearm_refuses_a_closed_lease():
+    marks, lease, exc = _suppressed_lease()
+    lease.close()
+    with pytest.raises(ValueError):
+        lease.rearm_after_reconsideration(_review(lease, "101.0"), exc)
+    assert lease.state == SUPPRESSED and lease._reviewed_through == {}
+
+
+def test_rearm_requires_exactly_the_lease_scope_set():
+    marks, lease, exc = _suppressed_lease()
+
+    missing = {exc.scope: "101.0"}                       # the thread scope is omitted
+    with pytest.raises(ValueError):
+        lease.rearm_after_reconsideration(missing, exc)
+
+    extra = _review(lease, "101.0")
+    extra[("thread", "C1", "999.0")] = "101.0"           # a scope this lease never held
+    with pytest.raises(ValueError):
+        lease.rearm_after_reconsideration(extra, exc)
+
+    assert lease.state == SUPPRESSED and lease._reviewed_through == {}
+
+
+def test_rearm_values_are_vetted_by_the_admission_parser():
+    """`parse_ts` is the gate — NOT `ts_key`, which is total and maps garbage to (0, 0). And
+    whatever `parse_ts` accepts is valid: the noncanonical '123.' passes, with no stricter
+    canonical-syntax check layered on top."""
+    marks, lease, exc = _suppressed_lease()
+
+    bad = _review(lease, "101.0")
+    bad[THREAD_SCOPE] = "garbage"
+    with pytest.raises(ValueError):
+        lease.rearm_after_reconsideration(bad, exc)
+    assert lease.state == SUPPRESSED and lease._reviewed_through == {}
+
+    lease.rearm_after_reconsideration(_review(lease, "123."), exc)
+    assert lease.state == PENDING
+    lease.authorize("final_post")     # the 101.0 watermark is below the reviewed baseline
+
+
+def test_rearm_rejects_non_monotonic_evidence():
+    marks, lease, exc = _suppressed_lease()
+    behind = _review(lease, "101.0")
+    behind[THREAD_SCOPE] = "99.0"     # behind that scope's effective baseline of 100.0
+    with pytest.raises(ValueError):
+        lease.rearm_after_reconsideration(behind, exc)
+    assert lease.state == SUPPRESSED and lease._reviewed_through == {}
+
+
+def test_rearm_requires_the_review_to_cover_the_suppressing_message():
+    marks, lease, exc = _suppressed_lease()
+    short = _review(lease, "100.5")   # monotonic in every scope, but 101.0 is not covered
+    with pytest.raises(ValueError):
+        lease.rearm_after_reconsideration(short, exc)
+    assert lease.state == SUPPRESSED and lease._reviewed_through == {}
+
+
+def test_a_rethrow_after_rearm_reports_the_effective_baseline_not_the_scalar():
+    """After a rearm advanced the baselines, a fresh suppression's exception — AND every
+    rethrow of it — reports the suppressing scope's EFFECTIVE baseline. The rethrow used to
+    reconstruct from the scalar `last_seen_ts` and report the admission-time 100.0 where the
+    first exception had said 101.0."""
+    marks, lease, first = _suppressed_lease()
+    lease.rearm_after_reconsideration(_review(lease, "101.0"), first)
+
+    marks.begin_turn(_msg("102.0"))
+    with pytest.raises(StaleSendSuppressed) as fresh:
+        lease.authorize("final_post")
+    with pytest.raises(StaleSendSuppressed) as rethrown:
+        lease.authorize("footer")
+
+    assert fresh.value.last_seen_ts == "101.0"
+    assert rethrown.value.last_seen_ts == "101.0", "the effective baseline, not the scalar"
+    assert rethrown.value.observed_latest_ts == "102.0"
+
+
+def test_a_second_rearm_is_bound_to_the_newest_exception():
+    """A later suppression re-remembers fresh evidence, and THAT exception becomes the one a
+    rearm must present; the first one is dead."""
+    marks, lease, first = _suppressed_lease()
+    lease.rearm_after_reconsideration(_review(lease, "101.0"), first)
+
+    marks.begin_turn(_msg("102.0"))
+    with pytest.raises(StaleSendSuppressed) as second:
+        lease.authorize("final_post")
+
+    with pytest.raises(ValueError):
+        lease.rearm_after_reconsideration(_review(lease, "102.0"), first)
+    assert lease.state == SUPPRESSED
+
+    lease.rearm_after_reconsideration(_review(lease, "102.0"), second.value)
+    assert lease.state == PENDING
+    lease.authorize("final_post")
+
+
+# --------------------------------------------------------- per-scope baselines never mask
+
+def test_a_rearmed_scope_does_not_mask_the_other_scope():
+    """THE PER-SCOPE PROPERTY. Reviewing the thread through its reply must not raise the TOP
+    scope's baseline: a same-sender fast-follow arriving after the review still suppresses."""
+    marks = ConversationWatermarks()
+    lease = marks.begin_turn(_msg("100.0"))
+    marks.begin_turn(_msg("100.5", thread="100.0", sender="U2"))   # a reply under the root
+
+    with pytest.raises(StaleSendSuppressed) as caught:
+        lease.authorize("final_post")
+    assert caught.value.scope == THREAD_SCOPE
+
+    lease.rearm_after_reconsideration(
+        {THREAD_SCOPE: "100.5", TOP_SCOPE: "100.0"}, caught.value)
+
+    marks.begin_turn(_msg("102.0"))   # the same sender's next top-level message
+    with pytest.raises(StaleSendSuppressed) as unmasked:
+        lease.authorize("final_post")
+    assert unmasked.value.scope == TOP_SCOPE
+    assert unmasked.value.observed_latest_ts == "102.0"
+
+
+def test_two_advanced_scopes_pick_the_newest_not_the_first_tuple_entry():
+    """Newest-selection preserved: both scopes exceed their baselines, and the evidence is the
+    newest candidate even though it lives in the SECOND scope of the tuple."""
+    marks = ConversationWatermarks()
+    lease = marks.begin_turn(_msg("100.0"))
+    marks.begin_turn(_msg("100.5", thread="100.0", sender="U2"))   # thread scope → 100.5
+    marks.begin_turn(_msg("102.0"))                                # top scope → 102.0
+
+    assert lease.scopes[0][0] == "thread", "precondition: the thread scope is first"
+    with pytest.raises(StaleSendSuppressed) as caught:
+        lease.authorize("final_post")
+    assert caught.value.scope == TOP_SCOPE
+    assert caught.value.observed_latest_ts == "102.0"
+
+
+# --------------------------------------------------------------------- the force waiver
+
+def test_force_waives_the_check_for_every_piece_and_commit_clears_it():
+    """The waiver covers the ONE logical delivery: split chunks and the truncation notice each
+    reauthorize and all pass, even against traffic newer than the review. The first confirmed
+    surface commits, explicitly clears the waiver, and normal semantics resume."""
+    marks, lease, exc = _suppressed_lease()
+    lease.force_after_reconsideration(exc)
+    assert lease.state == PENDING and lease._force_waiver is True
+
+    lease.authorize("final_post")            # first chunk
+    marks.begin_turn(_msg("103.0"))          # even newer traffic mid-delivery
+    lease.authorize("final_post")            # split retry / second chunk
+    lease.authorize("truncation_notice")     # …and the notice
+
+    lease.commit()
+    assert lease.state == COMMITTED
+    assert lease._force_waiver is False
+
+
+def test_an_uncommitted_waiver_dies_with_the_lease_at_close():
+    """A force that never delivers needs no undo: the waiver is lease-local state, and closing
+    releases the scopes with nothing leaked into the shared record."""
+    marks, lease, exc = _suppressed_lease()
+    lease.force_after_reconsideration(exc)
+    lease.close()
+
+    fresh = marks.begin_turn(_msg("104.0"))
+    marks.begin_turn(_msg("105.0"))
+    with pytest.raises(StaleSendSuppressed):
+        fresh.authorize("final_post")        # the next turn is guarded exactly as before
+
+
+def test_close_clears_the_waiver_on_the_lease_itself():
+    """The direct fact behind the isolation above: the waiver never survives its delivery, so
+    the closed lease's own waiver bit is cleared, not merely invisible to later leases."""
+    marks, lease, exc = _suppressed_lease()
+    lease.force_after_reconsideration(exc)
+    assert lease._force_waiver is True
+    lease.close()
+    assert lease._force_waiver is False
+
+
+def test_cancel_force_waiver_clears_only_the_waiver_and_is_idempotent():
+    """The runner's `delivery_exception` path (§4f): the waiver is revoked, nothing else
+    moves — state stays PENDING, the lease stays open — and a second call is a no-op."""
+    marks, lease, exc = _suppressed_lease()
+    lease.force_after_reconsideration(exc)
+    assert lease._force_waiver is True
+
+    lease.cancel_force_waiver()
+    assert lease._force_waiver is False
+    assert lease.state == PENDING and lease._closed is False
+
+    lease.cancel_force_waiver()                # idempotent
+    assert lease._force_waiver is False
+    assert lease.state == PENDING and lease._closed is False
+
+    marks.begin_turn(_msg("103.0"))
+    with pytest.raises(StaleSendSuppressed):
+        lease.authorize("final_post")          # normal semantics resumed

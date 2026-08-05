@@ -1,4 +1,4 @@
-"""The CV8 ledger checker — the thing the live battery trusts when it says a scenario passed.
+"""The CV9 ledger checker — the thing the live battery trusts when it says a scenario passed.
 
 Two properties matter here, and they pull in opposite directions:
 
@@ -58,7 +58,7 @@ def warning_names(payload):
     return {w["name"] for w in payload["warnings"]}
 
 
-def envelope(event, *, session=SESSION, version=8, contract="binary-v1", **fields):
+def envelope(event, *, session=SESSION, version=9, contract="binary-v1", **fields):
     """One line, built the way `record()` builds it: None-valued fields are OMITTED."""
     row = {"v": version, "at": 1_700_000_000.0, "session": session, "event": event}
     if contract is not None:
@@ -378,7 +378,7 @@ def test_a_foreign_gate_contract_fails(tmp_path):
 
 def test_a_future_contract_version_is_refused_rather_than_graded(tmp_path):
     rows = healthy_rows()
-    rows[row_index(rows, "turn_outcome")]["v"] = 9
+    rows[row_index(rows, "turn_outcome")]["v"] = 10
     code, payload = check(write_ledger(tmp_path, rows))
     assert code == 1
     assert "unknown_contract_version" in names(payload)

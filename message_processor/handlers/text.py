@@ -8,6 +8,7 @@ from typing import Any, List, Optional
 from base_client import BaseClient, Message, Response
 from config import config, pipeline_status
 from message_processor import participation_telemetry
+from message_processor.reconsideration import intercept_stale_send
 from message_processor.routing_facts import POSTURE_THREAD
 from message_processor.stale_send_guard import StaleSendSuppressed
 from message_processor.utilities import effective_request_model
@@ -3267,17 +3268,52 @@ class TextHandlerMixin:
                     # Capture the delivered ts so F5/F7 below key on the real message rather
                     # than on a placeholder that may never have carried the answer.
                     direct_send_meta: dict = {}
+
+                    async def _direct_final_post(text: str) -> Optional[str]:
+                        """This site's one delivery — run directly on the first attempt and
+                        re-run as the §4b closure on a reconsidered one. Replaces the site's
+                        canonical text (`response_text`) BEFORE the send, so the destination
+                        commit, F7 persistence and response-stream metadata below read the
+                        chosen text with no second code path. Returns send_message's native
+                        Optional ts; StaleSendSuppressed propagates (a re-race re-enters the
+                        runner's loop as the next pass)."""
+                        nonlocal response_text
+                        response_text = text
+                        direct_send_meta.clear()
+                        return await client.send_message(
+                            message.channel_id, effective_target, response_text,
+                            blocks=direct_footer_blocks, meta_out=direct_send_meta,
+                            lease=_send_lease(), receipts=receipts,
+                            # The first accepted part is a surface the room can already read,
+                            # so it is recorded before the rest of a split runs rather than
+                            # after.
+                            on_first_accept=_note_stream_observed)
+
+                    # STALE_RECONSIDERATION §4b/§5-r5-1: True when a reconsidered delivery
+                    # returned None — the runner already emitted error_dropped(delivery_failed
+                    # or delivery_exception),
+                    # and the `final_post_failed` rescue must NOT run (main.py would post the
+                    # very draft the guard refused). The site returns streamed=True/posted=False
+                    # instead, so normal failed-delivery terminal classification runs WITHOUT
+                    # another send.
+                    reconsider_owned_failure = False
                     # THE buffered path's only delivery — and therefore the one send the guard
                     # most has to cover. A silence-capable turn buffers its whole answer here
                     # precisely so this single check spans the entire model call; without the
                     # lease that promise was empty and a superseded answer still posted.
-                    posted_ts = await client.send_message(
-                        message.channel_id, effective_target, response_text,
-                        blocks=direct_footer_blocks, meta_out=direct_send_meta,
-                        lease=_send_lease(), receipts=receipts,
-                        # The first accepted part is a surface the room can already read, so it
-                        # is recorded before the rest of a split runs rather than after.
-                        on_first_accept=_note_stream_observed)
+                    try:
+                        posted_ts = await _direct_final_post(response_text)
+                    except StaleSendSuppressed as stale:
+                        # A COMPLETE buffered draft refused at its first visible surface — the
+                        # reconsideration case (STALE_RECONSIDERATION §3). The runner decides;
+                        # this site keeps delivering through the closure above. Channel turns
+                        # only; a DM suppression rethrows untouched.
+                        posted_ts = await intercept_stale_send(
+                            processor=self, client=client, message=message, turn=turn,
+                            lease=_send_lease(), suppressed=stale, draft=response_text,
+                            deliver=_direct_final_post, channel_turn=channel_turn)
+                        if posted_ts is None:
+                            reconsider_owned_failure = True
                     if posted_ts:
                         current_message_id = posted_ts
                         visible_content_delivered = True
@@ -3291,6 +3327,13 @@ class TextHandlerMixin:
                             delivery_complete = bool(direct_delivery.complete)
                             if not direct_delivery.complete:
                                 delivered_text_override = direct_delivery.text
+                    elif reconsider_owned_failure:
+                        # r5-1: a reconsideration-owned None. The runner emitted
+                        # error_dropped(delivery_failed) and today's failed-delivery accounting
+                        # owns the state — `posted` derives False from the missing delivered ts
+                        # below, `streamed` stays True, and main.py sends nothing again.
+                        self.log_error("Reconsidered final post did not deliver — no rescue, "
+                                       "the reconsider outcome stands")
                     else:
                         # send_message swallows SlackApiError and returns None. This post is the
                         # turn's ONLY delivery, so a swallowed failure here is a silently lost
@@ -3397,17 +3440,25 @@ class TextHandlerMixin:
                                            f"difference: {char_difference}, expected attribution: {expected_attribution_length})")
                     else:
                         self.log_debug("Sending final update to ensure loading indicator is removed")
-                    try:
-                        # Handle empty response. F32: empty text WITH artifacts is not a
-                        # failure — the model built a chart and let it speak for itself.
-                        # Apologizing directly above the chart that's about to land reads
-                        # as a bug to the user. The other honest empty — the turn's words went
-                        # into another thread — returns far above this, before the finalizer, so
-                        # it never reaches the apology either (search "words elsewhere").
-                        if not response_text and not artifact_containers:
-                            response_text = "I apologize, but I couldn't generate a response. OpenAI either didn't respond or returned an empty response. Please try again."
-                            self.log_warning("Empty response detected, using fallback message")
-                        
+                    async def _final_correction(text: str, *, reconsidered: bool
+                                                ) -> Optional[str]:
+                        """This branch's cut/overflow computation, run for the normal final
+                        correction AND re-run verbatim on a reconsidered delivery (§4b: the
+                        correction adapter re-runs the branch's own computation on the revised
+                        text). Replaces the branch's canonical text (`response_text`) BEFORE the
+                        writes, so the F7/destination bookkeeping below reads the chosen text.
+                        Returns the existing chrome surface's ts on success, None when the
+                        answer did not convert it.
+
+                        Head-fail/tail rule (r4-2): `update_message_streaming` can return
+                        success=False without raising, and in a RECONSIDERED delivery a failed
+                        head means the continuation tail is NOT posted — a tail must never
+                        stand over an unconverted chrome head — and the adapter returns None
+                        (`delivery_failed`). The normal path keeps its current unconditional
+                        behavior."""
+                        nonlocal response_text, delivery_split, delivery_complete, \
+                            delivered_text_override
+                        response_text = text
                         # Check if message is too long for a single update
                         if len(response_text) > 3900:  # Slack's approximate limit
                             # This shouldn't happen if streaming overflow worked correctly
@@ -3420,6 +3471,11 @@ class TextHandlerMixin:
                             final_result = await client.update_message_streaming(
                                 message.channel_id, current_message_id, truncated_text,
                                 lease=_send_lease(), receipts=receipts)
+                            if reconsidered and not final_result["success"]:
+                                self.log_error(
+                                    "Reconsidered head update failed — withholding the "
+                                    "continuation tail (r4-2)")
+                                return None
 
                             # Send the rest as new messages
                             overflow_text = response_text[cut:].lstrip()
@@ -3441,19 +3497,53 @@ class TextHandlerMixin:
                                     "reply is truncated in the room")
 
                             if final_result["success"]:
-                                visible_content_delivered = True
-                            else:
-                                self.log_error(f"Final truncated update failed: {final_result.get('error', 'Unknown error')}")
-                        else:
-                            final_result = await client.update_message_streaming(
-                                message.channel_id, current_message_id, response_text,
-                                lease=_send_lease(), receipts=receipts)
-                            if final_result["success"]:
-                                visible_content_delivered = True
-                            else:
-                                self.log_error(f"Final correction update failed: {final_result.get('error', 'Unknown error')}")
-                    except StaleSendSuppressed:
-                        raise  # a guarded write; the suppression belongs to handle_message
+                                return current_message_id
+                            self.log_error(f"Final truncated update failed: {final_result.get('error', 'Unknown error')}")
+                            return None
+                        final_result = await client.update_message_streaming(
+                            message.channel_id, current_message_id, response_text,
+                            lease=_send_lease(), receipts=receipts)
+                        if final_result["success"]:
+                            return current_message_id
+                        self.log_error(f"Final correction update failed: {final_result.get('error', 'Unknown error')}")
+                        return None
+
+                    async def _correction_deliver(text: str) -> Optional[str]:
+                        """The §4b delivery closure for the covered correction branches."""
+                        return await _final_correction(text, reconsidered=True)
+
+                    try:
+                        # Handle empty response. F32: empty text WITH artifacts is not a
+                        # failure — the model built a chart and let it speak for itself.
+                        # Apologizing directly above the chart that's about to land reads
+                        # as a bug to the user. The other honest empty — the turn's words went
+                        # into another thread — returns far above this, before the finalizer, so
+                        # it never reaches the apology either (search "words elsewhere").
+                        if not response_text and not artifact_containers:
+                            response_text = "I apologize, but I couldn't generate a response. OpenAI either didn't respond or returned an empty response. Please try again."
+                            self.log_warning("Empty response detected, using fallback message")
+
+                        corrected_ts = await _final_correction(response_text,
+                                                               reconsidered=False)
+                        if corrected_ts:
+                            visible_content_delivered = True
+                    except StaleSendSuppressed as stale:
+                        # The final correction converts a still-chrome surface into the answer,
+                        # so the lease is PENDING here and a COMPLETE corrected draft is in hand
+                        # — the covered correction site (STALE_RECONSIDERATION §3). The
+                        # current_part > 1 branches above are EXCLUDED: current_part exceeds 1
+                        # only via paths whose first visible success already committed the
+                        # lease, and a committed lease never raises. On a rethrow ending the
+                        # suppression continues to handle_message exactly as before; a
+                        # delivery_failed or delivery_exception None simply leaves nothing
+                        # delivered, which is this branch's existing failed-correction
+                        # accounting.
+                        corrected_ts = await intercept_stale_send(
+                            processor=self, client=client, message=message, turn=turn,
+                            lease=_send_lease(), suppressed=stale, draft=response_text,
+                            deliver=_correction_deliver, channel_turn=channel_turn)
+                        if corrected_ts:
+                            visible_content_delivered = True
                     except Exception as e:
                         self.log_error(f"Error in final correction update: {e}")
             

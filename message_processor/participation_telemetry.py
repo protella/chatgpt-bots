@@ -205,7 +205,15 @@ logger = setup_logger(name="slack_bot.ParticipationTelemetry")
 #     events are unchanged in identity, and no completeness rule ever named the removed event, so
 #     nothing that reads a v8 ledger has a denominator this invalidates. v8 rows written before
 #     this stay valid and readable; they simply carry an event nothing emits any more.
-CONTRACT_VERSION = 8
+# v9: STALE RECONSIDERATION (Docs/SINGLE_STREAM_SPEC.md §10, CV9 addendum). `stale_send` gains
+#     `turn_id` and its CARDINALITY generalizes from one-per-suppression to one per suppression
+#     EVENT — the initiating refusal, each per-pass re-race inside the reconsideration runner,
+#     and a post-run once-gate suppression each emit exactly one row. Two new turn-population
+#     events, `reconsider_start` (one per pass) and `reconsider_outcome` (at most one per runner
+#     invocation), join on `turn_id`; `turn_outcome` may carry a nested `reconsider` payload;
+#     `model_response` gains the `stale_reconsideration` fork reason. Unavailable optional
+#     fields are OMITTED, never null — the generic drop-None rule is part of this grammar.
+CONTRACT_VERSION = 9
 
 # WHICH gate produced these lines. The rich multi-signal classifier was "rich-v1"; the one-bit
 # wake gate is "binary-v1". A different gate is a different population even at the same
@@ -273,6 +281,11 @@ RECEIPT_OPS = frozenset({
 # `absent` is a real prior state: a finalize may insert a row that was never registered.
 RECEIPT_STATES = frozenset({"absent", "in_flight", "finalized", "chrome"})
 MODEL_RESPONSE_STATUSES = frozenset({"ok", "error"})
+# v9. How one reconsideration runner invocation ended. `posted_asis`/`posted_revised` assert
+# PHYSICAL Slack acceptance of the first surface, not finalized turn accounting.
+RECONSIDER_OUTCOMES = frozenset({
+    "posted_asis", "posted_revised", "skipped", "fuse_dropped", "error_dropped", "cancelled",
+})
 
 # Warn once per unknown value, not once per line: a typo in a hot path would otherwise fill
 # app.log with the same sentence and bury whatever else is happening.
@@ -807,22 +820,75 @@ def gate_decision(channel_id: Optional[str], trigger_ts: Optional[str], *,
 
 
 def stale_send(channel_id: Optional[str], trigger_ts: Optional[str], *,
-               attempt_id: Optional[str] = None, last_seen_ts: Any = None,
+               attempt_id: Optional[str] = None, turn_id: Optional[str] = None,
+               last_seen_ts: Any = None,
                observed_latest_ts: Any = None, scope: Optional[str] = None,
                surface: Optional[str] = None, guard_mode: Optional[str] = None) -> None:
-    """One suppression by the stale-send guard. DIAGNOSTIC, never terminal.
+    """One suppression EVENT by the stale-send guard. DIAGNOSTIC, never terminal.
+
+    CARDINALITY (v9): one row per suppression EVENT, not per suppressed turn — the initiating
+    refusal, each per-pass re-race inside the reconsideration runner, and a post-run once-gate
+    suppression each emit exactly one row. Single-owner rule: the runner emits for every
+    suppression it handles and marks the exception `telemetry_recorded`; an UNMARKED suppression
+    is emitted by main.py's terminal catch, so no suppression is counted twice or lost.
 
     Emitted for every suppression, INCLUDING on turns the gate never judged — mentions, DMs and
     thread continuations mint no attempt, so those rows carry no `attempt_id` and belong to no
     gate population. Any rate computed against `gate_start` has to exclude them, for the same
     reason the ledger excludes those turns everywhere else.
 
+    `turn_id` (v9) joins the row to the CHANNEL-TURN population, so a turn's suppression rows
+    can be counted beside its `reconsider_start`s. DM suppressions carry one too, with no
+    channel `turn_start` to join — the checker tolerates those rows by name.
+
     The terminal event says what the room saw; this says why, and with what evidence: the ts
     this turn had accounted for, the newer one that overtook it, which scope noticed, which
     surface was refused, and whether the turn was buffering to a single send or streaming."""
     record("stale_send", channel_id=channel_id, trigger_ts=trigger_ts, attempt_id=attempt_id,
+           turn_id=turn_id,
            last_seen_ts=last_seen_ts, observed_latest_ts=observed_latest_ts,
            scope=scope, surface=surface, guard_mode=guard_mode)
+
+
+def reconsider_start(channel_id: Optional[str], trigger_ts: Optional[str], *,
+                     turn_id: Optional[str], pass_number: int, scope: Any = None,
+                     observed_latest_ts: Any = None, attempt_id: Optional[str] = None,
+                     model_attempt_seq: Optional[int] = None) -> None:
+    """One reconsideration pass opened (v9). Emitted via the structured-decision wrapper's
+    `on_attempt_open` callback, after `ModelAttemptSink.open()` and before the request.
+
+    `turn_id` is the primary turn-population join — mandatory in the grammar. `pass_number`
+    lands on the wire as the literal key `pass`, counting from 1 and contiguous per turn.
+    `scope` is the suppressing scope as the FULL three-part tuple, written as a JSON list —
+    unlike `stale_send`, which keeps its `scope[0]`-only field. `attempt_id` is absent on
+    ungated channel turns; `model_attempt_seq` is absent when the attempt sink failed to open
+    (telemetry never blocks the model call). Unavailable optional fields are OMITTED — the
+    drop-None rule, never a null."""
+    record("reconsider_start", channel_id=channel_id, trigger_ts=trigger_ts,
+           turn_id=turn_id, attempt_id=attempt_id,
+           scope=list(scope) if scope is not None else None,
+           observed_latest_ts=observed_latest_ts,
+           model_attempt_seq=model_attempt_seq,
+           **{"pass": pass_number})
+
+
+def reconsider_outcome(channel_id: Optional[str], trigger_ts: Optional[str], *,
+                       turn_id: Optional[str], outcome: str, passes: int,
+                       attempt_id: Optional[str] = None, forced: Optional[bool] = None,
+                       error: Optional[str] = None) -> None:
+    """How one reconsideration runner invocation ended (v9). At most one per invocation;
+    exactly one on every non-cancelled path.
+
+    `passes` is the number of `reconsider_start` events THIS invocation emitted — a fuse drop
+    records 5, a failure or cancellation records the passes started by then. `forced` rides
+    only on posted outcomes (`posted_asis`/`posted_revised`) and is written even when False;
+    `error` rides only on `error_dropped`, carrying the §4f subtype. Both are OMITTED when
+    inapplicable — no nulls. A posted outcome asserts PHYSICAL Slack acceptance of the first
+    surface, not finalized turn accounting."""
+    _soft_check(outcome, RECONSIDER_OUTCOMES, "reconsider_outcome outcome")
+    record("reconsider_outcome", channel_id=channel_id, trigger_ts=trigger_ts,
+           turn_id=turn_id, attempt_id=attempt_id, outcome=outcome, passes=passes,
+           forced=forced, error=error)
 
 
 def queue_link(source_attempt_id: str, *, batched_into_attempt_id: Optional[str],
@@ -993,14 +1059,26 @@ def turn_outcome(channel_id: Optional[str], trigger_ts: Optional[str], *,
                  chars: Optional[int] = None, detached_started: bool = False,
                  error: Optional[str] = None, H: Optional[str] = None,
                  stream_build_present: bool = False,
-                 attempt_id: Optional[str] = None) -> None:
+                 attempt_id: Optional[str] = None,
+                 reconsider: Optional[Dict[str, Any]] = None) -> None:
     """What one channel turn ended up doing. Exactly one per `turn_start`.
 
     `destinations` is the OBSERVED set — every surface Slack accepted, whether or not it reached
-    its final text — because that is what the room saw. Memory extraction reads the COMMITTED
+    its final text — because that is what the room saw, with ONE ruled exception: the zero-chunk
+    truncation notice. When every first-chunk attempt fails, `send_message` may still post a
+    truncation warning — a finalized turn-owned receipt — without committing the lease; that
+    notice's ts never reaches `turn.destinations` (no `on_first_accept`, `first_ts=None`), so it
+    is absent here even though Slack accepted it. Pre-existing on every zero-chunk send, and
+    RULED accepted rather than plumbed into accounting (Docs/specs/STALE_RECONSIDERATION.md
+    §4a, r5-2). Memory extraction reads the COMMITTED
     subset instead (main.py), and the difference between the two lists is precisely an interrupted
     reply. It is written even when empty: a silent turn and a turn whose records were lost are not
     the same fact.
+
+    `reconsider` (v9) is the nested facts of the turn's reconsideration run —
+    `{outcome, passes[, forced][, error]}`, ReconsiderFacts.as_payload() verbatim — absent when
+    no reconsideration ran. Inapplicable keys are omitted inside it, never null: nested values
+    survive `record()`'s top-level drop-None untouched.
 
     `error` is one of the FOUR fail-closed codes (stream_over_budget, history_fetch_failed,
     stream_data_invalid, and origin_fetch_failed — a partial origin thread is a different
@@ -1016,7 +1094,7 @@ def turn_outcome(channel_id: Optional[str], trigger_ts: Optional[str], *,
            attempt_id=attempt_id, kind=kind,
            destinations=list(destinations or []),
            chars=chars, detached_started=bool(detached_started), error=error, H=H,
-           stream_build_present=bool(stream_build_present))
+           stream_build_present=bool(stream_build_present), reconsider=reconsider)
 
 
 def emit_turn_outcome(turn: Any, *, channel_id: Optional[str], trigger_ts: Optional[str],
@@ -1035,13 +1113,17 @@ def emit_turn_outcome(turn: Any, *, channel_id: Optional[str], trigger_ts: Optio
         records = list(getattr(turn, "destinations", None) or [])
         payloads = [r.as_payload() for r in records if hasattr(r, "as_payload")]
         sizes = [p.get("chars") for p in payloads if p.get("chars") is not None]
+        # v9. The reconsideration facts the runner stamped on the runtime, absent when none ran.
+        facts = getattr(turn, "reconsider", None)
+        reconsider = (facts.as_payload()
+                      if facts is not None and hasattr(facts, "as_payload") else None)
         turn_outcome(
             channel_id, trigger_ts,
             turn_id=getattr(turn, "turn_id", None), kind=kind, destinations=payloads,
             chars=sum(sizes) if sizes else None, detached_started=detached_started,
             error=getattr(turn, "turn_error", None), H=getattr(turn, "H", None),
             stream_build_present=bool(getattr(turn, "stream_build_present", False)),
-            attempt_id=attempt_id)
+            attempt_id=attempt_id, reconsider=reconsider)
         return True
     except Exception as e:  # noqa: BLE001 — a lost line is never worth a lost turn
         logger.debug(f"Participation turn outcome not written: {e}")
@@ -1071,7 +1153,9 @@ def model_response(*, turn_id: Optional[str], attempt_seq: Optional[int],
 
     Written on failure as well as success, because the question this answers is "how many calls
     did this turn cost and why", and an attempt that raised is exactly the expensive kind. Each
-    tool-loop round is its own attempt: the loop issues one API call per round.
+    tool-loop round is its own attempt: the loop issues one API call per round. A channel turn's
+    reconsideration passes are attempts of the SAME turn with `fork_reason` =
+    `stale_reconsideration` (v9), so their tokens and failures land here beside the responder's.
 
     `cached_input_tokens` is the provider's own `input_tokens_details.cached_tokens`, which is the
     only evidence that the pinned-prefix cache key is doing anything at all.

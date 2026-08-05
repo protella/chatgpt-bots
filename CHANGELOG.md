@@ -190,6 +190,18 @@ the channel was still holding open — even in a thread too old to be on screen 
 finds that thread and closes the loop there. The thread it was standing in gets at most a
 brief acknowledgment ("Got it — thanks."), never a report of the post.
 
+### ⏱️ Fixed - A finished answer survives being raced
+
+Before: if someone (or another bot) posted a new message in the seconds between the bot
+finishing an answer and posting it, the answer was silently thrown away — the room got
+nothing, not even an acknowledgment. Now the bot re-reads the conversation with the new
+messages included and decides for itself: post the answer as written, revise it to account
+for what arrived, or drop it because the room genuinely no longer needs it (someone else
+already answered). It can also force the post through when a busy room would otherwise
+out-race it forever. Applies to complete, not-yet-posted replies in channels; a reply already
+streaming keeps today's behavior. Every reconsideration is recorded in the participation
+ledger (telemetry contract v9) — what raced it, how many passes, and how it ended.
+
 ### 🔧 Fixed - Streamed replies now credit their tools
 
 A reply streamed natively into Slack that used web search, the sandbox, or an MCP server was

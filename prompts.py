@@ -599,6 +599,25 @@ CHANNEL_POST_TO_THREAD_TARGET_DESCRIPTION = (
 )
 
 
+# Stale reconsideration (Docs/specs/STALE_RECONSIDERATION.md §4d) — the ONE developer item the
+# runner appends after the entire normal channel request. Canonical text, generic voice, no
+# enumerated occasions (the owner's generic-prompts rule); `{n}` is the pass number. The draft
+# itself follows this instruction inside a backtick fence chosen not to occur in the draft, and
+# is introduced explicitly as quoted material, never as instructions.
+RECONSIDERATION_INSTRUCTION = (
+    "You drafted the reply quoted below for this trigger message:\n{trigger}\n\nBefore it "
+    "posted, the conversation gained the newer messages that appear after it in the stream "
+    "above. This is reconsideration pass {n}. The draft is your own finished work from this "
+    "turn, written with the evidence you gathered while producing it; that evidence is not "
+    "reproduced here, and you are not re-verifying the draft's facts. You are deciding "
+    "placement: what the room should get now. If your reason for speaking still stands, keep the "
+    "draft or revise it to account for what arrived — `post` delivers after one more staleness "
+    "check against anything even newer. If the conversation is moving too fast for that check to "
+    "ever pass and the reply genuinely still belongs, `force_post` delivers without it. If the "
+    "room no longer needs the reply, `skip` and it is never posted."
+)
+
+
 IMAGE_ANALYSIS_PROMPT = """Describe this image focusing on:
 Subject identification, specific colors and their locations, placement of objects in the scene, artistic style, lighting conditions, composition, and any distinctive visual elements.
 Be concise and technical. Do not add questions, interpretations, or conversational elements. Maximum 120 words."""

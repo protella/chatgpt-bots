@@ -91,14 +91,20 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pytest
 
+from config import config
+from message_processor import channel_request
 from message_processor.participation import SourceMessage, describe_attachment
 from openai_client import OpenAIClient
 from tests.integration.scenario_harness import (CHANNEL, CHANNEL_REPLY, CROSS_THREAD_POST,
                                                 DETACHED_EFFECT, IN_THREAD_REPLY, REACTION_ONLY,
-                                                SILENCE, TEAM, Room, Say, cross_thread_failures,
-                                                gather_trials, is_transport_error,
+                                                SILENCE, TEAM, FakeTransport, Room, Say,
+                                                actor_id, build_room_stream,
+                                                cross_thread_failures, gather_trials,
+                                                is_transport_error, platform_client,
+                                                processor_host, recording_registry,
                                                 run_responder_trial, run_wake_trial,
                                                 steering_snapshot)
+from tests.unit.channel_turn_harness import thread_config
 
 pytestmark = pytest.mark.integration
 
@@ -418,6 +424,19 @@ aside is `logistics`/`statement-of-fact` at the gate and `continuation-bait` in 
 reaction_only). They are re-run as regressions, not rewritten — the social-milestone cue is
 deliberately narrow enough that praise inside an exchange between people is not a milestone, which
 is what keeps them and win-lands-others where they are.
+
+============================ STALE RECONSIDERATION (§8) — OWNER REVIEW =========================
+
+The reconsideration decision itself (Docs/specs/STALE_RECONSIDERATION.md §4d): the bot finished a
+correct draft, a newer message landed before it posted, and the MAIN model — shown the updated
+room plus its own quoted draft — chooses post / force_post / skip. Both rows are MEASURE while
+the prompt is new: run, graded and recorded so a behaviour change stays visible, never blocking.
+The orchestrator records the live baseline after unit green.
+
+| id                            | setup                                                        | expected outcome                | bar     |
+|-------------------------------|--------------------------------------------------------------|---------------------------------|---------|
+| reconsider-raced-answered     | the racer fully answers the trigger before the draft posts   | skip                            | measure |
+| reconsider-raced-unrelated    | the racer is unrelated logistics; the question still stands  | post (force_post ok)            | measure |
 """
 
 
@@ -1425,6 +1444,72 @@ RESPONDER_SCENARIOS: Tuple[ResponderScenario, ...] = (
 
 
 # ============================================================================================
+# STALE RECONSIDERATION — the two §8 rows (Docs/specs/STALE_RECONSIDERATION.md)
+# ============================================================================================
+
+# One finished draft, two rooms that differ only in what raced it. The trial builds the
+# PRODUCTION reconsideration request — the full no-tools channel assembly over a real serialized
+# stream that already contains the racer, plus the one appended developer item quoting the draft
+# (message_processor/reconsideration.py:build_reconsideration_request) — and runs the real
+# structured-decision wrapper. Graded on the decision alone; nothing here can reach Slack.
+
+_RECONSIDER_ASK = Say("1780040100.000100", "Tessa Tran",
+                      "does anyone know what port postgres listens on in staging? the runbook "
+                      "says 5432 but pretty sure that's only prod")
+_RECONSIDER_DRAFT = (
+    "Staging postgres sits behind pgbouncer, so connect to port 6543 — 5432 is only right for "
+    "prod. The pool config lives in infra/staging/pgbouncer.ini if you want to double-check.")
+
+RACED_FULLY_ANSWERED = _room([
+    _RECONSIDER_ASK,
+    Say("1780040160.000100", "Dana Whitfield",
+        "it's 6543 — staging goes through pgbouncer, the app never talks to 5432 directly. "
+        "config is in infra/staging/pgbouncer.ini", thread="1780040100.000100"),
+])
+RACED_BY_UNRELATED = _room([
+    _RECONSIDER_ASK,
+    Say("1780040160.000100", "Tessa Tran",
+        "unrelated heads up — I moved sprint review to 2pm tomorrow, same meet link"),
+])
+
+
+@dataclass(frozen=True)
+class ReconsiderScenario:
+    id: str
+    room: Room
+    trigger_ts: str
+    racer_ts: str
+    draft: str
+    expected: Tuple[str, ...]
+    bar: str
+    why: str
+
+    @property
+    def trigger(self) -> Say:
+        for say in self.room.says:
+            if say.ts == self.trigger_ts:
+                return say
+        raise KeyError(f"{self.id}: no message at {self.trigger_ts}")
+
+
+RECONSIDER_SCENARIOS: Tuple[ReconsiderScenario, ...] = (
+    ReconsiderScenario("reconsider-raced-answered", RACED_FULLY_ANSWERED,
+                       "1780040100.000100", "1780040160.000100", _RECONSIDER_DRAFT,
+                       ("skip",), MEASURE,
+                       "Dana's reply fully answers the question the draft was written for — "
+                       "same port, same reason, same config path. Posting the draft anyway is "
+                       "the duplicate answer the guard exists to prevent; the room no longer "
+                       "needs it."),
+    ReconsiderScenario("reconsider-raced-unrelated", RACED_BY_UNRELATED,
+                       "1780040100.000100", "1780040160.000100", _RECONSIDER_DRAFT,
+                       ("post", "force_post"), MEASURE,
+                       "The racer is meeting logistics from the asker themselves; the question "
+                       "still stands unanswered. THE INCIDENT SHAPE: a correct finished answer "
+                       "must not be discarded because unrelated traffic advanced the scope."),
+)
+
+
+# ============================================================================================
 # scoring
 # ============================================================================================
 
@@ -1629,10 +1714,11 @@ def test_the_table_lists_every_scenario():
     listed = EXPECTED_OUTCOME_TABLE
     missing = [s.id for s in WAKE_SCENARIOS if f"| {s.id} " not in listed]
     missing += [s.id for s in RESPONDER_SCENARIOS if f"| {s.id} " not in listed]
+    missing += [s.id for s in RECONSIDER_SCENARIOS if f"| {s.id} " not in listed]
     assert not missing, f"scenarios absent from the expected-outcome table: {missing}"
     # Ids repeat ACROSS tiers on purpose — the same situation judged by the gate and by the
     # responder — so uniqueness is only required within a tier, where the baseline keys them.
-    for corpus in (WAKE_SCENARIOS, RESPONDER_SCENARIOS):
+    for corpus in (WAKE_SCENARIOS, RESPONDER_SCENARIOS, RECONSIDER_SCENARIOS):
         ids = [s.id for s in corpus]
         assert len(set(ids)) == len(ids), f"duplicate scenario ids: {ids}"
 
@@ -2232,3 +2318,101 @@ async def test_tier2_responder_corpus():
                                f"{was.get('passes')}/{was.get('trials')}")
     assert not failures, f"scenarios below their bar: {failures}"
     assert not regressions, f"regressions against the baseline: {regressions}"
+
+
+# ============================================================================================
+# stale reconsideration
+# ============================================================================================
+
+async def run_reconsideration_trial(openai_client: Any, scenario: ReconsiderScenario) -> str:
+    """One reconsideration decision, over the production request bytes.
+
+    The stream is serialized THROUGH the racer's ts — a reconsideration snapshot pins a fresh H,
+    so unlike a responder turn its window contains the message that suppressed the draft. The
+    request is the runner's own construction (`build_reconsideration_request`): the full
+    no-tools channel assembly plus the one appended developer item quoting the draft, and the
+    call is the real structured-decision wrapper with the production sampling pins. Returns the
+    decision string; graded on that alone.
+    """
+    from message_processor.reconsideration import build_reconsideration_request
+
+    host = processor_host()
+    client = platform_client(recording_registry([], FakeTransport()))
+    trigger = scenario.trigger
+    trigger_id = actor_id(scenario.room, trigger.who)
+    origin_thread = trigger.thread or trigger.ts
+    stream = build_room_stream(scenario.room, through=scenario.racer_ts)
+    cfg = thread_config(model=config.gpt_model, temperature=config.default_temperature,
+                        max_tokens=config.default_max_tokens,
+                        reasoning_effort=config.default_reasoning_effort,
+                        verbosity=config.default_verbosity)
+    ctx = channel_request.ChannelTurnContext(
+        stream=stream, steering=steering_snapshot(), thread_config=cfg,
+        channel_id=CHANNEL, team_id=TEAM, trigger_ts=trigger.ts,
+        origin_thread_ts=origin_thread, trigger_text=trigger.text,
+        canonical_files=channel_request.canonical_files_from_stream(stream),
+        requester=channel_request.RequesterFacts(user_id=trigger_id, real_name=trigger.who,
+                                                 sender_type=trigger.kind),
+        channel_info={"participation_level": scenario.room.participation_level,
+                      "reply_in_channel": scenario.room.reply_in_channel},
+        num_members=scenario.room.num_members, wake_source="channel_activity")
+    request, api_items, estimate = build_reconsideration_request(
+        processor=host, client=client, ctx=ctx, model=cfg["model"], pass_number=1,
+        draft=scenario.draft)
+    assert estimate.fits, f"{scenario.id}: the reconsideration request should trivially fit"
+    decision = await openai_client.create_reconsideration_decision(
+        input_items=api_items, instructions=request.instructions, model=cfg["model"],
+        reasoning_effort=cfg["reasoning_effort"], verbosity=cfg["verbosity"],
+        max_output_tokens=cfg["max_tokens"], temperature=cfg["temperature"],
+        prompt_cache_key=request.prompt_cache_key)
+    return decision.decision
+
+
+@pytest.mark.asyncio
+async def test_reconsideration_scenarios():
+    """The two §8 reconsideration rows, MEASURE: run, graded, recorded and reported — never
+    blocking. The orchestrator records the live baseline after unit green; until then a run
+    simply prints the distribution. A trial that raises anything that is not a provider
+    failure still fails the run — a harness bug must not hide as an outage."""
+    client = OpenAIClient()
+    scenarios = _in_scope(RECONSIDER_SCENARIOS)
+    if not scenarios:
+        pytest.skip("no reconsideration rows in scope for this run")
+    factories = [(scenario, lambda s=scenario: run_reconsideration_trial(client, s))
+                 for scenario in scenarios for _ in range(TRIALS)]
+    results = await gather_trials([f for _, f in factories])
+
+    per_scenario: Dict[str, List[Any]] = {s.id: [] for s in scenarios}
+    for (scenario, _), result in zip(factories, results):
+        per_scenario[scenario.id].append(result)
+
+    lines = [f"STALE RECONSIDERATION — {len(scenarios)} scenarios, {TRIALS} trials each "
+             f"(measure only)", "=" * 96]
+    bugs: List[str] = []
+    lost: List[str] = []
+    recorded: Dict[str, Any] = {}
+    for scenario in scenarios:
+        outcomes: List[str] = []
+        for trial in per_scenario[scenario.id]:
+            if isinstance(trial, Exception):
+                where = lost if is_transport_error(trial) else bugs
+                where.append(f"{scenario.id}: {type(trial).__name__}: {trial}")
+                continue
+            outcomes.append(trial)
+        passes = sum(1 for outcome in outcomes if outcome in scenario.expected)
+        recorded[scenario.id] = {"bar": scenario.bar, "expected": list(scenario.expected),
+                                 "passes": passes, "trials": len(outcomes),
+                                 "outcomes": outcomes}
+        lines.append(f"{scenario.id:<30} {scenario.bar:<7} {passes}/{len(outcomes)} "
+                     f"{','.join(sorted(set(outcomes))) or '(none)':<40}  (measure only)")
+    lines += ["-" * 96, f"trials lost: {len(lost)}"]
+    lines += [f"  {entry}" for entry in lost]
+    if bugs:
+        lines.append(f"trial errors (not the provider): {bugs}")
+    _report(lines)
+
+    if RECORDING:
+        _write_baseline("reconsider", {"scenarios": recorded})
+        pytest.skip("recording the reconsideration baseline")
+    assert not bugs, f"reconsideration trials raised something that is not a provider " \
+                     f"failure: {bugs}"

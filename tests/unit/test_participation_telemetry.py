@@ -209,13 +209,15 @@ def test_the_contract_version_says_the_event_set_changed():
     the `stale_send` diagnostic; v7 is the binary gate — `gate_decision` loses action, emoji,
     placement, reason, the staged findings, the overrules and the backoff taxonomy, and carries
     one bool plus four facts about the call; v8 adds the single-stream events and with them a
-    SECOND population keyed by turn_id. Each is a change an analysis written against the
-    older contract must be able to refuse.
+    SECOND population keyed by turn_id; v9 is stale reconsideration — `stale_send` gains
+    `turn_id` and one-per-suppression-EVENT cardinality, and the `reconsider_start` /
+    `reconsider_outcome` pair joins the turn population. Each is a change an analysis written
+    against the older contract must be able to refuse.
 
     GATE_CONTRACT is asserted beside it because the two move independently — v2–v6 rows remain
     valid under their own contracts, and a reader has to be able to tell which one a row obeys.
-    It deliberately did NOT move at v8: the gate is unchanged, so its rows still pool."""
-    assert pt.CONTRACT_VERSION == 8
+    It deliberately did NOT move at v8 or v9: the gate is unchanged, so its rows still pool."""
+    assert pt.CONTRACT_VERSION == 9
     assert pt.GATE_CONTRACT == "binary-v1"
 
 
@@ -1560,7 +1562,7 @@ def stream_render_row(**overrides):
     the rule that makes it necessary land together.
     """
     row = {
-        "v": 8, "at": 3.0, "session": "S", "gate_contract": "binary-v1",
+        "v": 9, "at": 3.0, "session": "S", "gate_contract": "binary-v1",
         "event": "stream_render", "turn_id": "t1",
         "channel_id": "C1", "H": "1.9",
         "periphery_floor_ts": "1.0", "inventory_start_ts": "0.5",
@@ -1581,15 +1583,16 @@ def stream_render_row(**overrides):
 
 def test_the_ledger_has_no_compaction_vocabulary(tmp_path):
     """T8. `compaction_snapshot` and the outbox that carried it are gone, and CONTRACT_VERSION
-    does NOT move for it.
+    did NOT move for it.
 
-    That last part is the claim worth testing. v8's turn population — turn_start, turn_outcome,
-    stream_render, model_response, outbound_receipt — is unchanged in identity, and no
-    completeness rule ever named the removed event, so no denominator anybody computes off a v8
-    ledger is invalidated. Bumping the version would tell every existing analysis its rows were
-    a different contract when they were not.
+    That was the claim worth testing when the removal shipped inside v8: the turn population —
+    turn_start, turn_outcome, stream_render, model_response, outbound_receipt — was unchanged in
+    identity, and no completeness rule ever named the removed event, so no denominator anybody
+    computes off a v8 ledger was invalidated. The version sits at 9 NOW because stale
+    reconsideration later changed event cardinality — a real contract change, unlike this
+    removal, which still earned no bump of its own.
     """
-    assert pt.CONTRACT_VERSION == 8
+    assert pt.CONTRACT_VERSION == 9
     for name in ("compaction_snapshot", "SNAPSHOT_OPS", "OUTBOX_OPS", "BUILD_STATUSES",
                  "BUILD_REASON_STATUSES", "FIT_RESULTS", "OUTBOX_EVENT",
                  "canonical_body_bytes", "extract_canonical_body", "validate_outbox_body",
@@ -1610,17 +1613,17 @@ def test_the_ledger_has_no_compaction_vocabulary(tmp_path):
 
     ledger = tmp_path / "participation.jsonl"
     rows = [
-        {"v": 8, "at": 1.0, "session": "S", "gate_contract": "binary-v1",
+        {"v": 9, "at": 1.0, "session": "S", "gate_contract": "binary-v1",
          "event": "session_start", "build": "abc"},
-        {"v": 8, "at": 2.0, "session": "S", "gate_contract": "binary-v1", "event": "turn_start",
+        {"v": 9, "at": 2.0, "session": "S", "gate_contract": "binary-v1", "event": "turn_start",
          "channel_id": "C1", "trigger_ts": "1.0", "turn_id": "t1", "surface": "channel",
          "gated": False},
         stream_render_row(),
-        {"v": 8, "at": 4.0, "session": "S", "gate_contract": "binary-v1",
+        {"v": 9, "at": 4.0, "session": "S", "gate_contract": "binary-v1",
          "event": "turn_outcome", "channel_id": "C1", "trigger_ts": "1.0", "turn_id": "t1",
          "kind": "silence", "detached_started": False, "stream_build_present": True,
          "destinations": []},
-        {"v": 8, "at": 5.0, "session": "S", "gate_contract": "binary-v1", "event": "session_end"},
+        {"v": 9, "at": 5.0, "session": "S", "gate_contract": "binary-v1", "event": "session_end"},
     ]
     ledger.write_text("".join(json.dumps(r) + "\n" for r in rows))
     result = subprocess.run([sys.executable, str(checker), str(ledger), "--json"],
@@ -1651,20 +1654,20 @@ def _ledger(*, render=None, renders=None, stream_build_present=True, outcome_ext
     """A complete one-turn session, with the stream_render row(s) under test substituted in."""
     if renders is None:
         renders = [] if render is None else [render]
-    outcome = {"v": 8, "at": 4.0, "session": "S", "gate_contract": "binary-v1",
+    outcome = {"v": 9, "at": 4.0, "session": "S", "gate_contract": "binary-v1",
                "event": "turn_outcome", "channel_id": "C1", "trigger_ts": "1.0",
                "turn_id": "t1", "kind": "silence", "detached_started": False,
                "stream_build_present": stream_build_present, "destinations": []}
     outcome.update(outcome_extra or {})
     return [
-        {"v": 8, "at": 1.0, "session": "S", "gate_contract": "binary-v1",
+        {"v": 9, "at": 1.0, "session": "S", "gate_contract": "binary-v1",
          "event": "session_start", "build": "abc"},
-        {"v": 8, "at": 2.0, "session": "S", "gate_contract": "binary-v1", "event": "turn_start",
+        {"v": 9, "at": 2.0, "session": "S", "gate_contract": "binary-v1", "event": "turn_start",
          "channel_id": "C1", "trigger_ts": "1.0", "turn_id": "t1", "surface": "channel",
          "gated": False},
         *renders,
         outcome,
-        {"v": 8, "at": 5.0, "session": "S", "gate_contract": "binary-v1", "event": "session_end"},
+        {"v": 9, "at": 5.0, "session": "S", "gate_contract": "binary-v1", "event": "session_end"},
     ]
 
 
@@ -1781,3 +1784,490 @@ def test_the_stream_render_contract_is_enforced(tmp_path):
     code, names = _run_checker(tmp_path, _ledger(
         renders=[stream_render_row(), stream_render_row(at=3.5)]))
     assert code == 1 and "stream_render_duplicate" in names
+
+
+# ================================================== CV9 — stale reconsideration (§5 of the spec)
+
+def test_a_stale_send_row_joins_the_turn_population_by_turn_id(sink):
+    """v9. The row's turn_id is what lets a turn's suppression EVENTS be counted beside its
+    reconsider_start rows. An ungated turn still mints no attempt, and the absent optional is
+    OMITTED, never null."""
+    pt.stale_send("C1", "10.0", turn_id="t1", last_seen_ts="9.0", observed_latest_ts="11.0",
+                  scope="thread", surface="reply", guard_mode="buffered")
+    row = sink("stale_send")[0]
+    assert row["turn_id"] == "t1"
+    assert row["scope"] == "thread"           # scope[0]-only, unchanged at v9
+    assert "attempt_id" not in row
+    assert None not in row.values()
+
+
+def test_a_reconsider_start_writes_the_literal_v9_keys(sink):
+    """The wire key is `pass` — a Python keyword, so the helper takes `pass_number` and the
+    grammar keeps the literal name. `scope` is the FULL three-part tuple, as a JSON list."""
+    pt.reconsider_start("C1", "10.0", turn_id="t1", pass_number=1,
+                        scope=("thread", "C1", "9.0"), observed_latest_ts="11.0",
+                        attempt_id="A1", model_attempt_seq=3)
+    row = sink("reconsider_start")[0]
+    assert row["pass"] == 1
+    assert "pass_number" not in row
+    assert row["scope"] == ["thread", "C1", "9.0"]
+    assert row["observed_latest_ts"] == "11.0"
+    assert (row["turn_id"], row["attempt_id"], row["model_attempt_seq"]) == ("t1", "A1", 3)
+    assert (row["channel_id"], row["trigger_ts"]) == ("C1", "10.0")
+
+
+def test_unavailable_optional_reconsider_fields_are_omitted_not_null(sink):
+    """The v9 null rule: an ungated channel turn has no attempt_id, a failed attempt-sink open
+    has no model_attempt_seq, a skip has no forced and no error — every one of them is ABSENT
+    from the line, matching record()'s drop-None behavior, so a reader never sees two buckets
+    (absent and null) meaning 'unavailable'."""
+    pt.reconsider_start("C1", "10.0", turn_id="t1", pass_number=2,
+                        scope=("thread", "C1", "9.0"), observed_latest_ts="11.0")
+    row = sink("reconsider_start")[0]
+    assert "attempt_id" not in row and "model_attempt_seq" not in row
+    assert None not in row.values()
+
+    pt.reconsider_outcome("C1", "10.0", turn_id="t1", outcome="skipped", passes=2)
+    out = sink("reconsider_outcome")[0]
+    assert (out["outcome"], out["passes"]) == ("skipped", 2)
+    for absent in ("forced", "error", "attempt_id"):
+        assert absent not in out
+    assert None not in out.values()
+
+
+def test_a_reconsider_outcome_carries_its_conditionals_only_where_they_apply(sink):
+    """`forced` rides only on posted outcomes — and False is WRITTEN, because only None means
+    unavailable. `error` rides only on error_dropped, carrying the §4f subtype."""
+    pt.reconsider_outcome("C1", "10.0", turn_id="t1", outcome="posted_asis", passes=1,
+                          forced=False)
+    pt.reconsider_outcome("C1", "10.0", turn_id="t2", outcome="error_dropped", passes=2,
+                          error="delivery_failed")
+    rows = sink("reconsider_outcome")
+    assert rows[0]["forced"] is False and "error" not in rows[0]
+    assert rows[1]["error"] == "delivery_failed" and "forced" not in rows[1]
+
+
+def test_reconsider_facts_omit_inapplicable_keys():
+    """as_payload() feeds turn_outcome's nested `reconsider` object, and nested values survive
+    record()'s top-level drop-None untouched — so the omission has to happen HERE, or a null
+    would reach the file."""
+    from message_processor.turn_runtime import ReconsiderFacts
+
+    assert ReconsiderFacts(outcome="posted_revised", passes=3, forced=True).as_payload() == {
+        "outcome": "posted_revised", "passes": 3, "forced": True}
+    assert ReconsiderFacts(outcome="posted_asis", passes=1, forced=False).as_payload() == {
+        "outcome": "posted_asis", "passes": 1, "forced": False}
+    assert ReconsiderFacts(outcome="error_dropped", passes=2,
+                           error="context_rebuild").as_payload() == {
+        "outcome": "error_dropped", "passes": 2, "error": "context_rebuild"}
+    # Inapplicable keys are dropped even when SET: forced on a skip, error on a fuse drop.
+    assert ReconsiderFacts(outcome="skipped", passes=1, forced=True,
+                           error="model_failure").as_payload() == {
+        "outcome": "skipped", "passes": 1}
+    assert ReconsiderFacts(outcome="fuse_dropped", passes=5,
+                           error="model_failure").as_payload() == {
+        "outcome": "fuse_dropped", "passes": 5}
+    # ...and a posted outcome whose forced was never recorded carries no null either.
+    assert ReconsiderFacts(outcome="posted_asis", passes=1).as_payload() == {
+        "outcome": "posted_asis", "passes": 1}
+
+
+def test_a_turn_outcome_attaches_the_reconsider_facts_and_only_then(sink):
+    """emit_turn_outcome reads TurnRuntime.reconsider — absent when no reconsideration ran, the
+    as_payload() dict verbatim when one did."""
+    from message_processor.turn_runtime import ReconsiderFacts
+
+    plain = _turn(turn_id="s:30")
+    pt.emit_turn_outcome(plain, channel_id="C1", trigger_ts="10.0", kind="reply")
+    reconsidered = _turn(turn_id="s:31")
+    reconsidered.reconsider = ReconsiderFacts(outcome="posted_revised", passes=2, forced=False)
+    pt.emit_turn_outcome(reconsidered, channel_id="C1", trigger_ts="11.0", kind="reply")
+
+    rows = sink("turn_outcome")
+    assert "reconsider" not in rows[0]
+    assert rows[1]["reconsider"] == {"outcome": "posted_revised", "passes": 2, "forced": False}
+
+
+# ------------------------------------------------------ the CV9 checker invariants, per §5
+
+def _v9(event, **fields):
+    row = {"v": 9, "at": 3.0, "session": "S", "gate_contract": "binary-v1", "event": event}
+    row.update(fields)
+    return row
+
+
+def _suppression(turn_id="t1", **over):
+    row = _v9("stale_send", channel_id="C1", trigger_ts="1.0", turn_id=turn_id,
+              last_seen_ts="1.0", observed_latest_ts="2.0", scope="thread",
+              surface="reply", guard_mode="buffered")
+    row.update(over)
+    return row
+
+
+def _start(pass_number, turn_id="t1", **over):
+    row = _v9("reconsider_start", at=4.0 + pass_number, channel_id="C1", trigger_ts="1.0",
+              turn_id=turn_id, scope=["thread", "C1", "1.0"], observed_latest_ts="2.0")
+    row["pass"] = pass_number
+    row.update(over)
+    return row
+
+
+def _outcome(outcome="skipped", passes=1, turn_id="t1", **over):
+    row = _v9("reconsider_outcome", at=8.0, channel_id="C1", trigger_ts="1.0",
+              turn_id=turn_id, outcome=outcome, passes=passes)
+    row.update(over)
+    return row
+
+
+def _reconsider_session(*middle):
+    """One UNGATED channel turn (no attempt_id anywhere — the join is turn_id alone) that ended
+    stale_suppressed, with the reconsideration rows under test in the middle."""
+    return [
+        _v9("session_start", at=1.0, build="abc"),
+        _v9("turn_start", at=2.0, channel_id="C1", trigger_ts="1.0", turn_id="t1",
+            surface="channel", gated=False),
+        *middle,
+        _v9("turn_outcome", at=9.0, channel_id="C1", trigger_ts="1.0", turn_id="t1",
+            kind="stale_suppressed", detached_started=False, stream_build_present=False,
+            destinations=[]),
+        _v9("session_end", at=10.0),
+    ]
+
+
+def test_the_checker_accepts_a_healthy_ungated_reconsideration(tmp_path):
+    """The baseline every violation case deviates from: two suppression events, two contiguous
+    passes, one outcome whose `passes` is the started-pass count — joined by turn_id with no
+    attempt_id on any row, because an ungated channel turn mints none."""
+    code, names = _run_checker(tmp_path, _reconsider_session(
+        _suppression(), _start(1), _suppression(at=4.5), _start(2),
+        _outcome(outcome="posted_asis", passes=2, forced=True)))
+    assert (code, names) == (0, [])
+
+
+def test_the_checker_accepts_the_passes_accounting_boundaries(tmp_path):
+    """A fuse drop records 5 — five suppression events, five started passes; a cancellation
+    before any pass started records 0. Both are legal `passes` values, and the checker must not
+    invent a floor of 1 for them."""
+    fuse = [_row for n in range(1, 6) for _row in (_suppression(at=3.0 + n), _start(n))]
+    code, names = _run_checker(tmp_path, _reconsider_session(
+        *fuse, _outcome(outcome="fuse_dropped", passes=5)))
+    assert (code, names) == (0, [])
+
+    code, names = _run_checker(tmp_path, _reconsider_session(
+        _suppression(), _outcome(outcome="cancelled", passes=0)))
+    assert (code, names) == (0, [])
+
+
+def test_pass_numbers_must_be_contiguous_from_one(tmp_path):
+    # A gap.
+    code, names = _run_checker(tmp_path, _reconsider_session(
+        _suppression(), _start(1), _suppression(at=4.5), _start(3), _outcome(passes=2)))
+    assert code == 1 and "reconsider_pass_not_contiguous" in names
+    # A sequence that never started at 1.
+    code, names = _run_checker(tmp_path, _reconsider_session(
+        _suppression(), _start(2), _outcome(passes=1)))
+    assert code == 1 and "reconsider_pass_not_contiguous" in names
+    # A repeat.
+    code, names = _run_checker(tmp_path, _reconsider_session(
+        _suppression(), _start(1), _suppression(at=4.5), _start(1), _outcome(passes=2)))
+    assert code == 1 and "reconsider_pass_duplicate" in names
+
+
+def test_a_turn_cannot_start_more_passes_than_it_had_suppression_events(tmp_path):
+    """Every pass exists because a suppression event preceded it, and each suppression event
+    writes exactly one stale_send row — so starts <= stale_sends, per turn, joined on turn_id."""
+    code, names = _run_checker(tmp_path, _reconsider_session(
+        _suppression(), _start(1), _start(2), _outcome(passes=2)))
+    assert code == 1 and "reconsider_start_exceeds_stale_send" in names
+
+
+def test_at_most_one_reconsider_outcome_per_turn(tmp_path):
+    """The once-per-turn gate makes a second runner invocation impossible, so a duplicate is an
+    emitter defect in any file, fragment or not."""
+    code, names = _run_checker(tmp_path, _reconsider_session(
+        _suppression(), _start(1), _outcome(passes=1),
+        _outcome(outcome="posted_asis", passes=1, forced=False, at=8.5)))
+    assert code == 1 and "reconsider_outcome_duplicate" in names
+
+
+def test_a_dm_stale_send_with_a_turn_id_and_no_turn_start_is_tolerated(tmp_path):
+    """The ruled tolerance: DM turns take leases and emit stale_send rows carrying a turn_id,
+    but DMs are outside the channel-turn population, so there is no turn_start to join — and
+    that must never read as a violation."""
+    rows = [
+        _v9("session_start", at=1.0, build="abc"),
+        _suppression(turn_id="dm-turn", at=2.0),
+        _v9("session_end", at=3.0),
+    ]
+    code, names = _run_checker(tmp_path, rows)
+    assert (code, names) == (0, [])
+
+
+def test_the_reconsider_event_grammar_is_enforced(tmp_path):
+    """One field broken at a time against the real checker, like the stream_render contract."""
+    # Mandatory keys, on both events.
+    for field in ("turn_id", "channel_id", "trigger_ts", "pass", "scope", "observed_latest_ts"):
+        start = _start(1)
+        start.pop(field)
+        code, names = _run_checker(tmp_path, _reconsider_session(
+            _suppression(), start, _outcome(passes=1)))
+        assert code == 1 and "reconsider_start_missing_field" in names, field
+    for field in ("turn_id", "channel_id", "trigger_ts", "outcome", "passes"):
+        outcome = _outcome(passes=1)
+        outcome.pop(field)
+        code, names = _run_checker(tmp_path, _reconsider_session(
+            _suppression(), _start(1), outcome))
+        assert code == 1 and "reconsider_outcome_missing_field" in names, field
+
+    # `pass` counts from 1; `scope` is the FULL three-part list; the seq is an int.
+    code, names = _run_checker(tmp_path, _reconsider_session(
+        _suppression(), _start(0), _outcome(passes=1)))
+    assert code == 1 and "reconsider_start_bad_pass" in names
+    for bad_scope in ("thread", ["thread", "C1"], None):
+        code, names = _run_checker(tmp_path, _reconsider_session(
+            _suppression(), _start(1, scope=bad_scope), _outcome(passes=1)))
+        assert code == 1 and "reconsider_start_bad_scope" in names, bad_scope
+    code, names = _run_checker(tmp_path, _reconsider_session(
+        _suppression(), _start(1, model_attempt_seq="3"), _outcome(passes=1)))
+    assert code == 1 and "reconsider_start_bad_field" in names
+
+    # The outcome vocabulary is closed, and `passes` is a non-negative int.
+    code, names = _run_checker(tmp_path, _reconsider_session(
+        _suppression(), _start(1), _outcome(outcome="gave_up", passes=1)))
+    assert code == 1 and "reconsider_outcome_bad_outcome" in names
+    code, names = _run_checker(tmp_path, _reconsider_session(
+        _suppression(), _start(1), _outcome(passes=-1)))
+    assert code == 1 and "reconsider_outcome_bad_passes" in names
+
+    # The conditionals: forced only on posted outcomes, error only on error_dropped, and the
+    # error subtype comes from the closed §4f set.
+    code, names = _run_checker(tmp_path, _reconsider_session(
+        _suppression(), _start(1), _outcome(outcome="skipped", passes=1, forced=True)))
+    assert code == 1 and "reconsider_outcome_bad_conditional" in names
+    code, names = _run_checker(tmp_path, _reconsider_session(
+        _suppression(), _start(1), _outcome(outcome="skipped", passes=1, error="model_failure")))
+    assert code == 1 and "reconsider_outcome_bad_conditional" in names
+    code, names = _run_checker(tmp_path, _reconsider_session(
+        _suppression(), _start(1),
+        _outcome(outcome="error_dropped", passes=1, error="mystery")))
+    assert code == 1 and "reconsider_outcome_bad_conditional" in names
+    # ...and the legal shapes of both conditionals pass.
+    code, names = _run_checker(tmp_path, _reconsider_session(
+        _suppression(), _start(1),
+        _outcome(outcome="error_dropped", passes=1, error="guard_rearm_failed")))
+    assert (code, names) == (0, [])
+
+
+def test_a_v9_stale_send_must_carry_its_turn_id(tmp_path):
+    """The pass-count invariant counts suppression EVENTS per turn, so a v9 row with no turn_id
+    counts toward no turn and quietly shrinks the denominator every `reconsider_start` is
+    measured against. Older rows are exempt for free — the checker skips anything below v9. The
+    healthy direction is the DM-tolerance case above: a turn_id with nothing to join is fine, a
+    missing one is not."""
+    orphan = _suppression()
+    orphan.pop("turn_id")
+    code, names = _run_checker(tmp_path, [
+        _v9("session_start", at=1.0, build="abc"),
+        orphan,
+        _v9("session_end", at=3.0),
+    ])
+    assert code == 1 and "stale_send_missing_turn_id" in names
+
+
+def test_a_stale_send_turn_id_must_be_a_non_empty_string(tmp_path):
+    """The type half of the same rule: an explicit null, a non-string or an empty string would
+    all be dropped SILENTLY by the checker's own join index — a suppression event that counts
+    toward no turn, shrinking the pass-count denominator with no finding. The grammar flags
+    each by name instead."""
+    for bad in (None, 7, ""):
+        code, names = _run_checker(tmp_path, [
+            _v9("session_start", at=1.0, build="abc"),
+            _suppression(turn_id=bad),
+            _v9("session_end", at=3.0),
+        ])
+        assert code == 1 and "stale_send_missing_turn_id" in names, bad
+
+
+def test_turn_start_and_turn_outcome_null_turn_ids_are_violations_not_silent_drops(tmp_path):
+    """The join-key rule covers EVERY turn-joined event, not only the three v9 rows with a
+    reject_null mandatory check: a `turn_start.turn_id = null` plus `turn_outcome.turn_id =
+    null` used to pass with zero violations — both rows silently discarded by the join index,
+    a whole turn vanishing from every invariant with no finding."""
+    for event, name in (("turn_start", "turn_start_missing_field"),
+                        ("turn_outcome", "turn_outcome_missing_field")):
+        code, names = _run_checker(tmp_path, [
+            _v9("session_start", at=1.0, build="abc"),
+            _v9("turn_start", at=1.5, turn_id=None if event == "turn_start" else "t1",
+                channel_id="C1", surface="channel"),
+            _v9("turn_outcome", at=2.0, turn_id=None if event == "turn_outcome" else "t1",
+                kind="reply", destinations=[], stream_build_present=True),
+            _v9("session_end", at=3.0),
+        ])
+        assert code == 1 and name in names, event
+
+
+def test_a_reconsider_optional_present_with_explicit_null_is_a_violation(tmp_path):
+    """No JSON nulls anywhere on the two v9 reconsider events — an unavailable OPTIONAL is
+    omitted by record()'s drop-None, so a null that reached the file was written on purpose."""
+    code, names = _run_checker(tmp_path, _reconsider_session(
+        _suppression(), _start(1, attempt_id=None), _outcome(passes=1)))
+    assert code == 1 and "reconsider_start_bad_field" in names
+    code, names = _run_checker(tmp_path, _reconsider_session(
+        _suppression(), _start(1), _outcome(passes=1, attempt_id=None)))
+    assert code == 1 and "reconsider_outcome_bad_field" in names
+
+
+def test_an_explicit_null_on_a_reconsider_identity_field_is_a_missing_field(tmp_path):
+    """No JSON nulls anywhere in the v9 grammar: record() omits None-valued fields, so a null
+    that reaches the file means something wrote one on purpose. It reads as "unavailable" beside
+    the absent encoding that already means that, so it fails under the SAME name as absence —
+    one defect, one bucket."""
+    # The baseline these deviate from, clean.
+    assert _run_checker(tmp_path, _reconsider_session(
+        _suppression(), _start(1), _outcome(passes=1))) == (0, [])
+
+    for field in ("turn_id", "channel_id", "trigger_ts", "pass", "scope", "observed_latest_ts"):
+        code, names = _run_checker(tmp_path, _reconsider_session(
+            _suppression(), _start(1, **{field: None}), _outcome(passes=1)))
+        assert code == 1 and "reconsider_start_missing_field" in names, field
+    for field in ("turn_id", "channel_id", "trigger_ts", "outcome", "passes"):
+        nulled = _outcome(passes=1)
+        nulled[field] = None
+        code, names = _run_checker(tmp_path, _reconsider_session(
+            _suppression(), _start(1), nulled))
+        assert code == 1 and "reconsider_outcome_missing_field" in names, field
+
+
+def test_a_reconsider_scope_is_three_strings(tmp_path):
+    """The full three-part suppressing scope is the pass's evidence, and a scope part that is not
+    a string is not a scope part — a float ts here would compare unequal to every string ts the
+    guard actually holds."""
+    assert _run_checker(tmp_path, _reconsider_session(
+        _suppression(), _start(1, scope=["thread", "C1", "1.0"]),
+        _outcome(passes=1))) == (0, [])
+    for bad in (["thread", "C1", 2.0], ["thread", None, "1.0"], [1, 2, 3]):
+        code, names = _run_checker(tmp_path, _reconsider_session(
+            _suppression(), _start(1, scope=bad), _outcome(passes=1)))
+        assert code == 1 and "reconsider_start_bad_scope" in names, bad
+
+
+def test_unknown_keys_on_the_two_reconsider_events_fail(tmp_path):
+    """The literal grammar is CLOSED. A field the emitter invented and no reader knows about is
+    how a contract drifts out from under the tool grading it, so it fails rather than being
+    ignored — while every legal optional stays silent."""
+    # Every optional present at once: the direction a closed-grammar rule most easily breaks.
+    assert _run_checker(tmp_path, _reconsider_session(
+        _suppression(), _start(1, attempt_id="A1", model_attempt_seq=3),
+        _outcome(outcome="posted_revised", passes=1, forced=True,
+                 attempt_id="A1"))) == (0, [])
+    assert _run_checker(tmp_path, _reconsider_session(
+        _suppression(), _start(1, attempt_id="A1", model_attempt_seq=3),
+        _outcome(outcome="error_dropped", passes=1, error="request_build",
+                 attempt_id="A1"))) == (0, [])
+
+    code, names = _run_checker(tmp_path, _reconsider_session(
+        _suppression(), _start(1, reviewed_through="2.0"), _outcome(passes=1)))
+    assert code == 1 and "reconsider_start_unknown_field" in names
+    code, names = _run_checker(tmp_path, _reconsider_session(
+        _suppression(), _start(1), _outcome(passes=1, decision="skip")))
+    assert code == 1 and "reconsider_outcome_unknown_field" in names
+
+
+def test_posted_outcomes_require_forced_and_error_drops_require_a_subtype(tmp_path):
+    """The other direction of the conditionals, and it applies to the EVENT only: the emitter
+    writes forced=False on every posted outcome and the runner always names a §4f subtype, so an
+    absence there is a lost fact rather than an omitted optional. The nested turn_outcome copy
+    comes from as_payload(), which legally omits a forced that was never recorded."""
+    for posted in ("posted_asis", "posted_revised"):
+        assert _run_checker(tmp_path, _reconsider_session(
+            _suppression(), _start(1),
+            _outcome(outcome=posted, passes=1, forced=False))) == (0, []), posted
+        code, names = _run_checker(tmp_path, _reconsider_session(
+            _suppression(), _start(1), _outcome(outcome=posted, passes=1)))
+        assert code == 1 and "reconsider_outcome_bad_conditional" in names, posted
+
+    assert _run_checker(tmp_path, _reconsider_session(
+        _suppression(), _start(1),
+        _outcome(outcome="error_dropped", passes=1, error="delivery_exception"))) == (0, [])
+    code, names = _run_checker(tmp_path, _reconsider_session(
+        _suppression(), _start(1), _outcome(outcome="error_dropped", passes=1)))
+    assert code == 1 and "reconsider_outcome_bad_conditional" in names
+
+    # The asymmetry, pinned: the nested copy without `forced` is HEALTHY.
+    rows = _reconsider_session(_suppression(), _start(1),
+                               _outcome(outcome="posted_asis", passes=1, forced=False))
+    rows[-2]["reconsider"] = {"outcome": "posted_asis", "passes": 1}
+    assert _run_checker(tmp_path, rows) == (0, [])
+
+
+def test_the_reconsider_error_vocabulary_is_the_eight_subtypes(tmp_path):
+    """All eight §4f subtypes, each sent through the real checker. Asserting the constant would
+    prove only that I typed them; the two the tightening ADDED are the ones that matter."""
+    for subtype in ("context_rebuild", "model_failure", "admission_overflow", "delivery_failed",
+                    "epoch_invalidated", "guard_rearm_failed", "request_build",
+                    "delivery_exception"):
+        assert _run_checker(tmp_path, _reconsider_session(
+            _suppression(), _start(1),
+            _outcome(outcome="error_dropped", passes=1, error=subtype))) == (0, []), subtype
+
+
+def test_an_outcomes_passes_equals_its_joined_start_count(tmp_path):
+    """`passes` IS the started-pass count, so a disagreement means one of the two is counting
+    something else — and every later reading of the file inherits that arithmetic. The healthy
+    exact match is the baseline above (two suppressions, two passes, passes=2)."""
+    code, names = _run_checker(tmp_path, _reconsider_session(
+        _suppression(), _start(1), _outcome(passes=2)))
+    assert code == 1 and "reconsider_outcome_passes_mismatch" in names
+    code, names = _run_checker(tmp_path, _reconsider_session(
+        _suppression(), _start(1), _suppression(at=4.5), _start(2), _outcome(passes=1)))
+    assert code == 1 and "reconsider_outcome_passes_mismatch" in names
+
+    # NOT graded when the turn's head is not in the input: a rotated file legitimately leaves the
+    # early passes in participation.jsonl.1, and counting what survived would invent a defect.
+    code, names = _run_checker(tmp_path, [
+        _suppression(turn_id="rotated", at=2.0),
+        _outcome(passes=3, turn_id="rotated"),
+    ])
+    assert (code, names) == (0, [])
+
+
+def test_the_nested_turn_outcome_reconsider_payload_is_checked(tmp_path):
+    """turn_outcome.reconsider follows the same rules as the event: closed outcome vocabulary,
+    int passes, conditionals only where they apply — nested nulls would survive record(), so the
+    checker is the tripwire for them."""
+    def _with_facts(facts):
+        rows = _reconsider_session(_suppression(), _start(1),
+                                   _outcome(outcome="posted_asis", passes=1, forced=False))
+        rows[-2]["reconsider"] = facts        # the turn_outcome row
+        return rows
+
+    code, names = _run_checker(
+        tmp_path, _with_facts({"outcome": "posted_asis", "passes": 1, "forced": False}))
+    assert (code, names) == (0, [])
+    for bad in ({"outcome": "gave_up", "passes": 1},
+                {"outcome": "skipped", "passes": None},
+                {"outcome": "skipped", "passes": 1, "error": "model_failure"},
+                {"outcome": "posted_asis", "passes": 1, "forced": None},
+                # r2 finding 5 — the nested grammar is CLOSED, null-free, non-negative:
+                {"outcome": "skipped", "passes": 1, "reviewed_through": "1.0"},
+                {"outcome": "error_dropped", "passes": 1, "error": None},
+                {"outcome": "skipped", "passes": -1},
+                "posted_asis"):
+        code, names = _run_checker(tmp_path, _with_facts(bad))
+        assert code == 1 and "turn_outcome_reconsider_malformed" in names, bad
+
+
+def test_the_checker_skips_v8_rows_rather_than_grading_them(tmp_path):
+    """The version moved, so the checker's older-contract rule now covers v8: a mixed file
+    across the deploy is the normal state of the world, and grading v8 rows by v9 rules would
+    invent violations out of correct history."""
+    assert plc.CONTRACT_VERSION == 9
+    rows = [
+        {"v": 8, "at": 1.0, "session": "S8", "gate_contract": "binary-v1",
+         "event": "turn_start", "channel_id": "C1", "trigger_ts": "1.0", "turn_id": "old",
+         "surface": "channel", "gated": False},   # v8, no outcome — must NOT be graded
+        _v9("session_start", at=2.0, build="abc"),
+        _v9("session_end", at=3.0),
+    ]
+    code, names = _run_checker(tmp_path, rows)
+    assert (code, names) == (0, [])
