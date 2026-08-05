@@ -154,7 +154,7 @@ def _client():
     # message (the composed section+actions path), so main.py sets its flag from reality.
     async def _send(channel_id, thread_id, text, blocks=None, meta_out=None,
                     lease=None, surface=None, receipts=None, receipt_kind=None,
-                    on_first_accept=None):
+                    receipt_class=None, on_first_accept=None):
         if meta_out is not None:
             meta_out["footer_attached"] = bool(blocks)
         if on_first_accept is not None:
@@ -237,7 +237,7 @@ async def test_main_suppresses_separate_footer_when_send_failed():
 
     async def _send_fail(channel_id, thread_id, text, blocks=None, meta_out=None,
                          lease=None, surface=None, receipts=None, receipt_kind=None,
-                         on_first_accept=None):
+                         receipt_class=None, on_first_accept=None):
         return None  # send failed — nothing accepted, so no first-accept callback either
     client.send_message = AsyncMock(side_effect=_send_fail)
     resp = Response(type="text", content="hello", metadata={"streamed": False, "model": "m"})

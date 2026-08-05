@@ -111,7 +111,8 @@ async def test_stage_one_reads_no_activity_and_no_receipt_rows(temp_db):
     await temp_db.record_thread_activity_async(TEAM, CH, "50.0", reply_ts="60.0",
                                                event_ts="60.0")
     await temp_db.register_receipt_async(TEAM, CH, "70.0", "turn-1", "finalized",
-                                         thread_root_ts="50.0")
+                                         thread_root_ts="50.0",
+                                         receipt_class="assistant_reply")
 
     payload = await temp_db.read_channel_window_anchor_async(TEAM, CH)
     assert set(payload) == {"anchor", "inventory"}
@@ -155,10 +156,12 @@ async def test_receipt_roots_name_the_threads_we_have_posted_in(temp_db):
     returns only top-level messages. Predicated into the same window by the ts of the message
     each receipt describes."""
     await temp_db.register_receipt_async(TEAM, CH, "500.0", "turn-1", "finalized",
-                                         thread_root_ts="120.0")
+                                         thread_root_ts="120.0",
+                                         receipt_class="assistant_reply")
     # Outside the window: its message ts is above H.
     await temp_db.register_receipt_async(TEAM, CH, "9000.0", "turn-2", "finalized",
-                                         thread_root_ts="130.0")
+                                         thread_root_ts="130.0",
+                                         receipt_class="assistant_reply")
 
     got = await temp_db.read_channel_discovery_roots_async(
         TEAM, CH, floor_ts="400.0", high_ts="800.0")

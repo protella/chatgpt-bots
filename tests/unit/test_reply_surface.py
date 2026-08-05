@@ -114,7 +114,7 @@ class FakeSlack:
 
     # -- writes
     async def send_message_get_ts(self, channel, thread, text, lease=None, surface=None,
-                                  receipts=None, receipt_kind=None):
+                                  receipts=None, receipt_kind=None, receipt_class=None):
         if lease is not None:
             lease.authorize(surface or "legacy_seed")
         if self.refuse_post:
@@ -128,7 +128,7 @@ class FakeSlack:
 
     async def send_message(self, channel, thread, text, blocks=None, meta_out=None,
                            username=None, lease=None, surface=None, receipts=None,
-                           receipt_kind=None, on_first_accept=None):
+                           receipt_kind=None, receipt_class=None, on_first_accept=None):
         """Splits like the real client, and returns the FIRST chunk's ts (or None on failure —
         the real one swallows SlackApiError, which is exactly the silent-loss hole).
 
@@ -160,7 +160,7 @@ class FakeSlack:
                 parts_total=parts, split=parts > 1)
         return first
 
-    async def update_message(self, channel, ts, text, receipts=None, receipt_kind=None):
+    async def update_message(self, channel, ts, text, receipts=None, receipt_kind=None, receipt_class=None):
         if ts not in self.live:
             return False
         self.calls.append(("update", ts))
@@ -600,7 +600,7 @@ class _FooterSlack(FakeSlack):
 
     async def send_message(self, channel, thread, text, blocks=None, meta_out=None,
                            username=None, lease=None, surface=None, receipts=None,
-                           receipt_kind=None, on_first_accept=None):
+                           receipt_kind=None, receipt_class=None, on_first_accept=None):
         if meta_out is not None:
             meta_out["footer_attached"] = bool(blocks)
         return await FakeSlack.send_message(self, channel, thread, text, blocks=blocks,

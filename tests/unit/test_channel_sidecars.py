@@ -119,7 +119,8 @@ async def test_the_id_list_comes_back_normalized_and_sorted(temp_db):
 
 async def test_receipts_are_read_whole_for_the_ids_asked_for(temp_db):
     await temp_db.register_receipt_async(TEAM, CH, INSIDE, "turn-1", "finalized",
-                                         thread_root_ts="1400.0")
+                                         thread_root_ts="1400.0",
+                                         receipt_class="assistant_reply")
     rows = {r["message_ts"]: r for r in (await _read(temp_db, ids=[INSIDE]))["receipts"]}
     assert set(rows) == {INSIDE}
     assert rows[INSIDE]["state"] == "finalized"
@@ -129,7 +130,8 @@ async def test_receipts_are_read_whole_for_the_ids_asked_for(temp_db):
 
 async def test_receipts_are_ts_ordered_numerically(temp_db):
     for ts in ("1000.000100", "999.999900"):
-        await temp_db.register_receipt_async(TEAM, CH, ts, "turn", "finalized")
+        await temp_db.register_receipt_async(TEAM, CH, ts, "turn", "finalized",
+                                             receipt_class="assistant_reply")
     payload = await _read(temp_db, ids=["1000.000100", "999.999900"])
     assert _ts(payload["receipts"]) == ["999.999900", "1000.000100"]
 
@@ -173,7 +175,8 @@ async def test_ambient_and_tool_usage_are_scoped_to_this_channel(temp_db):
 
 async def test_receipts_are_scoped_to_team_and_channel(temp_db):
     for team, channel in ((TEAM, CH), (TEAM, "C2"), ("T2", CH)):
-        await temp_db.register_receipt_async(team, channel, INSIDE, "turn", "finalized")
+        await temp_db.register_receipt_async(team, channel, INSIDE, "turn", "finalized",
+                                             receipt_class="assistant_reply")
 
     assert len((await _read(temp_db, ids=[INSIDE]))["receipts"]) == 1
 
@@ -238,7 +241,8 @@ async def test_versions_hash_is_stable_across_identical_reads(temp_db):
     _doc(temp_db, THREAD, INSIDE)
     _art(temp_db, CH, INSIDE)
     _tools(temp_db, CH, INSIDE)
-    await temp_db.register_receipt_async(TEAM, CH, INSIDE, "turn", "finalized")
+    await temp_db.register_receipt_async(TEAM, CH, INSIDE, "turn", "finalized",
+                                         receipt_class="assistant_reply")
 
     first = (await _read(temp_db, ids=[INSIDE]))["versions_hash"]
     second = (await _read(temp_db, ids=[INSIDE]))["versions_hash"]
@@ -261,9 +265,11 @@ async def test_versions_hash_changes_when_an_ambient_status_flips_to_ready(temp_
 
 
 async def test_versions_hash_changes_when_a_receipt_is_promoted(temp_db):
-    await temp_db.register_receipt_async(TEAM, CH, INSIDE, "turn", "in_flight")
+    await temp_db.register_receipt_async(TEAM, CH, INSIDE, "turn", "in_flight",
+                                         receipt_class="assistant_reply")
     before = (await _read(temp_db, ids=[INSIDE]))["versions_hash"]
-    await temp_db.register_receipt_async(TEAM, CH, INSIDE, "turn", "finalized")
+    await temp_db.register_receipt_async(TEAM, CH, INSIDE, "turn", "finalized",
+                                         receipt_class="assistant_reply")
     assert (await _read(temp_db, ids=[INSIDE]))["versions_hash"] != before
 
 
@@ -289,7 +295,8 @@ async def test_payload_is_plain_committed_data(temp_db):
     _doc(temp_db, THREAD, INSIDE)
     _art(temp_db, CH, INSIDE)
     _tools(temp_db, CH, INSIDE)
-    await temp_db.register_receipt_async(TEAM, CH, INSIDE, "turn", "finalized")
+    await temp_db.register_receipt_async(TEAM, CH, INSIDE, "turn", "finalized",
+                                         receipt_class="assistant_reply")
 
     payload = await _read(temp_db, ids=[INSIDE])
     # Exact types on purpose: a sqlite3.Row / lazy mapping must not survive the accessor.

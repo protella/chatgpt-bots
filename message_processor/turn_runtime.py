@@ -51,7 +51,8 @@ P3 added the other half of that sentence: what the turn has CAUSED.
 import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
+from types import MappingProxyType
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Set, Tuple
 
 from config import config
 from logger import setup_logger
@@ -67,6 +68,25 @@ logger = setup_logger(name="slack_bot.TurnRuntime")
 # thing they were asked for, and "the model saw a ts somewhere" is precisely what may not
 # authorize a post.
 DISCOVERY_SOURCES = frozenset({"fetch_thread_messages", "fetch_channel_history", "search_slack"})
+
+# EDIT §2/§4. The ONE receipt class whose finalized messages are editable. Restated from the
+# closed enum the receipt ledger validates (outbound_receipts), because authorization must name
+# the class it requires rather than accept whatever a row happens to carry — a legacy NULL-class
+# row, chrome, a correction announcement and a background-job card all fail this comparison.
+RECEIPT_CLASS_ASSISTANT_REPLY = "assistant_reply"
+
+
+@dataclass(frozen=True)
+class AuthorizedEditTarget:
+    """EDIT §2. One exact message this turn may edit, and the facts proved about it at proof
+    time. `edited_ts` is Slack's `edited.ts` snapshot when the proof was made (None for a
+    never-edited message) — the executor compares it again before overwriting anything."""
+
+    channel_id: str
+    message_ts: str
+    thread_root_ts: Optional[str]
+    edited_ts: Optional[str]
+    receipt_class: str
 
 # How long a straggling tool flight gets to unwind AFTER it has been cancelled. Cancellation is
 # established, not requested: the turn waits for the CancelledError to actually land, because the
@@ -233,6 +253,10 @@ class ToolFlight:
     # execution, so its claims are one list. Sibling isolation is unaffected — different calls
     # are different flights.
     staged_roots: List[Any] = field(default_factory=list, repr=False)
+    # EDIT §2b. Exact-message edit targets THIS EXECUTION's result claims, staged by the read
+    # executor and committed by whichever waiter selects the flight's real result — on the
+    # flight for exactly the same reason `staged_roots` is.
+    staged_edit_targets: List[Any] = field(default_factory=list, repr=False)
 
     def mark_launched(self) -> None:
         """Called by the executor ATOMICALLY immediately before the side-effect request."""
@@ -263,6 +287,8 @@ DEST_KIND_STREAM = "stream"
 DEST_KIND_SPLIT = "split"
 DEST_KIND_POST_TO_THREAD = "post_to_thread"
 DEST_KIND_RECONCILED = "reconciled"
+# EDIT §7. The correction disclosure `edit_own_message` posts before it overwrites anything.
+DEST_KIND_CORRECTION_ANNOUNCEMENT = "correction_announcement"
 
 # The registry name of the tool that produces that record. Stated here, next to the kind, because
 # the responder needs the NAME (to decide whether the cross-thread conduct paragraph rides this
@@ -367,6 +393,29 @@ class ReconsiderFacts:
         return payload
 
 
+# EDIT §7. The two states an EditRecord can be in. The record is created immediately after the
+# correction announcement is accepted (`announcement_only`); a successful chat.update mutates it
+# to `committed`; a post-announcement failure keeps `announcement_only` with the exact error.
+EDIT_STATE_ANNOUNCEMENT_ONLY = "announcement_only"
+EDIT_STATE_COMMITTED = "committed"
+
+
+@dataclass
+class EditRecord:
+    """EDIT §7. One `edit_own_message` attempt's outcome, held on `TurnRuntime.edits`.
+
+    Deliberately NOT under a `committed_*` name: the `committed_destinations` convention means
+    committed-only, and this list also carries the announcement-only partials — the disclosure
+    landed even though the overwrite did not, and provenance must say so.
+    """
+
+    channel_id: str
+    target_ts: str
+    announcement_ts: str
+    state: str = EDIT_STATE_ANNOUNCEMENT_ONLY
+    error: Optional[str] = None
+
+
 @dataclass
 class TurnRuntime:
     """Per-turn presentation + work-claim state. Created in main.py, threaded to the handlers."""
@@ -461,6 +510,14 @@ class TurnRuntime:
     # persisted, monotone within the turn. Separate from the stream's own labels so the two
     # sources stay distinguishable in telemetry and in the failure message.
     _discovered_roots: Set[str] = field(default_factory=set, repr=False)
+    # EDIT §2b. Exact messages this turn's TOOL RESULTS proved editable, keyed by message_ts.
+    # Turn-local, never persisted. Separate from the stream-rendered mapping for the same reason
+    # the discovered roots are separate from the stream's labels.
+    _discovered_edit_targets: Dict[str, AuthorizedEditTarget] = field(default_factory=dict,
+                                                                      repr=False)
+    # Targets excluded FOREVER this turn because two appearances disagreed about
+    # edited_ts/receipt_class/thread_root_ts. Conflict excludes; it never chooses.
+    _conflicted_edit_targets: Set[str] = field(default_factory=set, repr=False)
     # Did a stream build actually happen? Distinguishes "channel turn that rendered the room"
     # from one that failed closed before the fetch — a distinction turn_outcome reports.
     stream_build_present: bool = False
@@ -471,6 +528,10 @@ class TurnRuntime:
     # WHERE this turn's own words landed. Appended at the first Slack-accepted surface, marked
     # committed when that surface reaches its final text.
     destinations: List[DestinationRecord] = field(default_factory=list)
+    # EDIT §7. Every `edit_own_message` attempt that got as far as an accepted announcement —
+    # committed overwrites AND announcement-only partials. Provenance and `turn_outcome.edits`
+    # read this list whole; `committed_edits` below is the committed-only filter.
+    edits: List[EditRecord] = field(default_factory=list)
     # §5.4a exit-path amendment. THE PROVENANCE INPUTS THE TURN OWNS, accrued as tools run
     # rather than handed over when the loop returns.
     #
@@ -557,6 +618,85 @@ class TurnRuntime:
     def discovered_thread_roots(self) -> frozenset:
         return frozenset(self._discovered_roots)
 
+    # --- discovered edit targets (EDIT §2b) --------------------------------------------------
+
+    def enroll_discovered_edit_target(self, *, channel_id: str, message_ts: str,
+                                      thread_root_ts: Optional[str], edited_ts: Optional[str],
+                                      receipt_class: str, source: str) -> bool:
+        """Enroll ONE exact-message edit target, from ONE tool result. True when newly enrolled.
+
+        Refuses — returning False, logging at DEBUG, never raising — on anything short of full
+        proof: a source outside `DISCOVERY_SOURCES`, a channel that is not this turn's channel,
+        a ts that is not a string or does not parse, a malformed thread_root_ts/edited_ts, or a
+        receipt class that is not `assistant_reply` (§2c: legacy NULL-class rows and every other
+        class are ineligible — the executor already checked, and this re-check is what makes a
+        bypassed executor grant nothing).
+
+        A DUPLICATE ts must AGREE on edited_ts/receipt_class/thread_root_ts. A conflict EXCLUDES
+        the target for the rest of the turn rather than choosing a snapshot: two proofs that
+        disagree describe a message that changed while it was being proved.
+        """
+        if source not in DISCOVERY_SOURCES:
+            logger.debug(f"discovered edit target refused: {source!r} is not a staging tool")
+            return False
+        own = self._own_channel_id()
+        if not own or not isinstance(channel_id, str) or channel_id != own:
+            logger.debug(
+                f"discovered edit target refused: {channel_id!r} is not this turn's channel")
+            return False
+        if not isinstance(message_ts, str):
+            logger.debug(f"discovered edit target refused: {message_ts!r} is not a timestamp")
+            return False
+        try:
+            parse_ts(message_ts)
+        except TimestampError:
+            logger.debug(f"discovered edit target refused: {message_ts!r} does not parse")
+            return False
+        for label, value in (("thread_root_ts", thread_root_ts), ("edited_ts", edited_ts)):
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                logger.debug(f"discovered edit target refused: {label} {value!r} is not a "
+                             "timestamp")
+                return False
+            try:
+                parse_ts(value)
+            except TimestampError:
+                logger.debug(f"discovered edit target refused: {label} {value!r} does not parse")
+                return False
+        if receipt_class != RECEIPT_CLASS_ASSISTANT_REPLY:
+            logger.debug(
+                f"discovered edit target refused: class {receipt_class!r} is not editable")
+            return False
+        if message_ts in self._conflicted_edit_targets:
+            return False
+        target = AuthorizedEditTarget(channel_id=channel_id, message_ts=message_ts,
+                                      thread_root_ts=thread_root_ts, edited_ts=edited_ts,
+                                      receipt_class=receipt_class)
+        held = self._discovered_edit_targets.get(message_ts)
+        if held is not None:
+            if held == target:
+                return False
+            self._discovered_edit_targets.pop(message_ts, None)
+            self._conflicted_edit_targets.add(message_ts)
+            logger.debug(f"discovered edit target {message_ts} excluded: two proofs disagree "
+                         f"({held!r} vs {target!r})")
+            return False
+        self._discovered_edit_targets[message_ts] = target
+        return True
+
+    @property
+    def discovered_edit_targets(self) -> Mapping[str, AuthorizedEditTarget]:
+        """A frozen read of the enrolled targets — a copy behind a read-only proxy, so no caller
+        can widen the turn's authority by writing into what it was handed."""
+        return MappingProxyType(dict(self._discovered_edit_targets))
+
+    @property
+    def conflicted_edit_targets(self) -> frozenset:
+        """The ts values conflict has excluded — read by the combiner so a stream-rendered
+        appearance of an excluded target does not resurrect it."""
+        return frozenset(self._conflicted_edit_targets)
+
     # --- destination records ---------------------------------------------------------------
 
     def note_destination_observed(self, *, channel_id: Optional[str], first_ts: Optional[str],
@@ -627,6 +767,12 @@ class TurnRuntime:
     @property
     def committed_destinations(self) -> List[DestinationRecord]:
         return [r for r in self.destinations if r.committed]
+
+    @property
+    def committed_edits(self) -> List[EditRecord]:
+        """EDIT §7: the edits whose overwrite actually landed. Never supplies announcement
+        provenance — the announcement rides `turn.edits` in both states."""
+        return [e for e in self.edits if e.state == EDIT_STATE_COMMITTED]
 
     def next_model_attempt(self, *, model: Optional[str] = None,
                            fork_reason: Optional[str] = None) -> ModelAttempt:

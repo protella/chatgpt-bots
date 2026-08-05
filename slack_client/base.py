@@ -128,6 +128,14 @@ class SlackBot(SlackMessageEventsMixin,
             # showed it) instead of the DM instruction to acknowledge in the origin thread.
             registry.register(self.get_post_to_thread_tool_schema(), self.execute_post_to_thread,
                               channel_schema=self.get_post_to_thread_channel_schema)
+        # EDIT_OWN_MESSAGE §3: overwrite ONE own finalized reply, disclosure-first. One static
+        # schema, exposed on the CHANNEL surface only — DMs have no channel stream and receipts
+        # are structurally exempt there, so no exact-message proof exists (the executor
+        # re-refuses DM contexts as defense in depth). BUDGETED, not free: it performs two
+        # visible mutations. No feature flag, per the spec.
+        registry.register(self.get_edit_own_message_tool_schema(),
+                          self.execute_edit_own_message,
+                          enabled=lambda _cfg: False)
         # F2: on the DM surface no_response_needed is exposed only on turns whose ROUTE allows
         # silence (the `silence_capable` routing fact), via the per-request
         # _silence_capable_turn flag the text handler sets in a COPIED config. On the channel
@@ -221,24 +229,31 @@ class SlackBot(SlackMessageEventsMixin,
                                  lease: Any = None,
                                  surface: str = "error_notice",
                                  receipts: Any = None,
-                                 receipt_kind: Optional[str] = None) -> Optional[str]:
+                                 receipt_kind: Optional[str] = None,
+                                 receipt_class: Optional[str] = None) -> Optional[str]:
         """Send a text message (async version); forwards footer blocks, meta_out, the
-        stale-send lease and the receipt intent to send_message."""
+        stale-send lease and the receipt intent (kind AND class) to send_message."""
         return await self.send_message(channel_id, thread_id, text, blocks=blocks,
                                        meta_out=meta_out, lease=lease, surface=surface,
-                                       receipts=receipts, receipt_kind=receipt_kind)
+                                       receipts=receipts, receipt_kind=receipt_kind,
+                                       receipt_class=receipt_class)
 
     async def send_image_async(self, channel_id: str, thread_id: str, image_data: bytes, filename: str,
                                caption: str = "", meta_out: Optional[dict] = None,
-                               receipts: Any = None) -> Optional[str]:
-        """Send an image (async version); forwards meta_out to send_image."""
+                               receipts: Any = None, *,
+                               receipt_class: Optional[str]) -> Optional[str]:
+        """Send an image (async version); forwards meta_out and the §11.13 class stamp to
+        send_image."""
         return await self.send_image(channel_id, thread_id, image_data, filename, caption,
-                                     meta_out=meta_out, receipts=receipts)
+                                     meta_out=meta_out, receipts=receipts,
+                                     receipt_class=receipt_class)
 
     async def send_thinking_indicator_async(self, channel_id: str, thread_id: str,
-                                            receipts: Any = None) -> Optional[str]:
+                                            receipts: Any = None, *,
+                                            receipt_class: Optional[str]) -> Optional[str]:
         """Send a thinking/processing indicator (async version)"""
-        return await self.send_thinking_indicator(channel_id, thread_id, receipts=receipts)
+        return await self.send_thinking_indicator(channel_id, thread_id, receipts=receipts,
+                                                  receipt_class=receipt_class)
 
     async def delete_message_async(self, channel_id: str, message_id: str) -> bool:
         """Delete a message (async version)"""
@@ -246,10 +261,12 @@ class SlackBot(SlackMessageEventsMixin,
 
     async def update_message_async(self, channel_id: str, message_id: str, text: str,
                                    receipts: Any = None,
-                                   receipt_kind: Optional[str] = None) -> bool:
+                                   receipt_kind: Optional[str] = None,
+                                   receipt_class: Optional[str] = None) -> bool:
         """Update a message (async version)"""
         return await self.update_message(channel_id, message_id, text, receipts=receipts,
-                                         receipt_kind=receipt_kind)
+                                         receipt_kind=receipt_kind,
+                                         receipt_class=receipt_class)
 
     async def get_thread_history_async(self, channel_id: str, thread_id: str, limit: int = None,
                                        oldest: str = None) -> List[Message]:

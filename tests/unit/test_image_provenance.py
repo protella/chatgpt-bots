@@ -142,7 +142,7 @@ def _client(resolve=None, file_id="F123"):
     c = MagicMock()
 
     async def send_image(channel_id, thread_id, data, filename, caption, meta_out=None,
-                         receipts=None):
+                         receipts=None, *, receipt_class):
         if meta_out is not None and file_id is not None:
             meta_out["file_id"] = file_id
         return "https://files.slack.com/img.png"
@@ -287,14 +287,16 @@ class TestSendImageMetaOut:
     async def test_meta_out_receives_the_file_id(self):
         m = _Messaging(upload_result={"files": [{"id": "F123", "url_private": "u"}]})
         meta = {}
-        assert await m.send_image("C1", "1.0", b"x", "a.png", "", meta_out=meta) == "u"
+        assert await m.send_image("C1", "1.0", b"x", "a.png", "", meta_out=meta,
+                                  receipt_class="artifact") == "u"
         assert meta["file_id"] == "F123"
 
     @pytest.mark.asyncio
     async def test_without_meta_out_the_upload_still_works(self):
         """The return contract is the URL and nothing else — every legacy caller omits meta_out."""
         m = _Messaging(upload_result={"files": [{"id": "F123", "url_private": "u"}]})
-        assert await m.send_image("C1", "1.0", b"x", "a.png") == "u"
+        assert await m.send_image("C1", "1.0", b"x", "a.png",
+                                  receipt_class="artifact") == "u"
 
 
 # --------------------------------------------------------------------------- publish_image

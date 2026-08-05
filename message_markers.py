@@ -123,6 +123,53 @@ def starts_as_continuation(text: str) -> bool:
     return any(stripped.startswith(h) for h in _HEAD_VARIANTS)
 
 
+def extract_continuation_markers(text: str) -> Tuple[str, str, str]:
+    """Split a message into ``(prefix, body, suffix)`` around its continuation markers,
+    BYTE-PRESERVING: ``prefix + body + suffix == text`` always, and a legacy marker form
+    (``**bold**`` / ``_italic_``) is returned exactly as stored, never rewritten to the
+    canonical shape (EDIT_OWN_MESSAGE §6).
+
+    ``prefix`` is a leading part-prefix ("*Part 2 (continued)*\\n\\n") or continuation head
+    plus the whitespace that separates it from the body; ``suffix`` is every trailing
+    continuation trailer plus the whitespace either side of it. A message with no markers
+    comes back as ("", text, "") — an edit of it replaces the whole thing.
+
+    Exists for `edit_own_message`: the model supplies the BODY only, and the executor
+    reapplies these exact bytes around the replacement so a mid-split part keeps its seams.
+    """
+    if not text:
+        return "", text or "", ""
+    prefix_end = 0
+    match = _PART_PREFIX_RE.match(text)
+    if match:
+        prefix_end = match.end()
+    else:
+        lead_ws = len(text) - len(text.lstrip())
+        stripped = text[lead_ws:]
+        for head in _HEAD_VARIANTS:
+            if stripped.startswith(head):
+                after = lead_ws + len(head)
+                # The whitespace strip_continuation_markers eats after a head belongs to the
+                # marker, not the body — same characters, so the two never disagree.
+                rest = text[after:]
+                prefix_end = len(text) - len(rest.lstrip("\n "))
+                break
+    end = len(text)
+    while True:
+        remaining = text[prefix_end:end].rstrip()
+        found = None
+        for trailer in _TRAILER_VARIANTS:
+            if remaining.endswith(trailer):
+                found = trailer
+                break
+        if found is None:
+            break
+        # Body ends where its own text does; the whitespace that separated it from the
+        # trailer rides the suffix, so reapplying prefix+new_body+suffix restores the seam.
+        end = prefix_end + len(remaining[: -len(found)].rstrip())
+    return text[:prefix_end], text[prefix_end:end], text[end:]
+
+
 def strip_continuation_markers(text: str) -> str:
     """Remove part prefixes and continuation trailers/heads from a message body."""
     if not text:

@@ -49,6 +49,35 @@ OLD_ROOT = "1000.000100"
 OLD_REPLY = "1000.000200"
 
 
+def _class_aware(fake_slack_cls):
+    """test_reply_surface's FakeSlack predates the REQUIRED `receipt_class` keyword
+    (EDIT_OWN_MESSAGE §4) that every posting site now passes. Accept and record it here —
+    nothing else about the fake changes, and the recorded pairs let a test assert the class
+    a production call site actually stamped."""
+    class _ClassAware(fake_slack_cls):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.receipt_classes = []
+
+        async def send_message_get_ts(self, *args, receipt_class=None, **kwargs):
+            self.receipt_classes.append(("send_message_get_ts", receipt_class))
+            return await super().send_message_get_ts(*args, **kwargs)
+
+        async def send_message(self, *args, receipt_class=None, **kwargs):
+            self.receipt_classes.append(("send_message", receipt_class))
+            return await super().send_message(*args, **kwargs)
+
+        async def update_message(self, *args, receipt_class=None, **kwargs):
+            self.receipt_classes.append(("update_message", receipt_class))
+            return await super().update_message(*args, **kwargs)
+
+        async def update_message_streaming(self, *args, receipt_class=None, **kwargs):
+            self.receipt_classes.append(("update_message_streaming", receipt_class))
+            return await super().update_message_streaming(*args, **kwargs)
+
+    return _ClassAware
+
+
 # --------------------------------------------------------------- the recorded live payload
 #
 # WHAT SLACK ACTUALLY RETURNS (probe, 2026-07-31, workspace T0320A41P). An
@@ -1188,13 +1217,15 @@ async def test_an_in_place_streamed_reply_still_carries_its_own_provenance(temp_
     processor._build_tool_context = MagicMock(return_value=SimpleNamespace(
         background_job_started=False, sandbox_image_assets=[], mounted_files=[]))
 
-    slack = FakeSlack()
+    slack = _class_aware(FakeSlack)()
     message = _message(channel="C1", thread="10.0")
     response = await _run(processor, slack, message, _thread_state(), _thread_turn(message))
 
     assert (response.content or "") == "" or response.metadata.get("streamed")
     delivered = slack.posts
     assert delivered, "nothing was delivered, so this test proves nothing about the row"
+    # The reply site stamped its §4 class on the way through the transport.
+    assert ("send_message_get_ts", "assistant_reply") in slack.receipt_classes
     await MessageUtilitiesMixin.drain_background_tasks(processor)
 
     rows = await temp_db.get_thread_tool_usage_async("C1:10.0")
@@ -1441,7 +1472,7 @@ async def test_a_streamed_post_keeps_its_provenance_when_a_later_round_fails(
     processor._prepare_sandbox_tools = AsyncMock(return_value=None)
 
     # NATIVE, deliberately: hole 1a only exists once the native stream owns the message.
-    slack = FakeSlack(native=True)
+    slack = _class_aware(FakeSlack)(native=True)
     # The trigger has to be NEWER than the seeded thread: the scan only reads messages strictly
     # older than the message it is answering (§S3), and this file's fixtures live at 1000.x.
     message = _message(channel=CHANNEL, thread="10.0", ts="9000.0")
@@ -1509,7 +1540,7 @@ async def test_one_turn_that_replies_here_and_posts_there_writes_two_rows(temp_d
     processor._build_tool_context = MagicMock(return_value=SimpleNamespace(
         background_job_started=False, sandbox_image_assets=[], mounted_files=[]))
 
-    slack = FakeSlack()
+    slack = _class_aware(FakeSlack)()
     message = _message(channel=CHANNEL, thread="10.0")
     turn = _thread_turn(message)
     # The cross-thread post already landed this turn, exactly as `execute_post_to_thread` records
@@ -1525,6 +1556,9 @@ async def test_one_turn_that_replies_here_and_posts_there_writes_two_rows(temp_d
     in_place = await temp_db.get_thread_tool_usage_async(f"{CHANNEL}:10.0")
     detached = await temp_db.get_thread_tool_usage_async(f"{CHANNEL}:{OLD_ROOT}")
     assert slack.posts, "nothing was delivered in place, so there is no second key to compare"
+    # The in-place reply site stamped its §4 class on the way through the transport (this
+    # delivery rides the streaming seed, not a plain post).
+    assert ("send_message_get_ts", "assistant_reply") in slack.receipt_classes
     reply_ts = slack.posts[0]
     assert reply_ts in in_place, "the in-place reply lost its own provenance row"
     assert "9100.0" in detached, "the cross-thread post lost its provenance row"

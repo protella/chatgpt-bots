@@ -20,7 +20,8 @@ from message_processor.reconsideration import intercept_stale_send
 from message_processor.stale_send_guard import (ConversationWatermarks,
                                                 StaleSendSuppressed)
 from message_processor import turn_runtime
-from message_processor.turn_runtime import (DEST_KIND_POST_TO_THREAD, DEST_KIND_RECONCILED,
+from message_processor.turn_runtime import (DEST_KIND_CORRECTION_ANNOUNCEMENT,
+                                            DEST_KIND_POST_TO_THREAD, DEST_KIND_RECONCILED,
                                             DEST_KIND_REPLY, DEST_KIND_SPLIT, TurnRuntime)
 from message_processor import thread_files
 import token_counter
@@ -765,6 +766,14 @@ class ChatBotV2:
         return "stale_suppressed"
 
     @staticmethod
+    def _committed_correction_announcement(turn) -> bool:
+        """EDIT §7: whether this turn committed a correction disclosure — its OWN words in the
+        room, so wherever it and `detached` could both apply, `reply` wins (§11.5)."""
+        return turn is not None and any(
+            getattr(r, "kind", None) == DEST_KIND_CORRECTION_ANNOUNCEMENT
+            for r in (getattr(turn, "committed_destinations", None) or ()))
+
+    @staticmethod
     def _classify_visible_action(response, turn) -> str:
         """The ONE outcome the room saw, as a single label for the telemetry ledger.
 
@@ -805,6 +814,13 @@ class ChatBotV2:
             # a status card or a reply in another thread. Those are checked FIRST: they are the
             # loudest thing in the room, and a turn that visibly produced something is not a
             # silence no matter what the model called at the end.
+            #
+            # EDIT §11.5: the committed-correction-announcement ⇒ `reply` override runs BEFORE
+            # this terminal `detached` return. The disclosure sets visible_action_committed
+            # too, but it is this turn's OWN words in the room — a reply, not a detached
+            # producer's surface.
+            if ChatBotV2._committed_correction_announcement(turn):
+                return "reply"
             if (turn is not None and getattr(turn, "visible_action_committed", False)) \
                     or meta.get("background_job_started"):
                 return "detached"
@@ -829,6 +845,11 @@ class ChatBotV2:
             # so every delivery outage read as the bot talking normally.
             return "delivery_failed"
         if posted:
+            return "reply"
+        # EDIT §7: a committed correction announcement is this turn's OWN words in the room —
+        # the disclosure edit_own_message posted before overwriting anything. An empty-response
+        # turn that committed one spoke, so it is a `reply`, not a detached producer.
+        if ChatBotV2._committed_correction_announcement(turn):
             return "reply"
         if (turn is not None and getattr(turn, "visible_action_committed", False)) \
                 or meta.get("background_job_started"):
@@ -1016,6 +1037,7 @@ class ChatBotV2:
                     message.channel_id,
                     post_thread_id,
                     receipts=turn.receipt_ledger,
+                    receipt_class="chrome",
                 )
                 # Batched catch-up turn (drained queue): make the status say so.
                 batch_size = message.metadata.get("queued_batch_size", 0)
@@ -1125,6 +1147,7 @@ class ChatBotV2:
                                     message.channel_id, _thread, _response.content,
                                     blocks=_blocks, meta_out=_meta, lease=lease,
                                     receipts=turn.receipt_ledger,
+                                    receipt_class="assistant_reply",
                                     on_first_accept=_observe_reply)
 
                             # The stale guard's last chance on this path: the lease refuses
@@ -1147,6 +1170,7 @@ class ChatBotV2:
                                     meta_out=send_meta,
                                     lease=lease,
                                     receipts=turn.receipt_ledger,
+                                    receipt_class="assistant_reply",
                                     on_first_accept=_observe_reply,
                                 )
                             except StaleSendSuppressed as stale:
@@ -1655,8 +1679,13 @@ class ChatBotV2:
         # as one would have the bot remember a conversation in the wrong room. The post stays
         # observable in turn_outcome's destinations; grouping it with its own thread's evidence is
         # P4's, where the target's side of the exchange is available to group it with.
+        # A CORRECTION ANNOUNCEMENT is excluded for the same reason: it is disclosure chrome
+        # about an edit, not this exchange's answer — remembering "what was asked HERE" paired
+        # with "Correction to my earlier message…" would store a conversation nobody had.
         committed = [r for r in turn.committed_destinations
-                     if (r.text or "").strip() and r.kind != DEST_KIND_POST_TO_THREAD]
+                     if (r.text or "").strip()
+                     and r.kind not in (DEST_KIND_POST_TO_THREAD,
+                                        DEST_KIND_CORRECTION_ANNOUNCEMENT)]
         if not committed:
             return
         processor = self.processor

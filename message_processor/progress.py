@@ -139,7 +139,8 @@ class ProgressChecklist:
             return
         msg_id = None
         if hasattr(self._client, "send_thinking_indicator"):
-            msg_id = await self._client.send_thinking_indicator(self._channel_id, self._thread_id)
+            msg_id = await self._client.send_thinking_indicator(
+                self._channel_id, self._thread_id, receipt_class="chrome")
         if msg_id:
             self._message_id = msg_id
             self._surface = "message"
@@ -223,7 +224,10 @@ class ProgressChecklist:
         try:
             res = await self._client.send_message_get_ts(
                 self._channel_id, self._thread_id, self._message_body(),
-                receipts=self._receipts, receipt_kind="chrome")
+                receipts=self._receipts, receipt_kind="chrome",
+                # Spec §4: a job's progress checklist is chrome-STATE with class
+                # background_job (the "checklist" row of the class table).
+                receipt_class="background_job")
             if res and res.get("success") and res.get("ts"):
                 self._message_id = res["ts"]
                 return True

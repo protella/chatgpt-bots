@@ -491,9 +491,10 @@ def test_membership_hash_sorts_numerically_not_lexicographically():
 # ------------------------------------------------------------------ metadata + hash
 
 def test_item_metadata_keys_are_exactly_the_pinned_set():
+    # v4 added `edited_ts` — the EDIT §2a authorization snapshot rides the item's own metadata.
     stream = serialize_stream(pinned([msg(T1, root=T0)]))
     assert set(stream.message_items[0].metadata) == {
-        "channel_id", "sender_id", "ts", "thread_root_ts", "sender_type"}
+        "channel_id", "sender_id", "ts", "thread_root_ts", "sender_type", "edited_ts"}
     assert stream.message_items[0].metadata["ts"] == T1
     assert stream.message_items[0].metadata["thread_root_ts"] == T0
 
@@ -724,7 +725,7 @@ def test_the_canonical_sequence_is_horizon_messages_marker():
     stream = serialize_stream(pinned(
         [msg(T0, text="a human said this"),
          msg(T1, text="and we answered", sender="B0", sender_type="self")], cards=cards))
-    assert SERIALIZER_VERSION == 3
+    assert SERIALIZER_VERSION == 4
     assert stream.items[0] is stream.horizon_item
     assert stream.items[-1] is stream.end_marker_item
     assert stream.items[1:-1] == stream.message_items

@@ -425,6 +425,22 @@ reaction_only). They are re-run as regressions, not rewritten — the social-mil
 deliberately narrow enough that praise inside an exchange between people is not a milestone, which
 is what keeps them and win-lands-others where they are.
 
+=========================== NEW WITH EDIT_OWN_MESSAGE — OWNER REVIEW ===========================
+
+One row, the tool's whole restraint in one turn. Nothing else in the table moved.
+
+| id                            | setup                                                        | expected outcome                | bar     |
+|-------------------------------|--------------------------------------------------------------|---------------------------------|---------|
+| wrong-detail-new-correction   | its own rendered reply states a wrong figure; the person     | in_thread_reply STATING 48,000  | measure |
+|                               | corrects it to its face                                      | — a NEW message, not an edit    |         |
+
+WHY MEASURE. The owner's ruling is that the default correction is a NEW message and the edit is
+the exception for a detail whose wrong version standing in place would keep misleading — a
+judgment call the harness must not decide on the model's behalf (the same reasoning as
+team-welcome's bar). The row runs, records and reports the outcome AND any `edit_own_message`
+call in the effects every time, so a drift toward editing is loudly visible without blocking;
+the orchestrator records the baseline after unit green.
+
 ============================ STALE RECONSIDERATION (§8) — OWNER REVIEW =========================
 
 The reconsideration decision itself (Docs/specs/STALE_RECONSIDERATION.md §4d): the bot finished a
@@ -1122,6 +1138,23 @@ NEWS_SETTLES_BURIED_LOOP = _room([
 ])
 
 
+# EDIT_OWN_MESSAGE §9: the bot's own rendered reply carries a wrong figure, and the person it
+# answered points the error out to its face. The DEFAULT is a NEW correction message — editing
+# the standing message is the exception, licensed only when the wrong text itself would keep
+# misleading where it stands — so the expected outcome is an in-thread reply carrying the
+# corrected figure, and any edit_own_message call is visible in the recorded effects.
+WRONG_DETAIL_POINTED_OUT = _room([
+    Say("1780041000.000100", "Dana Whitfield",
+        "chatgpt — what's the cap on vendor renewals this quarter?"),
+    Say("1780041100.000100", "ChatGPT",
+        "The renewals cap this quarter is $36,000 — that's the figure finance recorded.",
+        kind="self", thread="1780041000.000100"),
+    Say("1780041200.000100", "Dana Whitfield",
+        "chatgpt that's not right — finance revised it last week, the cap is $48,000 now",
+        thread="1780041000.000100"),
+])
+
+
 @dataclass(frozen=True)
 class ResponderScenario:
     id: str
@@ -1440,6 +1473,23 @@ RESPONDER_SCENARIOS: Tuple[ResponderScenario, ...] = (
                       "lands on, not about going quiet when someone ribs it, and a fix that mutes "
                       "this row has taken the personality out with the dig.",
                       addressed=True, silence_capable=False),
+
+    # ------------------------------------------------ EDIT_OWN_MESSAGE §9: the default is a post
+    ResponderScenario("wrong-detail-new-correction", WRONG_DETAIL_POINTED_OUT,
+                      "1780041200.000100", (IN_THREAD_REPLY, CHANNEL_REPLY), MEASURE,
+                      "EDIT_OWN_MESSAGE §9. Its own rendered reply carries a wrong figure and "
+                      "the person points it out. The DEFAULT is a NEW correction message that "
+                      "states the corrected figure — an edit is licensed only when the standing "
+                      "wrong detail would keep misleading in place, and even an explicit 'fix "
+                      "the message itself' request supports that judgment rather than replacing "
+                      "it; when an edit does happen, the edited target's own thread gets the "
+                      "synthesized disclosure (§5). MEASURE while the tool is new: the outcome "
+                      "and any edit_own_message call in the recorded effects are run and "
+                      "reported every time (recording the baseline is the orchestrator's job), "
+                      "so a drift toward editing is visible without the harness deciding the "
+                      "owner's exception on the model's behalf.",
+                      addressed=True, silence_capable=False,
+                      must_state="48,000"),
 )
 
 

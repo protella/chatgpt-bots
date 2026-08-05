@@ -16,11 +16,14 @@ import asyncio
 import copy
 import hashlib
 import json
-from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Mapping, Optional
 
 from config import config
 from logger import setup_logger
+
+if TYPE_CHECKING:  # a module-scope import would cycle through slack_client.base
+    from message_processor.turn_runtime import AuthorizedEditTarget
 
 logger = setup_logger(name="slack_bot.ToolRegistry")
 
@@ -168,6 +171,13 @@ class ToolContext:
     # the model was shown is what it may act on, and the excluded/in-flight messages a snapshot
     # still carries were withheld from it on purpose.
     trusted_thread_roots: Optional[frozenset] = None
+    # EDIT §2. The exact own messages this turn may edit, keyed by message_ts. An edit is
+    # authorized iff the target ts is a key. UNLIKE the roots above there is no None sentinel:
+    # a missing or malformed source resolves to the EMPTY mapping, never None, because "no
+    # stream" must fail an edit closed where it keeps a legacy post path open. Restamped from
+    # the turn once at the top of every dispatch round, so a read and an edit in the SAME round
+    # can never authorize each other.
+    authorized_edit_targets: Mapping[str, "AuthorizedEditTarget"] = field(default_factory=dict)
     # --- per-call identity (spec §6 d2) ---------------------------------------------------
     # These four are set on a SHALLOW PER-CALL COPY of the context, never on the shared one: a
     # round's calls run CONCURRENTLY (dispatch_all gathers them), so a single mutable "current
@@ -544,6 +554,7 @@ class ToolRegistry:
         # fact about control flow rather than a guess made from a clock while the answer was
         # still undecided.
         self._commit_staged_roots(flight, turn, result)
+        self._commit_staged_edit_targets(flight, turn, result)
         return result
 
     @staticmethod
@@ -576,6 +587,35 @@ class ToolRegistry:
                 enroll(channel_id=root.channel_id, root_ts=root.root_ts, source=root.source)
         except Exception as e:  # noqa: BLE001 — authority is never load-bearing for the answer
             logger.debug(f"staged roots not committed: {e}")
+
+    @staticmethod
+    def _commit_staged_edit_targets(flight: Any, turn: Any, result: Any) -> None:
+        """EDIT §2b: enroll the staged edit targets whose own `"ts"` field survives into what is
+        delivered — the same commit moment, the same clipped bytes and the same field-pair rule
+        as the staged roots, because "the model saw the exact message" is one question.
+
+        Enrollment lands on the TURN, and the round's context is only re-stamped at the top of
+        the NEXT `dispatch_all` — which is what keeps a same-round read and edit from authorizing
+        each other. Never raises: a call that returned content must not fail over bookkeeping.
+        """
+        staged = getattr(flight, "staged_edit_targets", None) if flight is not None else None
+        if not staged:
+            return
+        enroll = getattr(turn, "enroll_discovered_edit_target", None)
+        if enroll is None:
+            return
+        try:
+            clipped = serialize_tool_result(result)
+            for target in staged:
+                if not isinstance(target, StagedEditTarget):
+                    continue
+                if not _field_pair_survives(clipped, target.field, target.message_ts):
+                    continue
+                enroll(channel_id=target.channel_id, message_ts=target.message_ts,
+                       thread_root_ts=target.thread_root_ts, edited_ts=target.edited_ts,
+                       receipt_class=target.receipt_class, source=target.source)
+        except Exception as e:  # noqa: BLE001 — authority is never load-bearing for the answer
+            logger.debug(f"staged edit targets not committed: {e}")
 
     @staticmethod
     def _abandon(turn: Any, flight: Any) -> None:
@@ -653,6 +693,26 @@ class ToolRegistry:
         except Exception as e:  # noqa: BLE001 — a refresh that fails leaves the round's own set
             logger.debug(f"trusted thread roots not re-stamped for this round: {e}")
 
+    @staticmethod
+    def _restamp_edit_targets(ctx: Any) -> None:
+        """EDIT §2b. Re-resolve this ROUND's edit-target mapping from the turn, ONCE, before any
+        of the round's calls run — the exact discipline `_restamp_trusted_roots` states, for the
+        same reason: at the top, never per call, so a read and an edit issued in the SAME round
+        cannot authorize each other. A context with no turn keeps its explicit mapping, and a
+        refresh that fails leaves the round's own mapping in place (the mapping itself is never
+        None — the combiner fails to EMPTY, not to wide)."""
+        turn = getattr(ctx, "turn", None)
+        if turn is None:
+            return
+        try:
+            from message_processor.handlers.text import _authorized_edit_targets
+            resolved = _authorized_edit_targets(turn)
+            if not isinstance(resolved, Mapping):
+                return
+            ctx.authorized_edit_targets = resolved
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"authorized edit targets not re-stamped for this round: {e}")
+
     async def dispatch_all(self, ctx: ToolContext, calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Run a round's calls in parallel; result order matches ``calls``.
 
@@ -660,6 +720,7 @@ class ToolRegistry:
         at: the loop hands the ids it already has, and the registry decides whether the work has
         been done before."""
         self._restamp_trusted_roots(ctx)
+        self._restamp_edit_targets(ctx)
         return list(await asyncio.gather(
             *(self.dispatch(ctx, c.get("name", ""), c.get("arguments"), c.get("call_id"))
               for c in calls)
@@ -727,8 +788,56 @@ def _survives_truncation(clipped: str, root: StagedRoot) -> bool:
     pair cannot be forged from message text: JSON escapes the quotes inside a string value, so
     text reading `"thread_ts": "…"` serializes as `\\"thread_ts\\": \\"…\\"` and does not match.
     """
+    return _field_pair_survives(clipped, root.field, root.root_ts)
+
+
+def _field_pair_survives(clipped: str, field_name: str, value: Any) -> bool:
+    """The one rule, factored so the staged roots and the staged edit targets (EDIT §2b) cannot
+    apply two different readings of "survived the clip"."""
     try:
-        pair = json.dumps({root.field: root.root_ts}, ensure_ascii=False, default=str)[1:-1]
+        pair = json.dumps({field_name: value}, ensure_ascii=False, default=str)[1:-1]
     except Exception:  # noqa: BLE001 — unserializable claim, no authority
         return False
     return bool(pair) and pair in clipped
+
+
+@dataclass(frozen=True)
+class StagedEditTarget:
+    """EDIT §2b. One exact own message a read tool's result CLAIMS is editable, before anything
+    has granted it authority.
+
+    The executor that stages it has already proved the §2b preconditions — result from the
+    turn's own channel, a raw Slack message that is OURS, a finalized `assistant_reply` receipt,
+    and the exact ts present in the returned result — and the registry commits the claim only if
+    its own `"<field>": "<ts>"` pair survives the clipped serialization the model receives.
+
+    `source` is the tool name that returned it; `field` is the structured field the ts survived
+    in, for the same survival rule `StagedRoot` carries its field for.
+    """
+
+    channel_id: str
+    message_ts: str
+    thread_root_ts: Optional[str]
+    edited_ts: Optional[str]
+    receipt_class: str
+    source: str
+    field: str
+
+
+def stage_discovered_edit_target(ctx: Any, *, channel_id: str, message_ts: str,
+                                 thread_root_ts: Optional[str], edited_ts: Optional[str],
+                                 receipt_class: str, source: str, field: str) -> None:
+    """An executor CLAIMS an edit target. It does not get one.
+
+    The same split as `stage_discovered_root`, for the same reason: the executor cannot know
+    whether its result will be the one the model receives, so it may only record the claim on
+    the FLIGHT; `ToolRegistry` commits the subset whose own field survives the delivered,
+    clipped payload, and `TurnRuntime.enroll_discovered_edit_target` re-validates on the way
+    in. A context with no flight stages nothing and is not an error.
+    """
+    staged = getattr(getattr(ctx, "tool_flight", None), "staged_edit_targets", None)
+    if not isinstance(staged, list):
+        return
+    staged.append(StagedEditTarget(channel_id=channel_id, message_ts=message_ts,
+                                   thread_root_ts=thread_root_ts, edited_ts=edited_ts,
+                                   receipt_class=receipt_class, source=source, field=field))

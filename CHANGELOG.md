@@ -190,6 +190,18 @@ the channel was still holding open — even in a thread too old to be on screen 
 finds that thread and closes the loop there. The thread it was standing in gets at most a
 brief acknowledgment ("Got it — thanks."), never a report of the post.
 
+### ✏️ Added - It can correct its own messages, never silently
+
+The bot can now edit a message it posted — but only the way a careful teammate would. The
+default when something it said turns out wrong is still a NEW correction message; editing is
+reserved for a detail that would keep misleading people as long as it stands. Every edit is
+announced: the edited message's own thread always gets a new post naming what changed, with a
+link to the message — a silent edit is structurally impossible (the announcement posts first,
+and if it can't, nothing is edited). It can only edit its own finalized replies (never status
+cards, notices, shared files, or anything posted before this release), only in the channel
+where it's talking, and only messages it actually saw this turn. Everything is recorded: each
+edit lands in the participation ledger (telemetry contract v10) with its announcement.
+
 ### ⏱️ Fixed - A finished answer survives being raced
 
 Before: if someone (or another bot) posted a new message in the seconds between the bot

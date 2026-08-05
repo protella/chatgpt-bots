@@ -36,7 +36,7 @@ async def test_dm_with_status_posts_no_placeholder(monkeypatch):
         chat_postMessage=AsyncMock(return_value={"ts": "1.1"}),
     )
     host = _MsgClient(client)
-    ts = await host.send_thinking_indicator("D123", "T1")
+    ts = await host.send_thinking_indicator("D123", "T1", receipt_class="chrome")
     assert ts is None
     client.chat_postMessage.assert_not_awaited()
     client.assistant_threads_setStatus.assert_awaited_once()
@@ -52,7 +52,7 @@ async def test_dm_with_status_failure_falls_back_to_placeholder(monkeypatch):
         chat_postMessage=AsyncMock(return_value={"ts": "1.1"}),
     )
     host = _MsgClient(client)
-    ts = await host.send_thinking_indicator("D123", "T1")
+    ts = await host.send_thinking_indicator("D123", "T1", receipt_class="chrome")
     assert ts == "1.1"
     client.chat_postMessage.assert_awaited_once()
 
@@ -68,7 +68,7 @@ async def test_channel_always_posts_placeholder(monkeypatch):
         chat_postMessage=AsyncMock(return_value={"ts": "2.2"}),
     )
     host = _MsgClient(client)
-    ts = await host.send_thinking_indicator("C123", "T1")
+    ts = await host.send_thinking_indicator("C123", "T1", receipt_class="chrome")
     assert ts == "2.2"
     client.chat_postMessage.assert_awaited_once()
 
@@ -84,7 +84,7 @@ async def test_channel_with_status_success_is_status_only(monkeypatch):
         chat_postMessage=AsyncMock(return_value={"ts": "3.3"}),
     )
     host = _MsgClient(client)
-    ts = await host.send_thinking_indicator("C123", "T1")
+    ts = await host.send_thinking_indicator("C123", "T1", receipt_class="chrome")
     assert ts is None
     client.chat_postMessage.assert_not_awaited()
 
@@ -100,7 +100,7 @@ async def test_channel_with_status_failure_posts_placeholder(monkeypatch):
         chat_postMessage=AsyncMock(return_value={"ts": "3.3"}),
     )
     host = _MsgClient(client)
-    ts = await host.send_thinking_indicator("C123", "T1")
+    ts = await host.send_thinking_indicator("C123", "T1", receipt_class="chrome")
     assert ts == "3.3"
 
 
@@ -112,7 +112,7 @@ async def test_dm_with_assistant_status_disabled_posts_placeholder(monkeypatch):
         chat_postMessage=AsyncMock(return_value={"ts": "4.4"}),
     )
     host = _MsgClient(client)
-    ts = await host.send_thinking_indicator("D123", "T1")
+    ts = await host.send_thinking_indicator("D123", "T1", receipt_class="chrome")
     assert ts == "4.4"
     client.assistant_threads_setStatus.assert_not_awaited()
 

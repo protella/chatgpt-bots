@@ -4,7 +4,9 @@ Before F52 a message_changed event only reconciled derived artifacts and re-offe
 ambient memory; it never drove a reply: "@mention the bot, then edit to add the question" gets silence, and a
 meaningful edit to an already-answered message never gets a correction. F52 adds that — behind
 ENABLE_EDIT_TRIGGERED_REPLIES — through a chain of zero-cost pre-gates and two routes: a mention
-ADDED by the edit takes the addressed wake path (Slack fires no app_mention for edits); every
+ADDED by the edit takes the addressed wake path (an edit CAN fire a genuine app_mention —
+observed live 2026-07-16 when the edit adds the bot's mention — so the synthetic dispatch is
+deduped against it and kept only as a fallback); every
 other channel edit goes through the participation engine's full typo-vs-meaning judgment.
 
 These exercise the real decision code in SlackMessageEventsMixin + ParticipationEngine with

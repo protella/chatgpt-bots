@@ -896,6 +896,7 @@ async def _upload_candidates(
                 channel_id=channel_id, thread_id=thread_id,
                 file_data=io.BytesIO(data), filename=filename,
                 receipts=receipts,
+                receipt_class="artifact",
             )
         except Exception as e:  # noqa: BLE001 — publish_artifacts must never raise
             logger.warning(f"Artifact upload raised for {filename}: {e}")
