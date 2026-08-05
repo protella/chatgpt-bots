@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate a `participation.jsonl` ledger against telemetry contract CV8.
+"""Validate a `participation.jsonl` ledger against telemetry contract CV9.
 
 WHY THIS EXISTS. The P2 live battery decides whether a scenario passed by reading this ledger, so
 the ledger's structure is load-bearing evidence and not a debugging convenience. A join that
@@ -47,7 +47,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 # message_processor/participation_telemetry.py — keep the names identical so a diff is readable.
 # ===========================================================================================
 
-CONTRACT_VERSION = 8
+CONTRACT_VERSION = 9
 GATE_CONTRACT = "binary-v1"
 
 # On every line, at every version the emitter has ever written... except that `gate_contract`
@@ -71,12 +71,36 @@ RECEIPT_OPS = frozenset({
 })
 RECEIPT_STATES = frozenset({"absent", "in_flight", "finalized", "chrome"})
 MODEL_RESPONSE_STATUSES = frozenset({"ok", "error"})
+# v9 — how one reconsideration runner invocation ended, and the ALL EIGHT §4f error subtypes an
+# `error_dropped` may carry. Posted outcomes assert physical Slack acceptance, nothing more.
+RECONSIDER_OUTCOMES = frozenset({
+    "posted_asis", "posted_revised", "skipped", "fuse_dropped", "error_dropped", "cancelled",
+})
+RECONSIDER_ERRORS = frozenset({
+    "context_rebuild", "model_failure", "admission_overflow", "delivery_failed",
+    "epoch_invalidated", "guard_rearm_failed", "request_build", "delivery_exception",
+})
+
+# The LITERAL key grammar of the two v9 events: envelope plus these and nothing else. An unknown
+# key is failed rather than ignored — a field the emitter invented and no reader knows about is
+# how a contract drifts out from under the tool that is supposed to be grading it.
+RECONSIDER_START_FIELDS = frozenset(ENVELOPE_FIELDS) | {
+    "turn_id", "channel_id", "trigger_ts", "attempt_id", "pass", "scope", "observed_latest_ts",
+    "model_attempt_seq",
+}
+RECONSIDER_OUTCOME_FIELDS = frozenset(ENVELOPE_FIELDS) | {
+    "turn_id", "channel_id", "trigger_ts", "attempt_id", "outcome", "passes", "forced", "error",
+}
+# The nested `turn_outcome.reconsider` copy — ReconsiderFacts.as_payload() verbatim, so its key
+# grammar is closed too: these four and nothing else, with inapplicable keys OMITTED, never null.
+RECONSIDER_NESTED_FIELDS = frozenset({"outcome", "passes", "forced", "error"})
 
 # THE TERMINAL POPULATION IS THIS AND NOTHING ELSE. `turn_outcome` is not a terminal event (see
 # the emitter's v8 note), so it must never reach the visible_action index — invariant 3 checks
 # that separation rather than trusting this constant.
 TERMINAL_EVENT = "visible_action"
-TURN_EVENTS = frozenset({"turn_start", "turn_outcome", "stream_render", "model_response"})
+TURN_EVENTS = frozenset({"turn_start", "turn_outcome", "stream_render", "model_response",
+                         "reconsider_start", "reconsider_outcome"})
 
 # Mandatory fields, with the reason absence is a defect rather than a legal omission.
 MANDATORY: Dict[str, Tuple[Tuple[str, str], ...]] = {
@@ -97,6 +121,25 @@ MANDATORY: Dict[str, Tuple[Tuple[str, str], ...]] = {
         ("attempt_seq", "the per-turn contiguity contract is uncheckable without it"),
         ("status", "the one fact the event exists for"),
     ),
+    "reconsider_start": (
+        ("turn_id", "the primary turn-population join; a pass nobody's turn owns counts nothing"),
+        ("channel_id", "the runner always has the conversation key"),
+        ("trigger_ts", "as above"),
+        ("pass", "the contiguity contract is uncheckable without it"),
+        ("scope", "the full three-part suppressing scope is the pass's evidence"),
+        ("observed_latest_ts", "the message the pass is reconsidering against"),
+    ),
+    "reconsider_outcome": (
+        ("turn_id", "pairs the outcome to its passes and its turn"),
+        ("channel_id", "the runner always has the conversation key"),
+        ("trigger_ts", "as above"),
+        ("outcome", "the one fact the event exists for"),
+        ("passes", "the started-pass accounting is unreadable without it"),
+    ),
+    "stale_send": (
+        ("turn_id", "v9 rows carry it; the pass-count invariant counts suppression events per "
+                    "turn, and a row without one counts toward no turn"),
+    ),
     "outbound_receipt": (
         ("channel_id", "a receipt names a message in a channel or it names nothing"),
         ("message_ts", "as above"),
@@ -113,6 +156,19 @@ MANDATORY: Dict[str, Tuple[Tuple[str, str], ...]] = {
 #       stream_over_budget, history_fetch_failed, origin_fetch_failed), attempt_id only on a
 #       GATED turn.
 #   model_response.model/token counts — a call that raised before the response has none.
+#   reconsider_start.attempt_id/model_attempt_seq — ungated channel turns mint no attempt, and
+#       a failed attempt-sink open omits the seq (telemetry never blocks the model call).
+#   reconsider_outcome.attempt_id — as above; `forced` rides only on posted outcomes and
+#       `error` only on `error_dropped` — their PRESENCE elsewhere is the violation, absence
+#       is the normal encoding.
+#   stale_send.turn_id — NOT a legal absence: v9 rows REQUIRE it (MANDATORY above), because the
+#       pass-count invariant reads the per-turn suppression count. Older rows stay exempt for
+#       free — _grade_version skips anything below v9. DM rows carrying a turn_id with no
+#       channel turn_start to join are still TOLERATED by ruling at the JOIN level (DMs are
+#       outside the turn population, as today); it is the missing FIELD that fails, not the
+#       missing join.
+#   turn_outcome.reconsider — present only when a reconsideration ran; nested keys follow the
+#       reconsider_outcome rules (forced posted-only, error error_dropped-only, no nulls).
 #   destinations[].thread_root_ts/chars — nullable INSIDE the list: nested nulls survive,
 #       because record() only strips top-level Nones.
 DESTINATION_FIELDS = ("channel_id", "thread_root_ts", "first_ts", "state", "chars", "kind")
@@ -303,10 +359,50 @@ def _check_envelope(row: Row, report: Report) -> None:
 # invariant 5 — payload spot checks
 # ===========================================================================================
 
-def _check_mandatory(row: Row, report: Report, name: str) -> None:
+def _check_mandatory(row: Row, report: Report, name: str, *, reject_null: bool = False) -> None:
+    """`reject_null` is opt-in, and only the three v9 events ask for it (the two reconsider
+    events and `stale_send`, whose mandated `turn_id` join key follows the same no-null rule).
+    Everywhere else
+    absence is the emitter's own encoding of "unavailable" and a null has never been produced, so
+    testing for one would be a rule about a shape no producer can make. On these two events the
+    grammar says it out loud (§5): no JSON nulls anywhere, so a present-but-null identity field is
+    the same defect as a missing one and gets the same violation name."""
     for field, why in MANDATORY.get(row.event, ()):
         if field not in row.obj:
             report.fail(name, row, f"{row.event} has no {field!r} — {why}")
+        elif reject_null and row.obj.get(field) is None:
+            report.fail(name, row, f"{row.event} has {field!r} = null — {why}")
+
+
+def _check_join_key_string(row: Row, report: Report, name: str, *,
+                           null_reported_elsewhere: bool = False) -> None:
+    """TYPE enforcement on the mandated `turn_id` join key: `Joins.add` indexes only non-empty
+    strings, so a null, non-string, or empty-string value would otherwise be DROPPED silently —
+    a row the join invariants should count would count toward no turn, with no finding. The
+    grammar flags it here first, so the join-side drop is a filter over already-failed rows,
+    never a silent one. On the three v9 events whose `reject_null` mandatory check already
+    reports an explicit null, the caller passes `null_reported_elsewhere=True` so one defect
+    earns one finding."""
+    if "turn_id" not in row.obj:
+        return
+    value = row.obj.get("turn_id")
+    if value is None:
+        if not null_reported_elsewhere:
+            report.fail(name, row, f"{row.event} has turn_id = null — the row joins no turn")
+    elif not isinstance(value, str) or not value:
+        report.fail(name, row, f"{row.event} has turn_id={value!r} — not a non-empty string, "
+                               f"so the row joins no turn")
+
+
+def _check_no_explicit_nulls(row: Row, report: Report, fields: Tuple[str, ...],
+                             name: str) -> None:
+    """The v9 no-null rule on OPTIONAL fields (§5): an unavailable optional is OMITTED by the
+    emitter's drop-None behavior, so a null that reached the file was written on purpose — a
+    second encoding of a fact the grammar already encodes by absence, and a defect."""
+    for field in fields:
+        if field in row.obj and row.obj.get(field) is None:
+            report.fail(name, row, f"{row.event} has {field!r} = null — unavailable optionals "
+                                   f"are omitted, never null")
 
 
 def _check_vocabulary(row: Row, report: Report, field: str, allowed: frozenset,
@@ -324,12 +420,14 @@ def _check_vocabulary(row: Row, report: Report, field: str, allowed: frozenset,
 
 def _check_turn_start(row: Row, report: Report) -> None:
     _check_mandatory(row, report, "turn_start_missing_field")
+    _check_join_key_string(row, report, "turn_start_missing_field")
     if "surface" in row.obj and row.obj.get("surface") not in TURN_SURFACES:
         report.fail("turn_start_bad_surface", row, f"surface={row.obj.get('surface')!r}")
 
 
 def _check_turn_outcome(row: Row, report: Report) -> None:
     _check_mandatory(row, report, "turn_outcome_missing_field")
+    _check_join_key_string(row, report, "turn_outcome_missing_field")
     _check_vocabulary(row, report, "kind", KINDS, "turn_outcome_bad_kind", required=False)
     if "stream_build_present" in row.obj \
             and not isinstance(row.obj.get("stream_build_present"), bool):
@@ -340,6 +438,40 @@ def _check_turn_outcome(row: Row, report: Report) -> None:
     # producer that survived the excision, and both are worth failing on.
     _check_vocabulary(row, report, "error", TURN_ERRORS, "turn_outcome_bad_error",
                       required=False)
+    # v9. The nested reconsideration facts, when a reconsideration ran. Nested values survive
+    # record()'s top-level drop-None, so a null INSIDE this object is an emitter defect.
+    if "reconsider" in row.obj:
+        facts = row.obj.get("reconsider")
+        if not isinstance(facts, dict):
+            report.fail("turn_outcome_reconsider_malformed", row,
+                        f"reconsider is {type(facts).__name__}, not an object")
+        else:
+            # The nested grammar is CLOSED (the four as_payload() keys) and null-free: nested
+            # values survive record()'s top-level drop-None, so an explicit null in here was
+            # written on purpose and an unknown key is contract drift the event-side
+            # closed-grammar check would never see.
+            for key in sorted(facts):
+                if key not in RECONSIDER_NESTED_FIELDS:
+                    report.fail("turn_outcome_reconsider_malformed", row,
+                                f"reconsider carries unknown key {key!r} — the nested grammar "
+                                f"is closed (outcome, passes, forced, error)")
+                elif facts.get(key) is None:
+                    report.fail("turn_outcome_reconsider_malformed", row,
+                                f"reconsider.{key} is null — inapplicable keys are omitted, "
+                                f"never null")
+            outcome = facts.get("outcome")
+            if outcome not in RECONSIDER_OUTCOMES:
+                report.fail("turn_outcome_reconsider_malformed", row,
+                            f"reconsider.outcome={outcome!r} not in "
+                            f"{{{', '.join(sorted(RECONSIDER_OUTCOMES))}}}")
+            nested_passes = _as_int(facts.get("passes"))
+            if nested_passes is None or nested_passes < 0:
+                report.fail("turn_outcome_reconsider_malformed", row,
+                            f"reconsider.passes={facts.get('passes')!r} is not a "
+                            f"non-negative int")
+            _check_reconsider_conditionals(row, report, facts, outcome,
+                                           "turn_outcome_reconsider_malformed",
+                                           where="reconsider.")
     if "destinations" not in row.obj:
         return
     destinations = row.obj.get("destinations")
@@ -377,6 +509,7 @@ def _check_stream_render(row: Row, report: Report) -> None:
     shown, so a field that is quietly absent or the wrong type makes the record unreadable at
     exactly the moment someone is trying to explain a bad answer."""
     _check_mandatory(row, report, "stream_render_missing_turn_id")
+    _check_join_key_string(row, report, "stream_render_missing_turn_id")
 
     for field in STREAM_RENDER_MANDATORY:
         # Absence and None are ONE case: record() omits None-valued fields rather than writing
@@ -443,12 +576,113 @@ def _check_stream_render(row: Row, report: Report) -> None:
 
 def _check_model_response(row: Row, report: Report) -> None:
     _check_mandatory(row, report, "model_response_missing_field")
+    _check_join_key_string(row, report, "model_response_missing_field")
     _check_vocabulary(row, report, "status", MODEL_RESPONSE_STATUSES,
                       "model_response_bad_status", required=False)
     sequence = row.obj.get("attempt_seq")
     if "attempt_seq" in row.obj and (not isinstance(sequence, int) or isinstance(sequence, bool)):
         report.fail("model_response_missing_field", row,
                     f"attempt_seq={sequence!r} is not an int")
+
+
+def _check_reconsider_conditionals(row: Row, report: Report, obj: Dict[str, Any],
+                                   outcome: Any, name: str, *, where: str = "",
+                                   required: bool = False) -> None:
+    """The two conditional keys, shared between the event and the nested turn_outcome copy.
+
+    `forced` rides ONLY on posted outcomes and `error` ONLY on `error_dropped`, so PRESENCE in
+    the wrong place is a defect on BOTH copies. No JSON nulls anywhere in this grammar.
+
+    `required` — the other direction — is asserted on the EVENT ONLY. There the emitter always
+    has the fact: it writes `forced=False` on every posted outcome and the runner always names a
+    §4f subtype when it drops. The nested `turn_outcome.reconsider` copy comes from
+    `ReconsiderFacts.as_payload()`, which legally omits a `forced` that was never recorded, so
+    demanding it there would fail a healthy row."""
+    if "forced" in obj:
+        if outcome not in ("posted_asis", "posted_revised"):
+            report.fail(name, row, f"{where}forced={obj.get('forced')!r} on "
+                                   f"outcome={outcome!r} — forced rides only on posted outcomes")
+        elif not isinstance(obj.get("forced"), bool):
+            report.fail(name, row, f"{where}forced={obj.get('forced')!r} is not a bool")
+    elif required and outcome in ("posted_asis", "posted_revised"):
+        report.fail(name, row, f"{where}outcome={outcome!r} has no {'forced'!r} — the emitter "
+                               f"writes forced=False on every posted outcome, so its absence is "
+                               f"a lost fact, not an omitted optional")
+    if "error" in obj:
+        if outcome != "error_dropped":
+            report.fail(name, row, f"{where}error={obj.get('error')!r} on outcome={outcome!r} "
+                                   f"— error rides only on error_dropped")
+        elif obj.get("error") not in RECONSIDER_ERRORS:
+            report.fail(name, row, f"{where}error={obj.get('error')!r} not in "
+                                   f"{{{', '.join(sorted(RECONSIDER_ERRORS))}}}")
+    elif required and outcome == "error_dropped":
+        report.fail(name, row, f"{where}error_dropped has no {'error'!r} — the runner always "
+                               f"has a §4f subtype, so a drop that names none says nothing")
+
+
+def _check_unknown_fields(row: Row, report: Report, allowed: frozenset, name: str) -> None:
+    """The literal grammar, enforced closed. Reported one key at a time so the name of the
+    invented field is in the finding rather than a count of them."""
+    for field in sorted(row.obj):
+        if field not in allowed:
+            report.fail(name, row, f"{row.event} carries unknown field {field!r} — the v9 "
+                                   f"grammar for this event is closed")
+
+
+def _check_reconsider_start(row: Row, report: Report) -> None:
+    """One reconsideration pass. `pass` counts from 1 (contiguity is a join invariant); `scope`
+    is the FULL three-part suppressing scope as a JSON list of three STRINGS — unlike
+    stale_send's scope[0]."""
+    _check_mandatory(row, report, "reconsider_start_missing_field", reject_null=True)
+    _check_join_key_string(row, report, "reconsider_start_bad_field", null_reported_elsewhere=True)
+    _check_no_explicit_nulls(row, report, ("attempt_id", "model_attempt_seq"),
+                             "reconsider_start_bad_field")
+    _check_unknown_fields(row, report, RECONSIDER_START_FIELDS, "reconsider_start_unknown_field")
+    number = row.obj.get("pass")
+    typed_number = _as_int(number)
+    if "pass" in row.obj and (typed_number is None or typed_number < 1):
+        report.fail("reconsider_start_bad_pass", row,
+                    f"pass={number!r} is not an int counting from 1")
+    scope = row.obj.get("scope")
+    if "scope" in row.obj and (not isinstance(scope, list) or len(scope) != 3
+                               or not all(isinstance(part, str) for part in scope)):
+        report.fail("reconsider_start_bad_scope", row,
+                    f"scope={scope!r} is not the full three-part scope as a JSON list of "
+                    f"three strings")
+    seq = row.obj.get("model_attempt_seq")
+    if "model_attempt_seq" in row.obj and not _typed(seq, int):
+        report.fail("reconsider_start_bad_field", row,
+                    f"model_attempt_seq={seq!r} is not an int")
+
+
+def _check_reconsider_outcome(row: Row, report: Report) -> None:
+    """How one runner invocation ended. `passes` is the started-pass count — a fuse drop
+    records 5, a failure or cancellation the passes started by then, so zero is legal."""
+    _check_mandatory(row, report, "reconsider_outcome_missing_field", reject_null=True)
+    _check_join_key_string(row, report, "reconsider_outcome_bad_field", null_reported_elsewhere=True)
+    _check_no_explicit_nulls(row, report, ("attempt_id",), "reconsider_outcome_bad_field")
+    _check_unknown_fields(row, report, RECONSIDER_OUTCOME_FIELDS,
+                          "reconsider_outcome_unknown_field")
+    outcome = row.obj.get("outcome")
+    _check_vocabulary(row, report, "outcome", RECONSIDER_OUTCOMES,
+                      "reconsider_outcome_bad_outcome", required=False)
+    passes = row.obj.get("passes")
+    typed_passes = _as_int(passes)
+    if "passes" in row.obj and (typed_passes is None or typed_passes < 0):
+        report.fail("reconsider_outcome_bad_passes", row,
+                    f"passes={passes!r} is not a non-negative int")
+    _check_reconsider_conditionals(row, report, row.obj, outcome,
+                                   "reconsider_outcome_bad_conditional", required=True)
+
+
+def _check_stale_send(row: Row, report: Report) -> None:
+    """A gate-population diagnostic still — the only payload rule is the v9 join key, and the
+    key is checked as a KEY: present, non-null (`reject_null` — the no-null rule covers this
+    event's one mandated field), and a non-empty string, so a defective one fails by name here
+    rather than being dropped silently at the join. Rows below v9 never reach here
+    (_grade_version skips them), so the migration needs no grandfathering."""
+    _check_mandatory(row, report, "stale_send_missing_turn_id", reject_null=True)
+    _check_join_key_string(row, report, "stale_send_missing_turn_id", null_reported_elsewhere=True)
 
 
 def _check_outbound_receipt(row: Row, report: Report) -> None:
@@ -478,12 +712,21 @@ def _typed(value: Any, kind: type) -> bool:
     return isinstance(value, kind)
 
 
+def _as_int(value: Any) -> Optional[int]:
+    """The value when `_typed(value, int)` holds, else None — the same rule as a narrowing the
+    type checker can see through, for the checks that go on to COMPARE the value."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 PAYLOAD_CHECKS = {
     "turn_start": _check_turn_start,
     "turn_outcome": _check_turn_outcome,
     "stream_render": _check_stream_render,
     "model_response": _check_model_response,
     "outbound_receipt": _check_outbound_receipt,
+    "reconsider_start": _check_reconsider_start,
+    "reconsider_outcome": _check_reconsider_outcome,
+    "stale_send": _check_stale_send,
 }
 
 
@@ -508,6 +751,12 @@ class Joins:
         self.gate_starts: Dict[str, List[Row]] = defaultdict(list)
         self.terminals: Dict[str, List[Row]] = defaultdict(list)
         self.terminal_rows: List[Row] = []
+        # v9 — the reconsideration joins, all keyed by turn_id. stale_send is indexed here TOO
+        # (by the turn_id v9 rows carry), because the pass-count invariant reads it; it stays a
+        # gate-population diagnostic everywhere else.
+        self.reconsider_starts: Dict[str, List[Row]] = defaultdict(list)
+        self.reconsider_outcomes: Dict[str, List[Row]] = defaultdict(list)
+        self.stale_sends: Dict[str, List[Row]] = defaultdict(list)
 
     def add(self, row: Row) -> None:
         event = row.event
@@ -524,6 +773,10 @@ class Joins:
             return
         turn_id = row.obj.get("turn_id")
         if not isinstance(turn_id, str) or not turn_id:
+            # NOT a silent discard: every event indexed below mandates `turn_id`, and the
+            # payload checks have already failed a missing / null / non-string / empty one by
+            # name (`_check_mandatory` + `_check_join_key_string`). This filter only keeps an
+            # already-flagged row from polluting the join keys.
             return
         if event == "turn_start":
             self.turn_starts[turn_id].append(row)
@@ -533,6 +786,12 @@ class Joins:
             self.stream_renders[turn_id].append(row)
         elif event == "model_response":
             self.model_responses[turn_id].append(row)
+        elif event == "reconsider_start":
+            self.reconsider_starts[turn_id].append(row)
+        elif event == "reconsider_outcome":
+            self.reconsider_outcomes[turn_id].append(row)
+        elif event == "stale_send":
+            self.stale_sends[turn_id].append(row)
 
 
 def _first_at(row: Row, other: Row) -> str:
@@ -668,6 +927,70 @@ def _check_model_attempts(joins: Joins, report: Report) -> None:
                         f"{expected}")
 
 
+def _check_reconsiderations(joins: Joins, report: Report) -> None:
+    """The v9 join invariants, all on turn_id: pass numbers contiguous from 1; a turn's
+    `reconsider_start` count never exceeds its `stale_send` count (every pass exists because a
+    suppression event preceded it, and each suppression event writes exactly one row); at most
+    one `reconsider_outcome` per turn (the once-per-turn gate makes a second invocation
+    impossible, so a duplicate is a defect in any file, fragment or not); and an outcome's
+    `passes` EQUALS the number of `reconsider_start` rows joined to that turn — the field is a
+    count of the passes this invocation started, so a disagreement means one of the two is
+    counting something else, which is exactly the arithmetic every later reading of the file
+    would inherit.
+
+    DELIBERATELY NOT HERE: no cross-join of posted outcomes to `turn_outcome` kind or to F7 —
+    F7 provenance is DB state with no ledger source, and the posted-outcome ⇒ ordinary-reply
+    correspondence is unit/integration-mandated instead. And DM `stale_send` rows that carry a
+    `turn_id` with no channel `turn_start` to join are TOLERATED by ruling: DMs are outside the
+    turn population, as today, so an unjoined suppression row is a DM's, not a defect.
+
+    Contiguity, the pass-count comparison and the `passes` equality are graded only for turns
+    whose `turn_start` is in the input: a rotated file can cut a turn's head off, and a sequence
+    that legitimately starts at 3 — or whose early suppression rows are in
+    `participation.jsonl.1` — must not be graded as a gap.
+    """
+    for turn_id, starts in sorted(joins.reconsider_starts.items()):
+        if turn_id not in joins.turn_starts:
+            report.warn("reconsider_start_orphan_turn", starts[0],
+                        f"turn_id={turn_id} has no turn_start (passes not graded)")
+            continue
+        numbers = [n for n in (r.obj.get("pass") for r in starts)
+                   if isinstance(n, int) and not isinstance(n, bool)]
+        duplicates = sorted({n for n in numbers if numbers.count(n) > 1})
+        if duplicates:
+            report.fail("reconsider_pass_duplicate", starts[-1],
+                        f"turn_id={turn_id} repeats pass {duplicates}")
+        expected = list(range(1, len(set(numbers)) + 1))
+        if sorted(set(numbers)) != expected:
+            report.fail("reconsider_pass_not_contiguous", starts[0],
+                        f"turn_id={turn_id} has passes {sorted(numbers)}, expected {expected}")
+        suppressions = len(joins.stale_sends.get(turn_id, []))
+        if len(starts) > suppressions:
+            report.fail("reconsider_start_exceeds_stale_send", starts[-1],
+                        f"turn_id={turn_id} has {len(starts)} reconsider_start rows but only "
+                        f"{suppressions} stale_send row(s) — every pass exists because a "
+                        f"suppression event preceded it")
+    for turn_id, outcomes in sorted(joins.reconsider_outcomes.items()):
+        if len(outcomes) > 1:
+            report.fail("reconsider_outcome_duplicate", outcomes[-1],
+                        f"turn_id={turn_id} has {len(outcomes)} reconsider_outcome rows "
+                        f"(first at {_first_at(outcomes[-1], outcomes[0])}) — at most one "
+                        f"runner invocation per turn")
+        if turn_id not in joins.turn_starts:
+            report.warn("reconsider_outcome_orphan_turn", outcomes[0],
+                        f"turn_id={turn_id} has no turn_start")
+            continue
+        # A malformed `passes` is already a payload violation; comparing it here too would only
+        # report the same defect twice under a name that suggests a different one.
+        passes = _as_int(outcomes[0].obj.get("passes"))
+        started = len(joins.reconsider_starts.get(turn_id, []))
+        if passes is not None and passes >= 0 and passes != started:
+            report.fail("reconsider_outcome_passes_mismatch", outcomes[0],
+                        f"turn_id={turn_id} records passes={passes} but {started} "
+                        f"reconsider_start row(s) joined — `passes` is the count of passes "
+                        f"this invocation started")
+
+
 def _check_terminal_invariant(joins: Joins, report: Report, rows: List[Row], *,
                               fragments: set) -> None:
     """INVARIANT 3: at most one `visible_action` per attempt_id, and every one of them has a
@@ -764,6 +1087,7 @@ def check_paths(paths: List[str]) -> Report:
     _check_turn_pairing(joins, report, tail_session=tail, fragments=fragments)
     _check_stream_render_joins(joins, report, fragments=fragments)
     _check_model_attempts(joins, report)
+    _check_reconsiderations(joins, report)
     _check_terminal_invariant(joins, report, graded, fragments=fragments)
 
     report.violations.sort(key=lambda f: (report.file_order(f.file), f.line, f.name))

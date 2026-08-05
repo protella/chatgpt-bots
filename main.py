@@ -16,6 +16,7 @@ from message_processor import (channel_steering, outbound_receipts,
                                participation_telemetry, routing_facts)
 from message_processor.participation import (ParticipationEngine,
                                              resolve_participation_level)
+from message_processor.reconsideration import intercept_stale_send
 from message_processor.stale_send_guard import (ConversationWatermarks,
                                                 StaleSendSuppressed)
 from message_processor import turn_runtime
@@ -1105,19 +1106,58 @@ class ChatBotV2:
                                     channel_id=message.channel_id, first_ts=ts,
                                     kind=DEST_KIND_REPLY, thread_root_ts=_thread)
 
+                            async def _reconsidered_reply_send(text: str,
+                                                               _response=response,
+                                                               _meta=send_meta,
+                                                               _blocks=footer_blocks,
+                                                               _thread=post_thread_id
+                                                               ) -> Optional[str]:
+                                """The §4b delivery closure for this site. Replaces the site's
+                                canonical text — `response.content` — BEFORE the send, so the
+                                footer guard, the destination commit and the F7 persistence
+                                below all read the chosen text with no second code path; then
+                                re-runs the site's OWN send (same target, F39 top-level None
+                                stays None). Returns send_message's native Optional ts;
+                                StaleSendSuppressed propagates (a re-race is the next pass)."""
+                                _response.content = text
+                                _meta.clear()
+                                return await client.send_message(
+                                    message.channel_id, _thread, _response.content,
+                                    blocks=_blocks, meta_out=_meta, lease=lease,
+                                    receipts=turn.receipt_ledger,
+                                    on_first_accept=_observe_reply)
+
                             # The stale guard's last chance on this path: the lease refuses
                             # rather than posting if the conversation moved on while the model
-                            # was writing. Raises StaleSendSuppressed, caught below.
-                            sent_ts = await client.send_message(
-                                message.channel_id,
-                                post_thread_id,
-                                response.content,
-                                blocks=footer_blocks,
-                                meta_out=send_meta,
-                                lease=lease,
-                                receipts=turn.receipt_ledger,
-                                on_first_accept=_observe_reply,
-                            )
+                            # was writing. Raises StaleSendSuppressed — and a COMPLETE drafted
+                            # reply refused at its first surface is exactly the reconsideration
+                            # case (STALE_RECONSIDERATION §3), so the suppression is handed to
+                            # the runner instead of straight to the terminal catch. Channel
+                            # turns only; DM suppressions rethrow untouched. The runner either
+                            # returns a delivered ts (bookkeeping below proceeds normally),
+                            # returns None on its accounted delivery_failed and
+                            # delivery_exception endings, or rethrows the suppression to the
+                            # terminal catch below.
+                            try:
+                                sent_ts = await client.send_message(
+                                    message.channel_id,
+                                    post_thread_id,
+                                    response.content,
+                                    blocks=footer_blocks,
+                                    meta_out=send_meta,
+                                    lease=lease,
+                                    receipts=turn.receipt_ledger,
+                                    on_first_accept=_observe_reply,
+                                )
+                            except StaleSendSuppressed as stale:
+                                sent_ts = await intercept_stale_send(
+                                    processor=self.processor, client=client,
+                                    message=message, turn=turn, lease=lease,
+                                    suppressed=stale, draft=response.content or "",
+                                    deliver=_reconsidered_reply_send,
+                                    channel_turn=bool(
+                                        message.channel_id
+                                        and not str(message.channel_id).startswith("D")))
                             # Honest accounting: the ACTUAL send result decides `posted` (a
                             # failed send must not burn the hourly unprompted quota).
                             if isinstance(response.metadata, dict):
@@ -1189,8 +1229,24 @@ class ChatBotV2:
                         # no chart. (A files-only turn has empty content by design — still publish.)
                         reply_landed = (response.metadata or {}).get("posted") is not False
                         files_only = not (response.content or "").strip()
+                        # STALE_RECONSIDERATION §4b (r6-1): a reconsideration that ended in ANY
+                        # non-posted outcome suppresses BOTH rescue paths — this publish and the
+                        # sandbox-image rescue below — so a failed reconsidered reply can never
+                        # be followed by a published artifact or image. Rethrow endings get this
+                        # for free (the exception propagates past these blocks); the
+                        # delivery_failed and delivery_exception RETURN paths are the ones that
+                        # need the explicit gate.
+                        reconsider_facts = getattr(turn, "reconsider", None)
+                        reconsider_nonposted = bool(
+                            reconsider_facts is not None
+                            and reconsider_facts.outcome not in ("posted_asis",
+                                                                 "posted_revised"))
                         published = []
-                        if artifact_containers and (reply_landed or files_only):
+                        if artifact_containers and reconsider_nonposted:
+                            main_logger.warning(
+                                "Reconsideration ended without a post — suppressing its "
+                                "artifacts (a file with no answer above it reads as a bug)")
+                        elif artifact_containers and (reply_landed or files_only):
                             try:
                                 from message_processor.artifacts import publish_artifacts
                                 # Whole-phase bound: the answer is already visible, but this still
@@ -1243,9 +1299,11 @@ class ChatBotV2:
                         # the model made images and then failed to use them, and they would die
                         # with the container. A silent no-output turn is the worst failure mode
                         # here, so hand them over rather than lose them.
-                        if not published:
+                        if not published and not reconsider_nonposted:
                             # B2: rescued sandbox images always thread — pass message.thread_id, not
                             # post_thread_id (None on a top-level channel reply).
+                            # `send_image` carries no lease, so without the reconsideration gate
+                            # above this rescue would post behind a reply the guard refused.
                             rescued = await self._rescue_sandbox_images(
                                 response, client, message, message.thread_id,
                                 receipts=turn.receipt_ledger)
@@ -1374,14 +1432,19 @@ class ChatBotV2:
                 # deliberately not created. The room sees nothing, which is the point.
                 main_logger.info(
                     f"Stale send suppressed on {message.channel_id}: {stale}")
-                participation_telemetry.stale_send(
-                    message.channel_id, (message.metadata or {}).get("ts"),
-                    attempt_id=participation_telemetry.attempt_id_for(message),
-                    last_seen_ts=stale.last_seen_ts,
-                    observed_latest_ts=stale.observed_latest_ts,
-                    scope=stale.scope[0] if stale.scope else None,
-                    surface=stale.surface,
-                    guard_mode=getattr(turn, "guard_mode", None) if turn is not None else None)
+                # Single-owner rule (STALE_RECONSIDERATION §5): the reconsideration runner marks
+                # every suppression it already wrote a `stale_send` row for. The marker skips
+                # EMISSION and only emission — retraction and cleanup below run either way.
+                if not getattr(stale, "telemetry_recorded", False):
+                    participation_telemetry.stale_send(
+                        message.channel_id, (message.metadata or {}).get("ts"),
+                        attempt_id=participation_telemetry.attempt_id_for(message),
+                        turn_id=getattr(turn, "turn_id", None) if turn is not None else None,
+                        last_seen_ts=stale.last_seen_ts,
+                        observed_latest_ts=stale.observed_latest_ts,
+                        scope=stale.scope[0] if stale.scope else None,
+                        surface=stale.surface,
+                        guard_mode=getattr(turn, "guard_mode", None) if turn is not None else None)
                 # Any speculative chrome this turn put up has to come down with it — a
                 # "Thinking…" bubble left over a reply that will never arrive is worse than
                 # either outcome on its own.
@@ -1463,6 +1526,7 @@ class ChatBotV2:
                     participation_telemetry.stale_send(
                         message.channel_id, (message.metadata or {}).get("ts"),
                         attempt_id=participation_telemetry.attempt_id_for(message),
+                        turn_id=getattr(turn, "turn_id", None) if turn is not None else None,
                         last_seen_ts=stale.last_seen_ts,
                         observed_latest_ts=stale.observed_latest_ts,
                         scope=stale.scope[0] if stale.scope else None,

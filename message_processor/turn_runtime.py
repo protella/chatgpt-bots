@@ -340,6 +340,34 @@ class ModelAttempt:
 
 
 @dataclass
+class ReconsiderFacts:
+    """How this turn's stale-draft reconsideration ended, for the `turn_outcome` event.
+
+    Stamped on `TurnRuntime.reconsider` by the reconsideration runner before every return,
+    rethrow, and cancellation propagation — so `turn.reconsider is not None` doubles as the
+    once-per-turn gate. `passes` is the started-pass count, the same number the
+    `reconsider_outcome` event records.
+    """
+
+    outcome: str
+    passes: int
+    forced: Optional[bool] = None
+    error: Optional[str] = None
+
+    def as_payload(self) -> Dict[str, Any]:
+        """The nested dict `turn_outcome` carries. Inapplicable keys are OMITTED — `forced`
+        only on posted outcomes, `error` only on `error_dropped` — because record() strips
+        top-level Nones but nested values survive verbatim, and a nested null would give a
+        group-by two buckets meaning the same thing."""
+        payload: Dict[str, Any] = {"outcome": self.outcome, "passes": self.passes}
+        if self.outcome in ("posted_asis", "posted_revised") and self.forced is not None:
+            payload["forced"] = self.forced
+        if self.outcome == "error_dropped" and self.error is not None:
+            payload["error"] = self.error
+        return payload
+
+
+@dataclass
 class TurnRuntime:
     """Per-turn presentation + work-claim state. Created in main.py, threaded to the handlers."""
 
@@ -394,6 +422,11 @@ class TurnRuntime:
     # `silence_capable` got it wrong for an addressed CHANNEL reply, which also buffers (it has
     # no native path) and was being reported as start_only.
     guard_mode: Optional[str] = None
+    # How this turn's stale-draft reconsideration ended, or None when none ran. Populated by the
+    # reconsideration runner before every return, rethrow, and cancellation propagation — its
+    # non-None-ness IS the once-per-turn gate the interception wrappers consult, and
+    # emit_turn_outcome attaches its as_payload() to the turn_outcome event.
+    reconsider: Optional[ReconsiderFacts] = None
     ack_lease: Optional[dict] = field(default=None, repr=False)
     ack_target_ts: Optional[str] = None
     # Where that claim was staked. Kept beside the ts purely so settle_ack can report a RETRACTED

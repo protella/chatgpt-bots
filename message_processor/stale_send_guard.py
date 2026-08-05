@@ -54,7 +54,7 @@ When a message carries none, the top scope is OMITTED rather than bucketed under
 collapsing unrelated senders into one scope would let a stranger's message silence an answer.
 """
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 from logger import setup_logger
 
@@ -148,11 +148,19 @@ class StaleSendSuppressed(Exception):
     went wrong, which is a worse outcome than the duplicate answer this exists to prevent."""
 
     def __init__(self, *, scope: Optional[Scope] = None, last_seen_ts: Any = None,
-                 observed_latest_ts: Any = None, surface: Optional[str] = None):
+                 observed_latest_ts: Any = None, surface: Optional[str] = None,
+                 lease_token: Any = None):
         self.scope = scope
         self.last_seen_ts = last_seen_ts
         self.observed_latest_ts = observed_latest_ts
         self.surface = surface
+        # Identity binding for reconsideration (§4a): the private token of the lease whose
+        # authorize() raised this. Unforgeable — rearm/force require `is self._token`, so an
+        # exception with identical scope/timestamp evidence from another lease can never pass.
+        self.lease_token = lease_token
+        # Single-owner telemetry rule (§5): the reconsideration runner marks a suppression it
+        # has emitted a `stale_send` row for, so the terminal catch never double-counts it.
+        self.telemetry_recorded = False
         super().__init__(
             f"newer message {observed_latest_ts} in {scope} supersedes this turn "
             f"(last seen {last_seen_ts}); {surface or 'surface'} not created")
@@ -184,6 +192,22 @@ class TurnSendLease:
     # (the watermark entry may be gone by then; the turn that raised it has closed its lease).
     _suppressed_scope: Optional[Scope] = field(default=None, repr=False)
     _suppressed_latest_ts: Optional[str] = field(default=None, repr=False)
+    # The suppressing scope's EFFECTIVE baseline at suppression time (§4a). After a rearm the
+    # scalar `last_seen_ts` is no longer what the check measured against, so a rethrow that
+    # reconstructed the exception from the scalar would report the wrong value; the baseline
+    # is remembered beside the other evidence and reported on every rethrow.
+    _suppressed_baseline: Optional[str] = field(default=None, repr=False)
+    # Per-scope reviewed baselines (§4a). Populated ONLY by rearm_after_reconsideration: a
+    # reconsideration pass that examined the conversation through these timestamps. Empty until
+    # the first rearm, and with the map empty authorize() is byte-equivalent to the pre-rearm
+    # guard.
+    _reviewed_through: Dict[Scope, str] = field(default_factory=dict, repr=False)
+    # Set only by force_after_reconsideration: the model's recorded judgment that this reply
+    # goes out without another staleness check. Skips ONLY the newer-message comparison.
+    _force_waiver: bool = field(default=False, repr=False)
+    # Unforgeable identity: every StaleSendSuppressed this lease raises carries it, and
+    # rearm/force accept only an exception whose token IS this object.
+    _token: object = field(default_factory=object, repr=False)
 
     # --- what this turn has accounted for -------------------------------------------------
 
@@ -212,21 +236,52 @@ class TurnSendLease:
         if self.state == COMMITTED:
             return
         if self.state == SUPPRESSED:
-            # The ORIGINAL evidence, rethrown: the surface differs, the reason does not.
+            # The ORIGINAL evidence, rethrown: the surface differs, the reason does not. The
+            # baseline is the suppressing scope's EFFECTIVE one, remembered at suppression
+            # time — after a rearm the scalar `last_seen_ts` would be the wrong value.
             raise StaleSendSuppressed(
-                scope=self._suppressed_scope, last_seen_ts=self.last_seen_ts,
-                observed_latest_ts=self._suppressed_latest_ts, surface=surface)
-        latest, scope = self.observed_latest()
-        if latest is not None and is_newer(latest, self.last_seen_ts):
+                scope=self._suppressed_scope, last_seen_ts=self._suppressed_baseline,
+                observed_latest_ts=self._suppressed_latest_ts, surface=surface,
+                lease_token=self._token)
+        if self._force_waiver:
+            # force_after_reconsideration: the newer-message comparison — and ONLY that — is
+            # skipped for every mutation of this one logical delivery.
+            return
+        # Each scope's watermark is measured against that scope's EFFECTIVE baseline —
+        # max(last_seen_ts, reviewed-through) — and among the scopes whose candidate exceeds
+        # it, the NEWEST candidate is the suppression evidence. With no rearm on record every
+        # baseline is last_seen_ts and this is exactly the original newest-selection check.
+        latest: Optional[str] = None
+        scope: Optional[Scope] = None
+        baseline: Optional[str] = None
+        if self._watermarks is not None:
+            for candidate_scope in self.scopes:
+                candidate = self._watermarks.latest_for(candidate_scope)
+                effective = self._effective_baseline(candidate_scope)
+                if is_newer(candidate, effective) and is_newer(candidate, latest):
+                    latest, scope, baseline = candidate, candidate_scope, effective
+        if latest is not None:
             self.state = SUPPRESSED
             self._suppressed_scope = scope
             self._suppressed_latest_ts = latest
+            self._suppressed_baseline = baseline
             logger.info(
                 f"Stale send suppressed ({surface}): {scope} advanced to {latest}, "
-                f"this turn had seen {self.last_seen_ts}")
+                f"this turn had seen {baseline}")
             raise StaleSendSuppressed(
-                scope=scope, last_seen_ts=self.last_seen_ts,
-                observed_latest_ts=latest, surface=surface)
+                scope=scope, last_seen_ts=baseline,
+                observed_latest_ts=latest, surface=surface,
+                lease_token=self._token)
+
+    def _effective_baseline(self, scope: Scope) -> Optional[str]:
+        """What this turn has accounted for IN THIS SCOPE: the newer of the admission-time mark
+        and the scope's reviewed-through baseline (populated only by rearm)."""
+        reviewed = self._reviewed_through.get(scope)
+        if reviewed is None:
+            return self.last_seen_ts
+        if self.last_seen_ts is None or ts_key(reviewed) >= ts_key(self.last_seen_ts):
+            return reviewed
+        return self.last_seen_ts
 
     def observed_latest(self) -> Tuple[Optional[str], Optional[Scope]]:
         """The newest ts any of this lease's scopes has seen, and which scope saw it."""
@@ -240,11 +295,103 @@ class TurnSendLease:
                 newest, found = candidate, scope
         return newest, found
 
+    # --- reconsideration (§4a) ------------------------------------------------------------
+
+    def rearm_after_reconsideration(self, reviewed_through: Mapping[Scope, str],
+                                    expected: StaleSendSuppressed) -> None:
+        """A reconsideration pass reviewed the conversation through these per-scope
+        timestamps; re-open this suppressed lease so the next authorize() measures against
+        them.
+
+        The reviewed-through values are computed by trusted runtime snapshot code, never
+        supplied by the model. Every precondition failure leaves the lease UNCHANGED and
+        raises ValueError — fail closed, the runner drops."""
+        from slack_client.normalizer import parse_ts  # local: messaging.py imports this module
+
+        # 1. Only a suppressed, still-open lease can be rearmed.
+        if self.state != SUPPRESSED:
+            raise ValueError(f"rearm requires a suppressed lease, not {self.state}")
+        if self._closed:
+            raise ValueError("rearm refused: the lease is closed")
+        # 2. Identity binding: the exception must be the one THIS lease last raised.
+        if expected.lease_token is not self._token:
+            raise ValueError("rearm refused: exception is not from this lease")
+        if (expected.scope != self._suppressed_scope
+                or expected.observed_latest_ts != self._suppressed_latest_ts):
+            raise ValueError(
+                "rearm refused: exception evidence does not match this lease's suppression")
+        # 3. Exactly this lease's scope set — a missing scope fails closed, an extra one is
+        # rejected.
+        if set(reviewed_through.keys()) != set(self.scopes):
+            raise ValueError(
+                f"rearm refused: reviewed_through keys {sorted(reviewed_through)} do not "
+                f"match lease scopes {sorted(self.scopes)}")
+        # 4. Every value parses as a ts and is monotonic against its scope's effective
+        # baseline.
+        for scope, value in reviewed_through.items():
+            try:
+                parse_ts(value)
+            except Exception as exc:
+                raise ValueError(
+                    f"rearm refused: unparseable reviewed_through for {scope}: "
+                    f"{value!r}") from exc
+            effective = self._effective_baseline(scope)
+            if effective is not None and ts_key(value) < ts_key(effective):
+                raise ValueError(
+                    f"rearm refused: reviewed_through for {scope} ({value!r}) is behind its "
+                    f"effective baseline ({effective!r})")
+        # 5. The suppressing message itself is covered by the review. Precondition 2 already
+        # matched `expected.scope` against this lease's live suppression, so a None here is a
+        # corrupted exception — refused like every other precondition failure.
+        suppressing_scope = expected.scope
+        if suppressing_scope is None:
+            raise ValueError("rearm refused: exception carries no suppressing scope")
+        covering = reviewed_through[suppressing_scope]
+        if ts_key(covering) < ts_key(expected.observed_latest_ts):
+            raise ValueError(
+                f"rearm refused: review through {covering!r} does not cover the suppressing "
+                f"message {expected.observed_latest_ts!r}")
+
+        for scope, value in reviewed_through.items():
+            self._reviewed_through[scope] = str(value)
+        self._suppressed_scope = None
+        self._suppressed_latest_ts = None
+        self._suppressed_baseline = None
+        self.state = PENDING
+
+    def force_after_reconsideration(self, expected: StaleSendSuppressed) -> None:
+        """The model's recorded judgment that this reply goes out without another staleness
+        check. Same identity preconditions as rearm; any failure leaves the lease unchanged
+        and raises ValueError."""
+        if self.state != SUPPRESSED:
+            raise ValueError(f"force requires a suppressed lease, not {self.state}")
+        if self._closed:
+            raise ValueError("force refused: the lease is closed")
+        if expected.lease_token is not self._token:
+            raise ValueError("force refused: exception is not from this lease")
+        if (expected.scope != self._suppressed_scope
+                or expected.observed_latest_ts != self._suppressed_latest_ts):
+            raise ValueError(
+                "force refused: exception evidence does not match this lease's suppression")
+        self._suppressed_scope = None
+        self._suppressed_latest_ts = None
+        self._suppressed_baseline = None
+        self.state = PENDING
+        self._force_waiver = True
+
+    def cancel_force_waiver(self) -> None:
+        """Revoke an outstanding force waiver — the runner's `delivery_exception` path (§4f).
+        Idempotent, and touches nothing else: the waiver never survives its delivery."""
+        self._force_waiver = False
+
     def commit(self) -> None:
         """A surface LANDED. Called only after Slack confirms — a definitive failure leaves the
         lease pending so a retry is checked again, rather than waved through."""
         if self.state != SUPPRESSED:
             self.state = COMMITTED
+            # A force waiver covers exactly one logical delivery; the first confirmed surface
+            # ends it and normal semantics resume.
+            self._force_waiver = False
 
     @property
     def suppressed(self) -> bool:
@@ -255,10 +402,12 @@ class TurnSendLease:
         return self.state == COMMITTED
 
     def close(self) -> None:
-        """Release this turn's hold on its scope entries. Idempotent."""
+        """Release this turn's hold on its scope entries. Idempotent. Also revokes any
+        outstanding force waiver — the waiver never survives its delivery (§4a)."""
         if self._closed:
             return
         self._closed = True
+        self._force_waiver = False
         if self._watermarks is not None:
             self._watermarks.release(self)
 

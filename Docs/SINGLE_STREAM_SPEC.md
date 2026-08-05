@@ -276,7 +276,7 @@ calibration in memory.
   let-the-exchange-end guidance (react or stay silent on landed closers) — the previously tabled
   "last word" item lands here.
 
-## 10. Telemetry — contract CV8
+## 10. Telemetry — contract CV8 (CV9 addendum below)
 
 (Authoritative event list; §16 describes usage in the battery.)
 - `visible_action` stays **gate-attempt-only** with its one-terminal-per-attempt invariant and
@@ -291,6 +291,53 @@ calibration in memory.
 - New `outbound_receipt` and `compaction_snapshot` (`read|publish|invalidate|stale_retained`)
   events; per-response model/fork-reason + cached-input token count.
 - Ledger version bump `v7 → v8`; the analyzer and live-battery checks update together.
+
+### CV9 addendum — stale reconsideration (2026-08-04)
+
+`CONTRACT_VERSION` 8 → 9 (`participation_telemetry.py`; checker
+`tools/participation_ledger_check.py`). Channel-turn population only — DMs stay excluded, and
+`GATE_CONTRACT` does not move. **Null encoding:** unavailable optional fields are OMITTED,
+matching the emitter's drop-None behavior; no JSON nulls anywhere in the grammar, and the
+checker treats an absent optional field as "unavailable".
+
+- **`stale_send`** gains one field, `turn_id` (both emitters), joining the row to the turn
+  population; its cardinality generalizes from one-per-suppression to **one per suppression
+  EVENT** — the initiating refusal, each per-pass re-race inside the reconsideration runner,
+  and a post-run once-gate suppression each emit exactly one row. Single-owner rule: the runner
+  emits for every suppression it handles and marks the exception `telemetry_recorded`; an
+  unmarked suppression is emitted by the terminal catch. The checker tolerates DM `stale_send`
+  rows that carry a `turn_id` with no channel `turn_start` to join. Everything else on the row
+  (including the `scope[0]`-only scope field) is unchanged.
+- **New `reconsider_start`** — one per reconsideration pass, emitted via the decision wrapper's
+  `on_attempt_open` callback. Keys: `turn_id` (mandatory; the primary turn-population join),
+  `channel_id`, `trigger_ts`, `attempt_id` (optional — ungated channel turns have none),
+  `pass` (int, from 1), `scope` (the full three-part suppressing scope as a JSON list),
+  `observed_latest_ts`, `model_attempt_seq` (optional — omitted when the attempt sink failed
+  to open).
+- **New `reconsider_outcome`** — at most one per runner invocation; exactly one on every
+  non-cancelled path. Keys: `turn_id` (mandatory), `channel_id`, `trigger_ts`, `attempt_id`
+  (optional), `outcome` ∈ {`posted_asis`, `posted_revised`, `skipped`, `fuse_dropped`,
+  `error_dropped`, `cancelled`}, `passes` (int — the number of `reconsider_start` events the
+  invocation emitted; a fuse drop records 5, a failure or cancellation the passes started by
+  then), `forced` (bool, posted outcomes only), `error` (`error_dropped` only, one of the
+  EIGHT §4f subtypes: `context_rebuild` / `model_failure` / `admission_overflow` /
+  `delivery_failed` / `epoch_invalidated` / `guard_rearm_failed` / `request_build` /
+  `delivery_exception`). A posted outcome asserts PHYSICAL Slack
+  acceptance of the first surface, not finalized turn accounting.
+- **`turn_outcome`** may carry a nested `reconsider` object —
+  `{outcome, passes[, forced][, error]}`, `ReconsiderFacts.as_payload()` verbatim, with
+  inapplicable keys omitted so no nested null survives — absent when no reconsideration ran.
+  Its `destinations` contract gains one ruled exception: the zero-chunk truncation notice
+  (Slack-accepted, turn-owned, never registered as a destination) is legitimately absent.
+- **`model_response`** gains the `stale_reconsideration` fork reason: each reconsideration
+  pass is a new `ModelAttempt` of the same turn.
+- **Checker invariants**, all joined on `turn_id`: pass numbers contiguous from 1; a turn's
+  `reconsider_start` count ≤ its `stale_send` count; ≤ 1 `reconsider_outcome` per turn; an
+  outcome's `passes` EQUALS the number of `reconsider_start` rows joined to its turn — the
+  field is the started-pass count, so a disagreement means one of the two is counting
+  something else. The
+  checker does NOT cross-join posted outcomes to `turn_outcome` kind or to F7 — that
+  correspondence is unit/integration-mandated instead.
 
 ## 11. Config & pinned rules
 
