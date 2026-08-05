@@ -48,7 +48,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from config import CHANNEL_CAPABILITY_KEYS, config
@@ -132,6 +132,17 @@ _BATCHED_IMAGES_NONE_CARRIED = (
 
 
 # ---------------------------------------------------------------- pinned turn context
+
+# The memo keys whose value is a function of the PINNED STREAM, as opposed to the pinned
+# evidence around it (STALE_RECONSIDERATION §4c). A reconsideration pass replaces the stream, so
+# these entries must be dropped from the copied memo and lazily recomputed; every other memo key
+# is pinned evidence that stays byte-identical across the pass.
+#
+# `roster` is TRANSITIVELY stream-derived: `build_evidence_items` computes it from
+# `ctx.stream_actors` (itself the memoized read of the stream), so a new actor in the fresh
+# stream must reach the roster evidence. Transitive dependencies are classified BY HAND here —
+# the tripwire test catches unclassified keys, not dependencies.
+STREAM_DERIVED_MEMO_KEYS = {"stream_actors", "roster"}
 
 
 @dataclass(frozen=True)
@@ -282,6 +293,22 @@ def native_file_token_bound(size_bytes: Optional[int], page_count: Optional[int]
     return max(by_bytes, by_pages)
 
 
+def fresh_turn_context(ctx: ChannelTurnContext, fresh_stream: ChannelStream
+                       ) -> ChannelTurnContext:
+    """The reconsideration pass's context: fresh stream, pinned everything else (§4c).
+
+    `dataclasses.replace` with BOTH fields replaced — the stream, and a COPY of the memo minus
+    `STREAM_DERIVED_MEMO_KEYS`. Pinned evidence (time, job notes, memory, topic, requester,
+    custom) stays byte-identical across the pass because the copied entries are the same
+    objects; the stream-derived entries are absent and lazily recompute from the fresh stream,
+    which is how a new actor in the rebuilt window reaches the roster evidence. Attachments,
+    document finalization and cohort/steering/profile evidence are NOT rerun — they ride the
+    copied context fields.
+    """
+    fresh_memo = {k: v for k, v in ctx.memo.items() if k not in STREAM_DERIVED_MEMO_KEYS}
+    return replace(ctx, stream=fresh_stream, memo=fresh_memo)
+
+
 # ---------------------------------------------------------------- the estimate
 
 
@@ -344,7 +371,8 @@ def estimate_admission(*, instructions: str, input_items: Sequence[Dict[str, Any
                        tools: Optional[Sequence[Dict[str, Any]]],
                        raw_document_texts: Sequence[Tuple[str, str]],
                        native_file_bounds: Sequence[int],
-                       model: Optional[str]) -> AdmissionEstimate:
+                       model: Optional[str],
+                       response_format: Optional[Dict[str, Any]] = None) -> AdmissionEstimate:
     """What this request can cost AT WORST, before anything is sent.
 
     An upper bound in every term: text is charged one token per utf-8 byte (no byte-level BPE
@@ -361,6 +389,11 @@ def estimate_admission(*, instructions: str, input_items: Sequence[Dict[str, Any
     already bought — a short document's reserve would not even hold the truncation marker, so its
     summary would be dropped entirely. One entry PER DOCUMENT, keyed but not deduplicated, so two
     documents that share a key are two charges and two grants [r4-3].
+
+    `response_format` is the OUTER `text.format` object a structured-output request will carry
+    (the stale-reconsideration decision is the one caller today, STALE_RECONSIDERATION §4d).
+    Charged by its serialized JSON length like other structure, under its own breakdown key;
+    absent means the request sends no format object and nothing is charged.
     """
     items = [item for item in input_items if isinstance(item, dict)]
     breakdown = {
@@ -375,6 +408,9 @@ def estimate_admission(*, instructions: str, input_items: Sequence[Dict[str, Any
     }
     reserves = tuple((key, admission_charge(text)) for key, text in raw_document_texts)
     breakdown["document_text"] = sum(charge for _key, charge in reserves)
+    if response_format is not None:
+        breakdown["response_format"] = admission_charge(
+            json.dumps(response_format, default=str))
     total = sum(breakdown.values())
     limit = config.get_model_token_limit(model or config.gpt_model)
     # BOTH MARKERS: the room's content is the canonical stream PLUS the origin block, which sits
@@ -875,19 +911,57 @@ def build_developer_suffix(ctx: ChannelTurnContext, *, processor: Any,
 # ---------------------------------------------------------------- the assembler
 
 
+def reconsideration_profile(thread_config: Optional[Dict[str, Any]], *,
+                            model: Optional[str]) -> Dict[str, Any]:
+    """The exact normalized no-tools capability profile (STALE_RECONSIDERATION §4d).
+
+    A non-mutating COPY of the pinned effective profile with every tool-bearing field off —
+    literal `False`, never deleted, because absent keys fall back to process config in
+    `hosted_tool_digest_entries` — `image_model=None` (the literal field the capability hash
+    reads), and `model` set to the SELECTED reconsideration model, so the capability suffix and
+    hash name the model actually called and claim no tool, and the tool-schema digest cannot
+    claim MCP.
+    """
+    profile = dict(thread_config or {})
+    profile["enable_web_search"] = False
+    profile["enable_code_interpreter"] = False
+    profile["enable_mcp"] = False
+    profile["enable_canvas_tools"] = False
+    profile["image_model"] = None
+    profile["model"] = model
+    return profile
+
+
 def assemble_channel_request(*, processor: Any, client: Any, ctx: ChannelTurnContext,
                              model: Optional[str], tools: Optional[List[Dict[str, Any]]],
                              request_config: Optional[Dict[str, Any]],
                              contract_suffix: Optional[str],
                              registry: Any = None,
                              reply_destination: Optional[str] = None,
-                             with_estimate: bool = False) -> ChannelRequest:
+                             with_estimate: bool = False,
+                             no_tools: bool = False,
+                             response_format: Optional[Dict[str, Any]] = None
+                             ) -> ChannelRequest:
     """Assemble ONE channel turn's request. Both text handlers converge here.
 
     `model` and `tools` are the only fork-local inputs: a timeout retry sends a different model
     envelope and no tools, and everything else — the stream, the evidence, the suffix — comes from
     the pinned context so the two attempts are answering the same question.
+
+    `no_tools=True` is the reconsideration assembly mode (STALE_RECONSIDERATION §4d): the
+    context's capability profile is normalized through `reconsideration_profile` with `model` as
+    the called model, and `registry`, `contract_suffix` and `tools` are forced to
+    None/None/[] — so the system instructions, the capability suffix and every hash describe a
+    request that genuinely offers no tool. `response_format` rides through to the admission
+    estimator so the estimate covers the structured-output format object the call will send.
     """
+    if no_tools:
+        profile = reconsideration_profile(ctx.thread_config, model=model)
+        ctx = replace(ctx, thread_config=profile)
+        request_config = profile
+        registry = None
+        contract_suffix = None
+        tools = []
     stream = ctx.stream
     instructions = _channel_instructions(processor, client, ctx, registry=registry)
     items: List[Dict[str, Any]] = []
@@ -935,7 +1009,8 @@ def assemble_channel_request(*, processor: Any, client: Any, ctx: ChannelTurnCon
         estimate = estimate_admission(
             instructions=instructions, input_items=items, tools=tools,
             raw_document_texts=ctx.raw_document_texts,
-            native_file_bounds=ctx.native_file_bounds, model=model)
+            native_file_bounds=ctx.native_file_bounds, model=model,
+            response_format=response_format)
     return ChannelRequest(instructions=instructions, input_items=items, tools=tools,
                           prompt_cache_key=prompt_cache_key(ctx.team_id, ctx.channel_id),
                           evidence_hash=evidence_hash, estimate=estimate)

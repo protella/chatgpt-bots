@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-from typing import Any, Callable, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from config import config, clamp_effort
 from openai_client.container_errors import (demote_container_tools, is_container_gone,
@@ -1372,6 +1373,211 @@ def _render_wake_source(source: Any, *, index: int, total: int) -> str:
                      "is being asked." if edit.get("already_replied")
                      else "The assistant has not replied to it yet.")
     return "\n".join(lines)
+
+
+# --------------------------------------------------- stale reconsideration (spec §4d)
+
+# The decision schema, LITERAL from STALE_RECONSIDERATION §4d. The model chooses one of three
+# options and may carry a revised draft; it carries NO timestamps — reviewed-through evidence is
+# computed by trusted runtime snapshot code, never supplied by the model.
+STALE_RECONSIDERATION_DECISION_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["decision", "text"],
+    "properties": {
+        "decision": {"enum": ["post", "force_post", "skip"]},
+        "text": {"type": ["string", "null"]},
+    },
+}
+
+# The OUTER `text.format` object the call sends, and the exact payload the admission estimator
+# charges under its `response_format` breakdown key.
+STALE_RECONSIDERATION_RESPONSE_FORMAT: Dict[str, Any] = {
+    "type": "json_schema",
+    "name": "stale_reconsideration_decision",
+    "strict": True,
+    "schema": STALE_RECONSIDERATION_DECISION_SCHEMA,
+}
+
+
+@dataclass(frozen=True)
+class ReconsiderationDecision:
+    """One usable decision out of the structured call.
+
+    `text` is the revised draft, already normalized: whitespace-only text is None (≡ null), and
+    a `skip` never carries text — the anomaly is logged, the text discarded. Comparing `text`
+    against the current draft (stripped) is the RUNNER's job, not this layer's.
+    """
+
+    decision: str            # "post" | "force_post" | "skip"
+    text: Optional[str]
+
+
+class ReconsiderationDecisionError(Exception):
+    """The reconsideration call completed without a usable decision (§4f `model_failure`).
+
+    `detail` is the subtype the failed `ModelAttempt` records: "refusal", "incomplete",
+    "empty" or "schema_invalid". API errors and timeouts propagate as themselves.
+    """
+
+    def __init__(self, detail: str, message: Optional[str] = None):
+        super().__init__(message or detail)
+        self.detail = detail
+
+
+def _parse_reconsideration_payload(raw: str) -> Optional[Tuple[str, Optional[str]]]:
+    """The strict schema's payload, or None on ANY shape the schema forbids.
+
+    Keys must be exactly {decision, text} (additionalProperties is false and both are
+    required), the decision must be one of the three options, and text must be a string or a
+    real JSON null — nothing is coerced, exactly as `_parse_wake` refuses to guess. The ENTIRE
+    stripped text must be the JSON document: a strict structured output never carries prose
+    around it, so surrounding content is schema-invalid, never salvaged by brace-hunting.
+    """
+    text = (raw or "").strip()
+    try:
+        payload = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict) or set(payload.keys()) != {"decision", "text"}:
+        return None
+    decision, draft = payload["decision"], payload["text"]
+    if decision not in ("post", "force_post", "skip"):
+        return None
+    if draft is not None and not isinstance(draft, str):
+        return None
+    return decision, draft
+
+
+async def create_reconsideration_decision(
+    self,
+    *,
+    input_items: List[Dict[str, Any]],
+    instructions: Optional[str] = None,
+    model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+    verbosity: Optional[str] = None,
+    max_output_tokens: Optional[int] = None,
+    temperature: Optional[float] = None,
+    prompt_cache_key: Optional[str] = None,
+    attempt_sink: Optional[Any] = None,
+    on_attempt_open: Optional[Callable[[Optional[int]], Any]] = None,
+) -> ReconsiderationDecision:
+    """The mandated structured-decision call over a stale draft (STALE_RECONSIDERATION §4d).
+
+    RESPONDER-model semantics, not utility-model: the request is assembled by the same builder
+    every responder call uses (`_build_request_params`, channel layout), so the sampling rules
+    match a retry of the original request exactly — reasoning efforts send `temperature=1.0`;
+    effort `none` passes the caller's pinned `temperature` and lets the builder resolve `top_p`
+    from process config. `store=False`, `tools=[]`, the caller's `prompt_cache_key`, the strict
+    decision format and `API_TIMEOUT_READ` ride every call. The wrapper itself rereads no
+    mutable settings — everything per-turn arrives as an argument.
+
+    `on_attempt_open(seq)` is invoked after `ModelAttemptSink.open()` and BEFORE the request —
+    the runner emits `reconsider_start` there. `open()` returning None hands the callback None
+    (the seq is then omitted from telemetry); a callback that raises is logged and never blocks
+    the call.
+
+    Raises `ReconsiderationDecisionError` on refusal / incomplete / empty / schema-invalid
+    output, with the failed attempt closed under that detail; API and timeout errors propagate
+    unchanged and the `finally` twin closes the attempt as the exception in flight.
+    """
+    request_params = _build(
+        model=model,
+        input_items=input_items,
+        system_prompt=instructions,
+        max_output_tokens=max_output_tokens,
+        reasoning_effort=reasoning_effort,
+        verbosity=verbosity,
+        temperature=temperature,
+        top_p=None,
+        store=False,
+        tools=[],
+        prompt_cache_key=prompt_cache_key,
+        layout="channel",
+    )
+    request_params.setdefault("text", {})["format"] = dict(STALE_RECONSIDERATION_RESPONSE_FORMAT)
+
+    attempts: List[Any] = []
+    usage_captured: Dict[str, Any] = {}
+    try:
+        _open_attempt(attempt_sink, request_params, attempts)
+        seq = getattr(attempts[-1], "attempt_seq", None) if attempts else None
+        if on_attempt_open is not None:
+            try:
+                result = on_attempt_open(seq)
+                if result is not None and hasattr(result, "__await__"):
+                    await result
+            except Exception as callback_error:  # noqa: BLE001 — telemetry never blocks the call
+                self.log_warning(
+                    f"reconsideration on_attempt_open callback failed: {callback_error}")
+
+        response = await self._safe_api_call(
+            self.client.responses.create,
+            operation_type="general",
+            timeout_seconds=config.api_timeout_read,
+            **request_params,
+        )
+        usage_captured = _capture_usage(None, response)
+
+        def _fail(detail: str, message: Optional[str] = None) -> ReconsiderationDecisionError:
+            _close_attempt(attempt_sink, attempts, status="error", usage=usage_captured,
+                           detail=detail)
+            return ReconsiderationDecisionError(detail, message)
+
+        # Only "completed" proceeds — a missing or unknown status is rejected, never waved
+        # through as if it were success.
+        status = getattr(response, "status", None)
+        if str(status or "") != "completed":
+            raise _fail("incomplete",
+                        f"reconsideration response was {status}"
+                        f" ({_incomplete_reason(response)})")
+
+        out = ""
+        refused = False
+        malformed_text: Optional[str] = None
+        for item in (getattr(response, "output", None) or []):
+            for content in (getattr(item, "content", None) or []):
+                if (getattr(content, "type", None) == "refusal"
+                        or getattr(content, "refusal", None)):
+                    refused = True
+                elif (getattr(content, "type", None) == "output_text"
+                        and getattr(content, "text", None) is not None):
+                    # ONLY structured-output text is parseable — arbitrary content types
+                    # carrying a `text` attribute are not the model's decision.
+                    if isinstance(content.text, str):
+                        out += content.text
+                    elif malformed_text is None:
+                        # A NON-STRING `text` on an output_text part — truthy (object, 1) or
+                        # falsey (0, False, [], {}) alike — is schema-invalid output,
+                        # classified as such below rather than escaping this function as a
+                        # TypeError the runner would misfile, and never mistaken for "empty".
+                        malformed_text = type(content.text).__name__
+        if refused:
+            # A refusal dominates: parseable text alongside it never overrides the model's
+            # stated unwillingness to decide.
+            raise _fail("refusal")
+        if malformed_text is not None:
+            raise _fail("schema_invalid",
+                        f"output_text.text is {malformed_text}, not a string")
+        if not out.strip():
+            raise _fail("empty")
+
+        parsed = _parse_reconsideration_payload(out)
+        if parsed is None:
+            raise _fail("schema_invalid")
+        decision, draft = parsed
+        if draft is not None and not draft.strip():
+            draft = None                       # whitespace-only ≡ null (§4d)
+        if decision == "skip" and draft is not None:
+            # The anomaly is logged; the text itself never is (§4d).
+            self.log_warning(
+                "reconsideration decision 'skip' arrived carrying text; the text is ignored")
+            draft = None
+        _close_attempt(attempt_sink, attempts, status="ok", usage=usage_captured)
+        return ReconsiderationDecision(decision=decision, text=draft)
+    finally:
+        _close_attempt_error(attempt_sink, attempts, usage_captured)
 
 
 async def extract_memory(self, exchange_text: str, existing_memory: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:

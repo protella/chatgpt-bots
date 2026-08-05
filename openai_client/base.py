@@ -14,6 +14,9 @@ from .api import images as image_api
 from .api import responses as responses_api
 from .api import tool_loop as tool_loop_api
 from .api import vision as vision_api
+from .api.responses import (STALE_RECONSIDERATION_DECISION_SCHEMA,
+                            STALE_RECONSIDERATION_RESPONSE_FORMAT,
+                            ReconsiderationDecision, ReconsiderationDecisionError)
 from .utilities import ImageData
 
 _request_log = setup_logger(name="slack_bot.request_builder")
@@ -617,6 +620,43 @@ class OpenAIClient(LoggerMixin):
             **params,
         )
 
+    async def create_reconsideration_decision(
+        self,
+        *,
+        input_items: List[Dict[str, Any]],
+        instructions: Optional[str] = None,
+        model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+        verbosity: Optional[str] = None,
+        max_output_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        prompt_cache_key: Optional[str] = None,
+        attempt_sink: Optional[Any] = None,
+        on_attempt_open: Optional[Callable[[Optional[int]], Any]] = None,
+    ) -> ReconsiderationDecision:
+        """The stale-reconsideration structured decision (STALE_RECONSIDERATION §4d).
+
+        Responder-model semantics through the one request builder: reasoning efforts pin
+        `temperature=1.0`; effort `none` passes the caller's pinned temperature and the
+        builder-resolved `top_p`; `store=False`, `tools=[]`, strict decision schema,
+        `API_TIMEOUT_READ`. `on_attempt_open(seq)` fires after the attempt opens and before the
+        request; a raising callback never blocks the call. Raises
+        `ReconsiderationDecisionError` (detail: refusal/incomplete/empty/schema_invalid) when
+        no usable decision came back."""
+        return await responses_api.create_reconsideration_decision(
+            self,
+            input_items=input_items,
+            instructions=instructions,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            verbosity=verbosity,
+            max_output_tokens=max_output_tokens,
+            temperature=temperature,
+            prompt_cache_key=prompt_cache_key,
+            attempt_sink=attempt_sink,
+            on_attempt_open=on_attempt_open,
+        )
+
     async def classify_wake(
         self,
         *,
@@ -892,4 +932,6 @@ class OpenAIClient(LoggerMixin):
         )
 
 
-__all__ = ["OpenAIClient", "ImageData", "attach_cache_breakpoint"]
+__all__ = ["OpenAIClient", "ImageData", "attach_cache_breakpoint",
+           "ReconsiderationDecision", "ReconsiderationDecisionError",
+           "STALE_RECONSIDERATION_DECISION_SCHEMA", "STALE_RECONSIDERATION_RESPONSE_FORMAT"]

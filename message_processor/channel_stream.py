@@ -1849,6 +1849,7 @@ def guaranteed_eligible_root(m: NormalizedMessage, chrome_ts: FrozenSet[str]) ->
 async def prepare_channel_turn(*, client: Any, db: Any, team_id: str, channel_id: str, h: str,
                                frontier: int = 0, drain_timeout: Optional[float] = None,
                                barrier_context: Optional[Dict[str, Any]] = None,
+                               skip_dev_barrier: bool = False,
                                ) -> PreparedTurn:
     """§4.4 steps 1-4, and NOTHING may fetch until it returns.
 
@@ -1857,6 +1858,11 @@ async def prepare_channel_turn(*, client: Any, db: Any, team_id: str, channel_id
     `conversations.replies` could begin before the drain had resolved — the one ordering P1
     established. Splitting the pre-fetch steps into their own awaited phase makes that violation
     impossible rather than merely discouraged.
+
+    `skip_dev_barrier=True` skips `dev_barriers.post_admission()` entirely — the barrier writes
+    files and can block, and omitting `barrier_context` does NOT skip it. The pure
+    reconsideration snapshot passes True (STALE_RECONSIDERATION §4c); every production turn
+    keeps the default.
     """
     checked_h = _checked_ts(h, "H")
 
@@ -1898,8 +1904,9 @@ async def prepare_channel_turn(*, client: Any, db: Any, team_id: str, channel_id
     # and a live event arriving mid-fetch would be silently clobbered by staler data.
     generation = actor_tail_module.generation(channel_id)
 
-    await dev_barriers.post_admission(**{**(barrier_context or {}), "channel_id": channel_id,
-                                         "H": checked_h, "floor_ts": floor_read or ""})
+    if not skip_dev_barrier:
+        await dev_barriers.post_admission(**{**(barrier_context or {}), "channel_id": channel_id,
+                                             "H": checked_h, "floor_ts": floor_read or ""})
     return PreparedTurn(team_id=team_id, channel_id=channel_id, h=checked_h, frontier=frontier,
                         floor_read=floor_read, coverage=coverage, generation=generation,
                         selection_version=SELECTION_VERSION,
@@ -2456,6 +2463,59 @@ async def build_channel_stream(*, client: Any, db: Any, team_id: str, channel_id
     _emit_stream_render(result, turn_id=turn_id, origin_root_ts=origin_root_ts,
                         trigger_ts=trigger_ts)
     return result
+
+
+async def build_reconsideration_snapshot(*, client: Any, db: Any, team_id: str, channel_id: str,
+                                         trigger_ts: Optional[str] = None,
+                                         origin_root_ts: Optional[str] = None,
+                                         capability_profile_hash: str = "",
+                                         tool_schema_version: str = "",
+                                         reach_tools: Tuple[str, ...] = (),
+                                         drain_timeout: Optional[float] = None,
+                                         ) -> StreamBuildResult:
+    """The PURE snapshot seam for stale reconsideration (STALE_RECONSIDERATION §4c).
+
+    Composed exactly like `build_channel_stream`: one shared absolute deadline taken when the
+    prepare phase returns, periphery and origin built CONCURRENTLY from the same phase methods.
+    H and the frontier come from a FRESH atomic `admission_watermark.pin()`, so the rebuilt
+    window contains everything admitted since the original turn pinned its own — including the
+    message that suppressed the draft.
+
+    Permitted side effects, exactly: in-memory username/display-name cache fills (the probe
+    acknowledges the same, `tools/stream_probe.py`). Forbidden, and structurally absent here:
+    the durable anchor write, dirty-state clearing and dead-root drops (`probe=True`),
+    actor-tail writes, telemetry emission of any kind, and the dev barrier
+    (`skip_dev_barrier=True` — the barrier writes files and can block).
+
+    A deadline miss or any fetch failure propagates; the caller treats it as a context-rebuild
+    failure (§4f), never as a reason to post unexamined.
+    """
+    pin = admission_watermark.pin(channel_id, trigger_ts)
+    prepared = await prepare_channel_turn(
+        client=client, db=db, team_id=team_id, channel_id=channel_id, h=pin.h,
+        frontier=pin.frontier, drain_timeout=drain_timeout, skip_dev_barrier=True)
+
+    # ONE absolute deadline, taken after the drain exactly as the full builder takes it.
+    deadline_at = time.monotonic() + float(config.fetch_retry_total_seconds)
+    origin_budget = FetchBudget(deadline_at=deadline_at, page_ceiling=None)
+
+    shared_task = asyncio.ensure_future(build_channel_pin(
+        prepared, client=client, db=db, reach_tools=reach_tools,
+        capability_profile_hash=capability_profile_hash,
+        tool_schema_version=tool_schema_version, probe=True, deadline_at=deadline_at))
+    origin_task = asyncio.ensure_future(fetch_origin_thread(
+        client, channel_id, origin_root_ts, pin.h, origin_budget, trigger_ts))
+    shared, origin_fetch = await _gather_or_cancel([shared_task, origin_task])
+
+    pinned, origin_pages = await build_origin_pin(shared, origin_fetch, db=db, client=client)
+    stream = serialize_stream(pinned)
+
+    # No anchor persist, no actor-tail reconcile, no `_emit_stream_render` — the snapshot reads
+    # the world and writes nothing durable about having done so.
+    return StreamBuildResult(
+        stream=stream, reselected=shared.reselected, anchor_advanced=False,
+        pages=PageCounts(history=shared.pages.history, reply=shared.pages.reply,
+                         origin=origin_pages))
 
 
 def _freeze_sidecars(payload: Optional[Dict[str, Any]]) -> SidecarPin:
