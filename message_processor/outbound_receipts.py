@@ -24,37 +24,53 @@ resurrect a message Slack has already confirmed gone. A process that dies with a
 queue permanently omits those rows; boot reconcile finalizes rows that EXIST, it cannot
 reconstruct a registration that only ever lived in memory.
 
-CLASSIFICATION INVENTORY (every durable post site; "exempt" = DM/ephemeral, no row possible)
+CLASSIFICATION INVENTORY (every durable post site; "exempt" = DM/ephemeral, no row possible).
+The `stamp` column is the EDIT_OWN_MESSAGE §4 receipt_class every producer passes EXPLICITLY —
+the ledger API takes it as a required keyword, there is no default and no inference.
 
-  site                                                     owner    class
-  --------------------------------------------------------------------------------------
-  send_message single post                                 turn     in_flight -> finalized
-  send_message split chunks 1..N                           turn     in_flight each, unit
-                                                                    finalize
-  send_message split-abort truncation notice               turn     finalized
-  _reconcile_uncertain_post late ts                        turn     late register -> finalize
-  send_message_get_ts legacy seed                          turn     in_flight -> finalized
-  native stream part 1..N (chat.startStream)               turn     in_flight each, unit
-                                                                    finalize
-  native stream abandon()                                  turn     delete after Slack confirms
-  legacy overflow part (_post_overflow_part)               turn     in_flight -> finalized
-  thinking placeholder                                     turn     chrome -> promote on the
-                                                                    first answer-bearing edit
-  "Retrying without ..." overwrite of a partial            turn     demote to chrome
-  terminal error / timeout / interruption notice           turn     finalized
-  prior-timeout notice (process_message)                   turn     finalized
-  status card post/update (research)                       job      chrome
-  progress checklist message                               turn     chrome
-  response footer post                                     turn     chrome
-  post_to_thread                                           turn     finalized + thread_root_ts
-  research findings / failure note                         job      finalized
-  detached image upload (publish_image)                    producer finalized via pending share
-  artifact upload (send_file)                              producer finalized via pending share
-  image-gen handler notices                                turn     finalized
-  channel-join hello + findings                            sys      finalized
-  channel welcome / reminder / settings-button posts       sys      chrome
-  settings "saved" confirmations in a channel              sys      finalized
-  ephemerals, DM targets, assistant greetings              --       exempt (structural)
+  site                                             owner    state lifecycle        stamp
+  ------------------------------------------------------------------------------------------
+  send_message single post                         turn     in_flight -> finalized caller's
+                                                                                   (reply sites
+                                                                                   stamp
+                                                                                   assistant_reply)
+  send_message split chunks 1..N                   turn     in_flight each, unit   caller's
+                                                            finalize
+  send_message split-abort truncation notice       turn     finalized              system_notice
+  _reconcile_uncertain_post late ts                turn     late register ->       caller's
+                                                            finalize
+  send_message_get_ts legacy seed                  turn     in_flight -> finalized caller's
+  native stream part 1..N (chat.startStream)       turn     in_flight each, unit   assistant_reply
+                                                            finalize
+  native stream abandon()                          turn     delete after confirm   --
+  legacy overflow part (_post_overflow_part)       turn     in_flight -> finalized assistant_reply
+  thinking placeholder                             turn     chrome -> promote on   chrome; promote
+                                                            first answer edit      maps to
+                                                                                   assistant_reply
+  "Retrying without ..." overwrite of a partial    turn     demote to chrome       maps back to
+                                                                                   chrome
+  terminal error / timeout / interruption notice   turn     finalized              system_notice
+  prior-timeout notice (process_message)           turn     finalized              system_notice
+  status card post/update (research)               job      chrome                 background_job
+  progress checklist message                       turn     chrome                 background_job
+  response footer post                             turn     chrome                 chrome
+  post_to_thread                                   turn     finalized + root       assistant_reply
+  research findings / failure note                 job      finalized              background_job
+  detached image upload (publish_image)            producer finalized via pending  artifact
+                                                            share
+  artifact upload (send_file)                      producer finalized via pending  artifact
+                                                            share
+  produced-image review comment                    job      in_flight -> finalized artifact
+                                                            (§11.3: job output beside
+                                                            the share, not an editable
+                                                            reply)
+  image-gen handler notices                        turn     finalized              system_notice
+  channel-join hello + findings                    sys      finalized              system_notice
+  channel welcome / reminder / settings-button     sys      chrome                 chrome
+  settings "saved" confirmations in a channel      sys      finalized              system_notice
+  correction disclosure (edit_own_message)         turn     finalized              correction_
+                                                                                   announcement
+  ephemerals, DM targets, assistant greetings      --       exempt (structural)    --
 """
 
 from __future__ import annotations
@@ -82,6 +98,56 @@ STATE_FINALIZED = "finalized"
 STATE_CHROME = "chrome"
 
 RECEIPT_KINDS = (STATE_CHROME, STATE_FINALIZED)
+
+# Receipt CLASSES (EDIT_OWN_MESSAGE spec §4): what KIND of surface a message is, orthogonal to
+# its lifecycle state above (a research status card is chrome-STATE with class background_job).
+# A closed enum, validated in Python; only `assistant_reply` rows are ever edit-eligible.
+# Legacy rows carry NULL and are ineligible for anything class-gated — never inferred.
+CLASS_ASSISTANT_REPLY = "assistant_reply"
+CLASS_CORRECTION_ANNOUNCEMENT = "correction_announcement"
+CLASS_SYSTEM_NOTICE = "system_notice"
+CLASS_BACKGROUND_JOB = "background_job"
+CLASS_ARTIFACT = "artifact"
+CLASS_CHROME = "chrome"
+
+RECEIPT_CLASSES = (CLASS_ASSISTANT_REPLY, CLASS_CORRECTION_ANNOUNCEMENT, CLASS_SYSTEM_NOTICE,
+                   CLASS_BACKGROUND_JOB, CLASS_ARTIFACT, CLASS_CHROME)
+
+
+def _checked_class(receipt_class: Any, *, site: str, message_ts: Any = None) -> Optional[str]:
+    """The ledger-side enum gate. Never raises into a posting path.
+
+    A producer passing an unknown class is a bug worth shouting about, but refusing the WRITE
+    would put the delivered message outside the stream forever — the module's worst failure.
+    So the row is written with a NULL class (ineligible for anything class-gated, exactly like
+    a legacy row: fail closed on the class, never on the delivery record) and the bug is
+    logged as an error. An explicit None gets the same loud line: every producer is required
+    to say what it posted.
+    """
+    if receipt_class in RECEIPT_CLASSES:
+        return receipt_class
+    logger.error(
+        "Receipt class %r at %s for ts=%s is not a valid class — recording NULL "
+        "(the row stays ineligible for anything class-gated)",
+        receipt_class, site, message_ts, stack_info=receipt_class is not None)
+    return None
+
+
+def receipt_has_class(receipt: Any, required_class: str) -> bool:
+    """Whether a receipt row carries EXACTLY `required_class` (spec §4 eligibility).
+
+    The single answer to "is this row class-gated in": a legacy row (receipt_class IS NULL)
+    is NEVER eligible, and nothing here infers a class from state, owner, text, provenance or
+    the pre-epoch grandfather. `receipt` may be a DB row dict or anything with a
+    `receipt_class` attribute; anything else is ineligible.
+    """
+    if required_class not in RECEIPT_CLASSES:
+        raise ValueError(f"invalid receipt class: {required_class!r}")
+    if isinstance(receipt, dict):
+        value = receipt.get("receipt_class")
+    else:
+        value = getattr(receipt, "receipt_class", None)
+    return value == required_class
 
 # How long a turn's settle may hold the outer finally before we give up on it and let the
 # drain worker carry the rows. Shielded, so the settle itself continues either way.
@@ -142,6 +208,44 @@ _RANK = {"chrome": 0, "register": 1, "promote": 1, "demote": 1, "pending_share":
 # Slack confirmed the thing is gone; nothing queued behind one may write a row for it again.
 _TOMBSTONES = frozenset({"delete", "delete_share"})
 
+
+class _PoisonedClass:
+    """Spec §11.12: the DISTINCT conflict-poisoned class sentinel.
+
+    Plain None could not carry the verdict: None also means "no claim yet", so a third claim
+    arriving after a conflict looked like a first fill and quietly refilled the class the
+    conflict had just voided. This object is truthy, equal only to itself, and sticky in every
+    merge — once a conflict stamps it, no later claim refills the class. It reaches the
+    database as NULL (`_Op.db_class`), the ineligible terminal state, and nothing else.
+    """
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<receipt class conflict-poisoned>"
+
+
+POISONED_CLASS = _PoisonedClass()
+
+
+def _merged_class(survivor: "_Op", other: "_Op") -> Any:
+    """The class the SURVIVING op carries after a lattice merge (spec §11.1/§11.12).
+
+    Two REAL classes disagreeing is a producer bug: the survivor fails closed to the distinct
+    POISONED_CLASS sentinel (writes as NULL, the ineligible terminal state). The poison is
+    STICKY — once either side carries it the merge answers poison, so a third claim after a
+    conflict can never refill the class. Otherwise the known class fills the unknown one.
+    """
+    a, b = survivor.receipt_class, other.receipt_class
+    if a is POISONED_CLASS or b is POISONED_CLASS:
+        return POISONED_CLASS
+    if a and b and a != b:
+        logger.error(
+            "Receipt class conflict in the lattice for %s/%s: %r vs %r — class poisoned "
+            "(ineligible; writes as NULL)",
+            survivor.channel_id, survivor.file_id or survivor.message_ts, a, b)
+        return POISONED_CLASS
+    return a or b
+
 # Lattice kind → ledger op (participation_telemetry.RECEIPT_OPS). `chrome` and `register` are one
 # op there: both are a registration, and the row's `new_state` already says which surface it made.
 # The share ops are absent on purpose — they touch pending_share_receipts, not outbound_receipts,
@@ -182,6 +286,11 @@ class _Op:
     message_ts: str
     owner: str
     thread_root_ts: Optional[str] = None
+    # Spec §4: the class the producer stamped, riding the queued write so a retried
+    # registration lands with the same claim the original made. None only for ops that carry
+    # no claim of their own (delete, demote — the DB maps the demotion class itself).
+    # POISONED_CLASS (spec §11.12) after a lattice conflict — sticky, never refilled.
+    receipt_class: Optional[Any] = None
     # Set only for pending-share ops, which have no message ts yet — the file id is the whole
     # handle Slack gave us.
     file_id: Optional[str] = None
@@ -189,6 +298,12 @@ class _Op:
     @property
     def rank(self) -> int:
         return _RANK.get(self.kind, 0)
+
+    @property
+    def db_class(self) -> Optional[str]:
+        """What the DATABASE is told: a conflict-poisoned class writes as NULL — the
+        ineligible terminal state — and the sentinel itself never leaves the lattice."""
+        return None if self.receipt_class is POISONED_CLASS else self.receipt_class
 
     @property
     def key(self) -> Tuple[str, str, str]:
@@ -268,9 +383,27 @@ class ReceiptService:
             if op.rank < existing.rank:
                 if op.thread_root_ts and not existing.thread_root_ts:
                     existing.thread_root_ts = op.thread_root_ts
+                existing.receipt_class = _merged_class(existing, op)
+                return
+            if op.kind == "pending_share" and existing.kind == "pending_share":
+                # Spec §11.12/§11.20: queued pending-share claims are UNCONDITIONALLY
+                # first-writer, mirroring the database's rule. An identical re-claim is an
+                # idempotent no-op; ANY differing second claim — class (None and poisoned
+                # included), owner or root — is dropped with the ERROR, because an equal-rank
+                # replacement would hand the file's ownership and class to the later claim.
+                if (op.owner == existing.owner
+                        and op.receipt_class == existing.receipt_class
+                        and op.thread_root_ts == existing.thread_root_ts):
+                    return
+                logger.error(
+                    "Pending share %s second claim differs in the lattice: first "
+                    "claim (%s) carries %r, %s claimed %r — the first claim stands",
+                    op.file_id, existing.owner, existing.receipt_class, op.owner,
+                    op.receipt_class)
                 return
             if existing.thread_root_ts and not op.thread_root_ts:
                 op.thread_root_ts = existing.thread_root_ts
+            op.receipt_class = _merged_class(op, existing)
         self._queue[key] = op
         self._ensure_drain()
 
@@ -360,20 +493,22 @@ class ReceiptService:
             if op.kind == "register":
                 result = await db.register_receipt_async(
                     op.team_id, op.channel_id, op.message_ts, op.owner, STATE_IN_FLIGHT,
-                    op.thread_root_ts)
+                    op.thread_root_ts, receipt_class=op.db_class)
             elif op.kind == "promote":
                 result = await db.register_receipt_async(
                     op.team_id, op.channel_id, op.message_ts, op.owner, STATE_IN_FLIGHT,
-                    op.thread_root_ts)
+                    op.thread_root_ts, receipt_class=op.db_class)
             elif op.kind == "chrome":
                 result = await db.register_chrome_async(
-                    op.team_id, op.channel_id, op.message_ts, op.owner, op.thread_root_ts)
+                    op.team_id, op.channel_id, op.message_ts, op.owner, op.thread_root_ts,
+                    receipt_class=op.db_class)
             elif op.kind == "demote":
                 result = await db.demote_receipt_chrome_async(
                     op.team_id, op.channel_id, op.message_ts, op.owner)
             elif op.kind == "finalize":
                 unit = await db.finalize_receipts_async(
-                    op.team_id, op.channel_id, [(op.message_ts, op.thread_root_ts)], op.owner)
+                    op.team_id, op.channel_id,
+                    [(op.message_ts, op.thread_root_ts, op.db_class)], op.owner)
                 result = unit[0] if isinstance(unit, (list, tuple)) and unit else None
             elif op.kind == "delete":
                 result = await db.delete_receipt_async(
@@ -386,7 +521,8 @@ class ReceiptService:
                                  op.file_id)
                     return True
                 await db.record_pending_share_async(
-                    op.team_id, op.channel_id, op.file_id, op.owner, op.thread_root_ts)
+                    op.team_id, op.channel_id, op.file_id, op.owner, op.thread_root_ts,
+                    receipt_class=op.db_class)
                 # Same overlap as the direct write: a deletion can stamp and scan while this
                 # one is in flight. Checked again now that it has committed.
                 await _drop_share_row_if_deleted(db, self, op.team_id, op.channel_id,
@@ -429,8 +565,13 @@ class ReceiptService:
         return False
 
     async def finalize_unit(self, team_id: str, channel_id: str,
-                            records: List[Tuple[str, Optional[str]]], owner: str) -> bool:
-        """Finalize a turn's posts as ONE unit; per-receipt fallback keeps the queue honest."""
+                            records: List[Tuple[str, Optional[str], Optional[str]]],
+                            owner: str) -> bool:
+        """Finalize a turn's posts as ONE unit; per-receipt fallback keeps the queue honest.
+
+        `records` = [(message_ts, thread_root_ts|None, receipt_class|None)] — the class each
+        post was stamped with rides the finalize, so a lost registration is inserted WITH its
+        class rather than as an unclassifiable row."""
         db = self.db
         if db is None or not records:
             return False
@@ -440,24 +581,24 @@ class ReceiptService:
         pending = [r for r in records
                    if self._queue.get((team_id, channel_id, r[0])) is None]
         deferred = [r for r in records if r not in pending]
-        for ts, root in deferred:
-            self._enqueue(_Op("finalize", team_id, channel_id, ts, owner, root))
+        for ts, root, cls in deferred:
+            self._enqueue(_Op("finalize", team_id, channel_id, ts, owner, root, cls))
         if not pending:
             return False
         try:
             results = await db.finalize_receipts_async(team_id, channel_id, pending, owner)
         except Exception as e:  # noqa: BLE001
             logger.warning("Receipt unit finalize failed for %s: %s", channel_id, e)
-            for ts, root in pending:
-                self._enqueue(_Op("finalize", team_id, channel_id, ts, owner, root))
+            for ts, root, cls in pending:
+                self._enqueue(_Op("finalize", team_id, channel_id, ts, owner, root, cls))
             return False
         # One event per message, zipped by position — the accessor returns one result per input
         # record in input order precisely so this attribution cannot slip.
         rows = list(results) if isinstance(results, (list, tuple)) else []
-        for (ts, _root), result in zip(pending, rows):
+        for (ts, _root, _cls), result in zip(pending, rows):
             _emit_transition(channel_id=channel_id, message_ts=ts, owner=owner, op="finalize",
                              result=result)
-        for ts, root in pending:
+        for ts, root, _cls in pending:
             logger.debug("Receipt finalize %s/%s owner=%s root=%s", channel_id, ts, owner, root)
         return True
 
@@ -476,14 +617,17 @@ class ReceiptService:
         task.add_done_callback(self._resolvers.discard)
 
     def queue_pending_share(self, *, team_id: str, channel_id: str, file_id: str, owner: str,
-                            thread_root_ts: Optional[str] = None) -> None:
+                            thread_root_ts: Optional[str] = None,
+                            receipt_class: Optional[str] = None) -> None:
         """The pending row could not be written. Retain the provenance in the lattice: without
         it a live-process SQLite blip loses the upload's owner for good — unless Slack has
-        already said the file is gone, in which case there is nothing left to be provenance for."""
+        already said the file is gone, in which case there is nothing left to be provenance for.
+        The producer's class rides the queued op (spec §4) so the retried row — and any
+        resolution consumed straight off the queue — still carries it."""
         if self.file_is_deleted(file_id):
             return
         self._enqueue(_Op("pending_share", str(team_id), str(channel_id), "", owner,
-                          thread_root_ts, file_id=str(file_id)))
+                          thread_root_ts, receipt_class, file_id=str(file_id)))
 
     def queued_pending_shares(self, file_id: str) -> List[_Op]:
         """Pending-share writes still waiting on the queue for one file id. Slack's
@@ -829,7 +973,8 @@ class ReceiptLedger:
         self.team_id = str(team_id or "")
         self.channel_id = str(channel_id or "")
         self._service = service
-        self._in_flight: Dict[str, Optional[str]] = {}
+        # ts -> (thread_root_ts, receipt_class): what settle will finalize each post AS.
+        self._in_flight: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
         self._settled = False
         # Whether this ledger may hold a turn still at the dev `post_partial_post` seam. OPT-IN:
         # only the responder turn's own ledger qualifies. A detached job and the sys owner post on
@@ -853,20 +998,29 @@ class ReceiptLedger:
     def pending_ts(self) -> List[str]:
         return list(self._in_flight)
 
-    def _op(self, kind: str, ts: str, root: Optional[str] = None) -> _Op:
-        return _Op(kind, self.team_id, self.channel_id, str(ts), self.owner_id, root)
+    def _op(self, kind: str, ts: str, root: Optional[str] = None,
+            receipt_class: Optional[str] = None) -> _Op:
+        return _Op(kind, self.team_id, self.channel_id, str(ts), self.owner_id, root,
+                   receipt_class)
 
     async def note_post(self, ts: Optional[str], kind: str = STATE_IN_FLIGHT,
-                        thread_root_ts: Optional[str] = None) -> None:
-        """Claim a durable post. `kind` chrome registers excluded chrome instead."""
+                        thread_root_ts: Optional[str] = None, *,
+                        receipt_class: Optional[str]) -> None:
+        """Claim a durable post. `kind` chrome registers excluded chrome instead.
+
+        `receipt_class` (spec §4) is REQUIRED — every producer says what kind of surface it
+        posted; there is no default and nothing downstream infers one. An invalid value is
+        recorded as NULL (class-ineligible) and logged loudly rather than losing the row."""
         if not ts or not self.active:
             return
+        receipt_class = _checked_class(receipt_class, site="note_post", message_ts=ts)
         try:
             if kind == STATE_CHROME:
-                await self.note_chrome(ts, thread_root_ts)
+                await self.note_chrome(ts, thread_root_ts, receipt_class=receipt_class)
                 return
             if kind == STATE_FINALIZED:
-                await self.service.apply(self._op("finalize", ts, thread_root_ts))
+                await self.service.apply(
+                    self._op("finalize", ts, thread_root_ts, receipt_class))
                 self._in_flight.pop(str(ts), None)
                 return
             if self._settled:
@@ -883,32 +1037,57 @@ class ReceiptLedger:
                     self.channel_id, ts, self.owner_id)
                 return
             if str(ts) in self._in_flight:
-                return  # already claimed this turn; a streaming tick is not a new message
-            self._in_flight[str(ts)] = thread_root_ts
-            await self.service.apply(self._op("register", ts, thread_root_ts))
+                # Already claimed this turn; a streaming tick is not a new message. A
+                # duplicate claim naming a DIFFERENT class is a producer bug: the class
+                # fails closed to NULL (spec §11.1) — locally, so settle cannot re-stamp
+                # it, and in the row, by forwarding the conflicting claim so the DB
+                # arbitration NULLs it and shouts.
+                prior_root, prior_class = self._in_flight[str(ts)]
+                if (prior_class is not None and receipt_class is not None
+                        and receipt_class != prior_class):
+                    logger.error(
+                        "Receipt class conflict at note_post for %s/%s: %r claimed over "
+                        "%r — class NULLed (ineligible)",
+                        self.channel_id, ts, receipt_class, prior_class)
+                    self._in_flight[str(ts)] = (prior_root, None)
+                    await self.service.apply(
+                        self._op("register", ts, prior_root, receipt_class))
+                return
+            self._in_flight[str(ts)] = (thread_root_ts, receipt_class)
+            await self.service.apply(self._op("register", ts, thread_root_ts, receipt_class))
             await self._partial_post_barrier(ts)
         except Exception as e:  # noqa: BLE001
             logger.debug("Receipt note_post skipped for %s: %s", ts, e)
 
     async def note_chrome(self, ts: Optional[str],
-                          thread_root_ts: Optional[str] = None) -> None:
+                          thread_root_ts: Optional[str] = None, *,
+                          receipt_class: Optional[str]) -> None:
+        """Register excluded chrome. `receipt_class` is REQUIRED (spec §4): chrome STATE says
+        "never in the stream", the class says what KIND of chrome — a research status card is
+        chrome-state with class background_job, a placeholder is class chrome."""
         if not ts or not self.active:
             return
+        receipt_class = _checked_class(receipt_class, site="note_chrome", message_ts=ts)
         try:
-            await self.service.apply(self._op("chrome", ts, thread_root_ts))
+            await self.service.apply(self._op("chrome", ts, thread_root_ts, receipt_class))
         except Exception as e:  # noqa: BLE001
             logger.debug("Receipt note_chrome skipped for %s: %s", ts, e)
 
     async def promote(self, ts: Optional[str],
                       thread_root_ts: Optional[str] = None) -> None:
-        """A chrome surface this owner holds is about to carry the answer."""
+        """A chrome surface this owner holds is about to carry the answer.
+
+        The class is NOT a parameter here: promotion IS the spec §4 atomic mapping
+        chrome → assistant_reply, and the DB applies it with the state move in one
+        transaction. Nothing else a promotion could claim is legal."""
         if not ts or not self.active:
             return
         try:
             if str(ts) in self._in_flight:
                 return  # promoted once; every later edit grows a surface we already own
-            self._in_flight[str(ts)] = thread_root_ts
-            await self.service.apply(self._op("promote", ts, thread_root_ts))
+            self._in_flight[str(ts)] = (thread_root_ts, CLASS_ASSISTANT_REPLY)
+            await self.service.apply(
+                self._op("promote", ts, thread_root_ts, CLASS_ASSISTANT_REPLY))
             # The legacy-placeholder path reaches its first conversational surface HERE, not in
             # note_post: the message already exists as chrome and this is the edit that makes it
             # an answer. Without this the seam would only ever catch native/split posts.
@@ -959,7 +1138,7 @@ class ReceiptLedger:
             self._settled = True
             return 0
         self._settled = True
-        records = [(ts, root) for ts, root in self._in_flight.items()]
+        records = [(ts, root, cls) for ts, (root, cls) in self._in_flight.items()]
         self._in_flight.clear()
         if not records:
             return 0
@@ -1031,6 +1210,7 @@ async def settle_ledger(ledger: Optional[ReceiptLedger], turn: Any = None) -> No
 async def record_transport_post(*, team_id: Optional[str], channel_id: Optional[str],
                                 message_ts: Optional[str], receipts: Optional[ReceiptLedger],
                                 receipt_kind: Optional[str] = None,
+                                receipt_class: Optional[str],
                                 thread_root_ts: Optional[str] = None,
                                 site: str = "transport") -> None:
     """The receipt intent contract for one durable post.
@@ -1039,11 +1219,16 @@ async def record_transport_post(*, team_id: Optional[str], channel_id: Optional[
     made. NEITHER is a plumbing bug, not a design: it is logged with a stack and the message
     is registered FINALIZED under the sys owner, because silently excluding real words from
     the stream is the one failure nobody would ever notice.
+
+    `receipt_class` (spec §4) is a REQUIRED keyword with no default: the producer says what
+    kind of surface this post is. A missing/invalid class is logged loudly and the row is
+    written with NULL — class-ineligible, exactly like a legacy row — never inferred.
     """
     if not message_ts:
         return
     if receipts is not None:
-        await receipts.note_post(message_ts, receipt_kind or STATE_IN_FLIGHT, thread_root_ts)
+        await receipts.note_post(message_ts, receipt_kind or STATE_IN_FLIGHT, thread_root_ts,
+                                 receipt_class=receipt_class)
         return
     if not receipts_apply(channel_id):
         return
@@ -1058,9 +1243,10 @@ async def record_transport_post(*, team_id: Optional[str], channel_id: Optional[
         receipt_kind = STATE_FINALIZED
     ledger = ReceiptLedger(sys_owner(), team_id, channel_id, service=svc)
     if receipt_kind == STATE_CHROME:
-        await ledger.note_chrome(message_ts, thread_root_ts)
+        await ledger.note_chrome(message_ts, thread_root_ts, receipt_class=receipt_class)
     else:
-        await ledger.note_post(message_ts, STATE_FINALIZED, thread_root_ts)
+        await ledger.note_post(message_ts, STATE_FINALIZED, thread_root_ts,
+                               receipt_class=receipt_class)
 
 
 # --- uploads ----------------------------------------------------------------------------
@@ -1068,7 +1254,8 @@ async def record_transport_post(*, team_id: Optional[str], channel_id: Optional[
 
 async def record_pending_share(db: Any, *, team_id: Optional[str], channel_id: Optional[str],
                                file_id: Optional[str], owner_turn_id: str,
-                               thread_root_ts: Optional[str] = None) -> bool:
+                               thread_root_ts: Optional[str] = None,
+                               receipt_class: Optional[str]) -> bool:
     """Written the instant files_upload_v2 hands back a file id, before resolution starts.
 
     A row that is already there is success — the file id is unique per upload, so the only way
@@ -1084,6 +1271,8 @@ async def record_pending_share(db: Any, *, team_id: Optional[str], channel_id: O
     """
     if not (db and file_id and receipts_apply(channel_id) and team_id):
         return False
+    receipt_class = _checked_class(receipt_class, site="record_pending_share",
+                                   message_ts=file_id)
     svc = get_service()
     if svc is not None and svc.file_is_deleted(file_id):
         logger.info("Upload %s completed after Slack confirmed the file gone — no pending row",
@@ -1091,13 +1280,15 @@ async def record_pending_share(db: Any, *, team_id: Optional[str], channel_id: O
         return False
     try:
         await db.record_pending_share_async(
-            str(team_id), str(channel_id), str(file_id), owner_turn_id, thread_root_ts)
+            str(team_id), str(channel_id), str(file_id), owner_turn_id, thread_root_ts,
+            receipt_class=receipt_class)
     except Exception as e:  # noqa: BLE001
         logger.warning("Pending share record failed for %s (queued for retry): %s", file_id, e)
         if svc is not None:
             svc.queue_pending_share(team_id=str(team_id), channel_id=str(channel_id),
                                     file_id=str(file_id), owner=owner_turn_id,
-                                    thread_root_ts=thread_root_ts)
+                                    thread_root_ts=thread_root_ts,
+                                    receipt_class=receipt_class)
         return False
     if await _drop_share_row_if_deleted(db, svc, team_id, channel_id, file_id):
         return False
@@ -1153,8 +1344,10 @@ async def resolve_pending_share(db: Any, *, team_id: Optional[str],
     queued = (svc.take_pending_share(str(team_id), str(channel_id), str(file_id))
               if svc is not None else None)
     if queued is not None:
+        # The queued op carries the producer's class (spec §4), so a share whose pending row
+        # never reached the database still finalizes WITH its class present.
         ok = await svc.apply(_Op("finalize", str(team_id), str(channel_id), str(message_ts),
-                                 queued.owner, queued.thread_root_ts))
+                                 queued.owner, queued.thread_root_ts, queued.receipt_class))
         # A false here means the finalize was queued, not refused — the share is still outside the
         # stream, so the transition genuinely has not happened yet.
         _emit_transition(channel_id=channel_id, message_ts=message_ts, owner=queued.owner,

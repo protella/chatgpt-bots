@@ -19,7 +19,7 @@ from slack_client.history_fetch import (FetchBudget, HistoryPageError, iter_page
 from slack_client.messaging import is_self_chrome_message
 from slack_client.normalizer import (ORIGIN_HISTORY, ORIGIN_REPLIES, TimestampError,
                                      normalize_slack_message, parse_ts)
-from tool_registry import stage_discovered_root
+from tool_registry import stage_discovered_edit_target, stage_discovered_root
 
 
 class SearchBackend(Enum):
@@ -150,6 +150,11 @@ def score_search_text(query: SearchQuery, normalized_text: str) -> Optional[Tupl
 # imported: this module must not pull the stream builder in behind a Slack tool.
 RECEIPT_FINALIZED = "finalized"
 
+# EDIT §2b: the one receipt class whose finalized messages are editable — restated for the same
+# reason the state literal is. A row without it (legacy NULL-class) grants NOTHING, and the
+# pre-epoch grandfathering that makes an own message SEARCHABLE never makes it editable.
+RECEIPT_CLASS_ASSISTANT_REPLY = "assistant_reply"
+
 # Below this much remaining budget the receipt read is not attempted at all. A busy timeout of a
 # couple of milliseconds would fail against any momentarily-locked database, and the outcome is
 # identical either way — own messages excluded — so the honest move is to skip the call rather
@@ -259,6 +264,11 @@ class _ChannelScan:
         # needs exactly these about an own message, and holding the raw dicts for every one of
         # our own posts in a fifty-page span to answer them would keep the whole walk in memory.
         self.self_facts: Dict[str, Tuple[bool, bool]] = {}
+        # EDIT §2b: the receipt ROWS the batched read returned, keyed by message_ts — kept whole
+        # because edit-target staging needs state, class and thread_root_ts, not just the state
+        # the searchability rule reads. Only ever holds rows for OUR OWN messages: the read is
+        # made over `self_ts` and nothing else.
+        self.receipt_rows: Dict[str, Dict[str, Any]] = {}
         self.unfetched_roots = False
         self.stopped_reason: Optional[str] = None
         self._seq = 0
@@ -993,6 +1003,7 @@ class SlackSearchToolMixin:
         payload = {"ok": True, "query": query, "scope": "channel",
                    "count": len(results), "results": results, "coverage": coverage}
         self._enroll_search_roots(ctx, payload, kept)
+        self._stage_scan_edit_targets(ctx, channel_id, scan, payload, kept)
         return payload
 
     def _normalize_scanned(self, raw: Any, channel_id: str, origin: str) -> Optional[Any]:
@@ -1248,6 +1259,10 @@ class SlackSearchToolMixin:
         rows = (payload or {}).get("receipts") or []
         states = {str(r.get("message_ts")): str(r.get("state"))
                   for r in rows if isinstance(r, dict) and r.get("message_ts")}
+        # EDIT §2b: keep the whole rows too — staging needs class and thread_root_ts, and a
+        # second read for facts this one already returned would be a second answer to race it.
+        scan.receipt_rows = {str(r.get("message_ts")): r
+                             for r in rows if isinstance(r, dict) and r.get("message_ts")}
         scan.admit_self(scan.searchable_self(
             receipts=states, epoch=(payload or {}).get("receipt_feature_epoch_ts")))
 
@@ -1366,6 +1381,51 @@ class SlackSearchToolMixin:
 
         await asyncio.gather(*(_one(c.ts) for c in candidates))
         return out
+
+    def _stage_scan_edit_targets(self, ctx, channel_id: str, scan: "_ChannelScan",
+                                 payload: Dict[str, Any],
+                                 kept: List[Tuple[Dict[str, Any], Optional[str],
+                                                  List[str]]]) -> None:
+        """EDIT §2b: claim the exact own messages among the FINAL results that are editable.
+
+        IT STAGES; IT DOES NOT ENROL — the registry commits the claims whose own `"ts"` field
+        survives the delivered, clipped payload. The §2b preconditions are proved here, from
+        evidence this scan already holds:
+
+        * the results ARE from `ctx.channel_id` — this backend cannot return anything else, and
+          `entry["channel"]` is stamped from that one value;
+        * a receipt row exists only for a message the walk classified as OUR OWN
+          (`scan.receipt_rows` is read over `scan.self_ts` and nothing else);
+        * the row must be `finalized` AND class `assistant_reply`. A pre-epoch own message the
+          searchability rule GRANDFATHERED has no row and therefore claims NOTHING here — being
+          readable is not being editable, and a legacy NULL-class row fails the class test the
+          same way;
+        * the exact ts is present in the returned result (these are the result entries).
+
+        `edited_ts` is Slack's `edited.ts` snapshot off the raw scanned payload;
+        `thread_root_ts` is the RECEIPT's. Never raises — a claim is bookkeeping, and failing
+        the search over it would cost a real answer.
+        """
+        try:
+            for entry, (raw, _source, _team_ids) in zip(payload.get("results") or (), kept):
+                ts = entry.get("ts")
+                row = scan.receipt_rows.get(str(ts)) if ts else None
+                if not isinstance(row, dict):
+                    continue  # foreign message, or an own message with no durable receipt
+                if str(row.get("state")) != RECEIPT_FINALIZED:
+                    continue
+                if row.get("receipt_class") != RECEIPT_CLASS_ASSISTANT_REPLY:
+                    continue
+                edited = raw.get("edited") if isinstance(raw, dict) else None
+                edited_ts = edited.get("ts") if isinstance(edited, dict) else None
+                stage_discovered_edit_target(
+                    ctx, channel_id=channel_id, message_ts=str(ts),
+                    thread_root_ts=row.get("thread_root_ts"),
+                    edited_ts=str(edited_ts) if edited_ts else None,
+                    receipt_class=str(row.get("receipt_class")),
+                    source="search_slack", field="ts")
+        except Exception as e:  # noqa: BLE001
+            self.log_warning(f"search_tool: edit-target staging failed for {channel_id}: {e}")
 
     def _enroll_search_roots(self, ctx, payload: Dict[str, Any],
                              kept: List[Tuple[Dict[str, Any], Optional[str], List[str]]]) -> None:

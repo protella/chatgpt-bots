@@ -1,4 +1,4 @@
-"""The CV9 ledger checker — the thing the live battery trusts when it says a scenario passed.
+"""The CV10 ledger checker — the thing the live battery trusts when it says a scenario passed.
 
 Two properties matter here, and they pull in opposite directions:
 
@@ -58,7 +58,7 @@ def warning_names(payload):
     return {w["name"] for w in payload["warnings"]}
 
 
-def envelope(event, *, session=SESSION, version=9, contract="binary-v1", **fields):
+def envelope(event, *, session=SESSION, version=10, contract="binary-v1", **fields):
     """One line, built the way `record()` builds it: None-valued fields are OMITTED."""
     row = {"v": version, "at": 1_700_000_000.0, "session": session, "event": event}
     if contract is not None:
@@ -118,7 +118,8 @@ def healthy_rows(session=SESSION):
                  turn_id=turn_id, attempt_id=attempt_id, kind="reply", chars=12,
                  detached_started=False, stream_build_present=True,
                  destinations=[{"channel_id": "C1", "thread_root_ts": "1.0", "first_ts": "2.0",
-                                "state": "committed", "chars": 12, "kind": "reply"}]),
+                                "state": "committed", "chars": 12, "kind": "reply"}],
+                 edits=[]),
         envelope("visible_action", session=session, channel_id="C1", trigger_ts="1.0",
                  kind="reply", attempt_id=attempt_id, gate_woke=True, responder_started=True,
                  reaction_visible=False, destination="thread",
@@ -215,7 +216,8 @@ def test_legal_absences_are_not_violations(tmp_path):
         envelope("turn_outcome", channel_id="C1", trigger_ts="1.0", turn_id="t9",
                  kind="silence", detached_started=False, stream_build_present=False,
                  destinations=[{"channel_id": "C1", "thread_root_ts": None, "first_ts": "2.0",
-                                "state": "observed", "chars": None, "kind": "stream"}]),
+                                "state": "observed", "chars": None, "kind": "stream"}],
+                 edits=[]),
         envelope("outbound_receipt", channel_id="C1", message_ts="2.0", owner_turn_id="t9",
                  op="pending_resolve", new_state="finalized", applied=True),
         envelope("session_end"),
@@ -378,7 +380,7 @@ def test_a_foreign_gate_contract_fails(tmp_path):
 
 def test_a_future_contract_version_is_refused_rather_than_graded(tmp_path):
     rows = healthy_rows()
-    rows[row_index(rows, "turn_outcome")]["v"] = 10
+    rows[row_index(rows, "turn_outcome")]["v"] = 11
     code, payload = check(write_ledger(tmp_path, rows))
     assert code == 1
     assert "unknown_contract_version" in names(payload)

@@ -276,6 +276,7 @@ class SlackChannelJoinMixin:
             await record_transport_post(
                 team_id=getattr(self, "self_team_id", None), channel_id=channel_id,
                 message_ts=message_ts, receipts=None, receipt_kind="finalized",
+                receipt_class="system_notice",
                 thread_root_ts=thread_root_ts, site="channel_intro")
         except Exception as e:  # noqa: BLE001
             self.log_debug(f"Channel intro receipt failed: {e}")

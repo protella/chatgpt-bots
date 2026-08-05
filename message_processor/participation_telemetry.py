@@ -213,7 +213,17 @@ logger = setup_logger(name="slack_bot.ParticipationTelemetry")
 #     invocation), join on `turn_id`; `turn_outcome` may carry a nested `reconsider` payload;
 #     `model_response` gains the `stale_reconsideration` fork reason. Unavailable optional
 #     fields are OMITTED, never null — the generic drop-None rule is part of this grammar.
-CONTRACT_VERSION = 9
+# v10: EDIT_OWN_MESSAGE (Docs/SINGLE_STREAM_SPEC.md §10, CV10 addendum). `turn_outcome` gains
+#     `edits` — ALWAYS present as a list (empty when the turn edited nothing), one entry per
+#     `TurnRuntime.edits` EditRecord: {"channel_id", "target_ts", "announcement_ts",
+#     "state": "announcement_only"|"committed"[, "error"]} — a record exists only once the
+#     disclosure was ACCEPTED (spec §11.6/§11.18), so `announcement_ts` is ALWAYS present;
+#     only `error` is optional, OMITTED per the drop-None rule (rides announcement_only
+#     always, committed never). `reconsider` and `edits` may coexist on one row. The
+#     destination kind vocabulary gains `correction_announcement` (the executor-synthesized
+#     disclosure post, recorded as a committed destination); every CV9 reconsideration field
+#     and invariant is preserved unchanged.
+CONTRACT_VERSION = 10
 
 # WHICH gate produced these lines. The rich multi-signal classifier was "rich-v1"; the one-bit
 # wake gate is "binary-v1". A different gate is a different population even at the same
@@ -1060,7 +1070,8 @@ def turn_outcome(channel_id: Optional[str], trigger_ts: Optional[str], *,
                  error: Optional[str] = None, H: Optional[str] = None,
                  stream_build_present: bool = False,
                  attempt_id: Optional[str] = None,
-                 reconsider: Optional[Dict[str, Any]] = None) -> None:
+                 reconsider: Optional[Dict[str, Any]] = None,
+                 edits: Optional[List[Dict[str, Any]]] = None) -> None:
     """What one channel turn ended up doing. Exactly one per `turn_start`.
 
     `destinations` is the OBSERVED set — every surface Slack accepted, whether or not it reached
@@ -1080,6 +1091,18 @@ def turn_outcome(channel_id: Optional[str], trigger_ts: Optional[str], *,
     no reconsideration ran. Inapplicable keys are omitted inside it, never null: nested values
     survive `record()`'s top-level drop-None untouched.
 
+    `edits` (v10) is ALWAYS present as a list — written even when empty, for the same reason
+    `destinations` is: a turn that edited nothing and a turn whose edit records were lost are
+    not the same fact. One entry per EditRecord on the turn:
+    `{"channel_id", "target_ts", "announcement_ts", "state":
+    "announcement_only"|"committed"[, "error"]}` — a record exists only once the disclosure
+    was ACCEPTED (spec §11.6/§11.18), so `announcement_ts` is ALWAYS present; only `error`
+    is OMITTED when unavailable, never null (nested values survive record()'s top-level
+    drop-None, so the omission happens at assembly). Every entry's `announcement_ts` joins a
+    committed `correction_announcement` destination in this row's `destinations` — the
+    disclosure post is a real destination the room saw. `reconsider` and `edits` may coexist
+    on one row.
+
     `error` is one of the FOUR fail-closed codes (stream_over_budget, history_fetch_failed,
     stream_data_invalid, and origin_fetch_failed — a partial origin thread is a different
     conversation, not a smaller one), absent on a turn that did not fail that way.
@@ -1094,7 +1117,8 @@ def turn_outcome(channel_id: Optional[str], trigger_ts: Optional[str], *,
            attempt_id=attempt_id, kind=kind,
            destinations=list(destinations or []),
            chars=chars, detached_started=bool(detached_started), error=error, H=H,
-           stream_build_present=bool(stream_build_present), reconsider=reconsider)
+           stream_build_present=bool(stream_build_present), reconsider=reconsider,
+           edits=list(edits or []))
 
 
 def emit_turn_outcome(turn: Any, *, channel_id: Optional[str], trigger_ts: Optional[str],
@@ -1117,13 +1141,28 @@ def emit_turn_outcome(turn: Any, *, channel_id: Optional[str], trigger_ts: Optio
         facts = getattr(turn, "reconsider", None)
         reconsider = (facts.as_payload()
                       if facts is not None and hasattr(facts, "as_payload") else None)
+        # v10. One entry per EditRecord on `turn.edits` (spec §7) — the exact payload, with
+        # `announcement_ts` and `error` OMITTED when None: nested values survive record()'s
+        # top-level drop-None, so the no-null rule has to be applied here.
+        edits: List[Dict[str, Any]] = []
+        for edit in (getattr(turn, "edits", None) or []):
+            entry: Dict[str, Any] = {
+                "channel_id": getattr(edit, "channel_id", None),
+                "target_ts": getattr(edit, "target_ts", None),
+                "state": getattr(edit, "state", None),
+            }
+            if getattr(edit, "announcement_ts", None) is not None:
+                entry["announcement_ts"] = edit.announcement_ts
+            if getattr(edit, "error", None) is not None:
+                entry["error"] = edit.error
+            edits.append(entry)
         turn_outcome(
             channel_id, trigger_ts,
             turn_id=getattr(turn, "turn_id", None), kind=kind, destinations=payloads,
             chars=sum(sizes) if sizes else None, detached_started=detached_started,
             error=getattr(turn, "turn_error", None), H=getattr(turn, "H", None),
             stream_build_present=bool(getattr(turn, "stream_build_present", False)),
-            attempt_id=attempt_id, reconsider=reconsider)
+            attempt_id=attempt_id, reconsider=reconsider, edits=edits)
         return True
     except Exception as e:  # noqa: BLE001 — a lost line is never worth a lost turn
         logger.debug(f"Participation turn outcome not written: {e}")

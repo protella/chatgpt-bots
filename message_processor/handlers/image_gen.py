@@ -78,7 +78,8 @@ class ImageJobMixin:
                         "I couldn't generate that image as it was flagged by content safety "
                         "filters. This can happen with certain brand names, people, or other "
                         "protected content. Try rephrasing your request or describing what you "
-                        "want without using specific names.", receipts=receipts)
+                        "want without using specific names.", receipts=receipts,
+                        receipt_class="system_notice")
                 except Exception:
                     pass
             else:

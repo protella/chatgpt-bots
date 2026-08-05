@@ -204,6 +204,8 @@ def _slack_tool_mock():
         "type": "function", "name": "search_slack", "parameters": {}}
     s.get_post_to_thread_tool_schema.return_value = {
         "type": "function", "name": "post_to_thread", "parameters": {}}
+    s.get_edit_own_message_tool_schema.return_value = {
+        "type": "function", "name": "edit_own_message", "parameters": {}}
     s.get_no_reply_tool_schema.return_value = {
         "type": "function", "name": "no_response_needed", "parameters": {}}
     s.get_emoji_search_tool_schema.return_value = {

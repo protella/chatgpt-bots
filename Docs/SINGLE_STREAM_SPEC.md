@@ -276,7 +276,7 @@ calibration in memory.
   let-the-exchange-end guidance (react or stay silent on landed closers) — the previously tabled
   "last word" item lands here.
 
-## 10. Telemetry — contract CV8 (CV9 addendum below)
+## 10. Telemetry — contract CV8 (CV9 and CV10 addenda below)
 
 (Authoritative event list; §16 describes usage in the battery.)
 - `visible_action` stays **gate-attempt-only** with its one-terminal-per-attempt invariant and
@@ -338,6 +338,37 @@ checker treats an absent optional field as "unavailable".
   something else. The
   checker does NOT cross-join posted outcomes to `turn_outcome` kind or to F7 — that
   correspondence is unit/integration-mandated instead.
+
+### CV10 addendum — edit_own_message (2026-08-04)
+
+`CONTRACT_VERSION` 9 → 10 (`participation_telemetry.py`; checker
+`tools/participation_ledger_check.py`; spec `Docs/specs/EDIT_OWN_MESSAGE.md` §7). Every CV9
+field and invariant above is preserved unchanged; v9 rows in a mixed file are skipped by the
+checker's existing older-contract rule, never graded by v10 rules. The null encoding is the
+CV9 rule, restated because the new grammar depends on it: unavailable optional values are
+OMITTED, never null.
+
+- **`turn_outcome`** gains **`edits`** — ALWAYS present as a list in CV10, written even when
+  empty (a turn that edited nothing and a turn whose edit records were lost are not the same
+  fact). One entry per `TurnRuntime.edits` EditRecord, exact payload:
+  `{"channel_id", "target_ts"[, "announcement_ts"],
+  "state": "announcement_only"|"committed"[, "error"]}`. The entry grammar is CLOSED (those
+  five keys and nothing else) and null-free: `announcement_ts` (the disclosure post's ts) and
+  `error` (the exact post-announcement failure code) are the only optionals, omitted when
+  unavailable. `state=announcement_only` means the disclosure landed and the `chat.update` did
+  not; `committed` means both did. `reconsider` and `edits` may COEXIST on one row — a turn
+  can be reconsidered and edit an earlier message.
+- **Destination kinds** gain **`correction_announcement`**
+  (`DEST_KIND_CORRECTION_ANNOUNCEMENT` in `turn_runtime.py`): the executor-synthesized
+  disclosure post of an `edit_own_message` transaction, recorded as a committed destination of
+  the turn that posted it.
+- **Checker** (`tools/participation_ledger_check.py`): `edits` is mandatory on v10
+  `turn_outcome` rows and must be a list; each entry is graded against the closed key grammar,
+  the two-value `state` vocabulary, and the no-explicit-null rule. **Join invariant** (checked
+  on the row, since both sides live on it): every entry's `announcement_ts`, when present,
+  joins a COMMITTED `correction_announcement` destination in that turn's `destinations` — the
+  disclosure is a real post the room saw, so an unjoined ts means one of the two records is
+  wrong about what was delivered.
 
 ## 11. Config & pinned rules
 

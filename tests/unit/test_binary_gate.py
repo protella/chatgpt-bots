@@ -651,7 +651,7 @@ class TestTelemetryV8:
         event set an attempt can produce changed. GATE_CONTRACT did NOT move: the gate is the
         same one bit it was under v7, and pooling its rows across the version boundary is
         legitimate in a way that pooling rich-gate rows never was."""
-        assert participation_telemetry.CONTRACT_VERSION == 9   # v9: stale reconsideration
+        assert participation_telemetry.CONTRACT_VERSION == 10   # v10: edit_own_message
         assert participation_telemetry.GATE_CONTRACT == "binary-v1"
 
     def test_gate_decision_writes_exactly_the_v7_field_set(self, monkeypatch):

@@ -11,13 +11,19 @@ from config import config
 from slack_client.formatting.blocks import extract_supplementary_text
 from slack_client.normalizer import ORIGIN_HISTORY, normalize_slack_message
 from slack_client.utilities import is_dm_conversation
-from tool_registry import stage_discovered_root
+from tool_registry import stage_discovered_edit_target, stage_discovered_root
 
 
 # Safety ceiling on how many conversations_replies pages a single thread fetch will
 # pull (1000 messages/page). Threads deeper than this are effectively nonexistent, but
 # the cap keeps a pathological thread from spinning the loop; when it's hit we say so.
 _MAX_THREAD_PAGES = 10
+
+# EDIT §2b: the receipt facts an edit-target claim requires, restated from the ledger's own
+# literals (outbound_receipts / turn_runtime) exactly as search_tool restates the state — a
+# leaf-layer tool must not import the message_processor stack for two strings.
+_RECEIPT_FINALIZED = "finalized"
+_RECEIPT_CLASS_ASSISTANT_REPLY = "assistant_reply"
 
 
 def build_history_result(messages: List[Dict[str, Any]], *, channel_id: Optional[str],
@@ -923,6 +929,9 @@ class SlackHistoryToolMixin:
                 or resp.get("has_more")
                 or len(all_messages) > n
             )
+            # EDIT §2b: claim edit targets from the exact raw window being returned, before the
+            # result is shaped — the raw payloads are what carry identity and `edited.ts`.
+            await self._stage_history_edit_targets(ctx, channel_id, raw, thread_ts)
             return build_history_result(
                 messages, channel_id=channel_id, thread_ts=thread_ts,
                 has_more=has_more, thread_truncated=thread_truncated)
@@ -1009,6 +1018,75 @@ class SlackHistoryToolMixin:
                                    "the app manifest and reinstall before pins can be read."}
             self.log_warning(f"history_tool: pins failed for {channel_id}: {err}")
             return {"ok": False, "error": err, "message": f"Could not fetch pins: {err}"}
+
+    async def _stage_history_edit_targets(self, ctx: Any, channel_id: Optional[str],
+                                          raw_messages: List[Dict[str, Any]],
+                                          thread_ts: Optional[str]) -> None:
+        """EDIT §2b: claim the exact own messages this fetch is returning that are editable.
+
+        IT STAGES; IT DOES NOT ENROL — the registry commits the claims whose own `"ts"` field
+        survives the delivered, clipped payload, exactly as the discovered roots work. Before a
+        claim is made this executor proves every §2b precondition itself:
+
+        * the result is from THIS turn's channel (`ctx.channel_id`) — a fetch of another channel
+          stages nothing;
+        * the raw Slack message is OURS (`is_own_message` on the raw payload);
+        * ONE BATCHED receipt read shows a `finalized` receipt of class `assistant_reply` — a
+          legacy NULL-class row, chrome and every other class grant nothing, and NO pre-epoch
+          grandfathering applies to edits (readability is not editability);
+        * the exact ts is present in the returned result (these are the returned messages).
+
+        `edited_ts` is Slack's `edited.ts` snapshot off the raw message at proof time;
+        `thread_root_ts` is the RECEIPT's, the value the disclosure would land under. Anything
+        unreadable — no db, no team id, a failed query — stages nothing, and no failure here
+        ever fails the fetch.
+        """
+        try:
+            flight_area = getattr(getattr(ctx, "tool_flight", None), "staged_edit_targets", None)
+            if not isinstance(flight_area, list):
+                return  # a hand-built context outside the registry claims nothing
+            if not channel_id or channel_id != getattr(ctx, "channel_id", None):
+                return
+            if is_dm_conversation(channel_id):
+                return  # receipts are structurally exempt in DMs — nothing can be proved
+            own_check = getattr(self, "is_own_message", None)
+            db = getattr(ctx, "db", None)
+            team_id = self._bot_team_id()
+            if own_check is None or db is None or not team_id:
+                return
+            own: Dict[str, Dict[str, Any]] = {}
+            for m in raw_messages:
+                if not isinstance(m, dict):
+                    continue
+                ts = m.get("ts")
+                if isinstance(ts, str) and ts and own_check(m):
+                    own[ts] = m
+            if not own:
+                return
+            payload = await db.read_channel_sidecars_for_async(team_id, channel_id,
+                                                               sorted(own))
+            rows = {str(r.get("message_ts")): r
+                    for r in ((payload or {}).get("receipts") or ())
+                    if isinstance(r, dict) and r.get("message_ts")}
+            source = "fetch_thread_messages" if thread_ts else "fetch_channel_history"
+            for ts, m in own.items():
+                row = rows.get(ts)
+                if not isinstance(row, dict):
+                    continue  # no durable receipt — grandfathering grants NOTHING here
+                if str(row.get("state")) != _RECEIPT_FINALIZED:
+                    continue
+                if row.get("receipt_class") != _RECEIPT_CLASS_ASSISTANT_REPLY:
+                    continue
+                edited = m.get("edited")
+                edited_ts = edited.get("ts") if isinstance(edited, dict) else None
+                stage_discovered_edit_target(
+                    ctx, channel_id=channel_id, message_ts=ts,
+                    thread_root_ts=row.get("thread_root_ts"),
+                    edited_ts=str(edited_ts) if edited_ts else None,
+                    receipt_class=str(row.get("receipt_class")),
+                    source=source, field="ts")
+        except Exception as e:  # noqa: BLE001 — a claim is never worth failing a fetch over
+            self.log_warning(f"history_tool: edit-target staging failed for {channel_id}: {e}")
 
     def _enroll_history_roots(self, ctx: Any, name: str, result: Any) -> None:
         """§2g. The roots THIS read proved exist, enrolled where the result is PRODUCED rather

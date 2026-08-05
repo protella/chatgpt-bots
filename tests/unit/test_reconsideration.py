@@ -979,7 +979,8 @@ class SiteSlack:
     async def delete_message(self, channel, ts):
         return True
 
-    async def update_message(self, channel, ts, text, receipts=None, receipt_kind=None):
+    async def update_message(self, channel, ts, text, receipts=None, receipt_kind=None,
+                             receipt_class=None):
         return True                                  # chrome writes; never answer text
 
     # -- lease and receipt plumbing
@@ -991,12 +992,13 @@ class SiteSlack:
         lease.authorize(surface)
         record["ok"] = True
 
-    async def _receipt(self, ts, receipts, kind, thread) -> None:
+    async def _receipt(self, ts, receipts, kind, thread, receipt_class) -> None:
         """messaging.py's `_record_receipt`, verbatim seam and all."""
         from message_processor.outbound_receipts import record_transport_post
 
         await record_transport_post(team_id="T1", channel_id=CH, message_ts=ts,
                                     receipts=receipts, receipt_kind=kind,
+                                    receipt_class=receipt_class,
                                     thread_root_ts=thread, site="site_slack")
 
     def _footer_rides(self, text: str, blocks) -> bool:
@@ -1006,19 +1008,19 @@ class SiteSlack:
 
     # -- writes
     async def send_message_get_ts(self, channel, thread, text, lease=None, surface=None,
-                                  receipts=None, receipt_kind=None):
+                                  receipts=None, receipt_kind=None, receipt_class=None):
         if lease is not None:
             lease.authorize(surface or "legacy_seed")
         return {"success": False}                    # no lazy seed in these scenarios
 
     async def send_message(self, channel, thread, text, blocks=None, meta_out=None,
                            username=None, lease=None, surface=None, receipts=None,
-                           receipt_kind=None, on_first_accept=None):
+                           receipt_kind=None, receipt_class=None, on_first_accept=None):
         from slack_client.messaging import Delivery
 
         surface = surface or "final_post"
         self.send_calls.append({"thread": thread, "text": text, "blocks": blocks,
-                                "surface": surface})
+                                "surface": surface, "receipt_class": receipt_class})
         if lease is not None:
             self._authorize(lease, surface, "entry")
         if self.refuse_post:
@@ -1041,7 +1043,7 @@ class SiteSlack:
             if meta_out is not None:
                 meta_out["delivery"] = Delivery(first_ts=ts, text=text, complete=True,
                                                 parts_delivered=1, parts_total=1)
-            await self._receipt(ts, receipts, receipt_kind, thread)
+            await self._receipt(ts, receipts, receipt_kind, thread, receipt_class)
             if meta_out is not None:
                 meta_out["footer_attached"] = attached
             if lease is not None:
@@ -1072,7 +1074,7 @@ class SiteSlack:
                     if on_first_accept is not None:
                         on_first_accept(first_ts)
                 delivered_parts = i + 1
-                await self._receipt(ts, receipts, receipt_kind, thread)
+                await self._receipt(ts, receipts, receipt_kind, thread, receipt_class)
                 posted = True
                 break
             if not posted:
@@ -1084,7 +1086,9 @@ class SiteSlack:
                 self._n += 1
                 self.notices.append(f"⚠️ This message was cut off — the remaining "
                                     f"{len(chunks) - i} part(s) failed to post to Slack.")
-                await self._receipt(f"post-{self._n}", receipts, "finalized", thread)
+                # The split-abort truncation notice stamps its own class (messaging.py).
+                await self._receipt(f"post-{self._n}", receipts, "finalized", thread,
+                                    "system_notice")
                 break
         if first_ts and meta_out is not None:
             meta_out["delivery"] = Delivery(
@@ -1490,7 +1494,7 @@ async def test_correction_site_force_promotes_the_chrome_receipt(events, monkeyp
     `promote()` itself — a fake that commits the lease and calls it done proves nothing."""
     rig = SiteRig(monkeypatch, decisions=[_decision("force_post", None)],
                   final_text="the answer", receipts=True)
-    await rig.ledger.note_chrome("chrome-1", TRIGGER_TS)
+    await rig.ledger.note_chrome("chrome-1", TRIGGER_TS, receipt_class="chrome")
     assert (await receipt_service.get_receipt_async("T1", CH, "chrome-1"))["state"] == "chrome"
 
     resp = await rig.run(thinking_id="chrome-1")
@@ -1569,7 +1573,7 @@ async def test_correction_edit_cancelled_before_promotion_stays_chrome_and_exclu
     slack = SiteSlack(cancel_after_edit=True)
     rig = SiteRig(monkeypatch, decisions=[_decision("post", None)], final_text="the answer",
                   slack=slack, receipts=True)
-    await rig.ledger.note_chrome(chrome_ts, TRIGGER_TS)
+    await rig.ledger.note_chrome(chrome_ts, TRIGGER_TS, receipt_class="chrome")
 
     with pytest.raises(asyncio.CancelledError):
         await rig.run(thinking_id=chrome_ts)

@@ -73,7 +73,8 @@ async def test_first_call_creates_message():
     c = ProgressChecklist(client, "C1", "T1", min_edit_interval=0)
     assert c.surface == "none"  # undetermined until first step
     await c.step("Working…")
-    client.send_thinking_indicator.assert_awaited_once_with("C1", "T1")
+    client.send_thinking_indicator.assert_awaited_once_with(
+        "C1", "T1", receipt_class="chrome")
     assert c.surface == "message"
     assert c.message_id == "msg1"
     client.update_message.assert_awaited_once()

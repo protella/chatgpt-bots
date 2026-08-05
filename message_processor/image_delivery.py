@@ -115,7 +115,11 @@ async def review_produced_image(*, processor, client, channel_id: str, thread_id
         processor.log_debug("Produced-image review: model had nothing to add")
         return
     try:
-        await client.send_message(channel_id, thread_id, text, receipts=receipts)
+        # Spec §11.3 (rules the §4 inventory gap): the review comment is job output
+        # accompanying the share, not an editable conversational reply — class `artifact`,
+        # the conservative default (the owner may widen later).
+        await client.send_message(channel_id, thread_id, text, receipts=receipts,
+                                  receipt_class="artifact")
         processor.log_info(f"Produced-image review posted ({len(text)} chars)")
     except Exception as e:  # noqa: BLE001
         processor.log_debug(f"produced-image review not posted: {e}")
@@ -206,6 +210,7 @@ async def publish_image(
             _enhanced_prompt_caption(image_data, prompt),
             meta_out=upload_meta,
             receipts=receipts,
+            receipt_class="artifact",
         )
     except Exception as e:  # noqa: BLE001
         processor.log_error(f"Image upload failed for {thread_key}: {e}", exc_info=True)

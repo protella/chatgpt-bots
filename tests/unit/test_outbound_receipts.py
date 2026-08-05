@@ -131,7 +131,7 @@ async def test_dm_and_user_targets_write_nothing(service, temp_db):
     for target in (DM, "U12345", "W12345"):
         ledger = _ledger(channel=target)
         assert not ledger.active
-        await ledger.note_post("100.0")
+        await ledger.note_post("100.0", receipt_class="assistant_reply")
         await ledger.settle()
         assert await temp_db.get_receipt_async(TEAM, target, "100.0") is None
 
@@ -139,7 +139,7 @@ async def test_dm_and_user_targets_write_nothing(service, temp_db):
 async def test_an_unknown_team_is_not_guessed_at(service, temp_db):
     ledger = ReceiptLedger("s:1", None, CH)
     assert not ledger.active
-    await ledger.note_post("100.0")
+    await ledger.note_post("100.0", receipt_class="assistant_reply")
     assert await temp_db.get_receipt_async(TEAM, CH, "100.0") is None
 
 
@@ -148,18 +148,19 @@ async def test_an_unknown_team_is_not_guessed_at(service, temp_db):
 
 async def test_post_then_settle_finalizes(service, temp_db):
     ledger = _ledger()
-    await ledger.note_post("100.000100", thread_root_ts="99.0")
+    await ledger.note_post("100.000100", thread_root_ts="99.0", receipt_class="assistant_reply")
     assert await _state(temp_db, "100.000100") == "in_flight"
     await ledger.settle()
     row = await temp_db.get_receipt_async(TEAM, CH, "100.000100")
     assert row["state"] == "finalized"
     assert row["thread_root_ts"] == "99.0"
+    assert row["receipt_class"] == "assistant_reply"
 
 
 async def test_settle_finalizes_every_part_as_one_unit(service, temp_db):
     ledger = _ledger()
     for ts in ("100.0", "101.0", "102.0"):
-        await ledger.note_post(ts, thread_root_ts="99.0")
+        await ledger.note_post(ts, thread_root_ts="99.0", receipt_class="assistant_reply")
     assert await ledger.settle() == 3
     for ts in ("100.0", "101.0", "102.0"):
         assert await _state(temp_db, ts) == "finalized"
@@ -167,21 +168,21 @@ async def test_settle_finalizes_every_part_as_one_unit(service, temp_db):
 
 async def test_settle_is_idempotent(service, temp_db):
     ledger = _ledger()
-    await ledger.note_post("100.0")
+    await ledger.note_post("100.0", receipt_class="assistant_reply")
     assert await ledger.settle() == 1
     assert await ledger.settle() == 0
 
 
 async def test_chrome_never_settles_into_the_stream(service, temp_db):
     ledger = _ledger()
-    await ledger.note_chrome("100.0")
+    await ledger.note_chrome("100.0", receipt_class="chrome")
     await ledger.settle()
     assert await _state(temp_db, "100.0") == "chrome"
 
 
 async def test_promotion_turns_a_placeholder_into_conversation(service, temp_db):
     ledger = _ledger()
-    await ledger.note_chrome("100.0")
+    await ledger.note_chrome("100.0", receipt_class="chrome")
     await ledger.promote("100.0")
     assert await _state(temp_db, "100.0") == "in_flight"
     await ledger.settle()
@@ -190,7 +191,7 @@ async def test_promotion_turns_a_placeholder_into_conversation(service, temp_db)
 
 async def test_repeated_promotion_costs_one_write(service, temp_db, monkeypatch):
     ledger = _ledger()
-    await ledger.note_chrome("100.0")
+    await ledger.note_chrome("100.0", receipt_class="chrome")
     calls = []
     original = temp_db.register_receipt_async
 
@@ -206,7 +207,7 @@ async def test_repeated_promotion_costs_one_write(service, temp_db, monkeypatch)
 
 async def test_demotion_takes_an_overwritten_partial_back_out(service, temp_db):
     ledger = _ledger()
-    await ledger.note_post("100.0")
+    await ledger.note_post("100.0", receipt_class="assistant_reply")
     await ledger.demote("100.0")
     assert await _state(temp_db, "100.0") == "chrome"
     await ledger.settle()
@@ -214,20 +215,20 @@ async def test_demotion_takes_an_overwritten_partial_back_out(service, temp_db):
 
 
 async def test_transfer_moves_a_chrome_surface_between_owners(service, temp_db):
-    await _ledger("s:1").note_chrome("100.0")
+    await _ledger("s:1").note_chrome("100.0", receipt_class="chrome")
     assert (await temp_db.transfer_receipt_async(TEAM, CH, "100.0", "s:1", "s:2")).applied
     assert (await temp_db.get_receipt_async(TEAM, CH, "100.0"))["turn_id"] == "s:2"
 
 
 async def test_transfer_refused_once_the_surface_carries_words(service, temp_db):
-    await _ledger("s:1").note_post("100.0")
+    await _ledger("s:1").note_post("100.0", receipt_class="assistant_reply")
     refused = await temp_db.transfer_receipt_async(TEAM, CH, "100.0", "s:1", "s:2")
     assert (refused.applied, refused.reason) == (False, "not_chrome_or_foreign")
 
 
 async def test_abort_drops_the_row(service, temp_db):
     ledger = _ledger()
-    await ledger.note_post("100.0")
+    await ledger.note_post("100.0", receipt_class="assistant_reply")
     await ledger.abort("100.0")
     assert await temp_db.get_receipt_async(TEAM, CH, "100.0") is None
     await ledger.settle()
@@ -241,7 +242,7 @@ async def test_an_exception_inside_the_turn_still_settles(service, temp_db):
     ledger = _ledger()
 
     async def turn_body():
-        await ledger.note_post("100.0")
+        await ledger.note_post("100.0", receipt_class="assistant_reply")
         raise RuntimeError("boom")
 
     with pytest.raises(RuntimeError):
@@ -257,7 +258,7 @@ async def test_a_cancelled_turn_still_settles(service, temp_db):
     started = asyncio.Event()
 
     async def turn_body():
-        await ledger.note_post("100.0")
+        await ledger.note_post("100.0", receipt_class="assistant_reply")
         started.set()
         try:
             await asyncio.sleep(30)
@@ -265,7 +266,9 @@ async def test_a_cancelled_turn_still_settles(service, temp_db):
             await orx.settle_ledger(ledger)
 
     task = asyncio.ensure_future(turn_body())
-    await started.wait()
+    # Bounded: if turn_body dies before started.set() (e.g. a TypeError out of note_post), the
+    # bare wait() would hang the whole suite rather than fail this test.
+    await asyncio.wait_for(started.wait(), timeout=5)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -302,7 +305,7 @@ async def test_a_failed_write_is_queued_and_drains_later(temp_db):
     svc = orx.install_service(broken)
     try:
         ledger = _ledger()
-        await ledger.note_post("100.0")
+        await ledger.note_post("100.0", receipt_class="assistant_reply")
         assert svc.queue_depth == 1
         svc.db = temp_db
         assert await svc.drain_once() == 1
@@ -318,9 +321,10 @@ async def test_a_deletion_tombstone_is_never_resurrected(temp_db):
     svc = orx.install_service(broken)
     try:
         ledger = _ledger()
-        await ledger.note_post("100.0")      # queued: register
+        await ledger.note_post("100.0", receipt_class="assistant_reply")      # queued: register
         await ledger.abort("100.0")          # queued: delete, absorbing
-        await ledger.note_post("100.0")      # a late retry must NOT bring the row back
+        # …and a late retry must NOT bring the row back.
+        await ledger.note_post("100.0", receipt_class="assistant_reply")
         assert svc.queue_depth == 1
         svc.db = temp_db
         await svc.drain_once()
@@ -335,7 +339,7 @@ async def test_finalize_absorbs_a_queued_registration(temp_db):
     svc = orx.install_service(broken)
     try:
         ledger = _ledger()
-        await ledger.note_post("100.0", thread_root_ts="99.0")
+        await ledger.note_post("100.0", thread_root_ts="99.0", receipt_class="assistant_reply")
         await ledger.settle()
         assert svc.queue_depth == 1
         svc.db = temp_db
@@ -343,6 +347,7 @@ async def test_finalize_absorbs_a_queued_registration(temp_db):
         row = await temp_db.get_receipt_async(TEAM, CH, "100.0")
         assert row["state"] == "finalized"
         assert row["thread_root_ts"] == "99.0"
+        assert row["receipt_class"] == "assistant_reply"
     finally:
         orx.reset_service()
 
@@ -352,7 +357,7 @@ async def test_a_still_failing_op_stays_queued(caplog):
     svc = orx.install_service(_BrokenDB())
     try:
         ledger = _ledger()
-        await ledger.note_post("100.0")
+        await ledger.note_post("100.0", receipt_class="assistant_reply")
         with caplog.at_level(logging.CRITICAL):
             assert await svc.drain_once() == 0
         assert svc.queue_depth == 1
@@ -380,7 +385,7 @@ def test_a_queued_root_survives_a_weaker_later_op():
 
 
 async def test_a_registration_is_written_down_as_it_happened(service, temp_db, events):
-    await _ledger().note_post("100.0", thread_root_ts="99.0")
+    await _ledger().note_post("100.0", thread_root_ts="99.0", receipt_class="assistant_reply")
     assert events == [{"channel_id": CH, "message_ts": "100.0", "owner_turn_id": "s:1",
                        "op": "register", "prior_state": "absent", "new_state": "in_flight",
                        "applied": True, "reason": "inserted"}]
@@ -390,14 +395,14 @@ async def test_a_chrome_registration_is_a_register_op_with_a_chrome_end_state(se
                                                                              events):
     """One op, because both are registrations; the row's own `new_state` is what says which
     surface it made."""
-    await _ledger().note_chrome("100.0")
+    await _ledger().note_chrome("100.0", receipt_class="chrome")
     assert [(e["op"], e["new_state"], e["reason"]) for e in events] == \
         [("register", "chrome", "inserted")]
 
 
 async def test_a_promotion_records_the_state_it_moved(service, temp_db, events):
     ledger = _ledger()
-    await ledger.note_chrome("100.0")
+    await ledger.note_chrome("100.0", receipt_class="chrome")
     await ledger.promote("100.0")
     assert [(e["op"], e["prior_state"], e["new_state"], e["reason"]) for e in events] == \
         [("register", "absent", "chrome", "inserted"),
@@ -406,7 +411,7 @@ async def test_a_promotion_records_the_state_it_moved(service, temp_db, events):
 
 async def test_a_demotion_records_its_own_op(service, temp_db, events):
     ledger = _ledger()
-    await ledger.note_post("100.0")
+    await ledger.note_post("100.0", receipt_class="assistant_reply")
     await ledger.demote("100.0")
     assert [(e["op"], e["prior_state"], e["new_state"], e["reason"]) for e in events][-1] == \
         ("demote", "in_flight", "chrome", "demoted")
@@ -416,7 +421,7 @@ async def test_a_refused_demotion_is_recorded_as_a_refusal_not_a_failure(service
                                                                         events):
     """The row belongs to somebody else. Nothing moved, and nothing broke either — the line that
     says so is the only evidence this ever happened."""
-    await _ledger("s:OTHER").note_post("100.0")
+    await _ledger("s:OTHER").note_post("100.0", receipt_class="assistant_reply")
     await _ledger("s:1").demote("100.0")
     demotes = [e for e in events if e["op"] == "demote"]
     assert [(e["applied"], e["reason"]) for e in demotes] == \
@@ -424,7 +429,8 @@ async def test_a_refused_demotion_is_recorded_as_a_refusal_not_a_failure(service
 
 
 async def test_a_single_finalize_op_is_recorded(service, temp_db, events):
-    await _ledger().note_post("100.0", orx.STATE_FINALIZED, "99.0")
+    await _ledger().note_post("100.0", orx.STATE_FINALIZED, "99.0",
+                  receipt_class="assistant_reply")
     assert [(e["op"], e["prior_state"], e["new_state"], e["reason"]) for e in events] == \
         [("finalize", "absent", "finalized", "inserted")]
 
@@ -432,7 +438,7 @@ async def test_a_single_finalize_op_is_recorded(service, temp_db, events):
 async def test_a_unit_settle_writes_one_line_per_message(service, temp_db, events):
     ledger = _ledger()
     for ts in ("100.0", "101.0", "102.0"):
-        await ledger.note_post(ts)
+        await ledger.note_post(ts, receipt_class="assistant_reply")
     events.clear()
     await ledger.settle()
     assert [(e["op"], e["message_ts"], e["prior_state"], e["new_state"], e["reason"])
@@ -447,10 +453,11 @@ async def test_a_unit_settle_a_foreign_turn_owns_records_the_refusal_per_message
     """The zip is the point: one line each, attributed to the right message, with only the
     contested one refused."""
     ledger = _ledger("s:1")
-    await ledger.note_post("100.0")
-    await ledger.note_post("101.0")
+    await ledger.note_post("100.0", receipt_class="assistant_reply")
+    await ledger.note_post("101.0", receipt_class="assistant_reply")
     await temp_db.delete_receipt_async(TEAM, CH, "101.0")
-    await temp_db.register_receipt_async(TEAM, CH, "101.0", "s:OTHER", "in_flight")
+    await temp_db.register_receipt_async(TEAM, CH, "101.0", "s:OTHER", "in_flight",
+                                         receipt_class="assistant_reply")
     events.clear()
     await ledger.settle()
     assert [(e["message_ts"], e["applied"], e["reason"]) for e in events] == \
@@ -459,7 +466,7 @@ async def test_a_unit_settle_a_foreign_turn_owns_records_the_refusal_per_message
 
 async def test_a_deletion_records_the_state_it_removed(service, temp_db, events):
     ledger = _ledger()
-    await ledger.note_post("100.0")
+    await ledger.note_post("100.0", receipt_class="assistant_reply")
     events.clear()
     await ledger.abort("100.0")
     assert events == [{"channel_id": CH, "message_ts": "100.0", "owner_turn_id": "s:1",
@@ -469,7 +476,8 @@ async def test_a_deletion_records_the_state_it_removed(service, temp_db, events)
 
 async def test_a_resolved_share_is_recorded_as_a_pending_resolve(service, temp_db, events):
     await orx.record_pending_share(temp_db, team_id=TEAM, channel_id=CH, file_id="F1",
-                                   owner_turn_id="s:1", thread_root_ts="99.0")
+                                   owner_turn_id="s:1", thread_root_ts="99.0",
+                                   receipt_class="artifact")
     assert events == [], "a pending-share row is not an outbound receipt"
     await orx.resolve_pending_share(temp_db, team_id=TEAM, channel_id=CH, file_id="F1",
                                    message_ts="150.0")
@@ -486,7 +494,8 @@ async def test_a_share_resolved_out_of_the_queue_records_both_halves(service, te
             raise RuntimeError("db busy")
 
     await orx.record_pending_share(_Refusing(), team_id=TEAM, channel_id=CH, file_id="F1",
-                                   owner_turn_id="s:1", thread_root_ts="99.0")
+                                   owner_turn_id="s:1", thread_root_ts="99.0",
+                                   receipt_class="artifact")
     events.clear()
     assert await orx.resolve_pending_share(temp_db, team_id=TEAM, channel_id=CH, file_id="F1",
                                            message_ts="150.0")
@@ -510,7 +519,7 @@ async def test_a_raising_write_writes_no_line_and_is_retried(service, temp_db, e
     orx.reset_service()
     svc = orx.install_service(_BrokenDB())
     try:
-        await _ledger().note_post("100.0")
+        await _ledger().note_post("100.0", receipt_class="assistant_reply")
         assert events == []
         assert svc.queue_depth == 1
     finally:
@@ -520,9 +529,9 @@ async def test_a_raising_write_writes_no_line_and_is_retried(service, temp_db, e
 async def test_a_refused_transition_is_not_retried(service, temp_db, events):
     """`_write` returns True for an applied=False result: the database answered, and asking it the
     same question forever would never change the answer."""
-    await _ledger("s:OTHER").note_post("100.0")
+    await _ledger("s:OTHER").note_post("100.0", receipt_class="assistant_reply")
     events.clear()
-    await _ledger("s:1").note_post("100.0")
+    await _ledger("s:1").note_post("100.0", receipt_class="assistant_reply")
     assert service.queue_depth == 0
     assert [(e["applied"], e["reason"]) for e in events] == [(False, "foreign_owner")]
 
@@ -533,14 +542,14 @@ async def test_the_ledger_speaks_the_declared_vocabulary(service, temp_db, event
     from message_processor import participation_telemetry as pt
 
     ledger = _ledger()
-    await ledger.note_chrome("100.0")
+    await ledger.note_chrome("100.0", receipt_class="chrome")
     await ledger.promote("100.0")
     await ledger.demote("100.0")
-    await ledger.note_post("101.0")
+    await ledger.note_post("101.0", receipt_class="assistant_reply")
     await ledger.settle()
     await ledger.abort("101.0")
     await orx.record_pending_share(temp_db, team_id=TEAM, channel_id=CH, file_id="F1",
-                                   owner_turn_id="s:1")
+                                   owner_turn_id="s:1", receipt_class="artifact")
     await orx.resolve_pending_share(temp_db, team_id=TEAM, channel_id=CH, file_id="F1",
                                    message_ts="150.0")
     assert events
@@ -555,8 +564,8 @@ async def test_the_ledger_speaks_the_declared_vocabulary(service, temp_db, event
 
 async def test_the_first_conversational_surface_pauses_a_turn_ledger(service, temp_db, barriers):
     ledger = orx.ledger_for("s:1", TEAM, CH)
-    await ledger.note_post("100.0")
-    await ledger.note_post("101.0")
+    await ledger.note_post("100.0", receipt_class="assistant_reply")
+    await ledger.note_post("101.0", receipt_class="assistant_reply")
     assert barriers == [{"channel_id": CH, "message_ts": "100.0", "owner": "s:1"}], \
         "the seam is the FIRST surface, not every one"
 
@@ -567,14 +576,15 @@ async def test_a_detached_job_ledger_never_pauses_a_battery(service, temp_db, ba
     is waiting to release is not coming."""
     job = orx.ledger_for_job("g1", TEAM, CH)
     assert not job._barrier_eligible
-    await job.note_post("100.0")
+    await job.note_post("100.0", receipt_class="background_job")
     await job.promote("100.0")
     assert barriers == []
 
 
 async def test_a_sys_owner_post_never_pauses_a_battery(service, temp_db, barriers):
     await record_transport_post(team_id=TEAM, channel_id=CH, message_ts="100.0", receipts=None,
-                               receipt_kind="finalized", site="channel_intro")
+                               receipt_kind="finalized", site="channel_intro",
+                               receipt_class="system_notice")
     assert barriers == []
 
 
@@ -583,11 +593,11 @@ async def test_the_promote_path_reaches_the_seam_exactly_once(service, temp_db, 
     not the post — the message already exists as chrome and this is the edit that makes it an
     answer. Every later edit grows a surface the turn already owns."""
     ledger = orx.ledger_for("s:1", TEAM, CH)
-    await ledger.note_chrome("100.0")
+    await ledger.note_chrome("100.0", receipt_class="chrome")
     assert barriers == [], "chrome is not conversation"
     await ledger.promote("100.0")
     await ledger.promote("100.0")
-    await ledger.note_post("101.0")
+    await ledger.note_post("101.0", receipt_class="assistant_reply")
     assert barriers == [{"channel_id": CH, "message_ts": "100.0", "owner": "s:1"}]
 
 
@@ -595,7 +605,7 @@ async def test_the_seam_is_a_hard_no_op_without_the_env_flag(service, temp_db, m
     """No DEV_TURN_BARRIERS, nothing touched — this sits on the production turn path."""
     monkeypatch.delenv("DEV_TURN_BARRIERS", raising=False)
     ledger = orx.ledger_for("s:1", TEAM, CH)
-    await ledger.note_post("100.0")
+    await ledger.note_post("100.0", receipt_class="assistant_reply")
     assert await _state(temp_db, "100.0") == "in_flight"
 
 
@@ -607,7 +617,7 @@ async def test_a_seam_that_raises_never_costs_the_receipt(service, temp_db, monk
 
     monkeypatch.setattr(dev_barriers, "post_partial_post", _explode)
     ledger = orx.ledger_for("s:1", TEAM, CH)
-    await ledger.note_post("100.0")
+    await ledger.note_post("100.0", receipt_class="assistant_reply")
     assert await _state(temp_db, "100.0") == "in_flight"
 
 
@@ -617,7 +627,8 @@ async def test_a_seam_that_raises_never_costs_the_receipt(service, temp_db, monk
 async def test_a_durable_post_with_no_intent_is_loud_and_still_recorded(service, temp_db, caplog):
     with caplog.at_level(logging.ERROR):
         await record_transport_post(team_id=TEAM, channel_id=CH, message_ts="100.0",
-                                    receipts=None, site="mystery_site")
+                                    receipts=None, site="mystery_site",
+                                    receipt_class="system_notice")
     assert "mystery_site" in caplog.text
     row = await temp_db.get_receipt_async(TEAM, CH, "100.0")
     assert row["state"] == "finalized"
@@ -627,7 +638,8 @@ async def test_a_durable_post_with_no_intent_is_loud_and_still_recorded(service,
 async def test_a_declared_chrome_post_needs_no_ledger(service, temp_db, caplog):
     with caplog.at_level(logging.ERROR):
         await record_transport_post(team_id=TEAM, channel_id=CH, message_ts="100.0",
-                                    receipts=None, receipt_kind="chrome", site="footer")
+                                    receipts=None, receipt_kind="chrome", site="footer",
+                                    receipt_class="chrome")
     assert caplog.text == ""
     assert await _state(temp_db, "100.0") == "chrome"
 
@@ -635,7 +647,8 @@ async def test_a_declared_chrome_post_needs_no_ledger(service, temp_db, caplog):
 async def test_a_declared_finalized_post_needs_no_ledger(service, temp_db):
     await record_transport_post(team_id=TEAM, channel_id=CH, message_ts="100.0",
                                 receipts=None, receipt_kind="finalized",
-                                thread_root_ts="99.0", site="channel_intro")
+                                thread_root_ts="99.0", site="channel_intro",
+                                receipt_class="system_notice")
     row = await temp_db.get_receipt_async(TEAM, CH, "100.0")
     assert (row["state"], row["thread_root_ts"]) == ("finalized", "99.0")
 
@@ -643,14 +656,15 @@ async def test_a_declared_finalized_post_needs_no_ledger(service, temp_db):
 async def test_an_ephemeral_with_no_ts_records_nothing(service, temp_db, caplog):
     with caplog.at_level(logging.ERROR):
         await record_transport_post(team_id=TEAM, channel_id=CH, message_ts=None,
-                                    receipts=None, site="ephemeral")
+                                    receipts=None, site="ephemeral", receipt_class="system_notice")
     assert caplog.text == ""
 
 
 async def test_a_dm_post_with_no_intent_is_not_an_error(service, caplog):
     with caplog.at_level(logging.ERROR):
         await record_transport_post(team_id=TEAM, channel_id=DM, message_ts="100.0",
-                                    receipts=None, site="dm_reply")
+                                    receipts=None, site="dm_reply",
+                                    receipt_class="assistant_reply")
     assert caplog.text == ""
 
 
@@ -717,20 +731,24 @@ def _messaging(db, slack):
 async def test_send_message_registers_its_post_under_the_turn(service, temp_db):
     bot = _messaging(temp_db, _FakeSlack())
     ledger = _ledger()
-    ts = await bot.send_message(CH, "99.0", "hello", receipts=ledger)
+    ts = await bot.send_message(CH, "99.0", "hello", receipts=ledger,
+                                receipt_class="assistant_reply")
     row = await temp_db.get_receipt_async(TEAM, CH, ts)
     assert (row["state"], row["turn_id"], row["thread_root_ts"]) == ("in_flight", "s:1", "99.0")
+    assert row["receipt_class"] == "assistant_reply"
 
 
 async def test_every_split_chunk_earns_a_receipt_and_they_finalize_together(service, temp_db):
     bot = _messaging(temp_db, _FakeSlack())
     bot.MAX_MESSAGE_LENGTH = 400
     ledger = _ledger()
-    await bot.send_message(CH, "99.0", "x " * 900, receipts=ledger)
+    await bot.send_message(CH, "99.0", "x " * 900, receipts=ledger,
+                           receipt_class="assistant_reply")
     assert len(ledger.pending_ts) > 1
     await ledger.settle()
     for ts in await temp_db.get_channel_receipts_async(TEAM, CH):
         assert ts["state"] == "finalized"
+        assert ts["receipt_class"] == "assistant_reply"
 
 
 async def test_a_thinking_placeholder_registers_as_chrome(service, temp_db):
@@ -741,7 +759,8 @@ async def test_a_thinking_placeholder_registers_as_chrome(service, temp_db):
 
     bot.set_assistant_status = no_status
     ledger = _ledger()
-    ts = await bot.send_thinking_indicator(CH, "99.0", receipts=ledger)
+    ts = await bot.send_thinking_indicator(CH, "99.0", receipts=ledger,
+                                           receipt_class="chrome")
     assert await _state(temp_db, ts) == "chrome"
 
 
@@ -756,7 +775,8 @@ async def test_a_stale_send_suppression_passes_straight_through(service, temp_db
             raise AssertionError("never reached")
 
     with pytest.raises(StaleSendSuppressed):
-        await bot.send_message(CH, "99.0", "hi", lease=_Lease(), receipts=_ledger())
+        await bot.send_message(CH, "99.0", "hi", lease=_Lease(), receipts=_ledger(),
+                               receipt_class="assistant_reply")
     assert await temp_db.get_channel_receipts_async(TEAM, CH) == []
 
 
@@ -779,6 +799,7 @@ async def test_post_to_thread_records_the_target_root(service, temp_db):
     assert result["ok"]
     row = await temp_db.get_receipt_async(TEAM, CH, result["posted_ts"])
     assert row["thread_root_ts"] == "77.0"
+    assert row["receipt_class"] == "assistant_reply"
 
 
 async def test_a_native_stream_claims_every_part(service, temp_db):
@@ -818,7 +839,7 @@ async def test_an_upload_records_a_pending_share_then_resolves_it(service, temp_
     ledger = _ledger()
     assert await orx.record_pending_share(
         temp_db, team_id=TEAM, channel_id=CH, file_id="F1",
-        owner_turn_id=ledger.owner_id, thread_root_ts="99.0")
+        owner_turn_id=ledger.owner_id, thread_root_ts="99.0", receipt_class="artifact")
     assert len(await temp_db.get_pending_shares_async()) == 1
 
     assert await orx.resolve_pending_share(
@@ -826,6 +847,7 @@ async def test_an_upload_records_a_pending_share_then_resolves_it(service, temp_
     assert await temp_db.get_pending_shares_async() == []
     row = await temp_db.get_receipt_async(TEAM, CH, "150.0")
     assert (row["state"], row["turn_id"], row["thread_root_ts"]) == ("finalized", "s:1", "99.0")
+    assert row["receipt_class"] == "artifact"
 
 
 async def _finish_resolvers(service):
@@ -840,6 +862,7 @@ async def test_an_artifact_upload_resolves_its_own_share_receipt(service, temp_d
     # transport does not start the poll the artifact never earns a receipt at all.
     bot = _messaging(temp_db, _FakeSlack())
     identity = await bot.send_file(CH, "99.0", io.BytesIO(b"x,y\n1,2\n"), "report.csv",
+                                   receipt_class="artifact",
                                    receipts=_ledger())
     assert identity["file_id"] == "F1"
     assert len(await temp_db.get_pending_shares_async()) == 1
@@ -848,13 +871,15 @@ async def test_an_artifact_upload_resolves_its_own_share_receipt(service, temp_d
     assert await temp_db.get_pending_shares_async() == []
     row = await temp_db.get_receipt_async(TEAM, CH, "150.0")
     assert (row["state"], row["turn_id"], row["thread_root_ts"]) == ("finalized", "s:1", "99.0")
+    assert row["receipt_class"] == "artifact"
 
 
 async def test_an_unresolvable_artifact_keeps_its_row_for_boot_recovery(service, temp_db,
                                                                         caplog):
     bot = _messaging(temp_db, _FakeSlack(share_ts=None))
     with patch.object(config, "image_share_ts_timeout_seconds", 0.0):
-        await bot.send_file(CH, "99.0", io.BytesIO(b"x"), "report.csv", receipts=_ledger())
+        await bot.send_file(CH, "99.0", io.BytesIO(b"x"), "report.csv",
+                            receipts=_ledger(), receipt_class="artifact")
         with caplog.at_level(logging.WARNING):
             await _finish_resolvers(service)
     assert len(await temp_db.get_pending_shares_async()) == 1
@@ -865,14 +890,16 @@ async def test_an_image_upload_leaves_the_poll_to_image_delivery(service, temp_d
     # One poll there feeds the indicator, provenance and the receipt; a second one here would
     # double the API calls to learn the same fact.
     bot = _messaging(temp_db, _FakeSlack())
-    await bot.send_image(CH, "99.0", b"bytes", "pic.png", receipts=_ledger())
+    await bot.send_image(CH, "99.0", b"bytes", "pic.png", receipts=_ledger(),
+                         receipt_class="artifact")
     assert not service._resolvers
     assert len(await temp_db.get_pending_shares_async()) == 1
 
 
 async def test_a_dm_artifact_upload_starts_no_poll(service, temp_db):
     bot = _messaging(temp_db, _FakeSlack())
-    await bot.send_file(DM, "99.0", io.BytesIO(b"x"), "report.csv", receipts=_ledger(channel=DM))
+    await bot.send_file(DM, "99.0", io.BytesIO(b"x"), "report.csv",
+                        receipts=_ledger(channel=DM), receipt_class="artifact")
     assert not service._resolvers
     assert await temp_db.get_pending_shares_async() == []
 
@@ -884,7 +911,7 @@ async def test_a_pending_row_that_never_landed_is_finalized_from_the_queue(servi
 
     assert not await orx.record_pending_share(
         _Refusing(), team_id=TEAM, channel_id=CH, file_id="F1", owner_turn_id="s:1",
-        thread_root_ts="99.0")
+        thread_root_ts="99.0", receipt_class="artifact")
     assert service.queue_depth == 1
 
     # The share ts arrived while the write was still queued: finalize the message directly
@@ -895,6 +922,7 @@ async def test_a_pending_row_that_never_landed_is_finalized_from_the_queue(servi
     assert service.queue_depth == 0
     row = await temp_db.get_receipt_async(TEAM, CH, "150.0")
     assert (row["state"], row["turn_id"], row["thread_root_ts"]) == ("finalized", "s:1", "99.0")
+    assert row["receipt_class"] == "artifact"
 
 
 async def test_a_queued_pending_row_drains_when_the_database_comes_back(service, temp_db):
@@ -903,7 +931,8 @@ async def test_a_queued_pending_row_drains_when_the_database_comes_back(service,
             raise RuntimeError("db busy")
 
     await orx.record_pending_share(_Refusing(), team_id=TEAM, channel_id=CH, file_id="F1",
-                                   owner_turn_id="s:1", thread_root_ts="99.0")
+                                   owner_turn_id="s:1", thread_root_ts="99.0",
+                                   receipt_class="artifact")
     assert await service.drain_once() == 1
     rows = await temp_db.get_pending_shares_async()
     assert (rows[0]["file_id"], rows[0]["owner_turn_id"]) == ("F1", "s:1")
@@ -911,7 +940,7 @@ async def test_a_queued_pending_row_drains_when_the_database_comes_back(service,
 
 async def test_a_deleted_file_drops_its_pending_row(service, temp_db):
     await orx.record_pending_share(temp_db, team_id=TEAM, channel_id=CH, file_id="F1",
-                                   owner_turn_id="s:1")
+                                   owner_turn_id="s:1", receipt_class="artifact")
     assert await orx.delete_pending_shares_for_file(temp_db, "F1") == 1
     assert await temp_db.get_pending_shares_async() == []
 
@@ -923,7 +952,7 @@ async def test_a_late_registration_cannot_resurrect_a_deleted_file(service, temp
     exists. That row can never resolve: it is retried and logged critically on every boot from
     then on. A per-key queue tombstone cannot cover it, because by then the key is empty."""
     await orx.record_pending_share(temp_db, team_id=TEAM, channel_id=CH, file_id="F1",
-                                   owner_turn_id="s:1")
+                                   owner_turn_id="s:1", receipt_class="artifact")
     assert await orx.delete_pending_shares_for_file(temp_db, "F1") == 1
     # No row, and nothing queued to absorb what comes next.
     assert await temp_db.get_pending_shares_async() == []
@@ -931,7 +960,7 @@ async def test_a_late_registration_cannot_resurrect_a_deleted_file(service, temp
 
     # …and NOW the upload's own registration lands.
     assert not await orx.record_pending_share(temp_db, team_id=TEAM, channel_id=CH, file_id="F1",
-                                              owner_turn_id="s:1")
+                                              owner_turn_id="s:1", receipt_class="artifact")
     assert await temp_db.get_pending_shares_async() == []
     assert service.queue_depth == 0
 
@@ -958,7 +987,8 @@ async def test_a_deletion_that_overlaps_the_registration_still_wins(service, tem
     with patch.object(temp_db, "record_pending_share_async",
                       _record_then_let_the_deletion_run):
         wrote = await orx.record_pending_share(temp_db, team_id=TEAM, channel_id=CH,
-                                               file_id="F1", owner_turn_id="s:1")
+                                               file_id="F1", owner_turn_id="s:1",
+                                               receipt_class="artifact")
 
     assert deletion_done, "the interleaving never happened"
     assert not wrote
@@ -982,7 +1012,8 @@ async def test_an_overlapping_deletion_is_retried_when_the_compensating_delete_f
     with patch.object(temp_db, "record_pending_share_async", _record_then_delete), \
          patch.object(temp_db, "delete_pending_share_async", _refuse_delete):
         assert not await orx.record_pending_share(temp_db, team_id=TEAM, channel_id=CH,
-                                                  file_id="F1", owner_turn_id="s:1")
+                                                  file_id="F1", owner_turn_id="s:1",
+                                                  receipt_class="artifact")
     assert service.queue_depth == 1
     assert len(await temp_db.get_pending_shares_async()) == 1
 
@@ -999,7 +1030,7 @@ async def test_a_queued_registration_that_overlaps_a_deletion_is_compensated(ser
             raise RuntimeError("db busy")
 
     await orx.record_pending_share(_Refusing(), team_id=TEAM, channel_id=CH, file_id="F1",
-                                   owner_turn_id="s:1")
+                                   owner_turn_id="s:1", receipt_class="artifact")
     assert service.queue_depth == 1
 
     real_record = temp_db.record_pending_share_async
@@ -1025,7 +1056,7 @@ async def test_lattice_compensation_survives_a_closed_queue(service, temp_db):
             raise RuntimeError("db busy")
 
     await orx.record_pending_share(_Refusing(), team_id=TEAM, channel_id=CH, file_id="F1",
-                                   owner_turn_id="s:1")
+                                   owner_turn_id="s:1", receipt_class="artifact")
     assert service.queue_depth == 1
 
     real_record = temp_db.record_pending_share_async
@@ -1060,7 +1091,8 @@ async def test_a_deleted_file_is_refused_even_when_the_row_never_landed(service,
 
     await orx.delete_pending_shares_for_file(temp_db, "F1")
     assert not await orx.record_pending_share(_Refusing(), team_id=TEAM, channel_id=CH,
-                                              file_id="F1", owner_turn_id="s:1")
+                                              file_id="F1", owner_turn_id="s:1",
+                                              receipt_class="artifact")
     assert service.queue_depth == 0
 
 
@@ -1073,7 +1105,7 @@ async def test_a_queued_pending_write_is_dropped_when_the_deletion_beats_its_dra
             raise RuntimeError("db busy")
 
     await orx.record_pending_share(_Refusing(), team_id=TEAM, channel_id=CH, file_id="F1",
-                                   owner_turn_id="s:1")
+                                   owner_turn_id="s:1", receipt_class="artifact")
     assert service.queue_depth == 1
     service.note_file_deleted("F1")
     # Drained as a success — there is nothing left to write — and no row appears.
@@ -1096,7 +1128,7 @@ async def test_a_deleted_file_tombstones_a_queued_pending_write(service, temp_db
             raise RuntimeError("db busy")
 
     await orx.record_pending_share(_Refusing(), team_id=TEAM, channel_id=CH, file_id="F1",
-                                   owner_turn_id="s:1")
+                                   owner_turn_id="s:1", receipt_class="artifact")
     await orx.delete_pending_shares_for_file(temp_db, "F1")
     await service.drain_once()
     assert await temp_db.get_pending_shares_async() == []
@@ -1113,20 +1145,21 @@ async def test_the_file_deleted_event_reaches_the_pending_cleanup(service, temp_
             pass
 
     await orx.record_pending_share(temp_db, team_id=TEAM, channel_id=CH, file_id="F1",
-                                   owner_turn_id="s:1")
+                                   owner_turn_id="s:1", receipt_class="artifact")
     await _Events(temp_db)._ambient_file_deleted({"file_id": "F1"})
     assert await temp_db.get_pending_shares_async() == []
 
 
 async def test_a_dm_upload_records_no_pending_row(service, temp_db):
     assert not await orx.record_pending_share(
-        temp_db, team_id=TEAM, channel_id=DM, file_id="F1", owner_turn_id="s:1")
+        temp_db, team_id=TEAM, channel_id=DM, file_id="F1", owner_turn_id="s:1",
+        receipt_class="artifact")
     assert await temp_db.get_pending_shares_async() == []
 
 
 async def test_a_failed_resolution_keeps_the_row_for_boot_recovery(service, temp_db):
     await orx.record_pending_share(temp_db, team_id=TEAM, channel_id=CH, file_id="F1",
-                                   owner_turn_id="s:1")
+                                   owner_turn_id="s:1", receipt_class="artifact")
 
     class _Exploding:
         async def resolve_pending_share_async(self, *a, **k):
@@ -1139,7 +1172,8 @@ async def test_a_failed_resolution_keeps_the_row_for_boot_recovery(service, temp
 
 async def test_boot_recovery_resolves_leftovers(service, temp_db):
     await orx.record_pending_share(temp_db, team_id=TEAM, channel_id=CH, file_id="F1",
-                                   owner_turn_id="s_old:3", thread_root_ts="99.0")
+                                   owner_turn_id="s_old:3", thread_root_ts="99.0",
+                                   receipt_class="artifact")
 
     class _Client:
         async def resolve_file_share_ts(self, channel_id, file_id):
@@ -1152,7 +1186,7 @@ async def test_boot_recovery_resolves_leftovers(service, temp_db):
 
 async def test_boot_recovery_retains_a_share_slack_still_cannot_place(service, temp_db, caplog):
     await orx.record_pending_share(temp_db, team_id=TEAM, channel_id=CH, file_id="F1",
-                                   owner_turn_id="s_old:3")
+                                   owner_turn_id="s_old:3", receipt_class="artifact")
 
     class _Client:
         async def resolve_file_share_ts(self, channel_id, file_id):
@@ -1168,8 +1202,10 @@ async def test_boot_recovery_retains_a_share_slack_still_cannot_place(service, t
 
 async def test_dead_session_reconcile_spares_the_live_session(service, temp_db):
     live = orx.next_turn_id()
-    await temp_db.register_receipt_async(TEAM, CH, "100.0", live, "in_flight")
-    await temp_db.register_receipt_async(TEAM, CH, "101.0", "deadsession:4", "in_flight")
+    await temp_db.register_receipt_async(TEAM, CH, "100.0", live, "in_flight",
+                                         receipt_class="assistant_reply")
+    await temp_db.register_receipt_async(TEAM, CH, "101.0", "deadsession:4", "in_flight",
+                                         receipt_class="assistant_reply")
 
     import runtime_identity
     moved = await temp_db.finalize_dead_session_receipts_async(runtime_identity.SESSION_ID)
@@ -1179,9 +1215,12 @@ async def test_dead_session_reconcile_spares_the_live_session(service, temp_db):
 
 
 async def test_reconcile_emits_one_row_per_recovered_message(service, temp_db, events):
-    await temp_db.register_receipt_async(TEAM, CH, "100.0", orx.next_turn_id(), "in_flight")
-    await temp_db.register_receipt_async(TEAM, CH, "101.0", "deadsession:4", "in_flight")
-    await temp_db.register_receipt_async(TEAM, "C2", "102.0", "deadsession:5", "in_flight")
+    await temp_db.register_receipt_async(TEAM, CH, "100.0", orx.next_turn_id(), "in_flight",
+                                         receipt_class="assistant_reply")
+    await temp_db.register_receipt_async(TEAM, CH, "101.0", "deadsession:4", "in_flight",
+                                         receipt_class="assistant_reply")
+    await temp_db.register_receipt_async(TEAM, "C2", "102.0", "deadsession:5", "in_flight",
+                                         receipt_class="assistant_reply")
 
     assert await orx.reconcile_dead_sessions(temp_db) == 2
     assert [(e["op"], e["message_ts"], e["owner_turn_id"], e["prior_state"], e["new_state"],
@@ -1247,7 +1286,7 @@ async def test_service_shutdown_drains_then_reports_what_it_could_not_write(temp
     orx.reset_service()
     svc = orx.install_service(_BrokenDB())
     try:
-        await _ledger().note_post("100.0")
+        await _ledger().note_post("100.0", receipt_class="assistant_reply")
         with caplog.at_level(logging.CRITICAL):
             await svc.shutdown()
         assert "permanently omitted" in caplog.text
@@ -1258,7 +1297,7 @@ async def test_service_shutdown_drains_then_reports_what_it_could_not_write(temp
 async def test_a_settle_already_in_flight_still_writes_during_shutdown(service, temp_db):
     # `_accepting` closes the door on NEW producers, not on the settles shutdown is waiting for.
     ledger = _ledger()
-    await ledger.note_post("100.0")
+    await ledger.note_post("100.0", receipt_class="assistant_reply")
     service.track(asyncio.ensure_future(ledger.settle()))
     await service.shutdown()
     assert await _state(temp_db, "100.0") == "finalized"
@@ -1404,7 +1443,7 @@ async def test_shutdown_does_not_move_on_until_a_slow_post_has_registered(post_g
 
     async def _slow_pair():
         await release.wait()
-        await _ledger().note_chrome("100.0")
+        await _ledger().note_chrome("100.0", receipt_class="chrome")
 
     task = asyncio.ensure_future(_slow_pair())
     post_gate.protect(task)
@@ -1440,7 +1479,7 @@ async def test_a_registration_that_fails_is_carried_by_the_final_drain(post_gate
 
     async def _pair():
         with patch.object(temp_db, "register_chrome_async", _fail_once):
-            await _ledger().note_chrome("100.0")
+            await _ledger().note_chrome("100.0", receipt_class="chrome")
 
     task = asyncio.ensure_future(_pair())
     post_gate.protect(task)
@@ -1550,7 +1589,7 @@ async def test_a_producer_arriving_after_shutdown_is_refused_not_queued(temp_db,
     try:
         await svc.shutdown()
         with caplog.at_level(logging.ERROR):
-            await _ledger().note_post("100.0")
+            await _ledger().note_post("100.0", receipt_class="assistant_reply")
         assert "refused" in caplog.text
         # No row, no queue entry, and no resurrected drain worker behind the final drain.
         assert await temp_db.get_receipt_async(TEAM, CH, "100.0") is None
@@ -1599,7 +1638,7 @@ async def test_shutdown_stops_the_drain_worker_before_its_own_final_pass(service
 
     with patch.object(service, "drain_once", _tracked):
         # A live worker exists (any enqueue starts one).
-        await _ledger().note_chrome("100.0")
+        await _ledger().note_chrome("100.0", receipt_class="chrome")
         service._enqueue(_Op("finalize", TEAM, CH, "100.0", "s:1"))
         assert service._drain_task is not None
         await service.shutdown()
@@ -1618,7 +1657,8 @@ async def test_a_compensating_delete_lands_even_during_the_final_drain(service, 
             raise RuntimeError("db busy")
 
     await orx.record_pending_share(_Refusing(), team_id=TEAM, channel_id=CH, file_id="F1",
-                                   owner_turn_id="s:1", thread_root_ts="99.0")
+                                   owner_turn_id="s:1", thread_root_ts="99.0",
+                                   receipt_class="artifact")
 
     real_record = temp_db.record_pending_share_async
     resolved = []
@@ -1663,7 +1703,8 @@ async def test_a_resolve_that_lands_mid_drain_undoes_the_stale_pending_row(servi
             raise RuntimeError("db busy")
 
     await orx.record_pending_share(_Refusing(), team_id=TEAM, channel_id=CH, file_id="F1",
-                                   owner_turn_id="s:1", thread_root_ts="99.0")
+                                   owner_turn_id="s:1", thread_root_ts="99.0",
+                                   receipt_class="artifact")
     assert service.queue_depth == 1
 
     with patch.object(temp_db, "record_pending_share_async", _slow_record):
@@ -1689,7 +1730,7 @@ async def test_a_file_deleted_cleanup_survives_a_transient_read_failure(service,
     the cleanup for the life of the database — the row survived, unresolvable, retried and
     logged critically on every boot."""
     await orx.record_pending_share(temp_db, team_id=TEAM, channel_id=CH, file_id="F1",
-                                   owner_turn_id="s:1")
+                                   owner_turn_id="s:1", receipt_class="artifact")
 
     async def _exploding(*a, **k):
         raise RuntimeError("db busy")
@@ -1706,7 +1747,7 @@ async def test_a_file_deleted_cleanup_survives_a_transient_read_failure(service,
 
 async def test_a_still_failing_file_wide_cleanup_stays_queued(service, temp_db):
     await orx.record_pending_share(temp_db, team_id=TEAM, channel_id=CH, file_id="F1",
-                                   owner_turn_id="s:1")
+                                   owner_turn_id="s:1", receipt_class="artifact")
 
     async def _exploding(*a, **k):
         raise RuntimeError("db busy")
@@ -1730,7 +1771,7 @@ async def test_shutdown_cancels_a_share_poll_rather_than_waiting_out_its_budget(
             return "150.0"
 
     await orx.record_pending_share(temp_db, team_id=TEAM, channel_id=CH, file_id="F1",
-                                   owner_turn_id="s:1")
+                                   owner_turn_id="s:1", receipt_class="artifact")
     task = orx.schedule_share_resolution(_SlowClient(), temp_db, team_id=TEAM, channel_id=CH,
                                          file_id="F1")
     await started.wait()
@@ -1744,7 +1785,7 @@ async def test_shutdown_cancels_a_share_poll_rather_than_waiting_out_its_budget(
 
 
 async def test_a_confirmed_raw_deletion_drops_its_receipt(service, temp_db):
-    await temp_db.register_chrome_async(TEAM, CH, "100.0", orx.sys_owner())
+    await temp_db.register_chrome_async(TEAM, CH, "100.0", orx.sys_owner(), receipt_class="chrome")
     await orx.delete_receipt_for(team_id=TEAM, channel_id=CH, message_ts="100.0",
                                  site="settings_reminder_cleanup")
     assert await temp_db.get_receipt_async(TEAM, CH, "100.0") is None
@@ -1759,7 +1800,7 @@ async def test_a_settings_reminder_takes_its_row_down_with_it(service, temp_db):
         def log_debug(self, *a, **k):
             pass
 
-    await temp_db.register_chrome_async(TEAM, CH, "100.0", orx.sys_owner())
+    await temp_db.register_chrome_async(TEAM, CH, "100.0", orx.sys_owner(), receipt_class="chrome")
     await _Settings()._drop_settings_receipt(CH, "100.0")
     assert await temp_db.get_receipt_async(TEAM, CH, "100.0") is None
 
@@ -1776,7 +1817,7 @@ async def test_an_aborted_checklist_message_drops_its_row(service, temp_db):
             return True
 
     ledger = _ledger(owner=orx.job_owner("g1"))
-    await ledger.note_chrome("100.0")
+    await ledger.note_chrome("100.0", receipt_class="background_job")
     checklist = SimpleNamespace(surface="message", mirrors_status=False, message_id="100.0")
     await _Job()._abort_checklist(checklist, _Client(), CH, "99.0", receipts=ledger)
     assert await temp_db.get_receipt_async(TEAM, CH, "100.0") is None
@@ -1794,7 +1835,7 @@ async def test_a_failed_delete_keeps_the_row(service, temp_db):
             return False
 
     ledger = _ledger(owner=orx.job_owner("g1"))
-    await ledger.note_chrome("100.0")
+    await ledger.note_chrome("100.0", receipt_class="background_job")
     checklist = SimpleNamespace(surface="message", mirrors_status=False, message_id="100.0")
     await _Job()._abort_checklist(checklist, _Client(), CH, "99.0", receipts=ledger)
     # The message is still in the channel; a row removed now would readmit it as an
@@ -1838,7 +1879,8 @@ async def test_a_failed_image_job_deletes_its_generating_surface_row(service, te
 
         log_debug = log_info = log_warning = log_error
 
-    await temp_db.register_chrome_async(TEAM, CH, "300.0", orx.job_owner("g1"))
+    await temp_db.register_chrome_async(TEAM, CH, "300.0", orx.job_owner("g1"),
+                                        receipt_class="chrome")
     await _Job()._finish_image_generation_background(
         client=_Client(), channel_id=CH, thread_id="99.0", thread_key=f"{CH}:99.0",
         prompt="a cat", enhance=False, conversation_history=[], thread_config={},

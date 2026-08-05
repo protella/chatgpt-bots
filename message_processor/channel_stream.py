@@ -47,6 +47,8 @@ from database import is_unattended_summary
 from logger import setup_logger
 import prompts
 from message_processor import dev_barriers
+from message_processor.turn_runtime import (AuthorizedEditTarget,
+                                            RECEIPT_CLASS_ASSISTANT_REPLY)
 from message_processor.utilities import api_part
 from openai_client.base import attach_cache_breakpoint
 from slack_client import actor_tail as actor_tail_module
@@ -75,7 +77,10 @@ logger = setup_logger(name="slack_bot.ChannelStream")
 # instructions can never name the same set in two different orders.
 REACH_TOOLS = prompts.REACH_TOOLS
 
-SERIALIZER_VERSION = 3
+# v4: the pinned authorization facts changed — `ReceiptRec` gained `receipt_class` and the
+# message-item metadata gained `edited_ts`, the two facts the edit_own_message authorization
+# mapping (EDIT §2a) is built from. Rendered bytes are unchanged; the pin's contents are not.
+SERIALIZER_VERSION = 4
 
 # Versions the SELECTION POLICY — floor semantics, target/ceiling arithmetic,
 # eligibility — separately from the serializer GRAMMAR, because a policy change must
@@ -339,6 +344,9 @@ class ReceiptRec:
     state: str
     turn_id: Optional[str]
     thread_root_ts: Optional[str]
+    # EDIT §2a/§4. The receipt's class, or None for a legacy row — and a legacy row authorizes
+    # NO edit, by comparison against `RECEIPT_CLASS_ASSISTANT_REPLY` rather than by inference.
+    receipt_class: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -694,8 +702,8 @@ def _merged_versions_hash(*, receipts, tool_usage, ids, epoch, images, documents
         "ids": list(ids),
         "receipt_feature_epoch_ts": epoch,
         "receipts": [{"message_ts": r.ts, "state": r.state, "turn_id": r.turn_id,
-                      "thread_root_ts": r.thread_root_ts} for r in
-                     sorted(receipts.values(), key=lambda r: parse_ts(r.ts))],
+                      "thread_root_ts": r.thread_root_ts, "receipt_class": r.receipt_class}
+                     for r in sorted(receipts.values(), key=lambda r: parse_ts(r.ts))],
         "image_analyses": [dict(r) for r in images],
         "document_extractions": [dict(r) for r in documents],
         "ambient_artifacts": [dict(r) for r in ambient],
@@ -844,6 +852,56 @@ class ChannelStream:
         if self.pinned.origin_root_ts:
             labelled.add(str(self.pinned.origin_root_ts))
         return frozenset(labelled)
+
+    @property
+    def authorized_edit_targets(self) -> Mapping[str, AuthorizedEditTarget]:
+        """EDIT §2a. The exact own messages this stream SHOWED the model that are editable.
+
+        Built from the serialized `message_items` + `origin_items` — what was rendered, never the
+        fetch snapshot — deduplicated by ts, and a ts is a key only when ALL of these hold:
+
+        * the item's role is `assistant` — a role one of our own messages gets ONLY through
+          receipt-based resolution, so the role itself is receipt-vouched;
+        * the durable receipt is `finalized`;
+        * the receipt's class is `assistant_reply` — a legacy NULL-class row, chrome, a
+          correction announcement and every other class fail here, by comparison and never by
+          inference;
+        * the item's channel is the pinned channel.
+
+        `thread_root_ts` is the RECEIPT's, not the header's: it is the value the disclosure
+        lands under (`receipt.thread_root_ts or message_ts`), and taking it from one source in
+        both §2a and §2b is what lets duplicate appearances agree. `edited_ts` is the rendered
+        metadata's snapshot. Duplicate appearances that disagree EXCLUDE the ts.
+        """
+        out: Dict[str, AuthorizedEditTarget] = {}
+        conflicted: set = set()
+        channel = self.pinned.channel_id
+        for item in (*self.message_items, *self.origin_items):
+            if item.role != ROLE_ASSISTANT:
+                continue
+            meta = item.metadata
+            ts = meta.get("ts")
+            if not ts or meta.get("channel_id") != channel:
+                continue
+            ts = str(ts)
+            receipt = self.pinned.sidecars.receipt_for(ts)
+            if receipt is None or receipt.state != RECEIPT_FINALIZED:
+                continue
+            if receipt.receipt_class != RECEIPT_CLASS_ASSISTANT_REPLY:
+                continue
+            target = AuthorizedEditTarget(
+                channel_id=str(channel), message_ts=ts,
+                thread_root_ts=receipt.thread_root_ts,
+                edited_ts=meta.get("edited_ts"),
+                receipt_class=str(receipt.receipt_class))
+            held = out.get(ts)
+            if held is not None and held != target:
+                conflicted.add(ts)
+                continue
+            out[ts] = target
+        for ts in conflicted:
+            out.pop(ts, None)
+        return MappingProxyType(out)
 
     def normalized_for(self, ts: Optional[str]) -> Optional[NormalizedMessage]:
         if not ts:
@@ -1415,6 +1473,9 @@ def _render_message_item(message: NormalizedMessage, *, role: str, actor_names: 
             "ts": message.ts,
             "thread_root_ts": message.thread_root_ts,
             "sender_type": message.sender_type,
+            # EDIT §2a. Slack's `edited.ts` snapshot as of THIS fetch (None when never edited) —
+            # the fact an edit authorization is proved against, pinned beside the ts it is about.
+            "edited_ts": message.edited_ts,
         })
 
 
@@ -2536,7 +2597,8 @@ def _freeze_sidecars(payload: Optional[Dict[str, Any]]) -> SidecarPin:
     receipts = tuple(
         ReceiptRec(ts=_checked_ts(row.get("message_ts"), "receipt message_ts"),
                    state=str(row.get("state") or ""),
-                   turn_id=row.get("turn_id"), thread_root_ts=row.get("thread_root_ts"))
+                   turn_id=row.get("turn_id"), thread_root_ts=row.get("thread_root_ts"),
+                   receipt_class=row.get("receipt_class"))
         for row in (data.get("receipts") or []))
     activity = tuple(data.get("activity") or [])
     activity_roots = tuple(_checked_ts(row.get("root_ts"), "activity root_ts")

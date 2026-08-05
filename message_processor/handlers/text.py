@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from base_client import BaseClient, Message, Response
 from config import config, pipeline_status
@@ -13,7 +13,9 @@ from message_processor.routing_facts import POSTURE_THREAD
 from message_processor.stale_send_guard import StaleSendSuppressed
 from message_processor.utilities import effective_request_model
 from message_processor.destination_tools import SET_REPLY_DESTINATION
-from message_processor.turn_runtime import (DEST_KIND_POST_TO_THREAD, POST_TO_THREAD_TOOL,
+from message_processor.turn_runtime import (DEST_KIND_CORRECTION_ANNOUNCEMENT,
+                                            DEST_KIND_POST_TO_THREAD, EDIT_STATE_COMMITTED,
+                                            POST_TO_THREAD_TOOL, AuthorizedEditTarget,
                                             TurnEffectsUnsettled, await_turn_effects,
                                             revoke_turn_effects)
 import prompts
@@ -461,6 +463,48 @@ def _trusted_thread_roots(turn: Any) -> Optional[frozenset]:
     return base | (discovered if isinstance(discovered, frozenset) else frozenset())
 
 
+def _authorized_edit_targets(turn: Any) -> Mapping[str, AuthorizedEditTarget]:
+    """EDIT §2. The exact messages this turn may edit: what its SERIALIZED stream showed the
+    model (§2a) plus what its own tool results have since proved (§2b).
+
+    ALWAYS a mapping, NEVER None — and missing or malformed anything resolves to the EMPTY
+    mapping. Unlike the thread roots there is no legacy surface to keep open here: a DM, a
+    background agent, a hand-built turn and a broken stream all mean "no message is editable",
+    which costs a tool call and an honest error where the other direction costs a silent
+    overwrite of a message nobody proved anything about.
+
+    Duplicate appearances of one ts — stream + discovery, or two tools — must AGREE on
+    edited_ts/receipt_class/thread_root_ts; a conflict EXCLUDES the target rather than choosing
+    a snapshot, and a ts discovery already excluded stays excluded whatever the stream rendered.
+    """
+    if turn is None:
+        return {}
+    combined: Dict[str, AuthorizedEditTarget] = {}
+    stream = getattr(turn, "channel_stream", None)
+    rendered = getattr(stream, "authorized_edit_targets", None) if stream is not None else None
+    if isinstance(rendered, Mapping):
+        for ts, target in rendered.items():
+            if isinstance(ts, str) and isinstance(target, AuthorizedEditTarget):
+                combined[ts] = target
+    discovered = getattr(turn, "discovered_edit_targets", None)
+    excluded: set = set()
+    if isinstance(discovered, Mapping):
+        for ts, target in discovered.items():
+            if not isinstance(ts, str) or not isinstance(target, AuthorizedEditTarget):
+                continue
+            held = combined.get(ts)
+            if held is not None and held != target:
+                excluded.add(ts)
+                continue
+            combined[ts] = target
+    conflicted = getattr(turn, "conflicted_edit_targets", None)
+    if isinstance(conflicted, frozenset):
+        excluded |= conflicted
+    for ts in excluded:
+        combined.pop(ts, None)
+    return combined
+
+
 def _prompt_tools_available(registry: Any) -> Optional[bool]:
     """What `_get_system_prompt` should believe about THIS attempt's local tools.
 
@@ -737,6 +781,10 @@ class TextHandlerMixin:
             # actually rendered. Frozen at pin time, so a message that arrives mid-turn does not
             # widen what this turn may act on.
             trusted_thread_roots=_trusted_thread_roots(turn),
+            # EDIT §2: the exact own messages this turn may edit — the stream-rendered mapping
+            # plus discovered proofs, EMPTY (never None) on anything missing or malformed.
+            # Re-stamped by the registry at the top of every dispatch round.
+            authorized_edit_targets=_authorized_edit_targets(turn),
         )
 
     async def _prepare_sandbox_tools(self, request_config: dict, thread_key: str,
@@ -911,13 +959,22 @@ class TextHandlerMixin:
         wherever it is called from — including a `finally` on a path that has no loop result at
         all. A passed-in list still wins nothing and loses nothing: the two are unioned.
 
+        EDIT_OWN_MESSAGE §7 rides the same seam, for the same timing reason. The tool's OWN
+        provenance record is appended by the loop only after dispatch returns, so persisting
+        from inside the executor would omit `edit_own_message` itself; this routine runs on the
+        clean exit AND the `finally`, reads `turn.edits`, and persists the edited TARGET ts
+        only for `state == "committed"` (union-merged into that message's existing row) while
+        the ANNOUNCEMENT ts is persisted for both states — the disclosure landed either way.
+
         A no-op for every turn that posted nowhere else, which is nearly all of them.
         """
         if not config.enable_tool_provenance or turn is None:
             return
         records = [record for record in getattr(turn, "committed_destinations", ())
                    if record.kind == DEST_KIND_POST_TO_THREAD and record.first_ts]
-        if not records:
+        edits = [edit for edit in (getattr(turn, "edits", None) or ())
+                 if getattr(edit, "announcement_ts", None)]
+        if not records and not edits:
             return
         # UNION, dedup by (name, gist), turn-owned records first — they are the ones that exist
         # on every path. A clean return supplies the same entries a second time and adds nothing;
@@ -949,6 +1006,28 @@ class TextHandlerMixin:
             self._persist_tool_provenance(
                 record.channel_id, record.first_ts,
                 f"{record.channel_id}:{record.thread_root_ts}", provenance)
+        # EDIT §7. The announcement's committed destination record knows the thread both
+        # surfaces live in (the disclosure lands in the edited message's own thread); an edit
+        # whose record somehow lacks one keys on the target itself. Best-effort like everything
+        # else here: the merge is atomic/idempotent, and a failure costs a row, never a turn.
+        try:
+            announcement_roots = {
+                record.first_ts: record.thread_root_ts
+                for record in getattr(turn, "committed_destinations", ())
+                if record.kind == DEST_KIND_CORRECTION_ANNOUNCEMENT and record.first_ts}
+            for edit in edits:
+                root = announcement_roots.get(edit.announcement_ts) or edit.target_ts
+                thread_key = f"{edit.channel_id}:{root}"
+                if getattr(edit, "state", None) == EDIT_STATE_COMMITTED:
+                    # The overwrite landed: the edited message's OLD provenance row gains this
+                    # turn's tools (union-merge — never a clobber of what produced it first).
+                    self._persist_tool_provenance(
+                        edit.channel_id, edit.target_ts, thread_key, provenance)
+                # The disclosure is in the room in BOTH states, so its row is written in both.
+                self._persist_tool_provenance(
+                    edit.channel_id, edit.announcement_ts, thread_key, provenance)
+        except Exception as e:  # noqa: BLE001 — provenance is never load-bearing
+            self.log_debug(f"edit provenance not persisted: {e}")
 
     async def _handle_text_response(self, user_content: Any, thread_state, client: BaseClient,
                               message: Message, thinking_id: Optional[str] = None,
@@ -1647,13 +1726,15 @@ class TextHandlerMixin:
         the PRIOR part's message id with the overflow text, because that overwrites the
         already-delivered first part."""
         result = await client.send_message_get_ts(channel_id, reply_target, continuation_text,
-                                                  receipts=receipts)  # unleased-ok: an overflow PART only exists after part 1 landed, so the lease is already committed
+                                                  receipts=receipts,
+                                                  receipt_class="assistant_reply")  # unleased-ok: an overflow PART only exists after part 1 landed, so the lease is already committed
         if result and result.get("success") and "ts" in result:
             return result["ts"]
         self.log_warning("Overflow continuation post failed - retrying once")
         await asyncio.sleep(1.0)
         result = await client.send_message_get_ts(channel_id, reply_target, continuation_text,
-                                                  receipts=receipts)  # unleased-ok: the retry of that same already-committed overflow part
+                                                  receipts=receipts,
+                                                  receipt_class="assistant_reply")  # unleased-ok: the retry of that same already-committed overflow part
         if result and result.get("success") and "ts" in result:
             return result["ts"]
         return None
@@ -2473,7 +2554,8 @@ class TextHandlerMixin:
                     return
                 seed = await client.send_message_get_ts(
                     message.channel_id, reply_target, initial_message,
-                    lease=_send_lease(), receipts=receipts)
+                    lease=_send_lease(), receipts=receipts,
+                    receipt_class="assistant_reply")
                 if seed and seed.get("success") and seed.get("ts"):
                     current_message_id = seed["ts"]
                     lazy_surface_owned = seed["ts"]  # ours: an MCP retry must reuse it
@@ -3284,6 +3366,7 @@ class TextHandlerMixin:
                             message.channel_id, effective_target, response_text,
                             blocks=direct_footer_blocks, meta_out=direct_send_meta,
                             lease=_send_lease(), receipts=receipts,
+                            receipt_class="assistant_reply",
                             # The first accepted part is a surface the room can already read,
                             # so it is recorded before the rest of a split runs rather than
                             # after.
@@ -3394,7 +3477,8 @@ class TextHandlerMixin:
                                 message.channel_id, reply_target,
                                 f"{CONTINUATION_HEAD}\n\n{overflow_text}",
                                 lease=_send_lease(), surface="legacy_update",
-                                meta_out=overflow_meta, receipts=receipts)
+                                meta_out=overflow_meta, receipts=receipts,
+                                receipt_class="assistant_reply")
                             delivery_split = True
                             overflow_delivery = overflow_meta.get("delivery")
                             if not overflow_ts or (overflow_delivery is not None
@@ -3484,7 +3568,8 @@ class TextHandlerMixin:
                                 message.channel_id, reply_target,
                                 f"{CONTINUATION_HEAD}\n\n{overflow_text}",
                                 lease=_send_lease(), surface="legacy_update",
-                                meta_out=overflow_meta, receipts=receipts)
+                                meta_out=overflow_meta, receipts=receipts,
+                                receipt_class="assistant_reply")
                             delivery_split = True
                             overflow_delivery = overflow_meta.get("delivery")
                             if not overflow_ts or (overflow_delivery is not None

@@ -1946,7 +1946,12 @@ class MessageUtilitiesMixin:
         can't reliably get the timestamp back.
         """
         try:
-            result_coro = client.send_message_get_ts(channel_id, thread_id, text)
+            # §11.9/inventory: a sync-context seed has no ledger to hand over, so it declares
+            # its intent bare — finalized, class assistant_reply (the legacy-seed row of the
+            # §4 inventory) — and the transport books it under the sys owner.
+            result_coro = client.send_message_get_ts(channel_id, thread_id, text,
+                                                     receipt_kind="finalized",
+                                                     receipt_class="assistant_reply")
             if hasattr(result_coro, '__await__'):
                 # This is a coroutine - schedule it to run
                 self._schedule_async_call(result_coro)

@@ -40,6 +40,23 @@ _COVERAGE_RENAME_KEY = "channel_coverage_renamed_to_inventory_at"
 # finalized is absorbing.
 _RECEIPT_STATES = ("in_flight", "finalized", "chrome")
 
+# Receipt CLASSES (EDIT_OWN_MESSAGE spec §4): what KIND of surface a receipt describes, distinct
+# from its lifecycle state. Closed enum, validated here in Python rather than by a CHECK
+# constraint so legacy rows keep their NULL — a NULL class is "stamped before the feature
+# existed" and is ineligible for anything class-gated; it is NEVER inferred from state, owner,
+# text or epoch. Every producer stamps a class explicitly; the only sanctioned transitions are
+# placeholder promotion (chrome → assistant_reply) and retry demotion (back to chrome) — any
+# other same-message class conflict fails closed and logs.
+_RECEIPT_CLASSES = ("assistant_reply", "correction_announcement", "system_notice",
+                    "background_job", "artifact", "chrome")
+
+
+def _check_receipt_class(receipt_class: Optional[str]) -> Optional[str]:
+    """Validate one class value. None is legal at this layer (legacy/defensive rows)."""
+    if receipt_class is not None and receipt_class not in _RECEIPT_CLASSES:
+        raise ValueError(f"invalid receipt class: {receipt_class!r}")
+    return receipt_class
+
 # Ids per `IN (...)` statement in the render pin. SQLite's default variable limit is 999 and a
 # channel turn can legitimately pin more identities than that, so the read chunks rather than
 # letting a platform limit decide whether a turn renders.
@@ -1116,6 +1133,7 @@ class DatabaseManager(LoggerMixin):
                 turn_id TEXT NOT NULL,
                 state TEXT NOT NULL CHECK (state IN ('in_flight', 'finalized', 'chrome')),
                 thread_root_ts TEXT,
+                receipt_class TEXT,
                 created_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 finalized_ts TIMESTAMP,
                 PRIMARY KEY (team_id, channel_id, message_ts)
@@ -1142,6 +1160,7 @@ class DatabaseManager(LoggerMixin):
                 file_id TEXT NOT NULL,
                 owner_turn_id TEXT NOT NULL,
                 thread_root_ts TEXT,
+                receipt_class TEXT,
                 created_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (team_id, channel_id, file_id)
             )
@@ -2092,6 +2111,24 @@ class DatabaseManager(LoggerMixin):
             # idempotent: a no-op on a fresh DB that never created it and on every re-run.
             self.conn.execute("DROP TABLE IF EXISTS channel_thread_mutes")
             self.conn.commit()
+
+        with self._migration_step("outbound_receipts.receipt_class"):
+            # EDIT_OWN_MESSAGE spec §4: nullable class column. Existing rows stay NULL —
+            # legacy, ineligible for anything class-gated, never backfilled or inferred.
+            cursor = self.conn.execute("PRAGMA table_info(outbound_receipts)")
+            if not any(col[1] == "receipt_class" for col in cursor.fetchall()):
+                self.conn.execute(
+                    "ALTER TABLE outbound_receipts ADD COLUMN receipt_class TEXT")
+                self.conn.commit()
+
+        with self._migration_step("pending_share_receipts.receipt_class"):
+            # Same ruling for the pending-share sidecar: the class rides the pending row so a
+            # share resolves into a receipt with its class present, never inferred at resolve.
+            cursor = self.conn.execute("PRAGMA table_info(pending_share_receipts)")
+            if not any(col[1] == "receipt_class" for col in cursor.fetchall()):
+                self.conn.execute(
+                    "ALTER TABLE pending_share_receipts ADD COLUMN receipt_class TEXT")
+                self.conn.commit()
 
     def _migrate_participation_redesign(self):
         """Layer 0 of the participation-backoff redesign. Idempotent and re-runnable.
@@ -6142,7 +6179,8 @@ class DatabaseManager(LoggerMixin):
 
     async def register_receipt_async(self, team_id: str, channel_id: str, message_ts: str,
                                      turn_id: str, state: str,
-                                     thread_root_ts: Optional[str] = None) -> TransitionResult:
+                                     thread_root_ts: Optional[str] = None, *,
+                                     receipt_class: Optional[str]) -> TransitionResult:
         """Claim a receipt for a message we posted. `applied` when this call owns the result.
 
         Every conflict resolves in favor of not losing a stronger claim:
@@ -6151,17 +6189,29 @@ class DatabaseManager(LoggerMixin):
         same-owner only. Registering chrome over an in_flight row is refused —
         demote_receipt_chrome_async is the only legal path down.
 
+        `receipt_class` (spec §4) is a REQUIRED keyword — every producer says what kind of
+        surface this is, and only plumbing that genuinely has no claim passes None (the row
+        then stays ineligible for anything class-gated). NULL is IMMUTABLE (spec §11.2): it is
+        never filled by a later same-owner claim and never promoted over — a legacy row can
+        never become editable. Placeholder promotion (chrome → assistant_reply, with the state
+        move, over a stored `chrome` class only) is the one sanctioned class change; any other
+        same-message class conflict fails CLOSED to NULL (spec §11.1) — the state transition is
+        refused, the row's class is NULLed (the ineligible terminal state),
+        `reason="class_conflict"`, and an ERROR names both classes.
+
         Each of those refusals returns its own `reason`, because from the call site they are
         indistinguishable and the ledger has to tell them apart.
         """
         if state not in _RECEIPT_STATES:
             raise ValueError(f"invalid receipt state: {state!r}")
+        _check_receipt_class(receipt_class)
         key = (team_id, channel_id, message_ts)
         async with self._stream_conn() as db:
             await db.execute("BEGIN IMMEDIATE")
             try:
                 async with db.execute(
-                    "SELECT turn_id, state, thread_root_ts FROM outbound_receipts "
+                    "SELECT turn_id, state, thread_root_ts, receipt_class "
+                    "FROM outbound_receipts "
                     "WHERE team_id = ? AND channel_id = ? AND message_ts = ?", key
                 ) as cursor:
                     row = await cursor.fetchone()
@@ -6170,13 +6220,39 @@ class DatabaseManager(LoggerMixin):
                     await db.execute(
                         "INSERT INTO outbound_receipts "
                         "(team_id, channel_id, message_ts, turn_id, state, thread_root_ts, "
-                        " finalized_ts) "
-                        "VALUES (?, ?, ?, ?, ?, ?, "
+                        " receipt_class, finalized_ts) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, "
                         "        CASE WHEN ? = 'finalized' THEN CURRENT_TIMESTAMP END)",
-                        (*key, turn_id, state, thread_root_ts, state))
+                        (*key, turn_id, state, thread_root_ts, receipt_class, state))
                     await db.execute("COMMIT")
-                    self.log_debug(f"Receipt {channel_id}/{message_ts} → {state} ({turn_id})")
+                    self.log_debug(f"Receipt {channel_id}/{message_ts} → {state} "
+                                   f"[{receipt_class}] ({turn_id})")
                     return TransitionResult(True, "absent", state, "inserted")
+
+                current = row["state"]
+                current_class = row["receipt_class"]
+
+                # Class arbitration BEFORE anything else, so a refused registration changes
+                # nothing but the class itself — not the root fill below, not the state. The
+                # one sanctioned change is the placeholder promotion: a stored `chrome` class
+                # becoming the answer. NULL is IMMUTABLE (spec §11.2): a NULL row promotes
+                # with class still NULL, so a legacy row can never become editable.
+                promotion = (current == "chrome" and state == "in_flight"
+                             and receipt_class == "assistant_reply"
+                             and current_class == "chrome")
+                if (receipt_class is not None and current_class is not None
+                        and receipt_class != current_class and not promotion):
+                    # Spec §11.1: a conflict fails closed to NULL — the ineligible terminal
+                    # state. Nothing editable can be produced by a conflict.
+                    await db.execute(
+                        "UPDATE outbound_receipts SET receipt_class = NULL "
+                        "WHERE team_id = ? AND channel_id = ? AND message_ts = ?", key)
+                    await db.execute("COMMIT")
+                    self.log_error(
+                        f"Receipt {channel_id}/{message_ts} class conflict: row was "
+                        f"{current_class!r}, {turn_id} claimed {receipt_class!r} — class "
+                        f"NULLed (ineligible), registration refused")
+                    return TransitionResult(False, current, current, "class_conflict")
 
                 # A message's destination root is a property of the message, not of the owner,
                 # so a later observation may FILL a NULL — it may never clear a known one.
@@ -6186,7 +6262,6 @@ class DatabaseManager(LoggerMixin):
                         "WHERE team_id = ? AND channel_id = ? AND message_ts = ?",
                         (thread_root_ts, *key))
 
-                current = row["state"]
                 if current == "finalized":
                     await db.execute("COMMIT")
                     self.log_debug(
@@ -6207,6 +6282,16 @@ class DatabaseManager(LoggerMixin):
                         f"{turn_id} refused (demote_receipt_chrome_async is the only path down)")
                     return TransitionResult(
                         False, "in_flight", "in_flight", "chrome_over_in_flight")
+                # The class this row ends the call with: a promotion rewrites it WITH the
+                # state (atomically — same transaction); otherwise the stored value —
+                # including an immutable NULL (spec §11.2, no same-owner fill) — is never
+                # touched.
+                class_to_write = receipt_class if promotion else current_class
+                if class_to_write != current_class:
+                    await db.execute(
+                        "UPDATE outbound_receipts SET receipt_class = ? "
+                        "WHERE team_id = ? AND channel_id = ? AND message_ts = ?",
+                        (class_to_write, *key))
                 if current != state:
                     await db.execute(
                         "UPDATE outbound_receipts SET state = ?, finalized_ts = "
@@ -6214,7 +6299,8 @@ class DatabaseManager(LoggerMixin):
                         "WHERE team_id = ? AND channel_id = ? AND message_ts = ?",
                         (state, state, *key))
                     self.log_debug(
-                        f"Receipt {channel_id}/{message_ts} {current}→{state} ({turn_id})")
+                        f"Receipt {channel_id}/{message_ts} {current}→{state} "
+                        f"[{class_to_write}] ({turn_id})")
                     await db.execute("COMMIT")
                     return TransitionResult(True, current, state, "transitioned")
                 await db.execute("COMMIT")
@@ -6228,10 +6314,15 @@ class DatabaseManager(LoggerMixin):
 
     async def register_chrome_async(self, team_id: str, channel_id: str, message_ts: str,
                                     owner_turn_id: str,
-                                    thread_root_ts: Optional[str] = None) -> TransitionResult:
-        """Register a permanently excluded surface (placeholder, status card, footer)."""
+                                    thread_root_ts: Optional[str] = None, *,
+                                    receipt_class: Optional[str]) -> TransitionResult:
+        """Register a permanently excluded surface (placeholder, status card, footer).
+
+        Chrome STATE and chrome CLASS are orthogonal: a research status card is chrome-state
+        with class `background_job`, a placeholder is chrome-state with class `chrome`."""
         return await self.register_receipt_async(
-            team_id, channel_id, message_ts, owner_turn_id, "chrome", thread_root_ts)
+            team_id, channel_id, message_ts, owner_turn_id, "chrome", thread_root_ts,
+            receipt_class=receipt_class)
 
     async def transfer_receipt_async(self, team_id: str, channel_id: str, message_ts: str,
                                      expected_owner: str,
@@ -6263,13 +6354,22 @@ class DatabaseManager(LoggerMixin):
             "transferred" if moved else "not_chrome_or_foreign")
 
     async def finalize_receipts_async(self, team_id: str, channel_id: str,
-                                      records: Iterable[Tuple[str, Optional[str]]],
+                                      records: Iterable[Tuple[str, Optional[str],
+                                                              Optional[str]]],
                                       turn_id: str) -> List[TransitionResult]:
-        """Finalize a turn's posts as ONE unit. `records` = [(message_ts, thread_root_ts|None)].
+        """Finalize a turn's posts as ONE unit.
+        `records` = [(message_ts, thread_root_ts|None, receipt_class|None)].
 
         Missing rows are INSERTED already finalized (their registration may have been lost to a
-        failed write) and carry their destination root. A row owned by another turn is left
-        alone; a NULL root is filled, a known root is never cleared.
+        failed write) and carry their destination root AND class. A row owned by another turn is
+        left alone; a NULL root is filled and a known one never cleared. An EXISTING row's class
+        is never touched at all — NULL is immutable (spec §11.2), so a NULL class stays NULL —
+        and a record claiming a DIFFERENT class than the row already carries fails CLOSED to
+        NULL for that record (spec §11.1): no state change, the row's class is NULLed (the
+        ineligible terminal state), and an ERROR names both classes. Class arbitration is
+        ORTHOGONAL to the ownership refusal (spec §11.12): a FOREIGN-owner record with a
+        conflicting class still NULLs the row's class — its `reason` stays "foreign_owner"
+        (the state refusal) while a same-owner conflict reports "class_conflict".
 
         ONE result per INPUT record, in the input order — callers zip the two lists to emit a
         per-message event, so a skipped record would silently reattribute every event after it.
@@ -6277,19 +6377,21 @@ class DatabaseManager(LoggerMixin):
         is what decides `applied`, so the conflict rule stays the single arbiter.
         """
         given = list(records)
-        if not any(ts for ts, _root in given):
+        if not any(ts for ts, _root, _cls in given):
             return [TransitionResult(False, None, None, "no_message_ts") for _ in given]
+        for _ts, _root, cls in given:
+            _check_receipt_class(cls)
         results: List[TransitionResult] = []
         async with self._stream_conn() as db:
             await db.execute("BEGIN IMMEDIATE")
             try:
-                for ts, root in given:
+                for ts, root, cls in given:
                     if not ts:
                         results.append(TransitionResult(False, None, None, "no_message_ts"))
                         continue
                     message_ts = str(ts)
                     async with db.execute(
-                        "SELECT state FROM outbound_receipts "
+                        "SELECT state, turn_id, receipt_class FROM outbound_receipts "
                         "WHERE team_id = ? AND channel_id = ? AND message_ts = ?",
                         (team_id, channel_id, message_ts)
                     ) as cursor:
@@ -6298,20 +6400,47 @@ class DatabaseManager(LoggerMixin):
                         """
                         INSERT INTO outbound_receipts
                             (team_id, channel_id, message_ts, turn_id, state, thread_root_ts,
-                             created_ts, finalized_ts)
-                        VALUES (?, ?, ?, ?, 'finalized', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                             receipt_class, created_ts, finalized_ts)
+                        VALUES (?, ?, ?, ?, 'finalized', ?, ?,
+                                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                         ON CONFLICT(team_id, channel_id, message_ts) DO UPDATE SET
                             state = 'finalized',
                             finalized_ts = COALESCE(outbound_receipts.finalized_ts,
                                                     CURRENT_TIMESTAMP),
                             thread_root_ts = COALESCE(excluded.thread_root_ts,
-                                                      outbound_receipts.thread_root_ts)
+                                                      outbound_receipts.thread_root_ts),
+                            receipt_class = outbound_receipts.receipt_class
                         WHERE outbound_receipts.turn_id = excluded.turn_id
+                          AND (outbound_receipts.receipt_class IS NULL
+                               OR excluded.receipt_class IS NULL
+                               OR outbound_receipts.receipt_class = excluded.receipt_class)
                         """,
-                        (team_id, channel_id, message_ts, turn_id, root))
+                        (team_id, channel_id, message_ts, turn_id, root, cls))
                     applied = bool(cursor.rowcount)
                     prior_state = prior["state"] if prior is not None else "absent"
                     if not applied:
+                        if (prior is not None
+                                and cls is not None and prior["receipt_class"] is not None
+                                and prior["receipt_class"] != cls):
+                            # Spec §11.1/§11.12: the conflict fails closed to NULL — the state
+                            # stays where it was, and the class lands in the ineligible
+                            # terminal state so nothing editable can come out of the
+                            # disagreement. Ownership does NOT shield the class: a foreign
+                            # owner's conflicting claim NULLs it too (class arbitration is
+                            # orthogonal to the state refusal, which keeps its own reason).
+                            await db.execute(
+                                "UPDATE outbound_receipts SET receipt_class = NULL "
+                                "WHERE team_id = ? AND channel_id = ? AND message_ts = ?",
+                                (team_id, channel_id, message_ts))
+                            self.log_error(
+                                f"Receipt {channel_id}/{message_ts} class conflict at "
+                                f"finalize: row was {prior['receipt_class']!r}, {turn_id} "
+                                f"claimed {cls!r} — class NULLed (ineligible), record refused")
+                            same_owner = prior["turn_id"] == turn_id
+                            results.append(TransitionResult(
+                                False, prior_state, prior_state,
+                                "class_conflict" if same_owner else "foreign_owner"))
+                            continue
                         results.append(TransitionResult(
                             False, prior_state, prior_state, "foreign_owner"))
                     elif prior is None:
@@ -6345,10 +6474,17 @@ class DatabaseManager(LoggerMixin):
         A refusal names no prior state: the guarded UPDATE never read one, and guessing
         `in_flight` for a row that was chrome, finalized or foreign would put an invented
         transition on the record.
+
+        The retry demotion maps the CLASS back too (spec §4): the surface stopped carrying an
+        answer, so whatever class the promotion stamped reverts to `chrome`, atomically with
+        the state — but only when a class was ever stamped. A legacy NULL stays NULL: the
+        demotion is a mapping-back, never a first stamping.
         """
         async with self._stream_conn() as db:
             cursor = await db.execute(
-                "UPDATE outbound_receipts SET state = 'chrome' "
+                "UPDATE outbound_receipts SET state = 'chrome', "
+                "  receipt_class = CASE WHEN receipt_class IS NULL THEN NULL "
+                "                       ELSE 'chrome' END "
                 "WHERE team_id = ? AND channel_id = ? AND message_ts = ? "
                 "  AND turn_id = ? AND state = 'in_flight'",
                 (team_id, channel_id, message_ts, turn_id))
@@ -6394,7 +6530,7 @@ class DatabaseManager(LoggerMixin):
         async with self._stream_conn() as db:
             async with db.execute(
                 "SELECT team_id, channel_id, message_ts, turn_id, state, thread_root_ts, "
-                "       created_ts, finalized_ts FROM outbound_receipts "
+                "       receipt_class, created_ts, finalized_ts FROM outbound_receipts "
                 "WHERE team_id = ? AND channel_id = ? ORDER BY CAST(message_ts AS REAL)",
                 (team_id, channel_id)
             ) as cursor:
@@ -6406,7 +6542,7 @@ class DatabaseManager(LoggerMixin):
         async with self._stream_conn() as db:
             async with db.execute(
                 "SELECT team_id, channel_id, message_ts, turn_id, state, thread_root_ts, "
-                "       created_ts, finalized_ts FROM outbound_receipts "
+                "       receipt_class, created_ts, finalized_ts FROM outbound_receipts "
                 "WHERE team_id = ? AND channel_id = ? AND message_ts = ?",
                 (team_id, channel_id, message_ts)
             ) as cursor:
@@ -6455,15 +6591,39 @@ class DatabaseManager(LoggerMixin):
 
     async def record_pending_share_async(self, team_id: str, channel_id: str, file_id: str,
                                          owner_turn_id: str,
-                                         thread_root_ts: Optional[str] = None) -> bool:
-        """Record an uploaded file whose share ts is not known yet. First writer owns it."""
+                                         thread_root_ts: Optional[str] = None, *,
+                                         receipt_class: Optional[str]) -> bool:
+        """Record an uploaded file whose share ts is not known yet. First writer owns it.
+
+        `receipt_class` rides the pending row end-to-end (spec §4): the resolve copies it into
+        the receipt, so an artifact share finalizes WITH its class present, never inferred.
+
+        A SECOND claim for the same file is refused (first writer owns it) — and when the
+        second claim names a DIFFERENT class, that conflict is detected and ERROR-logged
+        (spec §11.1); the first claim stands untouched."""
+        _check_receipt_class(receipt_class)
         async with self._stream_conn() as db:
             cursor = await db.execute(
                 "INSERT OR IGNORE INTO pending_share_receipts "
-                "(team_id, channel_id, file_id, owner_turn_id, thread_root_ts) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (team_id, channel_id, file_id, owner_turn_id, thread_root_ts))
-            return bool(cursor.rowcount)
+                "(team_id, channel_id, file_id, owner_turn_id, thread_root_ts, receipt_class) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (team_id, channel_id, file_id, owner_turn_id, thread_root_ts, receipt_class))
+            claimed = bool(cursor.rowcount)
+            if not claimed:
+                async with db.execute(
+                    "SELECT owner_turn_id, receipt_class FROM pending_share_receipts "
+                    "WHERE team_id = ? AND channel_id = ? AND file_id = ?",
+                    (team_id, channel_id, file_id)
+                ) as read:
+                    prior = await read.fetchone()
+                if (prior is not None and receipt_class is not None
+                        and prior["receipt_class"] is not None
+                        and prior["receipt_class"] != receipt_class):
+                    self.log_error(
+                        f"Pending share {file_id} second claim class conflict: first claim "
+                        f"({prior['owner_turn_id']}) carries {prior['receipt_class']!r}, "
+                        f"{owner_turn_id} claimed {receipt_class!r} — the first claim stands")
+            return claimed
 
     async def resolve_pending_share_async(self, team_id: str, channel_id: str, file_id: str,
                                           message_ts: str) -> bool:
@@ -6477,7 +6637,8 @@ class DatabaseManager(LoggerMixin):
             await db.execute("BEGIN IMMEDIATE")
             try:
                 async with db.execute(
-                    "SELECT owner_turn_id, thread_root_ts FROM pending_share_receipts "
+                    "SELECT owner_turn_id, thread_root_ts, receipt_class "
+                    "FROM pending_share_receipts "
                     "WHERE team_id = ? AND channel_id = ? AND file_id = ?",
                     (team_id, channel_id, file_id)
                 ) as cursor:
@@ -6486,20 +6647,54 @@ class DatabaseManager(LoggerMixin):
                     await db.execute("COMMIT")
                     return True
 
+                # The class the pending row carried resolves WITH the share (spec §4). If the
+                # ts already carries a DIFFERENT class, the conflict fails closed to NULL
+                # (spec §11.1) — the ineligible terminal state, ERROR-logged with both classes.
+                # The STATE resolution itself still lands, and the pending row is still
+                # deleted below (terminal — refusing the resolve would retry the same
+                # conflicted row on every boot forever). An EXISTING row's class is NEVER
+                # stamped by the resolve (spec §11.12): the upsert keeps whatever the row
+                # holds — a NULL (legacy or conflict-poisoned) stays NULL, a matching class
+                # is unchanged — and only a row this resolve CREATES carries the pending class.
+                async with db.execute(
+                    "SELECT receipt_class FROM outbound_receipts "
+                    "WHERE team_id = ? AND channel_id = ? AND message_ts = ?",
+                    (team_id, channel_id, str(message_ts))
+                ) as cursor:
+                    existing = await cursor.fetchone()
+                conflicted = (existing is not None and existing["receipt_class"] is not None
+                              and row["receipt_class"] is not None
+                              and existing["receipt_class"] != row["receipt_class"])
+                if conflicted:
+                    self.log_error(
+                        f"Pending share {file_id} class conflict at resolve: receipt "
+                        f"{channel_id}/{message_ts} is {existing['receipt_class']!r}, pending "
+                        f"row carried {row['receipt_class']!r} — class NULLed (ineligible), "
+                        f"resolution still lands")
+
                 await db.execute(
                     """
                     INSERT INTO outbound_receipts
                         (team_id, channel_id, message_ts, turn_id, state, thread_root_ts,
-                         created_ts, finalized_ts)
-                    VALUES (?, ?, ?, ?, 'finalized', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                         receipt_class, created_ts, finalized_ts)
+                    VALUES (?, ?, ?, ?, 'finalized', ?, ?,
+                            CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                     ON CONFLICT(team_id, channel_id, message_ts) DO UPDATE SET
                         state = 'finalized',
                         finalized_ts = COALESCE(outbound_receipts.finalized_ts, CURRENT_TIMESTAMP),
                         thread_root_ts = COALESCE(excluded.thread_root_ts,
-                                                  outbound_receipts.thread_root_ts)
+                                                  outbound_receipts.thread_root_ts),
+                        receipt_class = outbound_receipts.receipt_class
                     """,
                     (team_id, channel_id, str(message_ts), row["owner_turn_id"],
-                     row["thread_root_ts"]))
+                     row["thread_root_ts"], row["receipt_class"]))
+                if conflicted:
+                    # After the state resolution so the outcome is unambiguous whatever the
+                    # upsert kept: the conflicted class ends NULL, in the same transaction.
+                    await db.execute(
+                        "UPDATE outbound_receipts SET receipt_class = NULL "
+                        "WHERE team_id = ? AND channel_id = ? AND message_ts = ?",
+                        (team_id, channel_id, str(message_ts)))
                 await db.execute(
                     "DELETE FROM pending_share_receipts "
                     "WHERE team_id = ? AND channel_id = ? AND file_id = ?",
@@ -6532,8 +6727,8 @@ class DatabaseManager(LoggerMixin):
 
     async def get_pending_shares_async(self, team_id: Optional[str] = None) -> List[Dict]:
         """Unresolved shares, oldest first (boot recovery reads them all)."""
-        sql = ("SELECT team_id, channel_id, file_id, owner_turn_id, thread_root_ts, created_ts "
-               "FROM pending_share_receipts")
+        sql = ("SELECT team_id, channel_id, file_id, owner_turn_id, thread_root_ts, "
+               "receipt_class, created_ts FROM pending_share_receipts")
         params: Tuple = ()
         if team_id:
             sql += " WHERE team_id = ?"
@@ -7048,7 +7243,7 @@ class DatabaseManager(LoggerMixin):
                         marks = ",".join("?" * len(chunk))
 
                         async with db.execute(
-                            f"SELECT message_ts, turn_id, state, thread_root_ts "
+                            f"SELECT message_ts, turn_id, state, thread_root_ts, receipt_class "
                             f"FROM outbound_receipts "
                             f"WHERE team_id = ? AND channel_id = ? AND message_ts IN ({marks}) "
                             f"ORDER BY CAST(message_ts AS REAL)",
@@ -7147,8 +7342,11 @@ class DatabaseManager(LoggerMixin):
             "epoch": payload.get("receipt_feature_epoch_ts"),
             # The read carries its subject: "these rows, for these messages".
             "ids": list(payload.get("ids") or []),
+            # receipt_class is render-relevant material: it decides §2a edit authorization for
+            # a rendered own-message, so a class change must be a cache miss.
             "receipts": [[r.get("message_ts"), r.get("state"), r.get("turn_id"),
-                          r.get("thread_root_ts")] for r in payload.get("receipts") or []],
+                          r.get("thread_root_ts"), r.get("receipt_class")]
+                         for r in payload.get("receipts") or []],
             "images": [[r.get("message_ts"), r.get("url"), r.get("analysis"),
                         (r.get("metadata") or {}).get("filename")
                         if isinstance(r.get("metadata"), dict) else None]

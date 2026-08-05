@@ -567,9 +567,9 @@ def _anon_tombstone(ts=ROOT, root=ROOT):
                      "text": "This message was deleted."})
 
 
-async def _own_post(db, ts, root=ROOT):
+async def _own_post(db, ts, root=ROOT, receipt_class="assistant_reply"):
     await db.register_receipt_async(TEAM, CH, ts, "sess:turn-1", "finalized",
-                                    thread_root_ts=root)
+                                    thread_root_ts=root, receipt_class=receipt_class)
 
 
 def test_an_anonymous_deletion_asks_for_the_deleted_ts(client):
@@ -627,7 +627,7 @@ async def test_our_own_anonymous_tombstone_is_skipped(client, temp_db):
 async def test_a_receipt_in_any_state_counts_as_ours(client, temp_db):
     await feed_thread_activity_index(client, _reply())
     await temp_db.register_receipt_async(TEAM, CH, "102.000100", "sess:turn-1", "chrome",
-                                         thread_root_ts=ROOT)
+                                         thread_root_ts=ROOT, receipt_class="chrome")
 
     await feed_thread_activity_index(client, _anon_deleted("102.000100"))
 
@@ -641,7 +641,7 @@ async def test_the_image_indicator_delete_no_longer_dirties_its_thread(client, t
     await temp_db.clear_thread_dirty_async(TEAM, CH, ROOT,
                                            if_event_ts_equals="101.000100")
     indicator_ts = "103.000100"
-    await _own_post(temp_db, indicator_ts)
+    await _own_post(temp_db, indicator_ts, receipt_class="chrome")
 
     await feed_thread_activity_index(client, _anon_deleted(indicator_ts))
 
@@ -784,7 +784,8 @@ async def test_our_own_housekeeping_delete_is_not_human_activity(client, temp_db
     """
     ours, theirs = "500.000100", "600.000100"
     await temp_db.register_receipt_async(TEAM, CH, ours, turn_id="t1", state="in_flight",
-                                         thread_root_ts=ROOT)
+                                         thread_root_ts=ROOT,
+                                         receipt_class="assistant_reply")
 
     # A deletion of a message WE posted records nothing.
     await feed_thread_activity_index(
