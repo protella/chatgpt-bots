@@ -103,6 +103,8 @@ async def _register_raw_receipt(client_self, channel_id, message_ts, kind,
         await record_transport_post(
             team_id=getattr(client_self, "self_team_id", None), channel_id=channel_id,
             message_ts=message_ts, receipts=None, receipt_kind=kind,
+            # Spec §4: onboarding posts (welcome / reminder / settings-button) are class chrome.
+            receipt_class="chrome",
             thread_root_ts=thread_root_ts, site=site)
     except Exception:  # noqa: BLE001 — onboarding chrome never fails a turn
         pass

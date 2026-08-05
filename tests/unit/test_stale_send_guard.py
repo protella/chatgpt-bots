@@ -561,7 +561,7 @@ def test_the_new_kind_is_in_the_vocabulary_and_the_contract_moved():
     # v8 = the single-stream events on top of the binary gate. The version moves whenever the
     # ledger's field set or event cardinality changes, and this assertion exists so a field change
     # cannot ship without someone bumping it deliberately.
-    assert pt.CONTRACT_VERSION == 9
+    assert pt.CONTRACT_VERSION == 10
     assert pt.GATE_CONTRACT == "binary-v1"
 
 
@@ -1203,7 +1203,7 @@ async def test_handle_error_carries_the_lease_end_to_end(superseded):
     sent = []
 
     async def _send(channel_id, thread_id, text, blocks=None, meta_out=None, lease=None,
-                    receipts=None, receipt_kind=None):
+                    receipts=None, receipt_kind=None, receipt_class=None):
         if lease is not None:
             lease.authorize("error_notice")
         sent.append(text)
@@ -1260,7 +1260,7 @@ async def test_the_timeout_notice_is_awaited_with_the_lease_not_scheduled(supers
     edits = []
 
     async def _update(channel_id, message_id, text, lease=None, surface=None,
-                      receipts=None, receipt_kind=None):
+                      receipts=None, receipt_kind=None, receipt_class=None):
         if lease is not None:
             lease.authorize(surface or "error_notice")
         edits.append(text)

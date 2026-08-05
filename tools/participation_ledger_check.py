@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate a `participation.jsonl` ledger against telemetry contract CV9.
+"""Validate a `participation.jsonl` ledger against telemetry contract CV10.
 
 WHY THIS EXISTS. The P2 live battery decides whether a scenario passed by reading this ledger, so
 the ledger's structure is load-bearing evidence and not a debugging convenience. A join that
@@ -47,7 +47,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 # message_processor/participation_telemetry.py — keep the names identical so a diff is readable.
 # ===========================================================================================
 
-CONTRACT_VERSION = 9
+CONTRACT_VERSION = 10
 GATE_CONTRACT = "binary-v1"
 
 # On every line, at every version the emitter has ever written... except that `gate_contract`
@@ -62,9 +62,12 @@ KINDS = frozenset({
     "stale_suppressed",
 })
 TURN_SURFACES = frozenset({"channel", "dm"})
-# turn_outcome.destinations[] — DestinationRecord.as_payload()
+# turn_outcome.destinations[] — DestinationRecord.as_payload(). `correction_announcement`
+# (v10) is the executor-synthesized disclosure post of an edit_own_message transaction,
+# recorded as a committed destination (DEST_KIND_CORRECTION_ANNOUNCEMENT in turn_runtime).
 DESTINATION_STATES = frozenset({"observed", "committed"})
-DESTINATION_KINDS = frozenset({"reply", "stream", "split", "post_to_thread", "reconciled"})
+DESTINATION_KINDS = frozenset({"reply", "stream", "split", "post_to_thread", "reconciled",
+                               "correction_announcement"})
 RECEIPT_OPS = frozenset({
     "register", "promote", "finalize", "demote", "transfer", "delete", "reconcile_finalize",
     "pending_resolve",
@@ -95,6 +98,17 @@ RECONSIDER_OUTCOME_FIELDS = frozenset(ENVELOPE_FIELDS) | {
 # grammar is closed too: these four and nothing else, with inapplicable keys OMITTED, never null.
 RECONSIDER_NESTED_FIELDS = frozenset({"outcome", "passes", "forced", "error"})
 
+# v10 — turn_outcome.edits[], one entry per EditRecord (Docs/specs/EDIT_OWN_MESSAGE.md §7,
+# lifecycle per §11.6). The nested grammar is CLOSED and null-free, and the lifecycle is
+# SOUND: a record exists only once the disclosure was accepted (the shielded transaction runs
+# to completion), so BOTH states always carry `announcement_ts`; `committed` (disclosure AND
+# update landed) carries no `error`, `announcement_only` (the disclosure landed, the update
+# did not) always carries one. `error` is therefore the only conditional key, and only on
+# `committed` may it be absent.
+EDIT_FIELDS = frozenset({"channel_id", "target_ts", "announcement_ts", "state", "error"})
+EDIT_REQUIRED_FIELDS = ("channel_id", "target_ts", "state")
+EDIT_STATES = frozenset({"announcement_only", "committed"})
+
 # THE TERMINAL POPULATION IS THIS AND NOTHING ELSE. `turn_outcome` is not a terminal event (see
 # the emitter's v8 note), so it must never reach the visible_action index — invariant 3 checks
 # that separation rather than trusting this constant.
@@ -112,6 +126,8 @@ MANDATORY: Dict[str, Tuple[Tuple[str, str], ...]] = {
         ("kind", "the event exists to say what the room saw"),
         ("destinations", "written even when empty — a silent turn and a lost record differ"),
         ("stream_build_present", "always a bool from the emitter; drives invariant 2"),
+        ("edits", "v10: written even when empty — a turn that edited nothing and a turn whose "
+                  "edit records were lost are not the same fact"),
     ),
     "stream_render": (
         ("turn_id", "a build nobody's turn owns cannot be read as evidence about a turn"),
@@ -169,6 +185,10 @@ MANDATORY: Dict[str, Tuple[Tuple[str, str], ...]] = {
 #       missing join.
 #   turn_outcome.reconsider — present only when a reconsideration ran; nested keys follow the
 #       reconsider_outcome rules (forced posted-only, error error_dropped-only, no nulls).
+#   turn_outcome.edits[].announcement_ts — ALWAYS present, in BOTH states: announcement-first
+#       means a record exists only once the disclosure was accepted, so there is no legal
+#       absence. `error` is the entry's only conditional key (announcement_only always carries
+#       one, committed never); the entry itself never carries an explicit null anywhere.
 #   destinations[].thread_root_ts/chars — nullable INSIDE the list: nested nulls survive,
 #       because record() only strips top-level Nones.
 DESTINATION_FIELDS = ("channel_id", "thread_root_ts", "first_ts", "state", "chars", "kind")
@@ -319,11 +339,11 @@ def _read_file(path: str, file_index: int, report: Report) -> List[Row]:
 
 
 def _grade_version(row: Row, report: Report) -> bool:
-    """True when this line is a v8 line we are entitled to grade.
+    """True when this line carries the contract version this tool grades.
 
     Older lines are SKIPPED, not failed: the file rotates across a deploy, so a mixed file is
-    the normal state of the world and grading v7 rows by v8 rules would invent violations out of
-    correct history. A version we do not know is refused in the other direction — silently
+    the normal state of the world and grading v9 rows by v10 rules would invent violations out
+    of correct history. A version we do not know is refused in the other direction — silently
     grading a FUTURE contract by these rules is how a checker starts lying.
     """
     version = row.obj.get("v")
@@ -472,15 +492,96 @@ def _check_turn_outcome(row: Row, report: Report) -> None:
             _check_reconsider_conditionals(row, report, facts, outcome,
                                            "turn_outcome_reconsider_malformed",
                                            where="reconsider.")
-    if "destinations" not in row.obj:
-        return
     destinations = row.obj.get("destinations")
-    if not isinstance(destinations, list):
-        report.fail("turn_outcome_destinations_not_list", row,
-                    f"destinations is {type(destinations).__name__}")
+    if "destinations" in row.obj:
+        if not isinstance(destinations, list):
+            report.fail("turn_outcome_destinations_not_list", row,
+                        f"destinations is {type(destinations).__name__}")
+        else:
+            for index, destination in enumerate(destinations):
+                _check_destination(row, report, index, destination)
+    _check_edits(row, report, destinations if isinstance(destinations, list) else [])
+
+
+def _check_edits(row: Row, report: Report, destinations: List[Any]) -> None:
+    """v10: the turn's edit_own_message record, and its join to the disclosure destination.
+
+    The entry grammar is closed and null-free (EDIT_FIELDS above). The JOIN INVARIANT is checked
+    here rather than in a join pass because both sides live on this one row: every entry's
+    `announcement_ts` — ALWAYS present, announcement-first means a record exists only once the
+    disclosure was accepted — must name a COMMITTED `correction_announcement` destination in
+    this turn's `destinations` — the disclosure is a real post the room saw, so an announcement
+    ts that joins no destination means one of the two records is lying about what was
+    delivered."""
+    if "edits" not in row.obj:
+        return   # absence is already a mandatory-field violation
+    edits = row.obj.get("edits")
+    if not isinstance(edits, list):
+        report.fail("turn_outcome_edits_not_list", row,
+                    f"edits is {type(edits).__name__} — always a list in CV10, empty when the "
+                    f"turn edited nothing")
         return
-    for index, destination in enumerate(destinations):
-        _check_destination(row, report, index, destination)
+    announced = {destination.get("first_ts") for destination in destinations
+                 if isinstance(destination, dict)
+                 and destination.get("kind") == "correction_announcement"
+                 and destination.get("state") == "committed"}
+    for index, edit in enumerate(edits):
+        where = f"edits[{index}]"
+        if not isinstance(edit, dict):
+            report.fail("turn_outcome_edit_malformed", row,
+                        f"{where} is {type(edit).__name__}, not an object")
+            continue
+        for field in sorted(edit):
+            if field not in EDIT_FIELDS:
+                report.fail("turn_outcome_edit_malformed", row,
+                            f"{where} carries unknown key {field!r} — the nested grammar is "
+                            f"closed (channel_id, target_ts, announcement_ts, state, error)")
+            elif edit.get(field) is None:
+                report.fail("turn_outcome_edit_malformed", row,
+                            f"{where}.{field} is null — unavailable values are omitted, "
+                            f"never null")
+        for field in EDIT_REQUIRED_FIELDS:
+            if field not in edit:
+                report.fail("turn_outcome_edit_malformed", row, f"{where} has no {field!r}")
+        state = edit.get("state")
+        if "state" in edit and state not in EDIT_STATES:
+            report.fail("turn_outcome_edit_bad_state", row,
+                        f"{where}.state={state!r} not in "
+                        f"{{{', '.join(sorted(EDIT_STATES))}}}")
+        # §11.18: the identity fields name real Slack coordinates and `error` names a real
+        # failure code — a present-but-empty string satisfies neither, so all four require a
+        # NON-EMPTY string (None is already the null violation above).
+        for field in ("channel_id", "target_ts", "announcement_ts"):
+            if field in edit and edit.get(field) is not None \
+                    and (not isinstance(edit.get(field), str) or not edit.get(field)):
+                report.fail("turn_outcome_edit_malformed", row,
+                            f"{where}.{field}={edit.get(field)!r} is not a non-empty string "
+                            f"— the edit-entry identity fields name real Slack coordinates")
+        if "error" in edit and edit.get("error") is not None \
+                and (not isinstance(edit.get("error"), str) or not edit.get("error")):
+            report.fail("turn_outcome_edit_malformed", row,
+                        f"{where}.error={edit.get('error')!r} is not a non-empty string")
+        # §11.6 lifecycle soundness: records exist only post-acceptance, so BOTH states carry
+        # the disclosure ts; `error` rides announcement_only ALWAYS and committed NEVER.
+        if "announcement_ts" not in edit:
+            report.fail("turn_outcome_edit_announcement_missing", row,
+                        f"{where} has no announcement_ts — an edit record exists only once "
+                        f"the disclosure was accepted, so both states carry its ts")
+        if state == "committed" and "error" in edit:
+            report.fail("turn_outcome_edit_error_on_committed", row,
+                        f"{where}.error={edit.get('error')!r} on a committed edit — a "
+                        f"committed record carries no error")
+        if state == "announcement_only" and "error" not in edit:
+            report.fail("turn_outcome_edit_error_missing", row,
+                        f"{where} is announcement_only with no error — the update did not "
+                        f"land, and the record must say why")
+        announcement_ts = edit.get("announcement_ts")
+        if announcement_ts is not None and announcement_ts not in announced:
+            report.fail("turn_outcome_edit_announcement_unjoined", row,
+                        f"{where}.announcement_ts={announcement_ts!r} joins no committed "
+                        f"correction_announcement destination on this turn — the disclosure "
+                        f"post is a real destination, so an unjoined ts means one of the two "
+                        f"records is wrong about what was delivered")
 
 
 def _check_destination(row: Row, report: Report, index: int, destination: Any) -> None:

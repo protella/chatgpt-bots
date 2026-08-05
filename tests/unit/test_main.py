@@ -1415,7 +1415,8 @@ class TestShutdownQuiescesTurns:
         orx.reset_service()
         service = orx.install_service(db)
         bot.receipt_service = service
-        await db.record_pending_share_async("T1", "C0BKX77NU66", "F1", "turn-1", None)
+        await db.record_pending_share_async("T1", "C0BKX77NU66", "F1", "turn-1", None,
+                                            receipt_class="artifact")
         reads = {"n": 0}
         real_read = db.get_pending_shares_async
 
@@ -1564,7 +1565,8 @@ class TestShutdownQuiescesTurns:
                 ledger = orx.ReceiptLedger("s:1", "T1", "C0BKX77NU66")
                 running.set()
                 await asyncio.sleep(0.05)          # the model is still writing
-                await ledger.note_post("100.0")    # …and the answer lands mid-shutdown
+                await ledger.note_post("100.0",    # …and the answer lands mid-shutdown
+                                       receipt_class="assistant_reply")
                 await orx.settle_ledger(ledger)
 
             task = asyncio.ensure_future(_turn())
@@ -1576,6 +1578,7 @@ class TestShutdownQuiescesTurns:
             row = await db.get_receipt_async("T1", "C0BKX77NU66", "100.0")
             assert row is not None, "the turn's own words were never claimed"
             assert row["state"] == "finalized"
+            assert row["receipt_class"] == "assistant_reply"
         finally:
             orx.reset_service()
             db.conn.close()

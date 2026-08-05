@@ -413,7 +413,9 @@ class TestBaseClientContract:
             # The stale-send lease and the receipt ledger both ride every terminal notice;
             # None here because this contract test has no turn behind it.
             assert mock_send.await_args.args == ("C123", "T456", "Error: Something went wrong")
-            assert mock_send.await_args.kwargs == {"lease": None, "receipts": None}
+            # An error notice is stamped `system_notice` (EDIT_OWN_MESSAGE §4).
+            assert mock_send.await_args.kwargs == {"lease": None, "receipts": None,
+                                                   "receipt_class": "system_notice"}
     
     def test_format_error_message_default(self):
         """Test default error message formatting"""

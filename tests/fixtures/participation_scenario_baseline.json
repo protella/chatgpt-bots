@@ -743,6 +743,20 @@
         ],
         "passes": 3,
         "trials": 3
+      },
+      "wrong-detail-new-correction": {
+        "bar": "measure",
+        "expected": [
+          "in_thread_reply",
+          "channel_reply"
+        ],
+        "outcomes": [
+          "in_thread_reply",
+          "in_thread_reply",
+          "in_thread_reply"
+        ],
+        "passes": 2,
+        "trials": 3
       }
     }
   }

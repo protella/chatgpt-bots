@@ -829,7 +829,8 @@ class _ResearchCard:
         if self.label:
             ts = await client.post_status_card(
                 self.channel_id, self.thread_root, _CARD_FALLBACK_TEXT, blocks,
-                username=self.label, receipts=self.receipts)
+                username=self.label, receipts=self.receipts,
+                receipt_class="background_job")
             if ts is None:
                 setattr(self.processor, _RESEARCH_LABEL_DISABLED_ATTR, True)
                 self.processor.log_info(
@@ -839,7 +840,7 @@ class _ResearchCard:
         if ts is None:
             ts = await client.post_status_card(
                 self.channel_id, self.thread_root, _CARD_FALLBACK_TEXT, blocks,
-                receipts=self.receipts)
+                receipts=self.receipts, receipt_class="background_job")
         self.ts = ts
 
     async def set_todos(self, todos: Any) -> Optional[str]:
@@ -1853,7 +1854,8 @@ async def _deliver_findings(processor, client, channel_id: str, thread_root: str
     if label:
         try:
             posted = await client.send_message(channel_id, thread_root, text, username=label,
-                                               receipts=receipts)
+                                               receipts=receipts,
+                                               receipt_class="background_job")
         except Exception as e:  # noqa: BLE001
             processor.log_debug(f"Labelled research post raised: {e}")
             posted = None
@@ -1863,7 +1865,8 @@ async def _deliver_findings(processor, client, channel_id: str, thread_root: str
                 "Research label post failed (missing chat:write.customize?) — falling back to "
                 "plain posts for the rest of this process")
     if not posted:
-        posted = await client.send_message(channel_id, thread_root, text, receipts=receipts)
+        posted = await client.send_message(channel_id, thread_root, text, receipts=receipts,
+                                           receipt_class="background_job")
     return posted
 
 
@@ -1874,7 +1877,7 @@ async def _deliver_failure(client, channel_id: str, thread_root: str, reason: st
         await client.send_message(
             channel_id, thread_root,
             f"⚠️ That deep-research job hit a wall: {reason}. Try asking again.",
-            receipts=receipts)
+            receipts=receipts, receipt_class="background_job")
     except Exception:
         pass
 

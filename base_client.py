@@ -71,13 +71,27 @@ class HistoryFetchError(ChannelStreamError):
     """
 
 
+def _require_receipt_class(site: str, receipts: Any, receipt_class: Optional[str]) -> None:
+    """EDIT §4/§11.9/§11.13/§11.23: the ONE receipts-require-a-class guard.
+
+    Every receipt-bearing base method body calls it, so the contract lives in the BASE, not
+    only in concrete overrides: a receipted post that does not say its class is a programming
+    error, refused with ValueError before any platform call — never laundered into a
+    class-less (NULL, ineligible) row after the message is already in the room. MODULE-LEVEL
+    deliberately: the base seams are also driven against `MagicMock` stand-ins, where a
+    `self.`-resolved guard would be a mock that refuses nothing."""
+    if receipts is not None and receipt_class is None:
+        raise ValueError(
+            f"{site}: receipts passed without receipt_class (EDIT §4/§11.9)")
+
+
 class BaseClient(ABC, LoggerMixin):
     """Abstract base class for all chat clients"""
     
     def __init__(self, name: str):
         self.name = name
         self.log_info(f"{name} client initialized")
-    
+
     @abstractmethod
     def start(self):
         """Start the client and begin listening for events"""
@@ -93,7 +107,8 @@ class BaseClient(ABC, LoggerMixin):
                      blocks: Optional[list] = None,
                      meta_out: Optional[dict] = None,
                      receipts: Any = None,
-                     receipt_kind: Optional[str] = None) -> Optional[str]:
+                     receipt_kind: Optional[str] = None,
+                     receipt_class: Optional[str] = None) -> Optional[str]:
         """Send a text message. Returns the posted message ts (truthy on success) or None
         on failure.
 
@@ -103,8 +118,13 @@ class BaseClient(ABC, LoggerMixin):
         non-Slack impl).
         `meta_out`: optional caller-provided dict a platform MAY populate with delivery
         facts (e.g. meta_out["footer_attached"]); implementations that don't report any
-        may ignore it. Both kwargs default to None so non-Slack impls stay compatible."""
-        pass
+        may ignore it. Both kwargs default to None so non-Slack impls stay compatible.
+
+        Receipt contract (EDIT_OWN_MESSAGE §4/§11.9/§11.23): passing `receipts` REQUIRES
+        `receipt_class` in the same call — the base seam itself enforces it (the shared
+        `_require_receipt_class` guard), so a receipted post with no class raises ValueError
+        even through `super()` (a programming error, never laundered into a class-less row)."""
+        _require_receipt_class("send_message", receipts, receipt_class)
 
     @abstractmethod
     async def send_message_async(self, channel_id: str, thread_id: str, text: str,
@@ -112,56 +132,80 @@ class BaseClient(ABC, LoggerMixin):
                                  meta_out: Optional[dict] = None,
                                  lease: Any = None,
                                  receipts: Any = None,
-                                 receipt_kind: Optional[str] = None) -> Optional[str]:
+                                 receipt_kind: Optional[str] = None,
+                                 receipt_class: Optional[str] = None) -> Optional[str]:
         """Send a text message (async version). See send_message for the blocks/meta_out
-        contract and for `lease` (the stale-send guard)."""
-        pass
+        contract, the receipts-require-a-class ValueError contract (§11.9/§11.23 — enforced
+        by the base seam itself), and for `lease` (the stale-send guard)."""
+        _require_receipt_class("send_message_async", receipts, receipt_class)
 
     @abstractmethod
     async def send_image(self, channel_id: str, thread_id: str, image_data: bytes, filename: str,
                          caption: str = "", meta_out: Optional[dict] = None,
-                         receipts: Any = None) -> Optional[str]:
+                         receipts: Any = None, *,
+                         receipt_class: Optional[str]) -> Optional[str]:
         """Send an image. Returns the posted image's URL (truthy on success) or None.
 
         `meta_out`: optional caller-provided dict a platform MAY populate with delivery facts
         — meta_out["file_id"] is the uploaded file's id (F7), the only handle from which the
         image message's own ts can later be resolved. Implementations that report none may
-        ignore it; it defaults to None so non-Slack impls stay compatible."""
-        pass
+        ignore it; it defaults to None so non-Slack impls stay compatible.
+
+        Receipt contract (EDIT §4/§11.9/§11.13/§11.23): `receipt_class` is REQUIRED —
+        producers stamp the §4 inventory class (`artifact` for shares) — and the base seam
+        itself raises ValueError on receipts-without-class, before any platform call."""
+        _require_receipt_class("send_image", receipts, receipt_class)
 
     @abstractmethod
     async def send_image_async(self, channel_id: str, thread_id: str, image_data: bytes, filename: str,
                                caption: str = "", meta_out: Optional[dict] = None,
-                               receipts: Any = None) -> Optional[str]:
-        """Send an image (async version). See send_image for the return/meta_out contract."""
-        pass
+                               receipts: Any = None, *,
+                               receipt_class: Optional[str]) -> Optional[str]:
+        """Send an image (async version). See send_image for the return/meta_out contract and
+        the receipts-require-a-class ValueError contract (§11.9/§11.13/§11.23 — enforced by
+        the base seam itself)."""
+        _require_receipt_class("send_image_async", receipts, receipt_class)
 
     async def send_file(self, channel_id: str, thread_id: str, file_data,
                         filename: str, title: Optional[str] = None,
                         initial_comment: str = "",
-                        receipts: Any = None) -> Optional[Dict[str, Any]]:
+                        receipts: Any = None, *,
+                        receipt_class: Optional[str]) -> Optional[Dict[str, Any]]:
         """F32: upload an arbitrary file, returning its platform identity
         ({"file_id", "url_private", "permalink"}) or None.
 
         Deliberately NOT abstract: a platform that can't take file uploads is a platform
         where artifacts simply don't publish, not one that fails to construct. The default
         declines honestly so the caller drops the artifact and still posts its answer.
+
+        Receipt contract (EDIT §4/§11.9/§11.13): `receipt_class` is REQUIRED (producers
+        stamp `artifact`), and receipts-without-class raises ValueError before any platform
+        call — the default decline honors that contract too (§11.23 shared guard).
         """
+        _require_receipt_class("send_file", receipts, receipt_class)
         self.log_warning(f"send_file not implemented for {self.__class__.__name__} — "
                          f"dropping artifact '{filename}'")
         return None
 
     @abstractmethod
     def send_thinking_indicator(self, channel_id: str, thread_id: str,
-                                receipts: Any = None) -> Optional[str]:
-        """Send a thinking/processing indicator"""
-        pass
+                                receipts: Any = None, *,
+                                receipt_class: Optional[str]) -> Optional[str]:
+        """Send a thinking/processing indicator.
+
+        Receipt contract (EDIT §4/§11.9/§11.13/§11.23): `receipt_class` is REQUIRED
+        (producers stamp `chrome` — the placeholder is excluded scaffolding until promotion),
+        and the base seam itself raises ValueError on receipts-without-class."""
+        _require_receipt_class("send_thinking_indicator", receipts, receipt_class)
 
     @abstractmethod
     async def send_thinking_indicator_async(self, channel_id: str, thread_id: str,
-                                            receipts: Any = None) -> Optional[str]:
-        """Send a thinking/processing indicator (async version)"""
-        pass
+                                            receipts: Any = None, *,
+                                            receipt_class: Optional[str]) -> Optional[str]:
+        """Send a thinking/processing indicator (async version). See send_thinking_indicator
+        for the receipts-require-a-class ValueError contract (§11.9/§11.13/§11.23 — enforced
+        by the base seam itself)."""
+        _require_receipt_class("send_thinking_indicator_async", receipts, receipt_class)
 
     @abstractmethod
     def delete_message(self, channel_id: str, message_id: str) -> bool:
@@ -174,14 +218,22 @@ class BaseClient(ABC, LoggerMixin):
         pass
 
     def update_message(self, channel_id: str, message_id: str, text: str,
-                       receipts: Any = None, receipt_kind: Optional[str] = None) -> bool:
-        """Update a message (optional - not all platforms support this)"""
+                       receipts: Any = None, receipt_kind: Optional[str] = None,
+                       receipt_class: Optional[str] = None) -> bool:
+        """Update a message (optional - not all platforms support this).
+
+        Receipt contract (§11.9/§11.13/§11.23): receipts-without-class raises ValueError via
+        the shared base guard — the default decline honors the contract too."""
+        _require_receipt_class("update_message", receipts, receipt_class)
         return False
 
     async def update_message_async(self, channel_id: str, message_id: str, text: str,
                                    receipts: Any = None,
-                                   receipt_kind: Optional[str] = None) -> bool:
-        """Update a message (async version - optional)"""
+                                   receipt_kind: Optional[str] = None,
+                                   receipt_class: Optional[str] = None) -> bool:
+        """Update a message (async version - optional). Same §11.9/§11.13/§11.23 contract,
+        via the shared base guard."""
+        _require_receipt_class("update_message_async", receipts, receipt_class)
         return False
 
     async def react(self, channel_id: str, message_ts: str, emoji: str) -> bool:
@@ -237,8 +289,10 @@ class BaseClient(ABC, LoggerMixin):
 
         # Format error message for better readability
         formatted_error = self.format_error_message(error)
+        # Spec §4: an error notice is a system_notice, stamped here — the one producer of
+        # this surface — whatever ledger it settles under.
         await self.send_message_async(channel_id, thread_id, formatted_error, lease=lease,
-                                      receipts=receipts)
+                                      receipts=receipts, receipt_class="system_notice")
     
     def format_error_message(self, error: str) -> str:
         """Format error messages for display (can be overridden by platform-specific clients)"""

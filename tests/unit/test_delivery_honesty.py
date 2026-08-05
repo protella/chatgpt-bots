@@ -232,7 +232,7 @@ def _client(delivery, first_ts="posted.1"):
     del c.attachable_footer_blocks  # keep the branch simple: no footer chrome
 
     async def _send(channel_id, thread_id, text, blocks=None, meta_out=None, lease=None,
-                    surface=None, receipts=None, receipt_kind=None, on_first_accept=None):
+                    surface=None, receipts=None, receipt_kind=None, receipt_class=None, on_first_accept=None):
         if on_first_accept is not None:
             on_first_accept(first_ts)
         if meta_out is not None and delivery is not None:
@@ -300,7 +300,7 @@ async def test_main_observes_the_reply_at_the_first_accepted_surface():
     client = _client(None)
 
     async def _send(channel_id, thread_id, text, blocks=None, meta_out=None, lease=None,
-                    surface=None, receipts=None, receipt_kind=None, on_first_accept=None):
+                    surface=None, receipts=None, receipt_kind=None, receipt_class=None, on_first_accept=None):
         on_first_accept("posted.1")
         # Read the ledger while the send is STILL RUNNING — this is the whole contract.
         mid_send.extend([(r.first_ts, r.state) for r in captured["turn"].destinations])

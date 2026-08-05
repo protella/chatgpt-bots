@@ -830,7 +830,8 @@ class MessageProcessor(ThreadManagementMixin,
                         lease=getattr(turn, "send_lease", None),
                         surface="timeout_notice",
                         receipts=getattr(turn, "receipt_ledger", None),
-                        receipt_kind="finalized")
+                        receipt_kind="finalized",
+                        receipt_class="system_notice")
                     self.log_debug("Updated thinking message to show timeout")
                 except StaleSendSuppressed:
                     raise  # the conversation moved on; a "stopped waiting" notice is noise now
@@ -871,6 +872,7 @@ class MessageProcessor(ThreadManagementMixin,
                         surface="history_error_notice",
                         receipts=getattr(turn, "receipt_ledger", None),
                         receipt_kind="finalized",
+                        receipt_class="system_notice",
                     )
                 except StaleSendSuppressed:
                     raise      # no notice, and the suppression is the record — see update_message
@@ -916,6 +918,7 @@ class MessageProcessor(ThreadManagementMixin,
                         surface="channel_stream_error_notice",
                         receipts=getattr(turn, "receipt_ledger", None),
                         receipt_kind="finalized",
+                        receipt_class="system_notice",
                     )
                 except StaleSendSuppressed:
                     raise      # the conversation moved on; the suppression is the record
@@ -962,7 +965,8 @@ class MessageProcessor(ThreadManagementMixin,
                             lease=getattr(turn, "send_lease", None),
                             surface="timeout_notice",
                             receipts=getattr(turn, "receipt_ledger", None),
-                            receipt_kind="finalized")
+                            receipt_kind="finalized",
+                            receipt_class="system_notice")
                     except StaleSendSuppressed:
                         raise  # the conversation moved on; a timeout notice would be noise
                     except Exception:
@@ -985,7 +989,8 @@ class MessageProcessor(ThreadManagementMixin,
                             lease=getattr(turn, "send_lease", None),
                             surface="error_notice",
                             receipts=getattr(turn, "receipt_ledger", None),
-                            receipt_kind="finalized")
+                            receipt_kind="finalized",
+                            receipt_class="system_notice")
                     except StaleSendSuppressed:
                         raise  # "something went wrong" about a turn where nothing did
                     except Exception:
@@ -1299,6 +1304,7 @@ class MessageProcessor(ThreadManagementMixin,
                 lease=getattr(turn, "send_lease", None),
                 surface="failed_files_notice",
                 receipts=getattr(turn, "receipt_ledger", None),
+                receipt_class="system_notice",
             )
             # A notice that LANDED is a visible surface, so the answer belongs with it. Only on a
             # confirmed send: send_message swallows SlackApiError and returns None. A channel turn
@@ -1333,6 +1339,7 @@ class MessageProcessor(ThreadManagementMixin,
             lease=getattr(turn, "send_lease", None),
             surface="prior_timeout_notice",
             receipts=getattr(turn, "receipt_ledger", None),
+            receipt_class="system_notice",
         )
         # A notice that LANDED is a visible surface in the thread, so the answer belongs with it —
         # settle the destination there. Only on a confirmed send: send_message swallows
@@ -1362,6 +1369,7 @@ class MessageProcessor(ThreadManagementMixin,
                 message.channel_id, message.thread_id,
                 "⚠️ I hit an error catching up on the last few messages — please re-send.",
                 receipt_kind="finalized",
+                receipt_class="system_notice",
             )
         except Exception as notify_error:
             self.log_error(f"Failed to post drain-failure notice for {thread_key}: {notify_error}")

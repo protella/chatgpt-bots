@@ -213,7 +213,7 @@ async def test_thinking_indicator_fallback_uses_loading_pool(monkeypatch):
     monkeypatch.setattr(config, "enable_assistant_status", False)
     client = SimpleNamespace(chat_postMessage=AsyncMock(return_value={"ts": "1.0"}))
     host = _MsgClient(client)
-    assert await host.send_thinking_indicator("C1", "T1") == "1.0"
+    assert await host.send_thinking_indicator("C1", "T1", receipt_class="chrome") == "1.0"
     text = client.chat_postMessage.call_args.kwargs["text"]
     assert text.startswith(config.circle_loader_emoji)
     assert text.split(" ", 1)[1] in set(config.get_loading_messages())

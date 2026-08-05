@@ -42,6 +42,7 @@ def _slack_host():
         {"type": "function", "name": "fetch_thread_messages", "parameters": {}}]
     for getter, name in (("get_search_tool_schema", "search_slack"),
                          ("get_post_to_thread_tool_schema", "post_to_thread"),
+                         ("get_edit_own_message_tool_schema", "edit_own_message"),
                          ("get_no_reply_tool_schema", "no_response_needed"),
                          ("get_emoji_search_tool_schema", "search_workspace_emoji"),
                          ("get_lookup_channel_tool_schema", "lookup_channel"),

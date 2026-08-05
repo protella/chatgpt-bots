@@ -211,13 +211,16 @@ def test_the_contract_version_says_the_event_set_changed():
     one bool plus four facts about the call; v8 adds the single-stream events and with them a
     SECOND population keyed by turn_id; v9 is stale reconsideration — `stale_send` gains
     `turn_id` and one-per-suppression-EVENT cardinality, and the `reconsider_start` /
-    `reconsider_outcome` pair joins the turn population. Each is a change an analysis written
+    `reconsider_outcome` pair joins the turn population; v10 is edit_own_message —
+    `turn_outcome` gains the always-present `edits` list and the destination kinds gain
+    `correction_announcement`. Each is a change an analysis written
     against the older contract must be able to refuse.
 
     GATE_CONTRACT is asserted beside it because the two move independently — v2–v6 rows remain
     valid under their own contracts, and a reader has to be able to tell which one a row obeys.
-    It deliberately did NOT move at v8 or v9: the gate is unchanged, so its rows still pool."""
-    assert pt.CONTRACT_VERSION == 9
+    It deliberately did NOT move at v8, v9 or v10: the gate is unchanged, so its rows still
+    pool."""
+    assert pt.CONTRACT_VERSION == 10
     assert pt.GATE_CONTRACT == "binary-v1"
 
 
@@ -1562,7 +1565,7 @@ def stream_render_row(**overrides):
     the rule that makes it necessary land together.
     """
     row = {
-        "v": 9, "at": 3.0, "session": "S", "gate_contract": "binary-v1",
+        "v": 10, "at": 3.0, "session": "S", "gate_contract": "binary-v1",
         "event": "stream_render", "turn_id": "t1",
         "channel_id": "C1", "H": "1.9",
         "periphery_floor_ts": "1.0", "inventory_start_ts": "0.5",
@@ -1588,11 +1591,11 @@ def test_the_ledger_has_no_compaction_vocabulary(tmp_path):
     That was the claim worth testing when the removal shipped inside v8: the turn population —
     turn_start, turn_outcome, stream_render, model_response, outbound_receipt — was unchanged in
     identity, and no completeness rule ever named the removed event, so no denominator anybody
-    computes off a v8 ledger was invalidated. The version sits at 9 NOW because stale
-    reconsideration later changed event cardinality — a real contract change, unlike this
-    removal, which still earned no bump of its own.
+    computes off a v8 ledger was invalidated. The version sits at 10 NOW because stale
+    reconsideration (v9) and then edit_own_message (v10) each changed the contract for real —
+    unlike this removal, which still earned no bump of its own.
     """
-    assert pt.CONTRACT_VERSION == 9
+    assert pt.CONTRACT_VERSION == 10
     for name in ("compaction_snapshot", "SNAPSHOT_OPS", "OUTBOX_OPS", "BUILD_STATUSES",
                  "BUILD_REASON_STATUSES", "FIT_RESULTS", "OUTBOX_EVENT",
                  "canonical_body_bytes", "extract_canonical_body", "validate_outbox_body",
@@ -1613,17 +1616,18 @@ def test_the_ledger_has_no_compaction_vocabulary(tmp_path):
 
     ledger = tmp_path / "participation.jsonl"
     rows = [
-        {"v": 9, "at": 1.0, "session": "S", "gate_contract": "binary-v1",
+        {"v": 10, "at": 1.0, "session": "S", "gate_contract": "binary-v1",
          "event": "session_start", "build": "abc"},
-        {"v": 9, "at": 2.0, "session": "S", "gate_contract": "binary-v1", "event": "turn_start",
+        {"v": 10, "at": 2.0, "session": "S", "gate_contract": "binary-v1", "event": "turn_start",
          "channel_id": "C1", "trigger_ts": "1.0", "turn_id": "t1", "surface": "channel",
          "gated": False},
         stream_render_row(),
-        {"v": 9, "at": 4.0, "session": "S", "gate_contract": "binary-v1",
+        {"v": 10, "at": 4.0, "session": "S", "gate_contract": "binary-v1",
          "event": "turn_outcome", "channel_id": "C1", "trigger_ts": "1.0", "turn_id": "t1",
          "kind": "silence", "detached_started": False, "stream_build_present": True,
-         "destinations": []},
-        {"v": 9, "at": 5.0, "session": "S", "gate_contract": "binary-v1", "event": "session_end"},
+         "destinations": [], "edits": []},
+        {"v": 10, "at": 5.0, "session": "S", "gate_contract": "binary-v1",
+         "event": "session_end"},
     ]
     ledger.write_text("".join(json.dumps(r) + "\n" for r in rows))
     result = subprocess.run([sys.executable, str(checker), str(ledger), "--json"],
@@ -1654,20 +1658,21 @@ def _ledger(*, render=None, renders=None, stream_build_present=True, outcome_ext
     """A complete one-turn session, with the stream_render row(s) under test substituted in."""
     if renders is None:
         renders = [] if render is None else [render]
-    outcome = {"v": 9, "at": 4.0, "session": "S", "gate_contract": "binary-v1",
+    outcome = {"v": 10, "at": 4.0, "session": "S", "gate_contract": "binary-v1",
                "event": "turn_outcome", "channel_id": "C1", "trigger_ts": "1.0",
                "turn_id": "t1", "kind": "silence", "detached_started": False,
-               "stream_build_present": stream_build_present, "destinations": []}
+               "stream_build_present": stream_build_present, "destinations": [], "edits": []}
     outcome.update(outcome_extra or {})
     return [
-        {"v": 9, "at": 1.0, "session": "S", "gate_contract": "binary-v1",
+        {"v": 10, "at": 1.0, "session": "S", "gate_contract": "binary-v1",
          "event": "session_start", "build": "abc"},
-        {"v": 9, "at": 2.0, "session": "S", "gate_contract": "binary-v1", "event": "turn_start",
-         "channel_id": "C1", "trigger_ts": "1.0", "turn_id": "t1", "surface": "channel",
-         "gated": False},
+        {"v": 10, "at": 2.0, "session": "S", "gate_contract": "binary-v1",
+         "event": "turn_start", "channel_id": "C1", "trigger_ts": "1.0", "turn_id": "t1",
+         "surface": "channel", "gated": False},
         *renders,
         outcome,
-        {"v": 9, "at": 5.0, "session": "S", "gate_contract": "binary-v1", "event": "session_end"},
+        {"v": 10, "at": 5.0, "session": "S", "gate_contract": "binary-v1",
+         "event": "session_end"},
     ]
 
 
@@ -1786,7 +1791,7 @@ def test_the_stream_render_contract_is_enforced(tmp_path):
     assert code == 1 and "stream_render_duplicate" in names
 
 
-# ================================================== CV9 — stale reconsideration (§5 of the spec)
+# ==================================== CV9 — stale reconsideration (§5 of the spec), now at CV10
 
 def test_a_stale_send_row_joins_the_turn_population_by_turn_id(sink):
     """v9. The row's turn_id is what lets a turn's suppression EVENTS be counted beside its
@@ -1888,16 +1893,16 @@ def test_a_turn_outcome_attaches_the_reconsider_facts_and_only_then(sink):
     assert rows[1]["reconsider"] == {"outcome": "posted_revised", "passes": 2, "forced": False}
 
 
-# ------------------------------------------------------ the CV9 checker invariants, per §5
+# -------------------------- the CV9 checker invariants, per §5 — unchanged and graded at CV10
 
-def _v9(event, **fields):
-    row = {"v": 9, "at": 3.0, "session": "S", "gate_contract": "binary-v1", "event": event}
+def _v10(event, **fields):
+    row = {"v": 10, "at": 3.0, "session": "S", "gate_contract": "binary-v1", "event": event}
     row.update(fields)
     return row
 
 
 def _suppression(turn_id="t1", **over):
-    row = _v9("stale_send", channel_id="C1", trigger_ts="1.0", turn_id=turn_id,
+    row = _v10("stale_send", channel_id="C1", trigger_ts="1.0", turn_id=turn_id,
               last_seen_ts="1.0", observed_latest_ts="2.0", scope="thread",
               surface="reply", guard_mode="buffered")
     row.update(over)
@@ -1905,7 +1910,7 @@ def _suppression(turn_id="t1", **over):
 
 
 def _start(pass_number, turn_id="t1", **over):
-    row = _v9("reconsider_start", at=4.0 + pass_number, channel_id="C1", trigger_ts="1.0",
+    row = _v10("reconsider_start", at=4.0 + pass_number, channel_id="C1", trigger_ts="1.0",
               turn_id=turn_id, scope=["thread", "C1", "1.0"], observed_latest_ts="2.0")
     row["pass"] = pass_number
     row.update(over)
@@ -1913,7 +1918,7 @@ def _start(pass_number, turn_id="t1", **over):
 
 
 def _outcome(outcome="skipped", passes=1, turn_id="t1", **over):
-    row = _v9("reconsider_outcome", at=8.0, channel_id="C1", trigger_ts="1.0",
+    row = _v10("reconsider_outcome", at=8.0, channel_id="C1", trigger_ts="1.0",
               turn_id=turn_id, outcome=outcome, passes=passes)
     row.update(over)
     return row
@@ -1923,14 +1928,14 @@ def _reconsider_session(*middle):
     """One UNGATED channel turn (no attempt_id anywhere — the join is turn_id alone) that ended
     stale_suppressed, with the reconsideration rows under test in the middle."""
     return [
-        _v9("session_start", at=1.0, build="abc"),
-        _v9("turn_start", at=2.0, channel_id="C1", trigger_ts="1.0", turn_id="t1",
+        _v10("session_start", at=1.0, build="abc"),
+        _v10("turn_start", at=2.0, channel_id="C1", trigger_ts="1.0", turn_id="t1",
             surface="channel", gated=False),
         *middle,
-        _v9("turn_outcome", at=9.0, channel_id="C1", trigger_ts="1.0", turn_id="t1",
+        _v10("turn_outcome", at=9.0, channel_id="C1", trigger_ts="1.0", turn_id="t1",
             kind="stale_suppressed", detached_started=False, stream_build_present=False,
-            destinations=[]),
-        _v9("session_end", at=10.0),
+            destinations=[], edits=[]),
+        _v10("session_end", at=10.0),
     ]
 
 
@@ -1995,9 +2000,9 @@ def test_a_dm_stale_send_with_a_turn_id_and_no_turn_start_is_tolerated(tmp_path)
     but DMs are outside the channel-turn population, so there is no turn_start to join — and
     that must never read as a violation."""
     rows = [
-        _v9("session_start", at=1.0, build="abc"),
+        _v10("session_start", at=1.0, build="abc"),
         _suppression(turn_id="dm-turn", at=2.0),
-        _v9("session_end", at=3.0),
+        _v10("session_end", at=3.0),
     ]
     code, names = _run_checker(tmp_path, rows)
     assert (code, names) == (0, [])
@@ -2067,9 +2072,9 @@ def test_a_v9_stale_send_must_carry_its_turn_id(tmp_path):
     orphan = _suppression()
     orphan.pop("turn_id")
     code, names = _run_checker(tmp_path, [
-        _v9("session_start", at=1.0, build="abc"),
+        _v10("session_start", at=1.0, build="abc"),
         orphan,
-        _v9("session_end", at=3.0),
+        _v10("session_end", at=3.0),
     ])
     assert code == 1 and "stale_send_missing_turn_id" in names
 
@@ -2081,9 +2086,9 @@ def test_a_stale_send_turn_id_must_be_a_non_empty_string(tmp_path):
     each by name instead."""
     for bad in (None, 7, ""):
         code, names = _run_checker(tmp_path, [
-            _v9("session_start", at=1.0, build="abc"),
+            _v10("session_start", at=1.0, build="abc"),
             _suppression(turn_id=bad),
-            _v9("session_end", at=3.0),
+            _v10("session_end", at=3.0),
         ])
         assert code == 1 and "stale_send_missing_turn_id" in names, bad
 
@@ -2096,12 +2101,12 @@ def test_turn_start_and_turn_outcome_null_turn_ids_are_violations_not_silent_dro
     for event, name in (("turn_start", "turn_start_missing_field"),
                         ("turn_outcome", "turn_outcome_missing_field")):
         code, names = _run_checker(tmp_path, [
-            _v9("session_start", at=1.0, build="abc"),
-            _v9("turn_start", at=1.5, turn_id=None if event == "turn_start" else "t1",
+            _v10("session_start", at=1.0, build="abc"),
+            _v10("turn_start", at=1.5, turn_id=None if event == "turn_start" else "t1",
                 channel_id="C1", surface="channel"),
-            _v9("turn_outcome", at=2.0, turn_id=None if event == "turn_outcome" else "t1",
-                kind="reply", destinations=[], stream_build_present=True),
-            _v9("session_end", at=3.0),
+            _v10("turn_outcome", at=2.0, turn_id=None if event == "turn_outcome" else "t1",
+                kind="reply", destinations=[], stream_build_present=True, edits=[]),
+            _v10("session_end", at=3.0),
         ])
         assert code == 1 and name in names, event
 
@@ -2257,17 +2262,262 @@ def test_the_nested_turn_outcome_reconsider_payload_is_checked(tmp_path):
         assert code == 1 and "turn_outcome_reconsider_malformed" in names, bad
 
 
-def test_the_checker_skips_v8_rows_rather_than_grading_them(tmp_path):
-    """The version moved, so the checker's older-contract rule now covers v8: a mixed file
-    across the deploy is the normal state of the world, and grading v8 rows by v9 rules would
-    invent violations out of correct history."""
-    assert plc.CONTRACT_VERSION == 9
+def test_the_checker_skips_v8_and_v9_rows_rather_than_grading_them(tmp_path):
+    """The version moved, so the checker's older-contract rule now covers v9 as well as v8: a
+    mixed file across the deploy is the normal state of the world, and grading v9 rows by v10
+    rules — every one of which lacks `edits` — would invent violations out of correct
+    history."""
+    assert plc.CONTRACT_VERSION == 10
     rows = [
         {"v": 8, "at": 1.0, "session": "S8", "gate_contract": "binary-v1",
          "event": "turn_start", "channel_id": "C1", "trigger_ts": "1.0", "turn_id": "old",
          "surface": "channel", "gated": False},   # v8, no outcome — must NOT be graded
-        _v9("session_start", at=2.0, build="abc"),
-        _v9("session_end", at=3.0),
+        # A v9 turn, complete under ITS contract: turn_outcome has no `edits`, which is a v10
+        # violation and a healthy v9 row. Skipped, so it produces nothing.
+        {"v": 9, "at": 1.5, "session": "S9", "gate_contract": "binary-v1",
+         "event": "turn_start", "channel_id": "C1", "trigger_ts": "1.0", "turn_id": "older",
+         "surface": "channel", "gated": False},
+        {"v": 9, "at": 1.6, "session": "S9", "gate_contract": "binary-v1",
+         "event": "turn_outcome", "channel_id": "C1", "trigger_ts": "1.0", "turn_id": "older",
+         "kind": "silence", "detached_started": False, "stream_build_present": False,
+         "destinations": []},
+        _v10("session_start", at=2.0, build="abc"),
+        _v10("session_end", at=3.0),
     ]
     code, names = _run_checker(tmp_path, rows)
     assert (code, names) == (0, [])
+
+
+# ==================================== CV10 — edit_own_message (EDIT_OWN_MESSAGE.md §7)
+
+def test_a_turn_outcome_always_carries_the_edits_list(sink):
+    """v10: `edits` is written even when empty, for the same reason `destinations` is — a turn
+    that edited nothing and a turn whose edit records were lost are not the same fact."""
+    pt.emit_turn_outcome(_turn(turn_id="s:40"), channel_id="C1", trigger_ts="10.0", kind="reply")
+    pt.turn_outcome("C1", "11.0", turn_id="s:41", kind="silence")
+    rows = sink("turn_outcome")
+    assert rows[0]["edits"] == []
+    assert rows[1]["edits"] == []
+
+
+def test_emit_turn_outcome_reads_turn_edits_with_the_exact_payload(sink):
+    """One entry per EditRecord on `turn.edits`, the spec payload verbatim, over the REAL
+    §11.6 lifecycle (a record exists only post-acceptance, so both states carry
+    announcement_ts; only a committed record has error=None): None values are OMITTED —
+    nested values survive record()'s top-level drop-None, so the omission must happen at
+    assembly."""
+    from types import SimpleNamespace
+
+    committed = SimpleNamespace(channel_id="C1", target_ts="2.0", announcement_ts="3.0",
+                                state="committed", error=None)
+    partial = SimpleNamespace(channel_id="C1", target_ts="4.0", announcement_ts="5.0",
+                              state="announcement_only",
+                              error="epoch_refused_after_announcement")
+    turn = SimpleNamespace(turn_id="s:42", destinations=[], turn_error=None, H=None,
+                           stream_build_present=False, reconsider=None,
+                           edits=[committed, partial])
+    assert pt.emit_turn_outcome(turn, channel_id="C1", trigger_ts="10.0", kind="reply")
+
+    row = sink("turn_outcome")[0]
+    assert row["edits"] == [
+        {"channel_id": "C1", "target_ts": "2.0", "state": "committed",
+         "announcement_ts": "3.0"},
+        {"channel_id": "C1", "target_ts": "4.0", "state": "announcement_only",
+         "announcement_ts": "5.0", "error": "epoch_refused_after_announcement"},
+    ]
+    for entry in row["edits"]:
+        assert None not in entry.values()
+
+
+def test_reconsider_and_edits_coexist_on_one_emitted_turn_outcome(sink):
+    """The spec's coexistence ruling: a turn can be reconsidered AND edit an earlier message,
+    and one row carries both facts."""
+    from types import SimpleNamespace
+
+    from message_processor.turn_runtime import ReconsiderFacts
+
+    edit = SimpleNamespace(channel_id="C1", target_ts="2.0", announcement_ts="3.0",
+                           state="committed", error=None)
+    turn = SimpleNamespace(turn_id="s:43", destinations=[], turn_error=None, H=None,
+                           stream_build_present=False,
+                           reconsider=ReconsiderFacts(outcome="posted_asis", passes=1,
+                                                      forced=False),
+                           edits=[edit])
+    assert pt.emit_turn_outcome(turn, channel_id="C1", trigger_ts="10.0", kind="reply")
+    row = sink("turn_outcome")[0]
+    assert row["reconsider"] == {"outcome": "posted_asis", "passes": 1, "forced": False}
+    assert row["edits"] == [{"channel_id": "C1", "target_ts": "2.0", "state": "committed",
+                             "announcement_ts": "3.0"}]
+
+
+# ------------------------------------------------------ the CV10 checker invariants, per §7
+
+_ANNOUNCEMENT_DEST = {"channel_id": "C1", "thread_root_ts": "2.0", "first_ts": "3.0",
+                      "state": "committed", "chars": 40, "kind": "correction_announcement"}
+
+
+def _edit_entry(**over):
+    entry = {"channel_id": "C1", "target_ts": "2.0", "announcement_ts": "3.0",
+             "state": "committed"}
+    entry.update(over)
+    return entry
+
+
+def _edit_session(edits, destinations=None):
+    """One ungated channel turn whose turn_outcome carries the edits under test."""
+    return [
+        _v10("session_start", at=1.0, build="abc"),
+        _v10("turn_start", at=2.0, channel_id="C1", trigger_ts="1.0", turn_id="t1",
+             surface="channel", gated=False),
+        _v10("turn_outcome", at=9.0, channel_id="C1", trigger_ts="1.0", turn_id="t1",
+             kind="reply", detached_started=False, stream_build_present=False,
+             destinations=list(destinations or []), edits=edits),
+        _v10("session_end", at=10.0),
+    ]
+
+
+def test_a_v10_turn_outcome_with_empty_edits_is_healthy(tmp_path):
+    assert _run_checker(tmp_path, _edit_session([])) == (0, [])
+
+
+def test_a_v10_turn_outcome_without_edits_fails(tmp_path):
+    """`edits` is MANDATORY in CV10 — always a list, empty when the turn edited nothing."""
+    rows = _edit_session([])
+    del rows[2]["edits"]
+    code, names = _run_checker(tmp_path, rows)
+    assert code == 1 and "turn_outcome_missing_field" in names
+
+
+def test_the_edits_entry_grammar_is_enforced(tmp_path):
+    """One field broken at a time against the real checker, like the reconsider grammar."""
+    # The baseline every case deviates from: one committed edit whose announcement joins.
+    assert _run_checker(tmp_path, _edit_session(
+        [_edit_entry()], destinations=[_ANNOUNCEMENT_DEST])) == (0, [])
+    # ...and the announcement_only lifecycle shape — announcement_ts AND error present
+    # (§11.6: no `error` on committed is the ONLY legal omission; a bare announcement_only
+    # is a lifecycle violation, covered by the lifecycle test below).
+    assert _run_checker(tmp_path, _edit_session(
+        [{"channel_id": "C1", "target_ts": "2.0", "state": "announcement_only",
+          "announcement_ts": "3.0", "error": "stale_target_after_announcement"}],
+        destinations=[_ANNOUNCEMENT_DEST])) == (0, [])
+
+    # Not a list at all.
+    code, names = _run_checker(tmp_path, _edit_session({"target_ts": "2.0"}))
+    assert code == 1 and "turn_outcome_edits_not_list" in names
+    # An entry that is not an object.
+    code, names = _run_checker(tmp_path, _edit_session(["2.0"]))
+    assert code == 1 and "turn_outcome_edit_malformed" in names
+    # A state outside the two-value lifecycle.
+    code, names = _run_checker(tmp_path, _edit_session(
+        [_edit_entry(state="silent")], destinations=[_ANNOUNCEMENT_DEST]))
+    assert code == 1 and "turn_outcome_edit_bad_state" in names
+    # An unknown nested key — the grammar is CLOSED.
+    code, names = _run_checker(tmp_path, _edit_session(
+        [_edit_entry(note="fixed a typo")], destinations=[_ANNOUNCEMENT_DEST]))
+    assert code == 1 and "turn_outcome_edit_malformed" in names
+    # Explicit nulls — unavailable values are omitted, never null.
+    for field in ("channel_id", "target_ts", "state", "announcement_ts", "error"):
+        code, names = _run_checker(tmp_path, _edit_session(
+            [_edit_entry(**{field: None})], destinations=[_ANNOUNCEMENT_DEST]))
+        assert code == 1 and "turn_outcome_edit_malformed" in names, field
+    # A missing mandatory key.
+    for field in ("channel_id", "target_ts", "state"):
+        entry = _edit_entry()
+        entry.pop(field)
+        code, names = _run_checker(tmp_path, _edit_session(
+            [entry], destinations=[_ANNOUNCEMENT_DEST]))
+        assert code == 1 and "turn_outcome_edit_malformed" in names, field
+
+
+def test_the_edit_identity_fields_require_non_empty_strings(tmp_path):
+    """§11.18 regression: `channel_id`, `target_ts`, `announcement_ts` and `error` must be
+    NON-EMPTY strings — an empty or non-string value names no Slack coordinate and no
+    failure code (the old grammar accepted error="")."""
+    for field in ("channel_id", "target_ts", "announcement_ts"):
+        code, names = _run_checker(tmp_path, _edit_session(
+            [_edit_entry(**{field: ""})], destinations=[_ANNOUNCEMENT_DEST]))
+        assert code == 1 and "turn_outcome_edit_malformed" in names, field
+        code, names = _run_checker(tmp_path, _edit_session(
+            [_edit_entry(**{field: 7})], destinations=[_ANNOUNCEMENT_DEST]))
+        assert code == 1 and "turn_outcome_edit_malformed" in names, field
+    code, names = _run_checker(tmp_path, _edit_session(
+        [_edit_entry(state="announcement_only", error="")],
+        destinations=[_ANNOUNCEMENT_DEST]))
+    assert code == 1 and "turn_outcome_edit_malformed" in names
+    code, names = _run_checker(tmp_path, _edit_session(
+        [_edit_entry(state="announcement_only", error=17)],
+        destinations=[_ANNOUNCEMENT_DEST]))
+    assert code == 1 and "turn_outcome_edit_malformed" in names
+
+
+def test_the_edit_lifecycle_is_sound(tmp_path):
+    """§11.6: a record exists only once the disclosure was accepted, so BOTH states carry
+    `announcement_ts`; `committed` carries no `error` and `announcement_only` always carries
+    one. Each violation by its own name."""
+    # A bare announcement_only — the shape the old grammar blessed — breaks BOTH rules.
+    code, names = _run_checker(tmp_path, _edit_session(
+        [{"channel_id": "C1", "target_ts": "2.0", "state": "announcement_only"}]))
+    assert code == 1
+    assert "turn_outcome_edit_announcement_missing" in names
+    assert "turn_outcome_edit_error_missing" in names
+    # A committed record without its announcement ts — announcement-first makes it a lie.
+    entry = _edit_entry()
+    entry.pop("announcement_ts")
+    code, names = _run_checker(tmp_path, _edit_session([entry]))
+    assert code == 1 and "turn_outcome_edit_announcement_missing" in names
+    # committed ⇒ error absent.
+    code, names = _run_checker(tmp_path, _edit_session(
+        [_edit_entry(error="update_failed_after_announcement")],
+        destinations=[_ANNOUNCEMENT_DEST]))
+    assert code == 1 and "turn_outcome_edit_error_on_committed" in names
+    # announcement_only ⇒ error present.
+    code, names = _run_checker(tmp_path, _edit_session(
+        [_edit_entry(state="announcement_only")], destinations=[_ANNOUNCEMENT_DEST]))
+    assert code == 1 and "turn_outcome_edit_error_missing" in names
+
+
+def test_an_edits_announcement_ts_must_join_a_committed_disclosure_destination(tmp_path):
+    """The §7 join invariant: the disclosure post is a real destination the room saw, so an
+    entry's announcement_ts that joins no committed correction_announcement destination means
+    one of the two records is wrong about what was delivered."""
+    # Healthy — both states join the same way; the join does not depend on the edit's state.
+    assert _run_checker(tmp_path, _edit_session(
+        [_edit_entry()], destinations=[_ANNOUNCEMENT_DEST])) == (0, [])
+    assert _run_checker(tmp_path, _edit_session(
+        [_edit_entry(state="announcement_only",
+                     error="update_failed_after_announcement")],
+        destinations=[_ANNOUNCEMENT_DEST])) == (0, [])
+
+    # No destination at all.
+    code, names = _run_checker(tmp_path, _edit_session([_edit_entry()]))
+    assert code == 1 and "turn_outcome_edit_announcement_unjoined" in names
+    # A destination of the right kind that never committed.
+    observed = dict(_ANNOUNCEMENT_DEST, state="observed", chars=None)
+    code, names = _run_checker(tmp_path, _edit_session(
+        [_edit_entry()], destinations=[observed]))
+    assert code == 1 and "turn_outcome_edit_announcement_unjoined" in names
+    # A committed destination of the wrong kind.
+    reply = dict(_ANNOUNCEMENT_DEST, kind="reply")
+    code, names = _run_checker(tmp_path, _edit_session(
+        [_edit_entry()], destinations=[reply]))
+    assert code == 1 and "turn_outcome_edit_announcement_unjoined" in names
+    # A committed disclosure at a DIFFERENT ts.
+    elsewhere = dict(_ANNOUNCEMENT_DEST, first_ts="9.9")
+    code, names = _run_checker(tmp_path, _edit_session(
+        [_edit_entry()], destinations=[elsewhere]))
+    assert code == 1 and "turn_outcome_edit_announcement_unjoined" in names
+    # ...and the correction_announcement destination kind is legal on its own.
+    assert _run_checker(tmp_path, _edit_session([], destinations=[_ANNOUNCEMENT_DEST])) \
+        == (0, [])
+
+
+def test_reconsider_and_edits_coexist_on_one_checked_turn_outcome(tmp_path):
+    """The checker accepts the coexistence the emitter produces: one row carrying both the
+    nested reconsider facts and a joined edit entry."""
+    rows = _reconsider_session(_suppression(), _start(1),
+                               _outcome(outcome="posted_asis", passes=1, forced=False))
+    rows[-2]["reconsider"] = {"outcome": "posted_asis", "passes": 1, "forced": False}
+    rows[-2]["kind"] = "reply"
+    rows[-2]["destinations"] = [_ANNOUNCEMENT_DEST]
+    rows[-2]["edits"] = [_edit_entry()]
+    assert _run_checker(tmp_path, rows) == (0, [])

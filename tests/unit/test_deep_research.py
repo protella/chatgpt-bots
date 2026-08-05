@@ -22,14 +22,16 @@ import message_processor.research_tools as rt
 class _FakeClient:
     def __init__(self, fail_username=False):
         self.sent = []  # (channel, thread, text, username)
+        self.sent_classes = []  # receipt_class per send, parallel to `sent`
         self.fail_username = fail_username
 
     async def send_message(self, channel_id, thread_id, text, blocks=None, lease=None, surface=None,
                            receipts=None, receipt_kind=None,
-                           meta_out=None, username=None):
+                           meta_out=None, username=None, receipt_class=None):
         if username and self.fail_username:
             return None  # simulate missing_scope → send_message returns None
         self.sent.append((channel_id, thread_id, text, username))
+        self.sent_classes.append(receipt_class)
         return "9999.000001"
 
 
@@ -110,7 +112,7 @@ class _CardClient(_FakeClient):
         self._card_ts = card_ts
 
     async def post_status_card(self, channel_id, thread_id, text, blocks, username=None,
-                               receipts=None):
+                               receipts=None, *, receipt_class):
         if username and self.card_username_fails:
             return None
         self.card_posts.append((channel_id, thread_id, text, blocks, username))
@@ -293,6 +295,7 @@ async def test_happy_path_posts_findings_with_trailer(monkeypatch):
     assert "_deep research ·" in text and "effort" in text  # trailer
     assert "tools: web_search" in text  # visible tool attribution in the trailer
     assert username is None
+    assert client.sent_classes == ["background_job"]  # §4: findings ride as background_job
 
 
 @pytest.mark.asyncio
@@ -448,12 +451,12 @@ async def test_failed_findings_post_posts_failure_note(monkeypatch):
     class _FailingThenNoteClient(_FakeClient):
         async def send_message(self, channel_id, thread_id, text, blocks=None, lease=None, surface=None,
                                receipts=None, receipt_kind=None,
-                               meta_out=None, username=None):
+                               meta_out=None, username=None, receipt_class=None):
             if "hit a wall" not in text:
                 return None  # the findings post itself fails
             return await super().send_message(channel_id, thread_id, text,
                                               blocks=blocks, meta_out=meta_out,
-                                              username=username)
+                                              username=username, receipt_class=receipt_class)
 
     client = _FailingThenNoteClient()
     await rt._run_background_job(
@@ -1546,13 +1549,14 @@ async def test_a_published_chart_does_not_count_as_the_findings(monkeypatch):
     class _ReportFailsOnce(_CardClient):
         async def send_message(self, channel_id, thread_id, text, blocks=None, lease=None, surface=None,
                                receipts=None, receipt_kind=None,
-                               meta_out=None, username=None):
+                               meta_out=None, username=None, receipt_class=None):
             if "# Findings" in text:
                 posts["n"] += 1
                 if posts["n"] == 1:
                     return None          # the first report post fails
             return await super().send_message(channel_id, thread_id, text, blocks=blocks,
-                                              meta_out=meta_out, username=username)
+                                              meta_out=meta_out, username=username,
+                                              receipt_class=receipt_class)
 
     stub = _PlanStub(text=REPORT, plan={"reply": "Findings + a chart.", "publish": ["art_1"],
                                         "post_report": True})
@@ -1579,11 +1583,12 @@ async def test_a_cheerful_reply_cannot_mask_a_lost_report(monkeypatch):
     class _ReportAlwaysFails(_CardClient):
         async def send_message(self, channel_id, thread_id, text, blocks=None, lease=None, surface=None,
                                receipts=None, receipt_kind=None,
-                               meta_out=None, username=None):
+                               meta_out=None, username=None, receipt_class=None):
             if "# Findings" in text:
                 return None
             return await super().send_message(channel_id, thread_id, text, blocks=blocks,
-                                              meta_out=meta_out, username=username)
+                                              meta_out=meta_out, username=username,
+                                              receipt_class=receipt_class)
 
     stub = _PlanStub(text=REPORT, plan={"reply": "All done!", "publish": [],
                                         "post_report": True})

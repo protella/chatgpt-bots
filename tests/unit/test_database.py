@@ -965,7 +965,7 @@ class TestSingleStreamSchema:
     def test_receipt_columns_and_primary_key(self, temp_db):
         assert self._columns(temp_db, "outbound_receipts") == {
             "team_id", "channel_id", "message_ts", "turn_id", "state", "thread_root_ts",
-            "created_ts", "finalized_ts"}
+            "receipt_class", "created_ts", "finalized_ts"}
         pk = [row[1] for row in temp_db.conn.execute("PRAGMA table_info(outbound_receipts)")
               if row[5]]
         assert pk == ["team_id", "channel_id", "message_ts"]

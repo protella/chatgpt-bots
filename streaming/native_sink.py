@@ -122,7 +122,9 @@ class NativeStreamCoordinator:
         if self._receipts is None:
             return
         try:
-            await self._receipts.note_post(ts, thread_root_ts=self.thread_ts)
+            # Spec §4: every native stream part is the answer itself — assistant_reply.
+            await self._receipts.note_post(ts, thread_root_ts=self.thread_ts,
+                                           receipt_class="assistant_reply")
         except Exception as e:  # noqa: BLE001
             self._log(f"native part receipt failed: {e}")
 

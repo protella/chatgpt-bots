@@ -5,8 +5,9 @@ import random
 import re
 import time
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 from uuid import uuid4
 
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
@@ -18,9 +19,13 @@ from config import (SUPPORTED_CHAT_MODELS, config, dev_epoch_fence_requested,
                     pipeline_status_markers, valid_emoji_name)
 from message_processor import participation_telemetry
 from message_processor.stale_send_guard import StaleSendSuppressed
+from message_processor.turn_runtime import (DEST_KIND_CORRECTION_ANNOUNCEMENT,
+                                            EDIT_STATE_COMMITTED, EditRecord, EffectRevoked,
+                                            LaunchNotRecorded, mark_tool_launched, run_effect)
 from message_markers import (
     CONTINUATION_HEAD,
     continuation_trailer,
+    extract_continuation_markers,
     fence_safe_chunks,
     is_checklist_status_text,
 )
@@ -96,6 +101,68 @@ def _epoch_refused(client: Any, channel_id: Optional[str], site: str) -> bool:
             log(f"Epoch fence refused {site}: {e}")
         return True
 
+# EDIT §5: one process-wide keyed async lock per (team, channel, message_ts) — the WHOLE
+# edit_own_message transaction runs under it, preflight through accounting, so two turns can
+# never both announce and overwrite one message. Module-level on purpose (the keying is
+# process-wide, not per client instance). §11.11: an entry is PRUNED when it is uncontended at
+# transaction end, so the map never grows monotonically with the messages ever edited.
+_EDIT_TRANSACTION_LOCKS: Dict[Any, "asyncio.Lock"] = {}
+
+
+def _edit_transaction_lock(team_id: Any, channel_id: Any, message_ts: Any) -> "asyncio.Lock":
+    key = (team_id, channel_id, message_ts)
+    lock = _EDIT_TRANSACTION_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _EDIT_TRANSACTION_LOCKS[key] = lock
+    return lock
+
+
+def _prune_edit_transaction_lock(key: Any, lock: "asyncio.Lock") -> None:
+    """§11.11: drop the map entry when its transaction ends uncontended.
+
+    Sound because the fetch (`_edit_transaction_lock`) and the start of acquisition happen
+    without an intervening suspension point: a contender is either already IN `_waiters` (or
+    holding the lock) — in which case the entry survives — or has not fetched yet, and will
+    fetch a fresh entry with nothing left to race."""
+    if (_EDIT_TRANSACTION_LOCKS.get(key) is lock and not lock.locked()
+            and not getattr(lock, "_waiters", None)):
+        del _EDIT_TRANSACTION_LOCKS[key]
+
+
+@asynccontextmanager
+async def _edit_transaction_locked(team_id: Any, channel_id: Any, message_ts: Any):
+    """The §5 keyed critical section, with the §11.11 pruning on the way out. The fetch and
+    the start of acquisition run without an intervening suspension point (the fast-path
+    acquire never yields), which is what makes the prune sound."""
+    key = (team_id, channel_id, message_ts)
+    lock = _edit_transaction_lock(team_id, channel_id, message_ts)
+    try:
+        async with lock:
+            yield
+    finally:
+        _prune_edit_transaction_lock(key, lock)
+
+
+def _strip_block_ids(value: Any) -> Any:
+    """Blocks as WE wrote them: Slack stamps server-side `block_id`s on read-back, and the §5
+    ambiguous-update equality is about the content we sent, not identifiers we never chose."""
+    if isinstance(value, dict):
+        return {k: _strip_block_ids(v) for k, v in value.items() if k != "block_id"}
+    if isinstance(value, (list, tuple)):
+        return [_strip_block_ids(v) for v in value]
+    return value
+
+
+def _blocks_match(fetched: Any, rebuilt: Any) -> bool:
+    """§5's footer-reply equality half: the exact rebuilt blocks, modulo the `block_id`s Slack
+    mints on storage. Anything unreadable compares unequal — no blind retry either way."""
+    try:
+        return _strip_block_ids(fetched or []) == _strip_block_ids(rebuilt or [])
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # Block action_ids that mark a message as one of our UI helpers (channel footer's
 # Configure button, Phase H feedback strip + its user-settings button). PURE-chrome
 # messages are not conversation — the history rebuild must never feed them back into
@@ -160,6 +227,17 @@ def _note_first_accept(callback: Optional[Callable[[str], None]], ts: Optional[s
         callback(ts)
     except Exception:  # noqa: BLE001
         pass
+
+
+# EDIT §11.21: announcement-send exceptions whose PHYSICAL outcome is ambiguous — the request
+# may already have reached Slack when they were raised. Timeouts and connection failures are
+# raised at/after dispatch (and a reconciliation miss re-raises exactly those, flagged via
+# meta_out["transport_ambiguous"] for the types this tuple cannot anticipate); SlackApiError
+# rides along defensively for the paths where it escapes rather than becoming a None return.
+# Every exception OUTSIDE this classification is deterministic-local: raised before anything
+# could reach Slack.
+_AMBIGUOUS_SEND_EXC = (SlackApiError, TimeoutError, ConnectionError, OSError,
+                       asyncio.TimeoutError)
 
 
 def _is_ui_helper_message(msg: dict) -> bool:
@@ -763,13 +841,18 @@ class SlackMessagingMixin:
 
     async def _record_receipt(self, channel_id: Optional[str], message_ts: Optional[str], *,
                               receipts: Any = None, receipt_kind: Optional[str] = None,
+                              receipt_class: Optional[str],
                               thread_root_ts: Optional[str] = None, site: str = "") -> None:
-        """Spec §5 intent contract for one durable post. Never raises into the send path."""
+        """Spec §5 intent contract for one durable post. Never raises into the send path.
+
+        `receipt_class` (EDIT_OWN_MESSAGE §4) is a required keyword with no default: every
+        posting site says what kind of surface it minted."""
         from message_processor.outbound_receipts import record_transport_post
         try:
             await record_transport_post(
                 team_id=getattr(self, "self_team_id", None), channel_id=channel_id,
                 message_ts=message_ts, receipts=receipts, receipt_kind=receipt_kind,
+                receipt_class=receipt_class,
                 thread_root_ts=thread_root_ts, site=site)
         except Exception as e:  # noqa: BLE001
             self.log_debug(f"receipt record failed at {site}: {e}")
@@ -793,9 +876,15 @@ class SlackMessagingMixin:
                            surface: str = "final_post",
                            receipts: Any = None,
                            receipt_kind: Optional[str] = None,
+                           receipt_class: Optional[str] = None,
                            on_first_accept: Optional[Callable[[str], None]] = None
                            ) -> Optional[str]:
         """Send a text message to Slack, splitting if needed.
+
+        `receipt_class` (EDIT_OWN_MESSAGE §4): the caller-stamped class for the receipt this
+        post earns — a reply site stamps `assistant_reply`, a notice site `system_notice`, a
+        job delivery `background_job`. Every channel producer passes it explicitly; the
+        split-abort truncation notice below stamps its own `system_notice`.
 
         Returns the posted message ts (the FIRST chunk's ts when split), or None on
         failure. Truthy-on-success, so legacy `if await send_message(...)` callers keep
@@ -820,6 +909,13 @@ class SlackMessagingMixin:
         reports whether the footer ACTUALLY rode the message, so the caller sets its
         footer_attached flag from reality (a split/too-long reply must still get the
         separate footer)."""
+        # §11.9: a receipted post says its class in the SAME call. A ledger with no class is a
+        # programming error, refused loudly here — before Slack — rather than laundered into a
+        # NULL (class-ineligible) row after the message is already in the room.
+        if receipts is not None and receipt_class is None:
+            raise ValueError(
+                "send_message: receipts passed without receipt_class (EDIT §4/§11.9)")
+
         def _set_attached(v: bool) -> None:
             if meta_out is not None:
                 meta_out["footer_attached"] = v
@@ -880,6 +976,12 @@ class SlackMessagingMixin:
                     reconciled_ts = await self._reconcile_uncertain_post(
                         channel_id, thread_id, formatted_text, attempt_start)
                     if not reconciled_ts:
+                        # §11.21: mark the re-raise as a RECONCILIATION MISS — the request may
+                        # have reached Slack, whatever the exception's type — so a caller that
+                        # must classify the outcome (edit_own_message's announcement) can call
+                        # it unknown rather than guessing from the type.
+                        if meta_out is not None:
+                            meta_out["transport_ambiguous"] = True
                         raise
                     self.log_warning(
                         f"Final post response timed out but the message landed "
@@ -900,6 +1002,7 @@ class SlackMessagingMixin:
                         parts_delivered=1, parts_total=1))
                 await self._record_receipt(
                     channel_id, posted_ts, receipts=receipts, receipt_kind=receipt_kind,
+                    receipt_class=receipt_class,
                     thread_root_ts=thread_id, site="send_message")
                 # Report footer attachment only AFTER Slack returns a ts — a post that never
                 # landed hasn't attached anything, and the separate footer must still fire.
@@ -964,7 +1067,8 @@ class SlackMessagingMixin:
                             # They finalize together when the turn settles.
                             await self._record_receipt(
                                 channel_id, result.get("ts"), receipts=receipts,
-                                receipt_kind=receipt_kind, thread_root_ts=thread_id,
+                                receipt_kind=receipt_kind, receipt_class=receipt_class,
+                                thread_root_ts=thread_id,
                                 site="send_message_split")
                             posted = True
                             break
@@ -1005,6 +1109,7 @@ class SlackMessagingMixin:
                             await self._record_receipt(
                                 channel_id, notice.get("ts") if notice else None,
                                 receipts=receipts, receipt_kind="finalized",
+                                receipt_class="system_notice",
                                 thread_root_ts=thread_id, site="send_message_truncation")
                         except SlackApiError:
                             pass  # posting is broken; the ERROR log above stays loud
@@ -1134,11 +1239,16 @@ class SlackMessagingMixin:
                                   lease: Any = None,
                                   surface: str = "legacy_seed",
                                   receipts: Any = None,
-                                  receipt_kind: Optional[str] = None) -> Dict:
+                                  receipt_kind: Optional[str] = None,
+                                  receipt_class: Optional[str] = None) -> Dict:
         """Send a message and return the response including timestamp.
 
         `lease` (stale guard): the legacy streaming path seeds its reply with this call, so it
         is a first answer surface and is checked like one."""
+        # §11.9: receipts-without-class is a programming error — see send_message.
+        if receipts is not None and receipt_class is None:
+            raise ValueError(
+                "send_message_get_ts: receipts passed without receipt_class (EDIT §4/§11.9)")
         if lease is not None:
             lease.authorize(surface)
         _epoch_authorize(self, channel_id, f"send_message_get_ts:{surface}")
@@ -1161,6 +1271,7 @@ class SlackMessagingMixin:
             
             await self._record_receipt(
                 channel_id, result.get("ts"), receipts=receipts, receipt_kind=receipt_kind,
+                receipt_class=receipt_class,
                 thread_root_ts=thread_id, site="send_message_get_ts")
             if lease is not None:
                 lease.commit()
@@ -1171,7 +1282,8 @@ class SlackMessagingMixin:
 
     async def _record_pending_share(self, channel_id: Optional[str], file_id: Optional[str],
                                     receipts: Any, thread_id: Optional[str],
-                                    site: str, resolve_share: bool = False) -> None:
+                                    site: str, resolve_share: bool = False, *,
+                                    receipt_class: Optional[str]) -> None:
         """Spec §5: an upload has no message ts, so the file id is the only handle we can
         record. Written the instant Slack returns it, before resolution starts — the crash
         window in between is accepted (Slack supplies no id before the upload).
@@ -1186,10 +1298,13 @@ class SlackMessagingMixin:
         from message_processor.outbound_receipts import (record_pending_share,
                                                          schedule_share_resolution)
         try:
+            # Spec §4/§11.13: every image/file share is class `artifact` — stamped by the
+            # PRODUCER on the transport call, carried end-to-end into the resolved receipt.
             await record_pending_share(
                 getattr(self, "db", None), team_id=getattr(self, "self_team_id", None),
                 channel_id=channel_id, file_id=file_id,
-                owner_turn_id=getattr(receipts, "owner_id", ""), thread_root_ts=thread_id)
+                owner_turn_id=getattr(receipts, "owner_id", ""), thread_root_ts=thread_id,
+                receipt_class=receipt_class)
         except Exception as e:  # noqa: BLE001
             self.log_debug(f"pending share record failed at {site}: {e}")
         if not resolve_share:
@@ -1227,7 +1342,8 @@ class SlackMessagingMixin:
 
     async def send_image(self, channel_id: str, thread_id: str, image_data: bytes, filename: str,
                          caption: str = "", meta_out: Optional[dict] = None,
-                         receipts: Any = None) -> Optional[str]:
+                         receipts: Any = None, *,
+                         receipt_class: Optional[str]) -> Optional[str]:
         """Send an image to Slack and return the file URL.
 
         `meta_out` (F7): optional dict the caller reads back — `meta_out["file_id"]` is the
@@ -1236,7 +1352,14 @@ class SlackMessagingMixin:
         side channel rather than breaking every existing caller. It exists because
         files_upload_v2 hands back no share ts: the file id is the only handle from which the
         image message's ts can later be resolved (see resolve_file_share_ts).
+
+        `receipt_class` (§11.9/§11.13) is REQUIRED — producers pass `artifact` (the §4
+        inventory: an image share is job output, never hardcoded in the transport), and
+        receipts-without-class raises BEFORE Slack.
         """
+        if receipts is not None and receipt_class is None:
+            raise ValueError(
+                "send_image: receipts passed without receipt_class (EDIT §4/§11.9)")
         # BEFORE the upload, never after: an upload is irreversible and visible, so authorizing
         # it afterwards fences nothing.
         _epoch_authorize(self, channel_id, "send_image")
@@ -1257,7 +1380,8 @@ class SlackMessagingMixin:
                 if meta_out is not None:
                     meta_out["file_id"] = file_info.get("id")
                 await self._record_pending_share(
-                    channel_id, file_info.get("id"), receipts, thread_id, "send_image")
+                    channel_id, file_info.get("id"), receipts, thread_id, "send_image",
+                    receipt_class=receipt_class)
                 self.log_info(f"Image uploaded: {filename} - URL: {file_url}")
                 return file_url
             else:
@@ -1383,7 +1507,8 @@ class SlackMessagingMixin:
     async def send_file(self, channel_id: str, thread_id: str, file_data,
                         filename: str, title: Optional[str] = None,
                         initial_comment: str = "",
-                        receipts: Any = None) -> Optional[Dict[str, Any]]:
+                        receipts: Any = None, *,
+                        receipt_class: Optional[str]) -> Optional[Dict[str, Any]]:
         """F32: upload an arbitrary file (BytesIO) and return its full Slack identity.
 
         Distinct from send_image, which returns a bare URL: an artifact has to be findable
@@ -1392,8 +1517,13 @@ class SlackMessagingMixin:
         re-read its own artifact.
 
         Returns None on any failure — the caller decides whether that's fatal (for an
-        artifact it never is: the text answer already landed).
+        artifact it never is: the text answer already landed). `receipt_class`
+        (§11.9/§11.13) is REQUIRED — producers pass `artifact` (the §4 inventory, never
+        hardcoded in the transport), and receipts-without-class raises BEFORE Slack.
         """
+        if receipts is not None and receipt_class is None:
+            raise ValueError(
+                "send_file: receipts passed without receipt_class (EDIT §4/§11.9)")
         _epoch_authorize(self, channel_id, "send_file")
         try:
             result = await self.app.client.files_upload_v2(
@@ -1420,7 +1550,8 @@ class SlackMessagingMixin:
             identity = {"file_id": file_id, "url_private": url,
                         "permalink": info.get("permalink")}
             await self._record_pending_share(
-                channel_id, file_id, receipts, thread_id, "send_file", resolve_share=True)
+                channel_id, file_id, receipts, thread_id, "send_file", resolve_share=True,
+                receipt_class=receipt_class)
             self.log_info(f"File uploaded: {filename} (id={file_id})")
             return identity
         except SlackApiError as e:
@@ -1431,8 +1562,13 @@ class SlackMessagingMixin:
             return None
 
     async def send_thinking_indicator(self, channel_id: str, thread_id: str,
-                                      receipts: Any = None) -> Optional[str]:
+                                      receipts: Any = None, *,
+                                      receipt_class: Optional[str]) -> Optional[str]:
         """Show a progress indicator; returns the placeholder message ts, or None.
+
+        `receipt_class` (§11.9/§11.13) is REQUIRED — producers pass `chrome` (the §4
+        inventory: a placeholder is excluded scaffolding until promotion, never hardcoded in
+        the transport), and receipts-without-class raises BEFORE Slack.
 
         Contract: assistant.threads.setStatus is the SOLE indicator wherever Slack
         accepts it — the June-2026 agent surface renders the composer status in DMs
@@ -1445,6 +1581,10 @@ class SlackMessagingMixin:
         Only where setStatus FAILS (non-agent contexts, older surfaces) do we post
         the classic "Thinking..." placeholder and return its ts.
         """
+        if receipts is not None and receipt_class is None:
+            raise ValueError(
+                "send_thinking_indicator: receipts passed without receipt_class "
+                "(EDIT §4/§11.9)")
         if _epoch_refused(self, channel_id, "send_thinking_indicator"):
             return None
         status_set = await self.set_assistant_status(channel_id, thread_id)
@@ -1457,9 +1597,12 @@ class SlackMessagingMixin:
                 text=f"{config.circle_loader_emoji} {config.random_loading_message()}"
             )
             # Chrome until the turn writes its answer INTO it — the streaming handlers promote
-            # it (same owner) right before the first answer-bearing edit.
+            # it (same owner) right before the first answer-bearing edit, and the promotion
+            # atomically maps the class chrome → assistant_reply (spec §4). The class is the
+            # caller's stamp (§11.13 — producers pass chrome).
             await self._record_receipt(
                 channel_id, result.get("ts"), receipts=receipts, receipt_kind="chrome",
+                receipt_class=receipt_class,
                 thread_root_ts=thread_id, site="send_thinking_indicator")
             return result.get("ts")  # Return message timestamp for deletion
         except SlackApiError as e:
@@ -1482,7 +1625,8 @@ class SlackMessagingMixin:
                              lease: Any = None,
                              surface: str = "error_notice",
                              receipts: Any = None,
-                             receipt_kind: Optional[str] = None) -> bool:
+                             receipt_kind: Optional[str] = None,
+                             receipt_class: Optional[str] = None) -> bool:
         """Update a message in Slack.
 
         `lease` (stale guard): passed by the callers whose edit publishes TERMINAL text — an
@@ -1491,6 +1635,11 @@ class SlackMessagingMixin:
         must not be written: the suppression terminal is the honest record, and "something went
         wrong" would be a claim about a turn where nothing did. Chrome callers pass nothing and
         are unaffected."""
+        # §11.9/§11.13: a receipted edit says its class in the SAME call — refused loudly
+        # BEFORE Slack, never laundered into a class-less (NULL) row after the write landed.
+        if receipts is not None and receipt_class is None:
+            raise ValueError(
+                "update_message: receipts passed without receipt_class (EDIT §4/§11.9)")
         if lease is not None:
             lease.authorize(surface)
         try:
@@ -1508,7 +1657,7 @@ class SlackMessagingMixin:
             if receipts is not None and receipt_kind:
                 await self._record_receipt(
                     channel_id, message_id, receipts=receipts, receipt_kind=receipt_kind,
-                    site="update_message")
+                    receipt_class=receipt_class, site="update_message")
             # A terminal notice that LANDED is what the room saw, so this turn has spoken —
             # exactly like every other transport. Without it a leased error notice stayed
             # `pending`, and any later visible piece of the same turn could still be refused
@@ -1522,12 +1671,19 @@ class SlackMessagingMixin:
 
     async def post_status_card(self, channel_id: str, thread_id: str, text: str,
                                blocks: list, username: Optional[str] = None,
-                               receipts: Any = None) -> Optional[str]:
+                               receipts: Any = None, *,
+                               receipt_class: Optional[str]) -> Optional[str]:
         """F30.1: post a blocks status card (e.g. the deep-research todo card). Returns the
         posted ts, or None on failure. `text` is the CONSTANT notification fallback; `blocks`
         carry the visible card. `username` optionally labels the poster (needs the
         chat:write.customize scope; without it Slack raises missing_scope → None so the caller
-        can retry unlabeled). Best-effort — never raises."""
+        can retry unlabeled). Best-effort — never raises, EXCEPT the §11.9/§11.13 contract:
+        `receipt_class` is REQUIRED (its producers pass `background_job` — the §4 inventory,
+        never hardcoded in the transport), and receipts-without-class is a programming error
+        raised BEFORE Slack."""
+        if receipts is not None and receipt_class is None:
+            raise ValueError(
+                "post_status_card: receipts passed without receipt_class (EDIT §4/§11.9)")
         if _epoch_refused(self, channel_id, "post_status_card"):
             return None
         try:
@@ -1536,8 +1692,11 @@ class SlackMessagingMixin:
             if username:
                 kwargs["username"] = username
             result = await self.app.client.chat_postMessage(**kwargs)  # unleased-ok: post_ephemeral-style helper for chrome/notices, not the turn's answer
+            # A background job's own status surface: chrome STATE (never in the stream),
+            # class per the caller's §4 stamp (research status/checklist ⇒ background_job).
             await self._record_receipt(
                 channel_id, result.get("ts"), receipts=receipts, receipt_kind="chrome",
+                receipt_class=receipt_class,
                 thread_root_ts=thread_id, site="post_status_card")
             return result.get("ts")
         except SlackApiError as e:
@@ -2609,7 +2768,8 @@ class SlackMessagingMixin:
             posted = await self.send_message(
                 channel_id, target, text, lease=lease, surface="post_to_thread",
                 meta_out=send_meta, on_first_accept=_observe,
-                receipts=getattr(turn, "receipt_ledger", None) if turn is not None else None)
+                receipts=getattr(turn, "receipt_ledger", None) if turn is not None else None,
+                receipt_class="assistant_reply")
             if not posted:
                 return None, None
             landed = send_meta.get("delivery")
@@ -2682,6 +2842,641 @@ class SlackMessagingMixin:
                     "message": (f"Only {delivery.parts_delivered} of {delivery.parts_total} "
                                 "parts reached that thread; the rest failed to post.")}
         return {"ok": True, "thread_ts": target, "posted_ts": posted_ts}
+
+    # ------------------------------------------------------------------ edit_own_message (EDIT)
+
+    # §2c's one refusal for a target that is not on this turn's mapping — identical whether the
+    # ts exists, is somebody else's, is chrome, or was invented, so a probe learns nothing.
+    _EDIT_UNAUTHORIZED = {
+        "ok": False, "error": "unauthorized_target",
+        "message": "That message was not an editable reply shown to you this turn.",
+    }
+
+    def get_edit_own_message_tool_schema(self) -> dict:
+        """EDIT §3: the one static schema, both surfaces (the DM surface never exposes it).
+        No channel_id, no thread_ts, no announcement text, no old-text echo — the channel comes
+        from the ToolContext exactly as post_to_thread's does, and the disclosure is SYNTHESIZED
+        by the executor so it can never be omitted or weakened."""
+        return {
+            "type": "function",
+            "name": "edit_own_message",
+            "description": (
+                "Replace the text of ONE of your own earlier messages in this channel. This is "
+                "the exception, not the default: correct yourself with a NEW message unless the "
+                "standing wrong text itself would keep misleading anyone who reads it where it "
+                "is. Every edit posts a public correction notice into the edited message's "
+                "thread — there is no silent edit."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_ts": {
+                        "type": "string",
+                        "description": ("Exact ts of one editable assistant message shown in "
+                                        "this channel stream or returned by a read tool this "
+                                        "turn."),
+                    },
+                    "new_text": {
+                        "type": "string",
+                        "description": ("Complete corrected replacement body in normal "
+                                        "markdown. Omit continuation markers and footer "
+                                        "chrome; the tool preserves those."),
+                    },
+                    "correction_note": {
+                        "type": "string",
+                        "description": ("A concise public description of the specific fact or "
+                                        "detail being corrected."),
+                    },
+                },
+                "required": ["message_ts", "new_text", "correction_note"],
+            },
+        }
+
+    async def execute_edit_own_message(self, ctx, args: dict) -> dict:
+        """Thin observability shim: every refusal names itself in the log — the quiet
+        validation returns are invisible otherwise (the tool loop logs only ok/error), and a
+        live refusal with no name cost a debugging round."""
+        result = await self._execute_edit_own_message(ctx, args)
+        if isinstance(result, dict) and not result.get("ok"):
+            self.log_info(f"edit_own_message refused: {result.get('error')}")
+        return result
+
+    async def _execute_edit_own_message(self, ctx, args: dict) -> dict:
+        """EDIT §5/§7: the two-effect transaction — disclosure FIRST, overwrite second.
+
+        The ENTIRE transaction (preflight re-reads → announcement → post-announcement second
+        read → epoch authorization + chat.update → ambiguous-result reconciliation →
+        EditRecord/accounting) runs under ONE process-wide keyed lock `(team, channel, ts)`,
+        INSIDE one `run_effect` lease, so a cancellation after launch cannot split the pair and
+        two turns can never both announce and overwrite. `StaleSendSuppressed` from the
+        announcement's leased send re-raises UNCHANGED, exactly as post_to_thread's does — the
+        conversation moved on and nothing was attempted.
+
+        §11.14/§11.22: the `edit_failed` backstop guards from the executor's LITERAL first
+        line — the imports live at module scope and even the ctx reads run inside the try, so
+        a raising context property answers `edit_failed`, never a traceback. §11.15/§11.19:
+        acceptance accounting happens at send_message's `on_first_accept` seam over a
+        PRE-CREATED EditRecord, and is verified-and-repaired in-lock after the send.
+        §11.16/§11.21: announcement-send exceptions are classified exhaustively —
+        ambiguous-outcome ones return `announcement_outcome_unknown`, deterministic-local ones
+        the §5 `announcement_failed` row; either way no update and no EditRecord."""
+        # §11.22: nothing but bare-literal assignments before the try — exactly the names the
+        # except handlers read, none of which can raise.
+        channel_id: Optional[str] = None
+        message_ts = ""
+        turn = None
+        # Mutable cell rather than a nonlocal, so `_observe` (called from inside send_message)
+        # can read the landing thread the transaction resolved after the closure was built.
+        announcement_thread: Dict[str, Optional[str]] = {"ts": None}
+        # §11.8: the PHASE marker for the backstops. Filled the instant Slack accepts the
+        # disclosure, so an unexpected exception after that point can never be reported as a
+        # bare failure that invites a duplicate correction.
+        accepted: Dict[str, Any] = {"record": None, "ts": None}
+        try:
+            channel_id = getattr(ctx, "channel_id", None)
+            # §3: defense-in-depth for the surface the registration already hides this on. DMs
+            # have no receipts, so no exact-message proof can exist there.
+            if getattr(ctx, "is_dm", False) or str(channel_id or "").startswith("D"):
+                return {"ok": False, "error": "channel_only",
+                        "message": "Editing your own messages is only available in channels."}
+            if not channel_id:
+                return {"ok": False, "error": "no_channel", "message": "No channel to edit in."}
+            message_ts = str(args.get("message_ts") or "").strip()
+            if not message_ts:
+                return {"ok": False, "error": "missing_message_ts",
+                        "message": "A target message_ts is required."}
+            # §11.14/§11.22: model-supplied values are TYPE-CHECKED before any coercion — a
+            # numeric/list value must be `edit_failed`, never coerced into a postable string
+            # (str() on a list would PUBLISH the repr) and never laundered into an `empty_*`
+            # error by a falsey `or ""`.
+            raw_text = args.get("new_text")
+            raw_note = args.get("correction_note")
+            if (raw_text is not None and not isinstance(raw_text, str)) or \
+                    (raw_note is not None and not isinstance(raw_note, str)):
+                return {"ok": False, "error": "edit_failed",
+                        "message": "new_text and correction_note must be strings."}
+            # §11.17: citations are stripped BEFORE the emptiness checks — citation-only input
+            # names nothing, and a disclosure must never post about it.
+            new_text = strip_citations(raw_text or "")
+            if not new_text.strip():
+                return {"ok": False, "error": "empty_new_text",
+                        "message": "The complete corrected replacement text is required."}
+            note = strip_citations(raw_note or "").strip()
+            if not note:
+                return {"ok": False, "error": "empty_correction_note",
+                        "message": "A specific correction note is required."}
+            # §2: authorized iff the ts is a KEY of this round's mapping. Missing/malformed
+            # mapping is the EMPTY mapping — fail closed, never open.
+            targets = getattr(ctx, "authorized_edit_targets", None)
+            if not isinstance(targets, Mapping):
+                targets = {}
+            target = targets.get(message_ts)
+            if target is None or getattr(target, "channel_id", None) != channel_id:
+                return dict(self._EDIT_UNAUTHORIZED)
+            turn = getattr(ctx, "turn", None)
+            # §7: ONE edit attempt per turn, reserved atomically BEFORE any await — a second
+            # distinct call id is refused here (a duplicate of the SAME id never reaches this
+            # method twice; the tool flight serves it the first call's outcome).
+            if turn is not None:
+                if getattr(turn, "_edit_attempt_reserved", False):
+                    return {"ok": False, "error": "edit_already_attempted",
+                            "message": ("This turn already attempted an edit — one edit per "
+                                        "turn. Post a normal correction message instead if "
+                                        "more is needed.")}
+                turn._edit_attempt_reserved = True
+            team_id = getattr(self, "self_team_id", None)
+            lease = getattr(turn, "send_lease", None) if turn is not None else None
+            receipts = getattr(turn, "receipt_ledger", None) if turn is not None else None
+
+            # §11.19: the EditRecord is PRE-CREATED before the announcement send, so the
+            # acceptance observer below performs ASSIGNMENTS ONLY — and the post-send in-lock
+            # verification can repair whatever a swallowed callback crash cut short.
+            record = EditRecord(channel_id=channel_id, target_ts=message_ts,
+                                announcement_ts="")
+
+            def _observe(ts: str) -> None:
+                """§11.15/§11.19: the acceptance seam. Slack has taken the disclosure THIS
+                instant — inside send_message, BEFORE its receipt bookkeeping can raise — so
+                the durable facts land here, not after the send returns (§11.10 crash order).
+                Assignments only, in this order: the `turn.edits` append, the acceptance
+                flags, and `accepted["record"]` LAST — `_note_first_accept` swallows callback
+                exceptions, and with the phase marker set last a swallowed crash can never
+                leave the transaction believing the accounting succeeded."""
+                if turn is not None:
+                    turn.edits.append(record)
+                record.announcement_ts = ts
+                if turn is not None:
+                    turn.visible_action_committed = True
+                accepted["ts"] = ts
+                accepted["record"] = record
+
+            def _partial(record: Any, code: str, announcement_ts: str) -> dict:
+                """§5: the announcement landed and the overwrite did not. The model must NOT
+                post a second correction — the disclosure already carries it. Every partial
+                carries the CV10 join fact too: a landed disclosure ALWAYS has a committed
+                correction_announcement destination (review r5), committed here best-effort
+                when the normal path's commit never ran."""
+                record.error = code
+                if turn is not None and announcement_ts:
+                    try:
+                        already = any(
+                            getattr(d, "first_ts", None) == announcement_ts
+                            for d in getattr(turn, "destinations", ()) or ())
+                        if not already:
+                            # The synthesized disclosure text lives in the transaction body's
+                            # scope; on these exception paths the best-effort record carries
+                            # the note-derived reconstruction (the join key is the ts).
+                            turn.mark_destination_committed(
+                                first_ts=announcement_ts,
+                                kind=DEST_KIND_CORRECTION_ANNOUNCEMENT,
+                                text=f"Correction to my earlier message: {note}",
+                                complete=True, channel_id=channel_id,
+                                thread_root_ts=announcement_thread.get("ts"))
+                    except Exception as e:  # noqa: BLE001 — never fail a delivered disclosure
+                        self.log_debug(
+                            f"edit_own_message: could not record the announcement "
+                            f"destination on the partial path: {e}")
+                return {"ok": False, "error": code, "announcement_posted": True,
+                        "edited": False,
+                        "message_ts": message_ts, "announcement_ts": announcement_ts,
+                        "message": ("The correction notice is already posted in that thread; "
+                                    "the message itself was not changed. Do NOT post another "
+                                    "correction.")}
+
+            async def _transaction() -> dict:
+                async with _edit_transaction_locked(team_id, channel_id, message_ts):
+                    # §11.14: the post-acceptance backstop lives INSIDE the lock — its
+                    # accounting is part of the transaction, so no second contender can
+                    # interleave with a partial that is still being written down.
+                    try:
+                        return await self._edit_transaction_body(
+                            ctx, team_id, channel_id, message_ts, target, turn, lease,
+                            receipts, new_text, note, announcement_thread, accepted, record,
+                            _observe, _partial)
+                    except StaleSendSuppressed:
+                        raise
+                    except Exception as e:  # noqa: BLE001 — phase-aware, in-lock (§11.14)
+                        if accepted["record"] is None:
+                            # Pre-announcement: Slack is untouched — let the outer §11.14
+                            # backstop answer `edit_failed` (or its named refusals).
+                            raise
+                        self.log_error(
+                            f"edit_own_message: failed after the announcement for "
+                            f"{channel_id}/{message_ts}: {e}")
+                        return _partial(record, "edit_failed_after_announcement",
+                                        accepted["ts"])
+
+            # LEASED, and the lock is INSIDE the leased body: a caller that stops waiting
+            # does not stop the effect, and the lock is only released once the shielded
+            # transaction has actually finished its accounting — the in-lock backstop
+            # included.
+            return await run_effect(turn, "edit_own_message", _transaction)
+        except LaunchNotRecorded as e:
+            self.log_error(
+                f"edit_own_message: launch not recorded for {channel_id}/{message_ts}: {e}")
+            return {"ok": False, "error": "launch_not_recorded",
+                    "message": ("Something went wrong before the correction notice was posted, "
+                                "so nothing was changed.")}
+        except EffectRevoked:
+            self.log_warning(
+                f"edit_own_message: refused for {channel_id}/{message_ts} — the turn was cut "
+                "short")
+            return {"ok": False, "error": "turn_cancelled",
+                    "message": ("This turn was cut short before the correction went out, so "
+                                "nothing was posted and nothing was edited.")}
+        except StaleSendSuppressed:
+            # The conversation moved on before the disclosure landed. Nothing was attempted —
+            # re-raised UNCHANGED so the turn's own handler files it (matches post_to_thread).
+            raise
+        except Exception as e:  # noqa: BLE001 — a tool bug must not kill the response
+            # §11.8/§11.14: PHASE-AWARE, and it guards from the FIRST line of the executor —
+            # argument coercion included, so model-supplied junk never surfaces as a raw
+            # traceback. After the disclosure was accepted a bare failure would invite a
+            # duplicate correction, so the partial contract holds (normally already answered
+            # by the in-lock backstop; kept here as defense in depth).
+            record = accepted["record"]
+            if record is not None:
+                self.log_error(
+                    f"edit_own_message: failed after the announcement for "
+                    f"{channel_id}/{message_ts}: {e}")
+                return _partial(record, "edit_failed_after_announcement", accepted["ts"])
+            # Before the announcement, Slack is untouched: `edit_failed` is the §3
+            # pre-announcement backstop, and the model may fall back to a normal correction.
+            self.log_error(f"edit_own_message: failed for {channel_id}/{message_ts}: {e}")
+            return {"ok": False, "error": "edit_failed",
+                    "message": "Could not edit that message."}
+
+    async def _edit_transaction_body(self, ctx, team_id, channel_id: str, message_ts: str,
+                                     target, turn, lease, receipts, new_text: str, note: str,
+                                     announcement_thread: Dict[str, Optional[str]],
+                                     accepted: Dict[str, Any], record, _observe,
+                                     _partial) -> dict:
+        """The §5 two-effect transaction body, run under the keyed lock by
+        `execute_edit_own_message` (which owns the §11.14 backstops around it). `record` is
+        the §11.19 pre-created EditRecord the `_observe` acceptance seam assigns into."""
+        # -- preflight (§5 steps 1-4): everything read and validated before either
+        # -- mutation, under the same lock that covers the mutations.
+        row = await self._edit_preflight_receipt(ctx, team_id, channel_id, message_ts)
+        if row is None:
+            return dict(self._EDIT_UNAUTHORIZED)
+        thread_root = row.get("thread_root_ts") or None
+        live = await self._read_exact_message(channel_id, message_ts, thread_root)
+        if live is None:
+            return {"ok": False, "error": "stale_target",
+                    "message": ("That message could not be re-read as it stood — it "
+                                "may have changed or been deleted. Post a normal "
+                                "correction message instead.")}
+        if not self.is_own_message(live):
+            return dict(self._EDIT_UNAUTHORIZED)
+        if self._live_edited_ts(live) != getattr(target, "edited_ts", None):
+            return {"ok": False, "error": "stale_target",
+                    "message": ("That message changed after it was shown to you. Post "
+                                "a normal correction message instead.")}
+        shape = self._classify_edit_shape(live)
+        if shape is None:
+            return {"ok": False, "error": "unsupported_message_shape",
+                    "message": ("That message carries files, attachments or blocks an "
+                                "edit cannot faithfully preserve. Post a normal "
+                                "correction message instead.")}
+        shape_kind, footer_actions = shape
+        permalink = await self._edit_permalink(ctx, channel_id, message_ts)
+        if not permalink:
+            return {"ok": False, "error": "permalink_failed",
+                    "message": ("Could not link the target message for the public "
+                                "correction notice, so nothing was changed. Post a "
+                                "normal correction message instead.")}
+        live_text = live.get("text") or ""
+        prefix, _body, suffix = extract_continuation_markers(live_text)
+        # §11.17: `new_text` and `note` arrive citation-stripped — the validation stripped
+        # them BEFORE the emptiness checks, so there is nothing left to strip here.
+        formatted_body = self.format_text(new_text)
+        replacement = f"{prefix}{formatted_body}{suffix}"
+        if replacement == live_text:
+            return {"ok": False, "error": "no_change",
+                    "message": "The replacement is identical to the standing text."}
+        if shape_kind == "footer":
+            # §6: the inline-footer UX caps are the SEND path's — a replacement that no
+            # longer fits the section cannot ride this shape.
+            if (len(formatted_body) > self._SECTION_TEXT_LIMIT
+                    or len(formatted_body) > self._FOOTER_INLINE_MAX
+                    or formatted_body.count("\n") > 2):
+                return {"ok": False, "error": "edit_too_long_for_inline_footer",
+                        "message": ("The replacement no longer fits the inline-footer "
+                                    "message shape. Post a normal correction message "
+                                    "instead.")}
+        if len(replacement) > self.MAX_MESSAGE_LENGTH:
+            # NEVER split and never truncate an edit — the message is one message.
+            return {"ok": False, "error": "replacement_too_long",
+                    "message": (f"The replacement exceeds one Slack message "
+                                f"({self.MAX_MESSAGE_LENGTH} chars). Post a normal "
+                                "correction message instead.")}
+        # §5: the executor SYNTHESIZES the disclosure, so it can never be omitted or
+        # weakened — and it must fit ONE message; it never enters the split path.
+        announcement = f"Correction to [my earlier message]({permalink}): {note}"
+        formatted_announcement = self.format_text(announcement)
+        if len(formatted_announcement) > self.MAX_MESSAGE_LENGTH:
+            return {"ok": False, "error": "announcement_too_long",
+                    "message": ("The correction note is too long for one message — "
+                                "shorten it, or post a normal correction message "
+                                "instead.")}
+        announcement_thread["ts"] = thread_root or message_ts
+        # -- announcement FIRST (§5): the only order where a silent edit is
+        # -- unreachable. Launch is recorded immediately before the disclosure post.
+        mark_tool_launched(ctx)
+        send_meta: dict = {}
+        try:
+            posted = await self.send_message(
+                channel_id, announcement_thread["ts"], announcement, lease=lease,
+                surface="edit_own_message", meta_out=send_meta, on_first_accept=_observe,
+                receipts=receipts, receipt_kind="finalized",
+                receipt_class="correction_announcement")
+        except StaleSendSuppressed:
+            raise
+        except Exception as send_error:  # noqa: BLE001 — §11.16/§11.21 exhaustive
+            if accepted["record"] is not None:
+                # Slack ACCEPTED the disclosure (the seam fired), then the send's own
+                # bookkeeping raised — the record stands (§11.15/§11.19) and the in-lock
+                # backstop answers with the partial contract, never a bare failure.
+                raise
+            delivery = send_meta.get("delivery")
+            accepted_ts = getattr(delivery, "first_ts", None) if delivery is not None else None
+            if accepted_ts:
+                # The COMBINED failure (§11.19 review r4): Slack accepted the disclosure but
+                # the acceptance callback's own accounting crashed (swallowed by
+                # _note_first_accept, so accepted["record"] never set) AND the send then
+                # raised. A visible announcement must never escape accounting or read as
+                # announcement_failed — repair in-lock and answer with the partial contract.
+                record.announcement_ts = str(accepted_ts)
+                if turn is not None and record not in turn.edits:
+                    turn.edits.append(record)
+                if turn is not None:
+                    turn.visible_action_committed = True
+                accepted["ts"] = str(accepted_ts)
+                accepted["record"] = record
+                self.log_error(
+                    f"edit_own_message: acceptance accounting repaired after combined "
+                    f"callback+send failure for {channel_id}/{message_ts}: {send_error}")
+                return _partial(record, "edit_failed_after_announcement", str(accepted_ts))
+            if (isinstance(send_error, (_EPOCH_REFUSED,) + _AMBIGUOUS_SEND_EXC)
+                    or send_meta.get("transport_ambiguous")):
+                # §11.21: the notice's physical outcome is UNKNOWN — an epoch refusal at
+                # the announcement, a transport error after dispatch (SlackApiError, a
+                # timeout) or a reconciliation miss. The transaction STOPS: no update
+                # (silent-edit safety), no EditRecord, and the model is told the notice
+                # may already be visible.
+                self.log_error(
+                    f"edit_own_message: announcement outcome unknown for "
+                    f"{channel_id}/{message_ts}: {send_error}")
+                return {"ok": False, "error": "announcement_outcome_unknown",
+                        "message": ("The correction notice may or may not have posted — its "
+                                    "outcome is unknown — and the message was NOT edited. Do "
+                                    "not retry the edit; if a correction is still needed, post "
+                                    "at most ONE normal follow-up message.")}
+            # §11.21: every OTHER exception is deterministic-local — raised before anything
+            # could reach Slack — and maps to the §5 announcement_failed row: Slack
+            # untouched, and the model may fall back to a normal correction message.
+            self.log_error(
+                f"edit_own_message: announcement failed for "
+                f"{channel_id}/{message_ts}: {send_error}")
+            return {"ok": False, "error": "announcement_failed",
+                    "message": ("The public correction notice could not be posted, so "
+                                "the message was NOT edited. Post a normal correction "
+                                "message instead.")}
+        if not posted:
+            return {"ok": False, "error": "announcement_failed",
+                    "message": ("The public correction notice could not be posted, so "
+                                "the message was NOT edited. Post a normal correction "
+                                "message instead.")}
+        # §11.19: in-lock VERIFICATION-AND-REPAIR, before any update. `_note_first_accept`
+        # swallows callback exceptions, so the `_observe` accounting is PROVED here rather
+        # than trusted: whatever assignment a swallowed crash cut short is re-made (each is
+        # idempotent), and a transport that reported success without ever firing the seam
+        # is accounted the same way.
+        if not record.announcement_ts:
+            record.announcement_ts = posted
+        if turn is not None:
+            if record not in turn.edits:
+                self.log_error(
+                    f"edit_own_message: acceptance accounting for {channel_id}/"
+                    f"{message_ts} was cut short by a swallowed callback error — "
+                    f"repaired in-lock before the update")
+                turn.edits.append(record)
+            turn.visible_action_committed = True
+        if accepted["ts"] is None:
+            accepted["ts"] = record.announcement_ts
+        accepted["record"] = record
+        if turn is not None:
+            try:
+                # Best-effort destination OBSERVATION — moved out of the observer (§11.19
+                # allows it assignments only); the committed destination below is the
+                # durable record.
+                turn.note_destination_observed(
+                    channel_id=channel_id, first_ts=posted,
+                    kind=DEST_KIND_CORRECTION_ANNOUNCEMENT,
+                    thread_root_ts=announcement_thread.get("ts"))
+            except Exception as e:  # noqa: BLE001 — bookkeeping never fails a post
+                self.log_debug(f"edit_own_message: could not observe the announcement: {e}")
+        try:
+            # Only the destination/telemetry bookkeeping stays best-effort: the
+            # committed destination (kind correction_announcement, first_ts = its own
+            # ts — the CV10 join key) must never fail a delivered disclosure.
+            landed = send_meta.get("delivery")
+            turn.mark_destination_committed(
+                first_ts=posted, kind=DEST_KIND_CORRECTION_ANNOUNCEMENT,
+                text=landed.text if landed is not None else formatted_announcement,
+                complete=landed.complete if landed is not None else True,
+                channel_id=channel_id, thread_root_ts=announcement_thread["ts"])
+        except AttributeError:
+            pass  # no turn (a hand-built context): nothing to account on
+        except Exception as e:  # noqa: BLE001 — never fail a delivered disclosure
+            self.log_debug(f"edit_own_message: could not record the announcement: {e}")
+        # -- post-announcement SECOND exact read (§5): the target must still be the
+        # -- message that was proved, or nothing is overwritten.
+        second = await self._read_exact_message(channel_id, message_ts, thread_root)
+        if (second is None
+                or self._live_edited_ts(second) != getattr(target, "edited_ts", None)):
+            return _partial(record, "stale_target_after_announcement", posted)
+        # -- epoch authorization + the DEDICATED update ------------------------------
+        rebuilt_blocks = None
+        if shape_kind == "footer":
+            rebuilt_blocks = [{"type": "section",
+                              "text": {"type": "mrkdwn", "text": formatted_body}}
+                              ] + [footer_actions]
+        try:
+            await self._update_edited_message(channel_id, message_ts, replacement,
+                                              blocks=rebuilt_blocks)
+        except _EPOCH_REFUSED:
+            return _partial(record, "epoch_refused_after_announcement", posted)
+        except SlackApiError as e:
+            # Definitive API rejection: the correction notice stays visible — its
+            # wording is true either way — and there is no compensating deletion.
+            self.log_warning(
+                f"edit_own_message: update failed for {channel_id}/{message_ts}: {e}")
+            return _partial(record, "update_failed_after_announcement", posted)
+        except Exception as e:  # noqa: BLE001 — transport-ambiguous: reconcile, once
+            reconciled = await self._reconcile_uncertain_update(
+                channel_id, message_ts, thread_root, shape_kind, replacement,
+                rebuilt_blocks)
+            if not reconciled:
+                self.log_warning(
+                    f"edit_own_message: update outcome unknown for "
+                    f"{channel_id}/{message_ts}: {e}")
+                return _partial(record, "update_outcome_unknown_after_announcement",
+                                posted)
+        record.state = EDIT_STATE_COMMITTED
+        record.error = None
+        return {"ok": True, "message_ts": message_ts, "announcement_ts": posted,
+                "announcement_posted": True, "edited": True}
+
+    async def _edit_preflight_receipt(self, ctx, team_id, channel_id: str,
+                                      message_ts: str) -> Optional[dict]:
+        """§5 preflight step 1, receipt half: re-read the durable row and require finalized
+        `assistant_reply` — a legacy NULL-class row, chrome, and an unreadable DB all answer
+        None (fail closed, reveal nothing)."""
+        db = getattr(ctx, "db", None)
+        if db is None or not team_id:
+            return None
+        try:
+            payload = await db.read_channel_sidecars_for_async(team_id, channel_id,
+                                                               [message_ts])
+        except Exception as e:  # noqa: BLE001
+            self.log_warning(f"edit_own_message: receipt re-read failed for {message_ts}: {e}")
+            return None
+        for row in (payload or {}).get("receipts") or ():
+            if isinstance(row, dict) and str(row.get("message_ts")) == message_ts:
+                if (str(row.get("state")) == "finalized"
+                        and row.get("receipt_class") == "assistant_reply"):
+                    return row
+                return None
+        return None
+
+    async def _read_exact_message(self, channel_id: str, message_ts: str,
+                                  thread_root_ts: Optional[str]) -> Optional[dict]:
+        """§5: one EXACT Slack read of one message — the preflight read and the
+        post-announcement second read are both this. None on any failure or a missing ts."""
+        try:
+            if thread_root_ts and thread_root_ts != message_ts:
+                resp = await self.app.client.conversations_replies(
+                    channel=channel_id, ts=thread_root_ts, latest=message_ts,
+                    oldest=message_ts, inclusive=True, limit=1)
+            else:
+                resp = await self.app.client.conversations_history(
+                    channel=channel_id, latest=message_ts, oldest=message_ts, inclusive=True,
+                    limit=1)
+        except Exception as e:  # noqa: BLE001 — an unreadable target authorizes nothing
+            self.log_warning(f"edit_own_message: exact read failed for {message_ts}: {e}")
+            return None
+        for msg in (resp.get("messages") or ()) if resp else ():
+            if isinstance(msg, dict) and msg.get("ts") == message_ts:
+                return msg
+        return None
+
+    @staticmethod
+    def _live_edited_ts(message: dict) -> Optional[str]:
+        edited = message.get("edited")
+        ts = edited.get("ts") if isinstance(edited, dict) else None
+        return str(ts) if ts else None
+
+    @staticmethod
+    def _classify_edit_shape(live: dict) -> Optional[tuple]:
+        """§6: exactly two supported shapes, everything else refused.
+
+        ("plain", None) — no files/attachments, and either NO blocks or exactly ONE
+        Slack-minted `rich_text` mirror block (§11.25: Slack materializes one on every plain
+        chat.postMessage, so live read-back never shows a block-less plain message): the
+        update replaces formatted `text` and Slack remints the mirror.
+        ("footer", actions_block) — optional leading mrkdwn section + trailing actions block:
+        rebuilt as [new section] + the EXISTING actions block, byte-for-byte. STRICT (§11.4):
+        the section may carry ONLY `type`/`text` (+ the Slack-minted `block_id`) with mrkdwn
+        text — an `accessory`, `fields` or any other decoration cannot be faithfully rebuilt;
+        the actions block must carry EXACTLY ONE element, a BUTTON with action_id
+        `open_channel_settings` — duplicates and other element types are unsupported. None —
+        unsupported (files, attachments, rich-text or research blocks, unknown actions): never
+        silently dropped, never retained around a contradictory edit."""
+        if live.get("files") or live.get("attachments"):
+            return None
+        blocks = live.get("blocks") or []
+        if not blocks:
+            return "plain", None
+        # §11 live amendment (2026-08-05): Slack MATERIALIZES a `rich_text` block on every
+        # plain chat.postMessage, so "no blocks" never exists in read-back — the first live
+        # edit refused a one-line plain note as unsupported_message_shape. ONE rich_text
+        # block IS the plain shape: a text-only chat.update makes Slack regenerate it, which
+        # is exactly the replacement semantics the plain shape wants. Anything beyond that
+        # single Slack-minted mirror stays unsupported.
+        if len(blocks) == 1 and isinstance(blocks[0], dict) \
+                and blocks[0].get("type") == "rich_text":
+            return "plain", None
+        if len(blocks) == 1:
+            section, actions = None, blocks[0]
+        elif len(blocks) == 2:
+            section, actions = blocks[0], blocks[1]
+        else:
+            return None
+        if section is not None:
+            if not isinstance(section, dict) or section.get("type") != "section":
+                return None
+            if not set(section) <= {"type", "text", "block_id"}:
+                return None
+            section_text = section.get("text")
+            if (not isinstance(section_text, dict)
+                    or section_text.get("type") != "mrkdwn"):
+                return None
+        if not isinstance(actions, dict) or actions.get("type") != "actions":
+            return None
+        elements = actions.get("elements") or []
+        if len(elements) != 1:
+            return None
+        element = elements[0]
+        if (not isinstance(element, dict) or element.get("type") != "button"
+                or element.get("action_id") != "open_channel_settings"):
+            return None
+        return "footer", actions
+
+    async def _edit_permalink(self, ctx, channel_id: str, message_ts: str) -> Optional[str]:
+        """§5 preflight step 3: the permalink for the synthesized disclosure, via the existing
+        history-tool chat.getPermalink path. Any failure is None → `permalink_failed`, before
+        anything posts."""
+        try:
+            resp = await self.get_message_permalink_tool(channel_id, message_ts, ctx=ctx)
+        except Exception as e:  # noqa: BLE001
+            self.log_warning(f"edit_own_message: permalink failed for {message_ts}: {e}")
+            return None
+        if isinstance(resp, dict) and resp.get("ok") is True and resp.get("permalink"):
+            return str(resp["permalink"])
+        return None
+
+    async def _update_edited_message(self, channel_id: str, message_ts: str, text: str,
+                                     blocks: Optional[list] = None) -> None:
+        """§6/§7: the DEDICATED updater — NOT update_message and NOT the streaming updater
+        (wrong formatting, shape checks, reconciliation and epoch behavior). The caller has
+        already formatted and validated `text`; epoch authorization runs HERE, immediately
+        before the write, because generic updates don't check it and this one must. Raises —
+        the transaction owns the outcome classification."""
+        _epoch_authorize(self, channel_id, "edit_own_message:update")
+        kwargs: Dict[str, Any] = dict(channel=channel_id, ts=message_ts, text=text,
+                                      mrkdwn=True)
+        if blocks is not None:
+            kwargs["blocks"] = blocks
+        await self.app.client.chat_update(**kwargs)  # unleased-ok: inside the edit_own_message transaction's own run_effect lease
+
+    async def _reconcile_uncertain_update(self, channel_id: str, message_ts: str,
+                                          thread_root_ts: Optional[str], shape_kind: str,
+                                          replacement: str,
+                                          rebuilt_blocks: Optional[list]) -> bool:
+        """§5's ambiguous-update row: re-fetch the target and compare CONTENT — the exact
+        formatted text for a plain reply, the exact fallback text plus the exact rebuilt blocks
+        for a footer reply — NEVER Slack-generated `edited.ts`, and no blind retry. True means
+        the update landed (reconciled success). Block equality is "exact modulo the Slack-minted
+        `block_id`s" — §11.7 rules that stripping as the meaning of "exact rebuilt blocks"."""
+        fetched = await self._read_exact_message(channel_id, message_ts, thread_root_ts)
+        if fetched is None:
+            return False
+        if (fetched.get("text") or "") != replacement:
+            return False
+        if shape_kind == "footer":
+            return _blocks_match(fetched.get("blocks"), rebuilt_blocks)
+        return True
 
     def get_no_reply_tool_schema(self) -> dict:
         """Function-tool schema for the F2 terminal no-reply action (silence-capable turns only).
@@ -2972,7 +3767,8 @@ class SlackMessagingMixin:
                 )
                 await self._record_receipt(
                     channel_id, posted.get("ts") if posted else None, receipts=receipts,
-                    receipt_kind="chrome", thread_root_ts=thread_ts, site="feedback_footer")
+                    receipt_kind="chrome", receipt_class="chrome",
+                    thread_root_ts=thread_ts, site="feedback_footer")
                 return
             # Channels: per-channel settings footer.
             if not getattr(config, "enable_response_footer", True):
@@ -2992,6 +3788,7 @@ class SlackMessagingMixin:
             )
             await self._record_receipt(
                 channel_id, posted.get("ts") if posted else None, receipts=receipts,
-                receipt_kind="chrome", thread_root_ts=thread_ts, site="response_footer")
+                receipt_kind="chrome", receipt_class="chrome",
+                thread_root_ts=thread_ts, site="response_footer")
         except Exception as e:
             self.log_debug(f"Could not post response footer: {e}")
