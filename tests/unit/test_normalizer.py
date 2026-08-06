@@ -297,6 +297,36 @@ def test_reactions_count_falls_back_to_users(client):
         ("eyes", 2), ("tada", 7), ("shrug", 0)]
 
 
+def test_reaction_mine_is_membership_of_a_list_of_users_only(client):
+    """Slack puts the authenticated user in `users` whenever that user reacted, even when other
+    reactor ids are truncated — so a bigger `count` than `users` still reads as ours, and our
+    absence is a real non-reaction. Nothing but a list/tuple is tested for membership."""
+    rec = normalize_slack_message(client, _payload(reactions=[
+        {"name": "this", "count": 2, "users": ["U1", "UBOT"]},
+        {"name": "+1", "count": 2, "users": ["U1", "U2"]},
+        {"name": "eyes", "count": 40, "users": ["UBOT"]},
+        {"name": "wave", "count": 1},
+        {"name": "tada", "count": 1, "users": None},
+        {"name": "boom", "count": 1, "users": "UBOTHERED"},
+        {"name": "zap", "count": 1, "users": {"UBOT": 1}},
+    ]))
+    assert [(r.name, r.mine) for r in rec.reactions] == [
+        ("this", True), ("+1", False), ("eyes", True), ("wave", False),
+        ("tada", False), ("boom", False), ("zap", False)]
+
+
+def test_reaction_mine_fails_closed_without_an_identity():
+    """A caller that never wired `bot_user_id` gets `mine=False` everywhere rather than an
+    exception: the normalizer must not turn a missing identity into a failed read."""
+    anonymous = _Client()
+    anonymous.bot_user_id = None
+    rec = normalize_slack_message(anonymous, _payload(reactions=[
+        {"name": "this", "count": 1, "users": ["UBOT"]},
+        {"name": "+1", "count": 1, "users": ["U1"]},
+    ]))
+    assert [r.mine for r in rec.reactions] == [False, False]
+
+
 def test_edited_ts_reply_count_and_latest_reply_carried(client):
     rec = normalize_slack_message(client, _payload(
         edited={"user": "U1", "ts": "1752600180.000180"},
