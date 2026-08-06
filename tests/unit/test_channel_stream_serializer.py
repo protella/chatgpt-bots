@@ -1,4 +1,4 @@
-"""Grammar v3 of the channel stream, frozen byte for byte.
+"""Grammar v5 of the channel stream, frozen byte for byte.
 
 This is the contract the prompt cache, the stale-send guard and every cross-thread awareness
 claim rest on. `serialize_stream` is a pure function of the pinned tuple, so the tests are
@@ -9,6 +9,9 @@ The MESSAGE-item grammar below is v1's, unchanged, and it stays asserted here: v
 items exist and what the framing items say, not how a message renders. What v3 removed — the
 summary item and the anchor map — is asserted absent here and tripwired in
 `test_retired_machinery.py`; the escaping and the freeze it kept are asserted below.
+
+v5 changed exactly one marker: a reaction the bot itself placed renders a " (you)" suffix.
+Everything v3 removed stays removed; the rest of the grammar is unchanged.
 """
 from __future__ import annotations
 
@@ -290,6 +293,30 @@ def test_reactions_marker_takes_top_two_by_count_then_name():
                                      ReactionRec("bbb", 9)])
     assert contents(serialize_stream(pinned([m])))[1].split("\n")[-1] == (
         "[reactions: 9× bbb, 3× aaa]")
+
+
+def test_a_reaction_the_bot_placed_renders_a_you_suffix():
+    """v5's one changed marker. The suffix rides inside the reaction's own element, after the
+    sanitized name, so the bot can read its own past reaction out of the stream instead of
+    seeing an anonymous count."""
+    m = msg(T0, text="x", reactions=[ReactionRec("this", 2, True), ReactionRec("+1", 1)])
+    assert contents(serialize_stream(pinned([m])))[1].split("\n")[-1] == (
+        "[reactions: 2× this (you), 1× +1]")
+
+
+def test_a_mine_reaction_below_the_render_cap_does_not_render_and_does_not_leak():
+    """The cap is the cap: `mine` earns a suffix, never a promotion into the rendered top two."""
+    m = msg(T0, text="x", reactions=[ReactionRec("aaa", 3), ReactionRec("bbb", 2),
+                                     ReactionRec("ccc", 1, True)])
+    stream = serialize_stream(pinned([m]))
+    assert contents(stream)[1].split("\n")[-1] == "[reactions: 3× aaa, 2× bbb]"
+    assert "(you)" not in "\n".join(contents(stream))
+
+
+def test_a_message_without_reactions_renders_no_marker_and_no_you():
+    stream = serialize_stream(pinned([msg(T0, text="x")]))
+    assert contents(stream)[1] == f"[{STAMP0} alice (human) id=U1 ts={T0}]\nx"
+    assert "(you)" not in "\n".join(contents(stream))
 
 
 def test_marker_order_is_files_then_sidecars_then_reactions():
@@ -725,7 +752,7 @@ def test_the_canonical_sequence_is_horizon_messages_marker():
     stream = serialize_stream(pinned(
         [msg(T0, text="a human said this"),
          msg(T1, text="and we answered", sender="B0", sender_type="self")], cards=cards))
-    assert SERIALIZER_VERSION == 4
+    assert SERIALIZER_VERSION == 5
     assert stream.items[0] is stream.horizon_item
     assert stream.items[-1] is stream.end_marker_item
     assert stream.items[1:-1] == stream.message_items

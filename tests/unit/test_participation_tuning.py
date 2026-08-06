@@ -47,7 +47,7 @@ def test_c1_mid_flight_escape_present():
     s = CHANNEL_ACTIVITY_NO_REPLY_SUFFIX
     assert 'consist only of "I haven\'t tried it,"' in s
     assert "do not suppress a substantive answer merely because it includes a limitation" in s
-    assert "addressed by name, prefer a brief honest answer over silence" in s
+    assert "being addressed by name outranks this whole test" in s
     assert s.endswith("]")  # still one bracketed paragraph
     # ...and it coexists with the full-visibility framing rather than having replaced it.
     assert "The stream is the room, not an invitation." in s

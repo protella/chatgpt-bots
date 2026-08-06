@@ -80,20 +80,24 @@ REACH_TOOLS = prompts.REACH_TOOLS
 # v4: the pinned authorization facts changed — `ReceiptRec` gained `receipt_class` and the
 # message-item metadata gained `edited_ts`, the two facts the edit_own_message authorization
 # mapping (EDIT §2a) is built from. Rendered bytes are unchanged; the pin's contents are not.
-SERIALIZER_VERSION = 4
+# v5: one marker's bytes changed — a reaction the bot itself placed renders a " (you)"
+# suffix in the reactions marker (render_reactions_marker), carried by ReactionRec.mine.
+SERIALIZER_VERSION = 5
 
 # Versions the SELECTION POLICY — floor semantics, target/ceiling arithmetic,
 # eligibility — separately from the serializer GRAMMAR, because a policy change must
 # invalidate a persisted floor without necessarily changing a rendered byte.
 SELECTION_VERSION = 1
 
-# ---------------------------------------------------------------- grammar v3 constants
+# ---------------------------------------------------------------- grammar constants
 # Every one of these is part of the serialized bytes, so every one is a version-pinned
 # constant rather than a call-site literal. Changing any of them changes SERIALIZER_VERSION.
 # The horizon carries only SLOW-MOVING facts. H is deliberately absent: this is item 0 of the
 # cacheable prefix, and a per-turn value here would invalidate the whole stream beneath it on
 # every turn. The live edge is stated post-breakpoint in the turn coordinates and recorded in
 # `stream_render`.
+# v5 changed one marker's bytes (a reaction the bot placed renders " (you)"); everything
+# else in this block is v3's, unchanged.
 HORIZON_AWARENESS_LINE = (
     "Images and code-execution results in this stream are awareness-only outside the current "
     "thread; current-thread file, image and container details follow after the stream."
@@ -1221,7 +1225,7 @@ def render_reactions_marker(message: NormalizedMessage, *,
     if not top:
         return None
     return "[reactions: " + ", ".join(
-        f"{r.count}× {sanitize_name(r.name)}" for r in top) + "]"
+        f"{r.count}× {sanitize_name(r.name)}{' (you)' if r.mine else ''}" for r in top) + "]"
 
 
 _IMAGE_URL_ID_RES = (re.compile(r"/files-pri/[^/]+-([^/?]+)/"),

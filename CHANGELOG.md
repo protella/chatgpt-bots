@@ -164,6 +164,18 @@ the banter is aimed at it, and a channel-wide ping that only reports status wake
 standing rule whenever it does speak: jokes land on tools, situations, or itself — never on a
 coworker.
 
+### 🤐 Changed - Opinions need standing, and an empty search is not an answer
+
+The bot no longer takes sides by emoji: a reaction that signals agreement is an endorsement,
+and judgments it has no standing to hold — what a product is like to use day to day, whether
+one tool beats another — are not its to endorse or dispute, in words or by reaction. Open
+questions it can't genuinely help with now stay unanswered: handing back the asker's own
+guess, advising who to go ask, or reporting "I searched and found nothing" no longer counts
+as an answer — though a check whose empty result *is* the answer ("any failed jobs?" — none)
+still speaks, and asking the bot by name still always gets an honest reply. It can also
+finally see its own emoji reactions — the channel stream marks them "(you)" — so asked what
+it reacted with, it answers from the record instead of pleading ignorance.
+
 ### 🧵 Changed - A channel is one conversation now, not a stack of keyholes
 
 Channel answers used to be built from the current thread plus a short "recent activity" list.

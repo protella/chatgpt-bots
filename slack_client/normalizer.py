@@ -171,6 +171,7 @@ class FileRef:
 class ReactionRec:
     name: str
     count: int
+    mine: bool = False
 
 
 @dataclass(frozen=True)
@@ -258,15 +259,28 @@ def _file_refs(payload: Dict[str, Any]) -> Tuple[FileRef, ...]:
     return tuple(refs)
 
 
-def _reactions(payload: Dict[str, Any]) -> Tuple[ReactionRec, ...]:
+def _reactions(payload: Dict[str, Any], self_user_id: Optional[str]) -> Tuple[ReactionRec, ...]:
+    """`mine` is a strict-shape membership test, fail-closed on identity.
+
+    Slack puts the authenticated user in a reaction's `users` array whenever that user reacted,
+    even when other reactor ids are truncated — so `count > len(users)` with us present is still
+    `mine=True`, and our absence is a genuine non-reaction rather than a truncation. A `users`
+    that is not a list/tuple is never tested, so a string cannot match by substring nor a dict by
+    key. Without `self_user_id` every reaction is `mine=False`; absent identity never raises.
+    """
     recs: List[ReactionRec] = []
     for entry in payload.get("reactions") or []:
         if not isinstance(entry, dict) or not entry.get("name"):
             continue
         count = entry.get("count")
+        users = entry.get("users")
         if not isinstance(count, int):
-            count = len(entry.get("users") or [])
-        recs.append(ReactionRec(name=str(entry["name"]), count=int(count)))
+            count = len(users or [])
+        mine = False
+        if isinstance(users, (list, tuple)):
+            mine = bool(self_user_id) and any(
+                u == self_user_id for u in users if isinstance(u, str))
+        recs.append(ReactionRec(name=str(entry["name"]), count=int(count), mine=mine))
     return tuple(recs)
 
 
@@ -348,7 +362,7 @@ def normalize_slack_message(client: Any, payload: Any, *, channel_id: Optional[s
         raw_bot_name=_bot_name(payload),
         text=text,
         files=_file_refs(payload),
-        reactions=_reactions(payload),
+        reactions=_reactions(payload, getattr(client, "bot_user_id", None)),
         edited_ts=str(edited_ts) if edited_ts else None,
         is_broadcast=(subtype == "thread_broadcast"),
         is_tombstone=_is_tombstone(payload),
