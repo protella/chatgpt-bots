@@ -1,27 +1,54 @@
 #!/usr/bin/env bash
-# Last line of defence before a real name reaches a PUBLIC repository.
+# The gate every commit passes: nothing real about a person gets published, and nothing dirty
+# gets checked in.
 #
 # Install with `make install-hooks` (git hooks live in .git/, which is not tracked, so every
 # clone has to copy this in once).
 #
-# The same scan runs as a unit test, so this hook is redundant on a normal `make check` — which
-# is exactly the point. Both leaks this guard exists to prevent happened on commits where the
-# suite was not run.
+# Both checks also run elsewhere — the PII scan is a unit test, lint is `make lint` — and that
+# redundancy is deliberate. Both of this repo's PII leaks, and the 1114 type errors that
+# accumulated behind a silently-aborting mypy, arrived on commits where nobody ran anything.
+#
+# Cost is under a second with a warm mypy cache, so there is no reason to skip it.
 set -euo pipefail
 
 repo="$(git rev-parse --show-toplevel)"
 cd "$repo"
 
-if ! python3 -m tools.pii_scan; then
-    cat >&2 <<'EOF'
+fail() {
+    cat >&2 <<EOF
 
-COMMIT BLOCKED — see the findings above.
+COMMIT BLOCKED — $1
 
-This repository is PUBLIC. Real names, internal channel names and credentials must never be
-committed. Use the fictional cast in tests/fixtures/people.py; add a character there if the one
-you need does not exist yet.
-
-To bypass in a genuine false positive (and then fix the scanner):  git commit --no-verify
+$2
+To bypass in a genuine false positive (and then fix the checker):  git commit --no-verify
 EOF
     exit 1
+}
+
+# 1. Real names, internal channel names, credentials.
+if ! python3 -m tools.pii_scan; then
+    fail "see the findings above." \
+"This repository is PUBLIC. Real names, internal channel names and credentials must never be
+committed. Use the fictional cast in tests/fixtures/people.py; add a character there if the one
+you need does not exist yet.
+"
+fi
+
+# 2. Style and types. The tree is clean; keep it that way rather than leaving a new error for
+#    whoever runs `make lint` next and has to work out whether it was always there.
+if command -v ruff >/dev/null 2>&1; then
+    ruff check . || fail "ruff found style problems." \
+"Fix them, or run \`ruff check --fix .\` for the automatic ones.
+"
+fi
+
+if command -v mypy >/dev/null 2>&1; then
+    mypy . >/dev/null || {
+        mypy . >&2 || true
+        fail "mypy found type errors." \
+"\`make lint\` is expected to pass with zero errors — 1114 were cleared in one pass to get there,
+so a new one is a real signal. See mypy.ini for how the few unavoidable gaps are handled.
+"
+    }
 fi

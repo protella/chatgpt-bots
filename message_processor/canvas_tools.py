@@ -46,7 +46,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, cast
 
 from config import config
 from logger import setup_logger
@@ -527,8 +527,8 @@ async def build_catalog(client, channel_id: str, *, now: Optional[float] = None
         return []
     try:
         res = await _async(web.files_list, channel=channel_id, types="canvases", limit=MAX_LIST)
-    except Exception as e:  # noqa: BLE001
-        logger.warning(f"Canvas catalog lookup failed for {channel_id}: {e}")
+    except Exception as exc:  # noqa: BLE001 — `exc`, not `e`: the loop below owns that name
+        logger.warning(f"Canvas catalog lookup failed for {channel_id}: {exc}")
         return []
 
     entries = [{"canvas_id": f["id"], "title": (f.get("title") or "").strip() or UNTITLED,
@@ -544,8 +544,8 @@ async def build_catalog(client, channel_id: str, *, now: Optional[float] = None
         try:
             info = await _async(web.files_info, file=ch_id)
             title = ((info.get("file") or {}).get("title") or "").strip() or UNTITLED
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"Could not title the fresh channel canvas {ch_id}: {e}")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Could not title the fresh channel canvas {ch_id}: {exc}")
         entries.insert(0, {"canvas_id": ch_id, "title": title, "is_channel_canvas": False})
 
     for e in entries:
@@ -1515,7 +1515,7 @@ async def execute_delete_canvas(ctx: ToolContext, args: Dict[str, Any]) -> Dict[
                               limit=MAX_LIST)
         live = {f["id"] for f in (listed.get("files") or []) if f.get("id")}
         is_channel_canvas = canvas_id == await _channel_canvas_id(
-            web, ctx.channel_id, live, strict=True)
+            web, cast(str, ctx.channel_id), live, strict=True)
     except Exception as e:  # noqa: BLE001 — a failed check must not become a licence to delete
         logger.warning(f"Could not confirm {canvas_id} is not the channel canvas: {e}")
         return _err("check_failed",

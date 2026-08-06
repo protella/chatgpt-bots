@@ -79,7 +79,7 @@ import asyncio
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 from logger import setup_logger
 from runtime_identity import SESSION_ID
@@ -988,6 +988,14 @@ class ReceiptLedger:
         return self._service if self._service is not None else get_service()
 
     @property
+    def _svc(self) -> ReceiptService:
+        """`service` on the far side of an `active` check, where it is non-None by definition.
+
+        TYPING ONLY. `cast` is a no-op, so a caller that somehow got here without the check still
+        gets the same AttributeError it always did — into the same `except` that swallowed it."""
+        return cast(ReceiptService, self.service)
+
+    @property
     def active(self) -> bool:
         """False for DMs, unknown surfaces, an unknown team, or an unconfigured service."""
         svc = self.service
@@ -1019,7 +1027,7 @@ class ReceiptLedger:
                 await self.note_chrome(ts, thread_root_ts, receipt_class=receipt_class)
                 return
             if kind == STATE_FINALIZED:
-                await self.service.apply(
+                await self._svc.apply(
                     self._op("finalize", ts, thread_root_ts, receipt_class))
                 self._in_flight.pop(str(ts), None)
                 return
@@ -1050,11 +1058,11 @@ class ReceiptLedger:
                         "%r — class NULLed (ineligible)",
                         self.channel_id, ts, receipt_class, prior_class)
                     self._in_flight[str(ts)] = (prior_root, None)
-                    await self.service.apply(
+                    await self._svc.apply(
                         self._op("register", ts, prior_root, receipt_class))
                 return
             self._in_flight[str(ts)] = (thread_root_ts, receipt_class)
-            await self.service.apply(self._op("register", ts, thread_root_ts, receipt_class))
+            await self._svc.apply(self._op("register", ts, thread_root_ts, receipt_class))
             await self._partial_post_barrier(ts)
         except Exception as e:  # noqa: BLE001
             logger.debug("Receipt note_post skipped for %s: %s", ts, e)
@@ -1069,7 +1077,7 @@ class ReceiptLedger:
             return
         receipt_class = _checked_class(receipt_class, site="note_chrome", message_ts=ts)
         try:
-            await self.service.apply(self._op("chrome", ts, thread_root_ts, receipt_class))
+            await self._svc.apply(self._op("chrome", ts, thread_root_ts, receipt_class))
         except Exception as e:  # noqa: BLE001
             logger.debug("Receipt note_chrome skipped for %s: %s", ts, e)
 
@@ -1086,7 +1094,7 @@ class ReceiptLedger:
             if str(ts) in self._in_flight:
                 return  # promoted once; every later edit grows a surface we already own
             self._in_flight[str(ts)] = (thread_root_ts, CLASS_ASSISTANT_REPLY)
-            await self.service.apply(
+            await self._svc.apply(
                 self._op("promote", ts, thread_root_ts, CLASS_ASSISTANT_REPLY))
             # The legacy-placeholder path reaches its first conversational surface HERE, not in
             # note_post: the message already exists as chrome and this is the edit that makes it
@@ -1118,7 +1126,7 @@ class ReceiptLedger:
             return
         try:
             self._in_flight.pop(str(ts), None)
-            await self.service.apply(self._op("demote", ts))
+            await self._svc.apply(self._op("demote", ts))
         except Exception as e:  # noqa: BLE001
             logger.debug("Receipt demote skipped for %s: %s", ts, e)
 
@@ -1128,7 +1136,7 @@ class ReceiptLedger:
             return
         try:
             self._in_flight.pop(str(ts), None)
-            await self.service.apply(self._op("delete", ts))
+            await self._svc.apply(self._op("delete", ts))
         except Exception as e:  # noqa: BLE001
             logger.debug("Receipt abort skipped for %s: %s", ts, e)
 
@@ -1143,7 +1151,7 @@ class ReceiptLedger:
         if not records:
             return 0
         try:
-            await self.service.finalize_unit(
+            await self._svc.finalize_unit(
                 self.team_id, self.channel_id, records, self.owner_id)
         except Exception as e:  # noqa: BLE001
             logger.warning("Receipt settle failed for %s: %s", self.channel_id, e)
@@ -1186,7 +1194,7 @@ async def settle_ledger(ledger: Optional[ReceiptLedger], turn: Any = None) -> No
     """
     if turn is not None:
         waiter = getattr(turn, "wait_for_effects", None)
-        held = waiter() if waiter is not None else None
+        held: Any = waiter() if waiter is not None else None
         if hasattr(held, "__await__"):
             await held
     if ledger is None:
@@ -1346,8 +1354,10 @@ async def resolve_pending_share(db: Any, *, team_id: Optional[str],
     if queued is not None:
         # The queued op carries the producer's class (spec §4), so a share whose pending row
         # never reached the database still finalizes WITH its class present.
-        ok = await svc.apply(_Op("finalize", str(team_id), str(channel_id), str(message_ts),
-                                 queued.owner, queued.thread_root_ts, queued.receipt_class))
+        # cast: a queued op only exists because `svc` handed one over just above.
+        ok = await cast(ReceiptService, svc).apply(
+            _Op("finalize", str(team_id), str(channel_id), str(message_ts),
+                queued.owner, queued.thread_root_ts, queued.receipt_class))
         # A false here means the finalize was queued, not refused — the share is still outside the
         # stream, so the transition genuinely has not happened yet.
         _emit_transition(channel_id=channel_id, message_ts=message_ts, owner=queued.owner,

@@ -4,11 +4,12 @@ import aiohttp
 import logging
 import re
 import time
-from typing import Any, Dict, Iterable, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional
 
 from slack_sdk.errors import SlackApiError
 
 from config import config
+from slack_client._host import _Host
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +121,15 @@ def strip_citations(text: str) -> str:
 ACTOR_REMOTE_LOOKUP_DEFAULT = 25
 
 
-class SlackUtilitiesMixin:
+class SlackUtilitiesMixin(_Host):
+    if TYPE_CHECKING:
+        # Owned by SlackBot.__init__ and filled in by _ensure_self_identity below; not part
+        # of the host contract because only this mixin reads them.
+        bot_user_id: Optional[str]
+        bot_id: Optional[str]
+        bot_handle: Optional[str]
+        self_team_id: Optional[str]
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._session = None  # Reusable aiohttp session

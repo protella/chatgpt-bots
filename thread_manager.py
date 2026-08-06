@@ -5,7 +5,7 @@ Manages conversation state, locks, and memory for each Slack thread
 import time
 import asyncio
 from collections import deque
-from typing import Dict, List, Optional, Any
+from typing import Any, Callable, Dict, List, Optional, cast
 from dataclasses import dataclass, field
 from logger import LoggerMixin
 from config import config
@@ -37,7 +37,7 @@ class ThreadState:
     # after each call, plus chars/4 estimates for messages added between calls.
     context_tokens: int = 0
     
-    def add_message(self, role: str, content: Any, db = None, thread_key: str = None, message_ts: str = None, metadata: Dict[str, Any] = None, token_counter: Optional[TokenCounter] = None, max_tokens: int = None):
+    def add_message(self, role: str, content: Any, db = None, thread_key: Optional[str] = None, message_ts: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, token_counter: Optional[TokenCounter] = None, max_tokens: Optional[int] = None):
         """Add a message to the thread history with optional metadata and token management.
 
         Phase S: messages are NOT persisted — Slack is the only transcript and state is
@@ -67,7 +67,7 @@ class ThreadState:
         if token_counter and max_tokens:
             self._trim_to_token_limit(token_counter, max_tokens, db, thread_key)
     
-    def _trim_to_token_limit(self, token_counter: TokenCounter, max_tokens: int, db = None, thread_key: str = None):
+    def _trim_to_token_limit(self, token_counter: TokenCounter, max_tokens: int, db = None, thread_key: Optional[str] = None):
         """Trim messages to fit within token limit"""
         import logging
         logger = logging.getLogger(__name__)
@@ -140,7 +140,7 @@ class DocumentLedger:
                     total_pages: Optional[int] = None,
                     summary: Optional[str] = None,
                     metadata: Optional[Dict[str, Any]] = None,
-                    timestamp: float = None,
+                    timestamp: Optional[float] = None,
                     db = None, thread_id: Optional[str] = None,
                     message_ts: Optional[str] = None,
                     file_id: Optional[str] = None,
@@ -394,7 +394,7 @@ class AsyncThreadStateManager(LoggerMixin):
         queue = self._pending_queues.get(thread_key)
         if not queue:
             return []
-        batch = []
+        batch: List[Any] = []
         while queue and len(batch) < max_batch:
             batch.append(queue.popleft())
         if not queue:
@@ -546,8 +546,11 @@ class AsyncThreadStateManager(LoggerMixin):
             return
         entry["task"] = task
         if hasattr(task, "add_done_callback"):
-            task.add_done_callback(
-                lambda _t, k=thread_key, j=job_id: self.finish_research(k, j))
+            # cast: the lambda's default-arg capture makes it a 3-parameter callable to the
+            # checker, which cannot be matched against the 1-argument callback signature.
+            task.add_done_callback(cast(
+                Callable[["asyncio.Task[Any]"], object],
+                lambda _t, k=thread_key, j=job_id: self.finish_research(k, j)))
 
     def finish_research(self, thread_key: str, job_id: str) -> bool:
         """Clear ONE in-flight research job by id (never touches a sibling); returns True iff

@@ -17,7 +17,7 @@ help:
 	@echo "  make format        - Auto-format code"
 	@echo "  make check         - Run all checks (lint + pii + test)"
 	@echo "  make pii           - Scan tracked files for real names/channels/credentials"
-	@echo "  make install-hooks - Install the pre-commit PII guard into .git/hooks"
+	@echo "  make install-hooks - Install the pre-commit guard (pii + lint) into .git/hooks"
 
 # Install dependencies from the locked file
 install:
@@ -95,10 +95,11 @@ format:
 pii:
 	@python3 -m tools.pii_scan
 
-# One-time, per clone: git hooks are not tracked, so the guard has to be copied in.
+# One-time, per clone: git hooks are not tracked, so the guard (pii scan + ruff + mypy)
+# has to be copied in.
 install-hooks:
 	@install -m 755 tools/hooks/pre-commit .git/hooks/pre-commit
-	@echo "pre-commit PII guard installed"
+	@echo "pre-commit guard installed (pii scan + ruff + mypy)"
 
 # Run all checks
 check: lint pii test

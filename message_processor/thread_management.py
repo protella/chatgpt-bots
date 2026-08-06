@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from base_client import BaseClient, Message
+from base_client import Message
 from config import config, pipeline_status
 from message_markers import (
     ends_with_continuation,
     starts_as_continuation,
     strip_continuation_markers,
 )
+from message_processor._host import _Host
 from message_processor.message_timestamps import sender_timezone, stamp_content
 from message_processor.tool_provenance import (
     render_provenance_annotations,
@@ -17,8 +18,8 @@ from message_processor.tool_provenance import (
 from slack_client.normalizer import parse_ts
 
 
-class ThreadManagementMixin:
-    def _add_message_with_token_management(self, thread_state, role: str, content: Any, db=None, thread_key: str = None, message_ts: str = None, metadata: Dict[str, Any] = None, skip_auto_trim: bool = False):
+class ThreadManagementMixin(_Host):
+    def _add_message_with_token_management(self, thread_state, role: str, content: Any, db=None, thread_key: Optional[str] = None, message_ts: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, skip_auto_trim: bool = False):
         """Helper method to add messages with token management
         
         Args:
@@ -60,7 +61,7 @@ class ThreadManagementMixin:
         total_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
         self.log_debug(f"MESSAGE ADDED | Role: {role} | Tokens: {msg_tokens} | Total: {total_tokens}/{max_tokens}")
 
-    async def _pre_trim_messages_for_api(self, messages: List[Dict[str, Any]], new_message_tokens: int = 0, model: str = None, thread_state=None) -> List[Dict[str, Any]]:
+    async def _pre_trim_messages_for_api(self, messages: List[Dict[str, Any]], new_message_tokens: int = 0, model: Optional[str] = None, thread_state=None) -> List[Dict[str, Any]]:
         """Pre-trim messages to fit within context window before sending to API
         
         Args:
@@ -242,7 +243,7 @@ class ThreadManagementMixin:
                 return f"[ERROR: Document too large for model context window]\n{content[:1000]}..."
             return content  # Return original if summarization fails for other reasons
 
-    async def _smart_trim_with_summarization(self, thread_state, trim_count: int = None,
+    async def _smart_trim_with_summarization(self, thread_state, trim_count: Optional[int] = None,
                                              collector: Optional[List[Dict]] = None) -> int:
         """Intelligently trim messages, summarizing documents only when they're in the trim list
 
@@ -377,7 +378,7 @@ class ThreadManagementMixin:
         
         return messages_trimmed
 
-    def _smart_trim_oldest(self, thread_state, trim_count: int = None) -> int:
+    def _smart_trim_oldest(self, thread_state, trim_count: Optional[int] = None) -> int:
         """Intelligently trim oldest non-preserved messages from thread
         
         Args:
@@ -488,7 +489,7 @@ class ThreadManagementMixin:
             self.log_warning(f"Could not load prior thread summary: {e}")
 
         # Boundary: newest known ts among dropped messages; fall back to prior boundary
-        known_ts = [(m.get("metadata") or {}).get("ts") for m in ordered]
+        known_ts: List[Any] = [(m.get("metadata") or {}).get("ts") for m in ordered]
         known_ts = [t for t in known_ts if t]
         boundary_ts = max(known_ts, key=float) if known_ts else (prior or {}).get("boundary_ts")
         if not boundary_ts:
@@ -1077,7 +1078,11 @@ class ThreadManagementMixin:
     async def _get_or_rebuild_thread_state(
         self,
         message: Message,
-        client: BaseClient,
+        # `Any`, not BaseClient: the rebuild path calls the platform client's ASYNC surface
+        # (get_thread_history, download_file), which every real client implements as a
+        # coroutine while the ABC still declares the sync signature. Annotating BaseClient
+        # here would describe a contract this method does not use.
+        client: Any,
         thinking_id: Optional[str] = None
     ) -> Any:
         """Get existing thread state or rebuild from platform history"""
@@ -1121,7 +1126,7 @@ class ThreadManagementMixin:
                 thread_state.messages.clear()
                 thread_state.has_summary_head = False
             thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
-            summary_row = None
+            summary_row: Any = None
             if self.db:
                 try:
                     summary_row = await self.db.get_thread_summary_async(thread_key)
@@ -1222,7 +1227,9 @@ class ThreadManagementMixin:
             # reinject "[used tools: …]" onto matching assistant turns during the loop below.
             # Messages at/behind the summary boundary are already skipped, so nothing behind
             # a compaction boundary is ever annotated.
-            tool_usage_by_ts: Dict[str, list] = {}
+            # Keyed by ts, but probed with `metadata.get("ts")`, which is legitimately None on
+            # a message that carries no ts — a miss, not an error. Hence Any, not str.
+            tool_usage_by_ts: Dict[Any, list] = {}
             if config.enable_tool_provenance and self.db:
                 try:
                     tool_usage_by_ts = await self.db.get_thread_tool_usage_async(thread_key)

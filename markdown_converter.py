@@ -37,7 +37,7 @@ class MarkdownConverter(LoggerMixin):
     def _convert_to_slack(self, text: str) -> str:
         """Convert Markdown to Slack mrkdwn format"""
         # Store code blocks to protect them from conversion
-        code_blocks = []
+        code_blocks: List[str] = []
         text = self._extract_code_blocks(text, code_blocks)
 
         # Tables are converted immediately after code extraction and before every
@@ -51,7 +51,7 @@ class MarkdownConverter(LoggerMixin):
         # The rendered table is itself stashed as a placeholder (separate storage
         # from code_blocks, restored after them) so that the ``` fence we emit,
         # its padding, and its dashed rule survive the italic/list/rule passes.
-        tables = []
+        tables: List[str] = []
         text = self._convert_tables_slack(text, tables, code_blocks)
 
         # Convert various Markdown elements for Slack

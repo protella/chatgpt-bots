@@ -7,6 +7,7 @@ from typing import Any, Awaitable, Callable, Dict, List, NamedTuple, Optional, T
 from config import config
 from logger import setup_logger
 from slack_client import admission_watermark
+from slack_client._host import _Host
 from slack_client.event_handlers import feedback as feedback_handlers
 from slack_client.normalizer import MUTATION_SUBTYPES, mutation_activity_ts
 
@@ -415,7 +416,7 @@ def _admit(client_self, event) -> object:
     return ticket
 
 
-class SlackRegistrationMixin:
+class SlackRegistrationMixin(_Host):
     def _register_handlers(self):
         """Register Slack-specific event handlers."""
 

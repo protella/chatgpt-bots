@@ -205,6 +205,10 @@ def _build_request_params(
 class OpenAIClient(LoggerMixin):
     """Async wrapper for OpenAI API using Responses API."""
 
+    # Declared here rather than only in __init__: that body is untyped, so mypy cannot pick the
+    # annotation up from the assignment there.
+    _session: Optional[aiohttp.ClientSession]
+
     def _get_session(self) -> aiohttp.ClientSession:
         """Get or create a reusable aiohttp session"""
         if self._session is None or self._session.closed:
@@ -354,7 +358,8 @@ class OpenAIClient(LoggerMixin):
                         self.log_error(error_msg)
                         # Create TimeoutError with operation_type for retry logic
                         timeout_error = asyncio.TimeoutError(error_msg)
-                        timeout_error.operation_type = operation_type
+                        # Ad-hoc attribute the retry logic reads back off the exception.
+                        timeout_error.operation_type = operation_type  # type: ignore[attr-defined]
                         raise timeout_error
 
                     # Still within timeout but worth a warning
@@ -715,7 +720,8 @@ class OpenAIClient(LoggerMixin):
             self.log_error(f"API call ({operation_type}) timed out after {timeout}s")
             # Create TimeoutError with operation_type attribute for smart retry logic
             timeout_error = TimeoutError(f"OpenAI API call timed out after {timeout} seconds")
-            timeout_error.operation_type = operation_type
+            # Ad-hoc attribute the retry logic reads back off the exception.
+            timeout_error.operation_type = operation_type  # type: ignore[attr-defined]
             raise timeout_error
         except Exception as e:
             error_msg = str(e).lower()
@@ -723,7 +729,8 @@ class OpenAIClient(LoggerMixin):
                 self.log_error(f"API call ({operation_type}) timed out after {timeout}s: {e}")
                 # Create TimeoutError with operation_type attribute for smart retry logic
                 timeout_error = TimeoutError(f"OpenAI API call timed out after {timeout} seconds")
-                timeout_error.operation_type = operation_type
+                # Ad-hoc attribute the retry logic reads back off the exception.
+                timeout_error.operation_type = operation_type  # type: ignore[attr-defined]
                 raise timeout_error
             raise
 

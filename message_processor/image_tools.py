@@ -27,7 +27,7 @@ import asyncio
 import base64
 import binascii
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 from uuid import uuid4
 
 from config import config, pipeline_status
@@ -942,7 +942,7 @@ async def execute_edit_image(ctx, args: Dict[str, Any]) -> Dict[str, Any]:
             return _err("unreadable_source",
                         f"The source image ({entry['image_id']}) {rejection_text(meta)}")
         b64_images.append(b64)
-        input_mimetypes.append(meta)
+        input_mimetypes.append(cast(str, meta))  # bytes present ⇒ mimetype present
 
     # The edit-prompt enhancer wants a description of what it is editing. The catalog
     # already carries the stored analysis, so the old flow's extra vision round-trip

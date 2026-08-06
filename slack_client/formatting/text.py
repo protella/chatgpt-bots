@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 
 from config import config
+from slack_client._host import _Host
 
 # A real Slack mention id is a user/workspace/bot id: U/W/B + uppercase alnum.
 _SLACK_ID_RE = re.compile(r'^[UWB][A-Z0-9]{6,}$')
@@ -119,7 +120,7 @@ def strip_leading_self_prefix(text, names=None):
     return text
 
 
-class SlackFormattingMixin:
+class SlackFormattingMixin(_Host):
     def _clean_mentions(self, text: str) -> str:
         """Resolve inbound Slack mentions: drop our own mention, render others as @name, strip
         unknown ids. (Method name kept for backward compatibility with existing call sites.)"""
@@ -131,7 +132,7 @@ class SlackFormattingMixin:
 
     def _build_name_to_id_map(self) -> dict:
         """Reverse map of known display/real names -> user id, derived from the user cache."""
-        mapping = {}
+        mapping: dict = {}
         cache = getattr(self, 'user_cache', None) or {}
         for uid, info in cache.items():
             if not isinstance(info, dict):

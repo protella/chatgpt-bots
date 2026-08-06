@@ -16,7 +16,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import pytest
 from slack_sdk.errors import SlackApiError
@@ -136,7 +136,9 @@ def clock(monkeypatch):
 def install(monkeypatch):
     """Install a client pair and clear the identity caches around the test."""
     def _install(user=None, bot=None) -> bh.Clients:
-        pair = bh.Clients(user=user or FakeSlack(), bot=bot or user or FakeSlack())
+        # FakeSlack stands in for the AsyncWebClient the real pair carries.
+        pair = bh.Clients(user=cast(Any, user or FakeSlack()),
+                          bot=cast(Any, bot or user or FakeSlack()))
         monkeypatch.setattr(bh, "_clients", pair)
         monkeypatch.setattr(bh, "_bot_auth_data", None)
         monkeypatch.setattr(bh, "_harness_user_identity", None)
@@ -1211,7 +1213,8 @@ def _posted_literals(module=None) -> List[str]:
     their literal parts; the substituted values come from the generators, which the other test
     covers.
     """
-    tree = ast.parse(pathlib.Path((module or rows).__file__).read_text(encoding="utf-8"))
+    # A live module always has a __file__; the Optional is the general module-type declaration.
+    tree = ast.parse(pathlib.Path(cast(str, (module or rows).__file__)).read_text(encoding="utf-8"))
     found: List[str] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):

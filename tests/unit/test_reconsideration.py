@@ -21,7 +21,7 @@ import ast
 import asyncio
 import inspect
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1133,7 +1133,7 @@ def _zero_chunk_slack() -> SiteSlack:
         slack.notices.append("Response was cut off due to length limits")
         return None                                  # zero chunks landed; notice posted
 
-    slack.send_message = _refuse_after_rearm
+    slack.send_message = _refuse_after_rearm  # type: ignore[method-assign]  # swapping it is the test
     return slack
 
 
@@ -1218,7 +1218,7 @@ class SiteRig:
         from tests.unit.channel_turn_harness import thread_config
         self.cfg = thread_config()
         self.turn.capability_profile = self.cfg
-        prepared = (None, {}, False, "", None)
+        prepared: Tuple[Any, ...] = (None, {}, False, "", None)
         self.ctx = pin_channel_turn(self.turn, trigger_ts=TRIGGER_TS,
                                     origin_thread_ts=TRIGGER_TS, config=self.cfg,
                                     prepared=prepared)

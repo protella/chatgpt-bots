@@ -14,7 +14,7 @@ import uuid
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Optional, Sequence, Dict, Iterable, List, Any, Tuple
+from typing import Optional, Sequence, Dict, Iterable, List, Any, Tuple, cast
 import logging
 import asyncio
 from config import dev_epoch_fence_requested
@@ -2479,7 +2479,7 @@ class DatabaseManager(LoggerMixin):
         )
         self.conn.commit()
         logger.debug(f"Added channel_memory for {channel_id} (scope={scope})")
-        return cursor.lastrowid
+        return cast(int, cursor.lastrowid)
 
     def update_channel_memory(self, memory_id: int, content: str):
         """Update an existing memory row's content (and updated_ts)."""
@@ -3398,8 +3398,9 @@ class DatabaseManager(LoggerMixin):
         
         return None
     
-    def save_user_info(self, user_id: str, username: str = None, real_name: str = None,
-                       email: str = None, timezone: str = None, tz_label: str = None, tz_offset: int = None):
+    def save_user_info(self, user_id: str, username: Optional[str] = None, real_name: Optional[str] = None,
+                       email: Optional[str] = None, timezone: Optional[str] = None,
+                       tz_label: Optional[str] = None, tz_offset: Optional[int] = None):
         """
         Save comprehensive user information.
         
@@ -3413,8 +3414,8 @@ class DatabaseManager(LoggerMixin):
             tz_offset: Offset in seconds from UTC
         """
         # Build update query dynamically based on provided fields
-        updates = []
-        params = []
+        updates: List[str] = []
+        params: List[Any] = []
         
         if username is not None:
             updates.append("username = ?")
@@ -4918,7 +4919,7 @@ class DatabaseManager(LoggerMixin):
                 (channel_id, scope, content, author)
             )
             await db.commit()
-            return cursor.lastrowid
+            return cast(int, cursor.lastrowid)
 
     async def update_channel_memory_async(self, memory_id: int, content: str):
         """Async version of update_channel_memory."""
@@ -5022,7 +5023,7 @@ class DatabaseManager(LoggerMixin):
                         "AND (author IS NULL OR author NOT LIKE ? || '%')",
                         (channel_id, PREF_AUTHOR_PREFIX),
                     ) as cur:
-                        (count,) = await cur.fetchone()
+                        (count,) = cast(Any, await cur.fetchone())
                     if count >= max(1, int(max_rows)):
                         await db.execute("ROLLBACK")
                         return None
@@ -5093,7 +5094,7 @@ class DatabaseManager(LoggerMixin):
             # overlay is process-local, so there is no second writer to serialize against.
             store, key = overlay
             from message_processor.channel_steering import PREF_AUTHOR_PREFIX
-            current = {r["id"]: r["content"] for r in store.memory(key)
+            current: Dict[Any, str] = {r["id"]: r["content"] for r in store.memory(key)
                        if r["scope"] == "channel"
                        and not (r["author"] or "").startswith(PREF_AUTHOR_PREFIX)}
             seed_ids = {int(mid): h for mid, h in (seed or [])}
@@ -5136,7 +5137,7 @@ class DatabaseManager(LoggerMixin):
                     "AND (author IS NULL OR author NOT LIKE ? || '%')",
                     (channel_id, PREF_AUTHOR_PREFIX),
                 ) as cur:
-                    current: Dict[Any, str] = {
+                    current = {
                         row["id"]: row["content"] for row in await cur.fetchall()
                     }
 
@@ -5262,7 +5263,7 @@ class DatabaseManager(LoggerMixin):
                 "WHERE channel_id = ? AND created_ts >= datetime('now', ?)",
                 (channel_id, f"-{int(days)} days")
             ) as cursor:
-                row = await cursor.fetchone()
+                row = cast(Any, await cursor.fetchone())
         positive = row["positive"] or 0
         negative = row["negative"] or 0
         total = positive + negative
@@ -5468,6 +5469,7 @@ class DatabaseManager(LoggerMixin):
             db.row_factory = aiosqlite.Row
             await db.execute("PRAGMA journal_mode=WAL")
 
+            params: Tuple[Any, ...]
             if image_type:
                 query = ("SELECT * FROM images WHERE thread_id = ? AND image_type = ? "
                          "ORDER BY created_at ASC")
@@ -6002,7 +6004,8 @@ class DatabaseManager(LoggerMixin):
                 return row["timezone"] if row and row["timezone"] else None
 
     async def save_user_info_async(self, user_id: str, username: str, real_name: str, email: str,
-                                   timezone: str = None, tz_label: str = None, tz_offset: int = None):
+                                   timezone: Optional[str] = None, tz_label: Optional[str] = None,
+                                   tz_offset: Optional[int] = None):
         """
         Async version of save_user_info.
 

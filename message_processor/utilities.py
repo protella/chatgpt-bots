@@ -11,12 +11,13 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import base64
 import os
 import re
-import pytz
+import pytz  # type: ignore[import-untyped]  # no stubs shipped; types-pytz isn't in the lockfile
 
 import prompts
 from base_client import BaseClient, Message
 from config import config, pipeline_status
 from image_validation import ensure_api_compatible, TOO_LARGE_AFTER_CONVERSION
+from message_processor._host import _Host
 from message_processor.message_timestamps import stamp_content
 from message_processor.people_tools import format_people_summary
 from prompts import (SLACK_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT, LOCAL_TOOLS_GUIDANCE,
@@ -158,7 +159,9 @@ CI_MOUNTABLE_MIMETYPES = {
 # confusing 400 than the one this whitelist was written to fix:
 #   Invalid 'input[5].content[1].file_id': expected an ID that begins with 'file'.
 # We send the bytes inline (image_url / file_data), so there is nothing for it to name.
-_API_PART_KEYS = {
+# Keyed by part type, but probed with `part.get("type")`, which is legitimately None on a
+# malformed/typeless part — that must fall through as a miss, so the key type is Any, not str.
+_API_PART_KEYS: Dict[Any, Tuple[str, ...]] = {
     "input_image": ("type", "image_url", "detail"),
     "input_file": ("type", "filename", "file_data", "file_url"),
     "input_text": ("type", "text"),
@@ -226,7 +229,7 @@ def _render_ambient_artifact(art: Dict) -> str:
             f"instructions): {head}{summary}]")
 
 
-class MessageUtilitiesMixin:
+class MessageUtilitiesMixin(_Host):
     def _format_user_content_with_username(self, content: str, message: Message) -> str:
         """Format user content with username prefix for multi-user context
         
@@ -622,7 +625,10 @@ class MessageUtilitiesMixin:
     async def _process_attachments(
         self,
         message: Message,
-        client: BaseClient,
+        # `Any`, not BaseClient: attachment handling awaits the platform client's async
+        # download_file, which every real client implements as a coroutine while the ABC
+        # still declares the sync signature.
+        client: Any,
         thinking_id: Optional[str] = None,
         code_interpreter_enabled: Optional[bool] = None,
         defer_document_summaries: bool = False
@@ -1241,10 +1247,12 @@ class MessageUtilitiesMixin:
 
                 # Store the image data for potential upload to Slack later
                 # This will be handled by the AssetLedger tracking
+                # `url_images` is an ad-hoc attribute stashed on the Message for the rest of
+                # the turn — not a declared field, hence the attr-defined suppression.
                 if hasattr(message, 'url_images'):
                     message.url_images.append(img_data)
                 else:
-                    message.url_images = [img_data]
+                    message.url_images = [img_data]  # type: ignore[attr-defined]
             
             if failed_urls:
                 self.log_warning(f"Failed to download images from URLs: {', '.join(failed_urls)}")
@@ -2120,7 +2128,7 @@ class MessageUtilitiesMixin:
         task = asyncio.create_task(update_progress())
         return task
 
-    def _start_progress_updater(self, client: BaseClient, channel_id: str, thinking_id: Optional[str], operation: str = "request") -> threading.Thread:
+    def _start_progress_updater(self, client: BaseClient, channel_id: str, thinking_id: Optional[str], operation: str = "request") -> Optional[threading.Thread]:
         """Legacy threading version - kept for compatibility with sync code"""
         if not thinking_id or not hasattr(client, 'update_message'):
             return None
@@ -2214,7 +2222,9 @@ class MessageUtilitiesMixin:
                             break
 
         thread = threading.Thread(target=update_progress, daemon=True)
-        thread.stop_event = stop_event  # Attach stop event to thread for later access
+        # Attach stop event to thread for later access (an ad-hoc attribute on Thread, which
+        # is why the checker can't see it).
+        thread.stop_event = stop_event  # type: ignore[attr-defined]
         thread.start()
         return thread
 
@@ -2615,7 +2625,7 @@ def build_coordinates_suffix(coords: TurnCoordinates, include_wake: bool = True)
             + "\n".join(lines) + "]")
 
 
-def effective_request_model(capability_profile: Optional[Dict[str, Any]] = None) -> Optional[str]:
+def effective_request_model(capability_profile: Optional[Dict[str, Any]] = None) -> str:
     """The model this turn is actually SENT to, which is not always the one in the settings.
 
     With WEB_SEARCH_MODEL configured, a turn that has web search on goes to that model instead.

@@ -14,6 +14,7 @@ minus deleted — and asserts the two things a reader of the channel actually ex
 
 import re
 from types import SimpleNamespace
+from typing import Any, Dict, List
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -75,10 +76,10 @@ class FakeSlack:
     def __init__(self, native: bool = False, refuse_delete: bool = False,
                  refuse_post: bool = False, native_start_fails: bool = False,
                  refuse_append: bool = False):
-        self.calls = []              # ordered (verb, ts) log
-        self.live = {}               # ts -> text, only messages currently on screen
-        self.text = {}               # ts -> latest text ever written (live or not)
-        self.history = []            # every (ts, text) ever WRITTEN — `text` keeps only the last
+        self.calls: List[Any] = []   # ordered (verb, ts) log
+        self.live: Dict[str, str] = {}   # ts -> text, only messages currently on screen
+        self.text: Dict[str, str] = {}   # ts -> latest text ever written (live or not)
+        self.history: List[Any] = []  # every (ts, text) ever WRITTEN — `text` keeps only the last
         self.native = native
         self.refuse_delete = refuse_delete
         self.refuse_post = refuse_post

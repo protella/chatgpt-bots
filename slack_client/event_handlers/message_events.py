@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional, cast
 
 from slack_sdk.errors import SlackApiError
 
@@ -11,6 +11,7 @@ from base_client import Message
 from config import config
 from message_processor.routing_facts import stamp_routing_facts
 from slack_client import actor_tail
+from slack_client._host import _Host
 from slack_client.formatting.blocks import extract_supplementary_text
 
 
@@ -138,7 +139,13 @@ async def _post_onboarding_notice(client_self, client, *, site, receipt_channel,
         return await post_then_register(_post_and_register())
 
 
-class SlackMessageEventsMixin:
+class SlackMessageEventsMixin(_Host):
+    if TYPE_CHECKING:
+        # Both created lazily on first onboarding turn (hasattr-guarded below), so they are
+        # declared rather than assigned.
+        _welcomed_users: set
+        _reminder_messages: Dict[Any, list]
+
     async def _event_to_message(self, event: Dict[str, Any], client) -> Message:
         """Convert a Slack event into the universal Message format (no side effects).
 
@@ -232,11 +239,13 @@ class SlackMessageEventsMixin:
                 self.log_debug(f"User from DB for {user_id}: email={user_email}, real_name={user_real_name}")
 
         # Create universal message
+        # Every event that reaches here carries a channel and a ts; the casts only tell the
+        # checker that, they neither test nor change anything.
         message = Message(
             text=text,
-            user_id=user_id,
-            channel_id=event.get("channel"),
-            thread_id=event.get("thread_ts") or event.get("ts"),
+            user_id=cast(str, user_id),
+            channel_id=cast(str, event.get("channel")),
+            thread_id=cast(str, event.get("thread_ts") or event.get("ts")),
             attachments=attachments,
             metadata={
                 "ts": event.get("ts"),
@@ -959,7 +968,7 @@ class SlackMessageEventsMixin:
         if self.is_own_message(event):
             return
 
-        channel_id = event.get("channel")
+        channel_id = cast(str, event.get("channel"))
         cs = await self._get_channel_settings(channel_id)
         # Participation levels (off / mentions_only / on). participation_level wins over the
         # legacy response_mode; both map cleanly (off≡off, tag_only≡mentions_only, auto_respond≡on).
@@ -1025,7 +1034,7 @@ class SlackMessageEventsMixin:
         # it — the channel-read gate may skip the membership lookup for THIS conversation.
         attest_message_origin(message, event, message.metadata.get("sender_type"))
         # Phase 6: reply in-thread by default (a top-level message keys as its own length-1 thread).
-        message.thread_id = thread_ts or ts
+        message.thread_id = cast(str, thread_ts or ts)
         message.metadata["channel_listen"] = True
         message.metadata["participation_level"] = level
         # F3 wake source: a name-in-text hit reads as name_mention (engine-gated or the
@@ -1073,7 +1082,8 @@ class SlackMessageEventsMixin:
         if self.message_handler:
             await self.message_handler(message, self)
 
-    async def _handle_slack_message(self, event: Dict[str, Any], client, wake_source: str = None,
+    async def _handle_slack_message(self, event: Dict[str, Any], client,
+                                    wake_source: Optional[str] = None,
                                     origin_verified: bool = False,
                                     admission_ts: Optional[str] = None):
         """Handle a mention/DM event: build the message, run onboarding, dispatch (unchanged).
@@ -1187,7 +1197,7 @@ class SlackMessageEventsMixin:
             # and — silently, exactly once — DM the settings button so the newcomer can tune it if
             # they want. No public onboarding chrome, no blocking. DMs keep the full flow below.
             if message.channel_id and not message.channel_id.startswith('D'):
-                await self._welcome_new_channel_user_via_dm(user_id, client)
+                await self._welcome_new_channel_user_via_dm(cast(str, user_id), client)
                 if self.message_handler:
                     await self.message_handler(message, self)
                 return
@@ -1280,7 +1290,7 @@ class SlackMessageEventsMixin:
                         target_thread = message.thread_id
                     else:
                         # For channels/threads, send as a DM to the user
-                        target_channel = user_id  # Send to user's DM
+                        target_channel = cast(str, user_id)  # Send to user's DM
                         target_thread = None  # No thread in DM
                         
                         # Also send a brief message in the thread to acknowledge

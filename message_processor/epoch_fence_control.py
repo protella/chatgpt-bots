@@ -28,11 +28,14 @@ import os
 import secrets
 import stat
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, cast
 
 from logger import setup_logger
 
 from message_processor import epoch_fence
+
+if TYPE_CHECKING:  # asyncio is imported where it is used, so annotations borrow it from here
+    import asyncio
 
 logger = setup_logger(name="slack_bot.EpochFenceControl")
 
@@ -178,7 +181,7 @@ def _passed(expiry_ts: Optional[str]) -> bool:
     """True when an expiry has already gone by. An unparseable or absent one counts as passed —
     a lease whose lifetime cannot be read is not a lease anything should resume."""
     try:
-        return time.time() >= float(expiry_ts)
+        return time.time() >= float(expiry_ts)  # type: ignore[arg-type]  # None → TypeError, caught
     except (TypeError, ValueError):
         return True
 
@@ -199,8 +202,10 @@ class EpochFenceWatcher:
     def __init__(self, client: Any):
         import asyncio
         self._client = client
-        self._db = getattr(client, "db", None)
-        self._task = None
+        # DatabaseManager. Typed `Any`, not `Optional[...]`: the watcher only ever starts behind
+        # the flag, on a client that has one, and every method here calls straight through.
+        self._db: Any = getattr(client, "db", None)
+        self._task: Optional["asyncio.Task"] = None
         self._ready = False
         #: Set when `_boot` has finished, SUCCEEDED OR NOT — it is a "startup is over" edge, not a
         #: success flag. `wait_ready` reports which it was via `self._ready`.
@@ -217,8 +222,11 @@ class EpochFenceWatcher:
             return
         self._task = asyncio.create_task(self._run(), name="epoch_fence_watcher")
         self._task.add_done_callback(
-            lambda t: t.cancelled() or (t.exception() and logger.error(
-                f"Epoch fence watcher stopped with: {t.exception()}")))
+            # ignore[func-returns-value]: `logger.error` returns None; it is used for its effect.
+            lambda t: t.cancelled() or (
+                t.exception()
+                and logger.error(  # type: ignore[func-returns-value]
+                    f"Epoch fence watcher stopped with: {t.exception()}")))
 
     async def wait_ready(self, timeout: Optional[float] = None) -> bool:
         """Block until startup has finished. True when it SUCCEEDED.
@@ -508,7 +516,8 @@ class EpochFenceWatcher:
             row = await self._db.read_epoch_lease_async(team, channel)
             if row is not None and row["expiry_ts"] != fence.expiry_ts:
                 epoch_fence.set_fence_expiry(team, channel, row["expiry_ts"])
-                fence = epoch_fence.active_fence(team, channel)
+                # cast: the scope came out of the registry a line ago and only a release removes it
+                fence = cast(epoch_fence.ActiveFence, epoch_fence.active_fence(team, channel))
             if not epoch_fence._expired(fence):
                 continue
             logger.error(

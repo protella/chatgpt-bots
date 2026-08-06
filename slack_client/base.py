@@ -1,5 +1,5 @@
 """Slack Bot Client Implementation."""
-from typing import Any, Optional, Callable, List
+from typing import Any, Optional, Callable, List, cast
 
 from slack_bolt.async_app import AsyncApp
 
@@ -22,7 +22,7 @@ from .history_tool import SlackHistoryToolMixin
 from .channel_lookup_tool import (SlackChannelLookupToolMixin,
                                   register_channel_lookup_tool)
 from .search_tool import SlackSearchToolMixin
-from tool_registry import ToolRegistry
+from tool_registry import Executor, ToolRegistry
 from message_processor.destination_tools import register_destination_tools
 from message_processor.memory_tools import register_memory_tools
 from message_processor.participation_tools import register_participation_tools
@@ -35,7 +35,12 @@ from message_processor.people_tools import register_people_tools
 from message_processor.research_tools import register_research_tools
 
 
-class SlackBot(SlackMessageEventsMixin,
+# The ignore[misc] on the class statement: BaseClient still declares send_message,
+# update_message, delete_message, send_thinking_indicator, get_thread_history and download_file
+# as SYNC abstract methods, while every Slack implementation of them is `async def`. That
+# divergence lives in base_client.py's seam, not here, and narrowing it would mean changing what
+# those methods return at runtime.
+class SlackBot(SlackMessageEventsMixin,  # type: ignore[misc]
                SlackSettingsHandlersMixin,
                SlackRegistrationMixin,
                SlackAssistantEventsMixin,
@@ -96,7 +101,10 @@ class SlackBot(SlackMessageEventsMixin,
             name = schema["name"]
             registry.register(
                 schema,
-                lambda ctx, args, _name=name: self.dispatch_history_tool_call(_name, args, ctx),
+                # cast: the default-arg late-binding capture is what makes the lambda's type
+                # unresolvable to the checker, not its shape.
+                cast(Executor,
+                     lambda ctx, args, _name=name: self.dispatch_history_tool_call(_name, args, ctx)),
             )
         # Name → id resolution for the tools above, scoped to conversations the REQUESTER and
         # the bot share. Without it "what's in #product-insights?" from a DM dead-ends: the model
@@ -223,7 +231,10 @@ class SlackBot(SlackMessageEventsMixin,
         return registry
 
     # Async versions required by BaseClient
-    async def send_message_async(self, channel_id: str, thread_id: str, text: str,
+    # ignore[override]: Slack's `surface` sits between `lease` and `receipts`, so the parameter
+    # ORDER differs from BaseClient's. Every caller passes these by keyword; moving it would be a
+    # runtime change to the seam for no type benefit.
+    async def send_message_async(self, channel_id: str, thread_id: str, text: str,  # type: ignore[override]
                                  blocks: Optional[list] = None,
                                  meta_out: Optional[dict] = None,
                                  lease: Any = None,
@@ -268,8 +279,9 @@ class SlackBot(SlackMessageEventsMixin,
                                          receipt_kind=receipt_kind,
                                          receipt_class=receipt_class)
 
-    async def get_thread_history_async(self, channel_id: str, thread_id: str, limit: int = None,
-                                       oldest: str = None) -> List[Message]:
+    async def get_thread_history_async(self, channel_id: str, thread_id: str,
+                                       limit: Optional[int] = None,
+                                       oldest: Optional[str] = None) -> List[Message]:
         """Get message history for a thread (async version)"""
         return await self.get_thread_history(channel_id, thread_id, limit, oldest=oldest)
 

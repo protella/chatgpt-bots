@@ -23,6 +23,12 @@ pytest-mock>=3.14.0
 pytest-env>=1.0.0
 coverage[toml]>=7.4.0
 
+# Type stubs — checked by `make lint`, never imported at runtime. Without them mypy cannot see
+# into these libraries and reports import-untyped. (pytesseract publishes no stubs at all and no
+# types-pytesseract exists; it is handled by a narrow per-module override in mypy.ini.)
+types-croniter>=6.0.0
+pandas-stubs>=2.2.0
+
 # Document processing dependencies
 beautifulsoup4>=4.12.0  # Parse Slack canvas HTML back into markdown (canvas_tools); hard dependency
 pypdf>=5.0.0

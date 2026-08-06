@@ -32,6 +32,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Dict, List, Tuple
 
 from config import config
+from slack_client._host import _Host
 from slack_client.history_tool import ACCESS_DENIED_MESSAGE
 
 # Most candidate names resolve to one channel; a handful is already pathological. Each
@@ -63,7 +64,7 @@ def _name_matches(entry: Dict[str, Any], want: str) -> bool:
     return False
 
 
-class SlackChannelLookupToolMixin:
+class SlackChannelLookupToolMixin(_Host):
     """`lookup_channel`: name → id, scoped to conversations the requester and bot share."""
 
     if TYPE_CHECKING:  # provided by the host (SlackBot) and SlackHistoryToolMixin

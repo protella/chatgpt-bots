@@ -12,6 +12,7 @@ Pure builder tests use a db-less SettingsModal. No live Slack, no API.
 from __future__ import annotations
 
 import json
+from typing import Optional
 
 from database import memory_content_hash, normalize_memory_line
 from settings_modal import SettingsModal
@@ -27,7 +28,7 @@ def _blocks(view) -> list:
     return view["blocks"]
 
 
-def _memory_input(view) -> dict:
+def _memory_input(view) -> Optional[dict]:
     """The channel_memory textarea element, or None."""
     for b in _blocks(view):
         if b.get("block_id") == "channel_memory_block":

@@ -21,9 +21,10 @@ Correctness spine:
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from config import config
+from slack_client._host import _Host
 
 # Slack message-metadata marker stamped on the posted intro. Nonsensitive — a version + the channel
 # id only — so the crash-reconcile can recognize our own prior intro in conversations.history.
@@ -58,7 +59,12 @@ _TUNE_LINE = (
 )
 
 
-class SlackChannelJoinMixin:
+class SlackChannelJoinMixin(_Host):
+    if TYPE_CHECKING:
+        # Created lazily by _spawn_channel_intro, so declared rather than assigned: the strong
+        # refs that keep the detached intro tasks from being GC'd mid-flight.
+        _channel_intro_tasks: set
+
     """member_joined_channel → one-time public intro. Mixed into SlackBot (has self.app,
     self.db, self.bot_user_id, self.processor, and the log_* helpers)."""
 
@@ -294,7 +300,7 @@ class SlackChannelJoinMixin:
         # under, but clip defensively so an over-long compose can never sink the post.
         if len(text) > 2900:
             text = text[:2899].rstrip() + "…"
-        blocks = [
+        blocks: List[Dict[str, Any]] = [
             {"type": "section", "text": {"type": "mrkdwn", "text": text}},
             {"type": "actions", "elements": [
                 {"type": "button",

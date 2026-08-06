@@ -45,6 +45,18 @@ architecture notes.
 - Prefer lean, single-responsibility modules; extract helpers into adjacent files
   rather than growing the runners.
 - Format with `black` + `isort`, lint with `ruff`, keep type hints passing `mypy`.
+- **`make lint` passes with ZERO errors across 298 files, and every commit must leave it that
+  way — run it before you commit** (the pre-commit hook runs ruff and mypy too, in under a
+  second). 1114 type errors were cleared in one pass to reach zero, so a new one is a real
+  signal rather than noise to scroll past.
+- Write to the linters' taste as you go: annotate parameters and returns, `Optional[X]` for
+  anything defaulting to `None`, no unused imports. Never silence what you could fix —
+  `# type: ignore[code]` is a last resort, always with the specific code and a `#` comment
+  saying why. Never narrow a type with `assert x is not None` in production code; it changes
+  runtime, and `typing.cast` does not.
+- Mixin classes take their host contract from `slack_client/_host.py` and
+  `message_processor/_host.py` — a typing-only base that is plain `object` at runtime. Read the
+  docstring there before adding a mixin or a shared attribute.
 
 ## Testing Guidelines
 - Name test files `test_*.py` (see `pytest.ini`). Markers: `unit`, `integration`,

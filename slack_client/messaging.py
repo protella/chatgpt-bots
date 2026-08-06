@@ -7,7 +7,8 @@ import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Mapping,
+                    Optional, cast)
 from uuid import uuid4
 
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
@@ -36,6 +37,7 @@ from slack_client.event_handlers.feedback import (
     feedback_enabled,
     should_offer_feedback,
 )
+from slack_client._host import _Host
 from slack_client.formatting.blocks import extract_supplementary_text
 from slack_client.utilities import strip_citations
 
@@ -51,7 +53,7 @@ import re as _re
 # With the flag SET, an import failure here is logged at ERROR and leaves the fence disabled, but
 # it is `main.initialize` that REFUSES TO START on it. This module is also imported by tools and
 # tests that have no boot sequence to abort, so the abort belongs where the boot is.
-_epoch_fence = None
+_epoch_fence: Any = None   # the module itself once imported; typed loosely so the rebind is legal
 if dev_epoch_fence_requested():
     try:
         from message_processor import epoch_fence as _epoch_fence
@@ -583,10 +585,17 @@ class WorkspaceEmojiCache:
         return [s[3] for s in scored[:max(0, int(limit or 0))]]
 
 
-class SlackMessagingMixin:
+class SlackMessagingMixin(_Host):
     # How long stop() will wait out a socket-mode close that hung past its first 0.1s try. Long
     # enough for a real close to finish, short enough that a wedged one cannot hold shutdown.
     _HANDLER_CLOSE_TIMEOUT = 5.0
+
+    if TYPE_CHECKING:
+        # Created lazily on first use (see reserve_reaction_slot), so they are declared rather
+        # than assigned — the shapes are (channel, ts) -> {emoji: Future|True} and
+        # (channel, ts) -> monotonic touch time.
+        _reaction_guard: "OrderedDict[Any, Dict[str, Any]]"
+        _reaction_guard_ts: Dict[Any, float]
 
     async def start(self):
         """Start the Slack bot"""
@@ -1081,7 +1090,7 @@ class SlackMessagingMixin:
                             # Honor Slack's Retry-After on 429s; brief pause otherwise.
                             delay = 1.0
                             try:
-                                delay = float(getattr(chunk_error, "response", None)
+                                delay = float(cast(Any, getattr(chunk_error, "response", None))
                                               .headers.get("Retry-After", 1))
                             except Exception:
                                 pass
@@ -1745,8 +1754,9 @@ class SlackMessagingMixin:
                     continue
                 raise
 
-    async def get_thread_history(self, channel_id: str, thread_id: str, limit: int = None,
-                                 oldest: str = None) -> List[Message]:
+    async def get_thread_history(self, channel_id: str, thread_id: str,
+                                 limit: Optional[int] = None,
+                                 oldest: Optional[str] = None) -> List[Message]:
         """Get COMPLETE thread history from Slack - fetches ALL messages by default.
 
         `oldest` (Slack ts) fetches only messages strictly after it (Slack's default
@@ -1991,8 +2001,9 @@ class SlackMessagingMixin:
             msgs = [pick]
             status_text = pick
         try:
-            kwargs = {"channel_id": channel_id, "thread_ts": thread_id,
-                      "status": _status_plain_text(status_text) if status_text else ""}
+            kwargs: Dict[str, Any] = {
+                "channel_id": channel_id, "thread_ts": thread_id,
+                "status": _status_plain_text(status_text) if status_text else ""}
             texts = [t for t in (_status_plain_text(m) for m in msgs) if t]
             if texts:
                 kwargs["loading_messages"] = texts
@@ -2099,8 +2110,9 @@ class SlackMessagingMixin:
         no allowlist is set, the workspace's custom emoji are surfaced as EXTRA named choices in
         the field DESCRIPTION (never an enum — an enum would forbid every standard emoji)."""
         allowed = [e.strip().strip(":") for e in (config.reaction_emojis or []) if e and e.strip().strip(":")]
-        emoji_schema = {"type": "string",
-                        "description": "Any standard Slack emoji shorthand name (no colons), e.g. joy, tada, fire."}
+        emoji_schema: Dict[str, Any] = {
+            "type": "string",
+            "description": "Any standard Slack emoji shorthand name (no colons), e.g. joy, tada, fire."}
         if allowed:
             emoji_schema["enum"] = allowed
         else:
@@ -2150,8 +2162,9 @@ class SlackMessagingMixin:
 
         `cfg` is accepted and ignored so the registry can call it like a factory."""
         allowed = [e.strip().strip(":") for e in (config.reaction_emojis or []) if e and e.strip().strip(":")]
-        emoji_schema = {"type": "string",
-                        "description": "Any standard Slack emoji shorthand name (no colons), e.g. joy, tada, fire."}
+        emoji_schema: Dict[str, Any] = {
+            "type": "string",
+            "description": "Any standard Slack emoji shorthand name (no colons), e.g. joy, tada, fire."}
         if allowed:
             emoji_schema["enum"] = allowed
         else:
@@ -2380,7 +2393,7 @@ class SlackMessagingMixin:
         otherwise the slot would stay `removing` forever, and since owned slots are pinned
         against eviction, a run of cancelled turns would grow the guard without bound."""
         guard = getattr(self, "_reaction_guard", None)
-        slots = (guard or {}).get((channel_id, ts))
+        slots: Any = (guard or {}).get((channel_id, ts))
         slot = slots.get(emoji) if slots is not None else None
         if not (isinstance(slot, dict) and slot.get("token") == token
                 and slot.get(self._REMOVING) is not None):
@@ -2428,10 +2441,11 @@ class SlackMessagingMixin:
         cancelled turn cannot strand the slot mid-removal. The caller merely waits for it."""
         if not lease:
             return False
-        channel_id, ts = lease.get("channel_id"), lease.get("ts")
-        emoji, token = lease.get("emoji"), lease.get("token")
+        # A lease is only ever minted by reserve_reaction_slot, which fills all four keys.
+        channel_id, ts = cast(str, lease.get("channel_id")), cast(str, lease.get("ts"))
+        emoji, token = cast(str, lease.get("emoji")), cast(str, lease.get("token"))
         guard = getattr(self, "_reaction_guard", None)
-        slots = (guard or {}).get((channel_id, ts))
+        slots: Any = (guard or {}).get((channel_id, ts))
         slot = slots.get(emoji) if slots is not None else None
         if not (isinstance(slot, dict) and slot.get("token") == token
                 and slot.get(self._REMOVING) is None):
@@ -3186,7 +3200,7 @@ class SlackMessagingMixin:
         send_meta: dict = {}
         try:
             posted = await self.send_message(
-                channel_id, announcement_thread["ts"], announcement, lease=lease,
+                channel_id, cast(str, announcement_thread["ts"]), announcement, lease=lease,
                 surface="edit_own_message", meta_out=send_meta, on_first_accept=_observe,
                 receipts=receipts, receipt_kind="finalized",
                 receipt_class="correction_announcement")
@@ -3672,7 +3686,7 @@ class SlackMessagingMixin:
                 "error": str(e)
             }
 
-    def _build_response_footer_blocks(self, model: str) -> list:
+    def _build_response_footer_blocks(self, model: Optional[str]) -> list:
         """Footer: a single compact row — one small button carrying the model name that opens
         the per-channel settings modal (handled by the ``open_channel_settings`` action)."""
         model_label = model or config.gpt_model

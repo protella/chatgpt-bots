@@ -2,19 +2,20 @@ from __future__ import annotations
 
 import json
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 from slack_sdk.errors import SlackApiError
 
 from config import config
 from message_processor.outbound_receipts import channel_post_admission
+from slack_client._host import _Host
 # Every callback below is ingress-tracked: they do substantial DB work, and shutdown's claim to
 # have quiesced "Slack ingress" is only honest if it covers them too. See _IngressTracker.
 from slack_client.event_handlers.registration import track_ingress
 from slack_client.formatting.blocks import extract_supplementary_text
 
 
-class SlackSettingsHandlersMixin:
+class SlackSettingsHandlersMixin(_Host):
 
     if TYPE_CHECKING:  # provided by the host (SlackBot) — declared so this mixin type-checks
         app: Any
@@ -76,7 +77,7 @@ class SlackSettingsHandlersMixin:
         except Exception as e:  # noqa: BLE001
             self.log_debug(f"Settings receipt deletion failed: {e}")
 
-    async def _get_session_data(self, body) -> dict:
+    async def _get_session_data(self, body) -> Optional[dict]:
         """
         Helper to get session data from database using session_id in metadata.
 

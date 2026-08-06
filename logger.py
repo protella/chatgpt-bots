@@ -11,7 +11,7 @@ from logging.handlers import RotatingFileHandler, QueueHandler, QueueListener
 import queue
 import threading
 import warnings
-from typing import Dict
+from typing import Dict, List
 try:
     from concurrent_log_handler import ConcurrentRotatingFileHandler
     USE_CONCURRENT_HANDLER = True
@@ -111,7 +111,7 @@ def setup_logger(
             _log_queue = queue.Queue(-1)  # Unbounded queue
 
             # Create the actual file handlers
-            handlers = []
+            handlers: List[logging.Handler] = []
 
             # Console handler with colors (only if enabled)
             if config.console_logging_enabled:
@@ -125,6 +125,7 @@ def setup_logger(
 
             # Main app log file (all levels)
             app_log_file = os.path.join(logs_dir, "app.log")
+            app_handler: logging.Handler
             if USE_CONCURRENT_HANDLER:
                 app_handler = ConcurrentRotatingFileHandler(
                     app_log_file,
@@ -148,6 +149,7 @@ def setup_logger(
 
             # Error log file (ERROR and CRITICAL only)
             error_log_file = os.path.join(logs_dir, "error.log")
+            error_handler: logging.Handler
             if USE_CONCURRENT_HANDLER:
                 error_handler = ConcurrentRotatingFileHandler(
                     error_log_file,

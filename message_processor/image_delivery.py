@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Optional, TypeGuard
+from typing import Any, Dict, Optional, TypeGuard
 
 from config import clamp_effort, config
 from message_processor.progress import ProgressChecklist
@@ -231,7 +231,7 @@ async def publish_image(
     prompt_text = prompt or getattr(image_data, "prompt", "") or ""
     try:
         if db:
-            meta = {"timestamp": time.time()}
+            meta: Dict[str, Any] = {"timestamp": time.time()}
             if generation_id:
                 meta["generation_id"] = generation_id
             # Direct, breadcrumb-INDEPENDENT write (a Phase-Q refresh between lock release

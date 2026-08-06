@@ -51,10 +51,10 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from config import config
 from database import DatabaseManager
-from message_processor.channel_stream import (SELECTION_VERSION, PreparedTurn, build_channel_pin,
-                                              build_origin_pin, eligible_for_stream,
-                                              fetch_origin_thread, serialize_stream,
-                                              serializer_config_snapshot)
+from message_processor.channel_stream import (SELECTION_VERSION, ChannelStream, PreparedTurn,
+                                              build_channel_pin, build_origin_pin,
+                                              eligible_for_stream, fetch_origin_thread,
+                                              serialize_stream, serializer_config_snapshot)
 from message_processor.utilities import reach_tools_for
 from slack_client import actor_tail as actor_tail_module
 from slack_client.history_fetch import FetchBudget, page_messages
@@ -89,7 +89,7 @@ async def _independent_origin_walk(client: Any, db: Any, *, team_id: str, channe
     from message_processor.channel_stream import (_dedup, _freeze_sidecars, _normalize_page,
                                                   _web, classify_chrome)
 
-    method = _web(client, "conversations_replies")
+    method: Any = _web(client, "conversations_replies")
     raw = await page_messages(method, channel_id=channel_id,
                               extra_params={"ts": str(origin_root_ts)},
                               latest=h, inclusive=True,
@@ -244,7 +244,7 @@ async def run_probe(*, client: Any, db: Any, team_id: str, channel_id: str,
                                      deadline_at=deadline_at,
                                      reach_tools=reach_tools_for())
 
-    entries: List[Dict[str, Any]] = []
+    entries: List[Tuple[Dict[str, Any], ChannelStream]] = []
     stream_hashes = set()
     for origin_root_ts in origins:
         # Each origin gets its OWN budget carrying the SAME deadline — `build_origin_pin` raises

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tupl
 from slack_sdk.errors import SlackApiError
 
 from config import config
+from slack_client._host import _Host
 from slack_client.formatting.blocks import extract_supplementary_text
 from slack_client.normalizer import ORIGIN_HISTORY, normalize_slack_message
 from slack_client.utilities import is_dm_conversation
@@ -142,7 +143,7 @@ _USER_CONVOS_MAX_PAGES = 60
 _USER_CONVOS_TIME_BUDGET_S = 8.0
 
 
-class SlackHistoryToolMixin:
+class SlackHistoryToolMixin(_Host):
     """On-demand Slack history-fetch tool (Phase 8).
 
     Lets the model deliberately pull a bounded slice of a thread's/channel's recent

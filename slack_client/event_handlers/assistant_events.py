@@ -3,9 +3,10 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from config import config
+from slack_client._host import _Host
 
 
-class SlackAssistantEventsMixin:
+class SlackAssistantEventsMixin(_Host):
     """Agent split-view (Assistant surface) adapter.
 
     Handles the assistant-thread lifecycle events additively: greeting + suggested prompts

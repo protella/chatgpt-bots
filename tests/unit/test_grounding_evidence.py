@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import re
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -87,7 +88,7 @@ def _gate_payload() -> str:
 def _responder_prompt() -> str:
     from message_processor.utilities import MessageUtilitiesMixin
 
-    proc = MessageUtilitiesMixin.__new__(type("P", (MessageUtilitiesMixin,), {}))
+    proc: Any = MessageUtilitiesMixin.__new__(type("P", (MessageUtilitiesMixin,), {}))
     client = MagicMock()
     client.name = "slack"
     return proc._get_system_prompt(

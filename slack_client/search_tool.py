@@ -14,6 +14,7 @@ from slack_sdk.errors import SlackApiError
 
 from base_client import HistoryFetchError
 from config import config
+from slack_client._host import _Host
 from slack_client.history_fetch import (FetchBudget, HistoryPageError, iter_pages,
                                         slack_error_code)
 from slack_client.messaging import is_self_chrome_message
@@ -476,7 +477,7 @@ _TOKEN_ERRORS = {
 _VALID_CHANNEL_TYPES = {"public_channel", "private_channel", "im", "mpim"}
 
 
-class SlackSearchToolMixin:
+class SlackSearchToolMixin(_Host):
     """`search_slack` — ONE tool name over TWO backends, split by surface (`search_backend_for`).
 
     DM (true IM) → `assistant.search.context`, Phase B, unchanged: Slack's own index, the whole

@@ -697,7 +697,8 @@ def test_the_cache_key_stays_channel_scoped_and_forks_only_four_ways(monkeypatch
     assert prompt_cache_key("T1", "C1") == prompt_cache_key("T1", "C1")
     assert a.stream_sha256 == b.stream_sha256
     assert a.union_sha256 != b.union_sha256
-    assert OriginFetch and build_origin_pin and serialize_stream  # the split-phase API is real
+    # ignore: they are a class and two functions, so always truthy — that IS the assertion.
+    assert OriginFetch and build_origin_pin and serialize_stream  # type: ignore[truthy-function]  # the split-phase API is real
 
     # THE FOUR FORKS, each DRIVEN rather than described.
     test_fork_one_the_code_interpreter_container_is_thread_scoped(monkeypatch)
