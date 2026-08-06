@@ -212,7 +212,7 @@ class ImageURLHandler:
         """
         self.max_image_size = max_image_size
         self.timeout = timeout
-        self._session = None  # Reusable session for better resource management
+        self._session: Optional[aiohttp.ClientSession] = None  # Reusable session for better resource management
 
     async def __aenter__(self):
         """Async context manager entry"""
@@ -360,7 +360,7 @@ class ImageURLHandler:
         api_bytes, verdict = ensure_api_compatible(content)
         if api_bytes is None:
             logger.error(f"Rejecting image from {url}: {verdict}")
-            logger.debug(f"First 20 bytes: {content[:20]}")
+            logger.debug(f"First 20 bytes: {content[:20]!r}")
             return None
         content = api_bytes  # transcoded PNG when the source format needed it
         mimetype = verdict

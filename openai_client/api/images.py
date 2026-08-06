@@ -228,7 +228,8 @@ async def _enhance_image_edit_prompt(
 
                     if text_chunk:
                         enhanced += text_chunk
-                        if stream_callback:
+                        # Defensive re-check; the outer branch already narrowed it non-None.
+                        if stream_callback:  # type: ignore[truthy-function]
                             stream_callback(text_chunk)
         else:
             # Non-streaming fallback

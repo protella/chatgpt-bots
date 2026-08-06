@@ -17,7 +17,7 @@ from __future__ import annotations
 import datetime
 from typing import Any, Dict, Optional
 
-import pytz
+import pytz  # type: ignore[import-untyped]  # types-pytz isn't a dependency; pytz ships no stubs
 
 
 def render_message_timestamp(ts: Any, tz: Optional[str] = "UTC") -> str:

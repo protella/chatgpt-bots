@@ -101,15 +101,22 @@ class TestBaseClient:
     """Test BaseClient abstract class"""
     
     class MockClient(BaseClient):
-        """Concrete implementation for testing"""
-        
+        """Concrete implementation for testing
+
+        The platform-method signatures below have drifted from BaseClient's (sync vs async,
+        `channel`/`thread_ts` vs `channel_id`/`thread_id`), hence the `# type: ignore[override]`
+        on each. Nothing here calls them through the BaseClient contract — the tests drive the
+        compatibility wrappers (post_message/upload_image/fetch_thread_history) — so the drift
+        is a typing fact only.
+        """
+
         def __init__(self):
             super().__init__(name="MockClient")
             self.platform = "mock"
             self.posted_messages = []
             self.uploaded_images = []
         
-        async def send_message(self, channel: str, text: str, thread_ts: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+        async def send_message(self, channel: str, text: str, thread_ts: Optional[str] = None, **kwargs) -> Dict[str, Any]:  # type: ignore[override]
             """Mock send message"""
             self.posted_messages.append({
                 "channel": channel,
@@ -118,7 +125,7 @@ class TestBaseClient:
             })
             return {"ts": f"msg_{len(self.posted_messages)}"}
         
-        async def send_image(self, channel: str, image_data: bytes, filename: str, thread_ts: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+        async def send_image(self, channel: str, image_data: bytes, filename: str, thread_ts: Optional[str] = None, **kwargs) -> Dict[str, Any]:  # type: ignore[override]
             """Mock send image"""
             self.uploaded_images.append({
                 "channel": channel,
@@ -127,21 +134,21 @@ class TestBaseClient:
             })
             return {"file": {"url_private": f"https://mock.com/{filename}"}}
         
-        async def get_thread_history(self, channel: str, thread_ts: str, **kwargs) -> List[Dict[str, Any]]:
+        async def get_thread_history(self, channel: str, thread_ts: str, **kwargs) -> List[Dict[str, Any]]:  # type: ignore[override]
             """Mock get thread history"""
             return [
                 {"user": "U123", "text": "Previous message", "ts": "123.456"}
             ]
         
-        async def send_thinking_indicator(self, channel: str, thread_ts: Optional[str] = None) -> Optional[str]:
+        async def send_thinking_indicator(self, channel: str, thread_ts: Optional[str] = None) -> Optional[str]:  # type: ignore[override]
             """Mock send thinking indicator"""
             return "thinking_123"
         
-        async def delete_message(self, channel: str, ts: str) -> bool:
+        async def delete_message(self, channel: str, ts: str) -> bool:  # type: ignore[override]
             """Mock delete message"""
             return True
         
-        async def download_file(self, url: str) -> bytes:
+        async def download_file(self, url: str) -> bytes:  # type: ignore[override]
             """Mock download file"""
             return b"fake_file_content"
         
@@ -176,19 +183,19 @@ class TestBaseClient:
             pass
 
         # Add the missing async abstract methods
-        async def send_message_async(self, channel: str, text: str, thread_ts: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+        async def send_message_async(self, channel: str, text: str, thread_ts: Optional[str] = None, **kwargs) -> Dict[str, Any]:  # type: ignore[override]
             """Async version of send_message"""
             return await self.send_message(channel, text, thread_ts, **kwargs)
 
-        async def send_image_async(self, channel: str, image_data: bytes, filename: str, thread_ts: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+        async def send_image_async(self, channel: str, image_data: bytes, filename: str, thread_ts: Optional[str] = None, **kwargs) -> Dict[str, Any]:  # type: ignore[override]
             """Async version of send_image"""
             return await self.send_image(channel, image_data, filename, thread_ts, **kwargs)
 
-        async def get_thread_history_async(self, channel: str, thread_ts: str, **kwargs) -> List[Dict[str, Any]]:
+        async def get_thread_history_async(self, channel: str, thread_ts: str, **kwargs) -> List[Dict[str, Any]]:  # type: ignore[override]
             """Async version of get_thread_history"""
             return await self.get_thread_history(channel, thread_ts, **kwargs)
 
-        async def send_thinking_indicator_async(self, channel: str, thread_ts: Optional[str] = None) -> Optional[str]:
+        async def send_thinking_indicator_async(self, channel: str, thread_ts: Optional[str] = None) -> Optional[str]:  # type: ignore[override]
             """Async version of send_thinking_indicator"""
             return await self.send_thinking_indicator(channel, thread_ts)
 
@@ -196,7 +203,7 @@ class TestBaseClient:
             """Async version of delete_message"""
             return await self.delete_message(channel, ts)
 
-        async def download_file_async(self, url: str) -> bytes:
+        async def download_file_async(self, url: str) -> bytes:  # type: ignore[override]
             """Async version of download_file"""
             return await self.download_file(url)
     

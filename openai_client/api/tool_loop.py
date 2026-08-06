@@ -16,7 +16,7 @@ tools run, and only the final round's text reaches the user.
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, cast
 
 from config import config
 from message_markers import join_segments
@@ -163,7 +163,7 @@ def _replay_round_items(sink: List[Dict[str, Any]], input_items: List[Dict[str, 
             input_items.append({"role": "user", "content": content})
 
 
-def _merge_used(tools_used_all: List[str], round_used: List[str],
+def _merge_used(tools_used_all: List[str], round_used: List[Any],
                 tool_context: Any = None) -> None:
     """Merge a round's used-tool names into the loop's accumulator AND onto the turn.
 
@@ -540,7 +540,8 @@ async def create_text_response_with_tool_loop(
 
     while True:
         sink: List[Dict[str, Any]] = []
-        result = await responses_api.create_text_response_with_tools(
+        # return_metadata=True makes this a metadata dict, which the declared `-> str` omits.
+        result = cast(Dict[str, Any], await responses_api.create_text_response_with_tools(
             self,
             messages=input_items,
             tools=tools,
@@ -548,7 +549,7 @@ async def create_text_response_with_tool_loop(
             function_call_sink=sink,
             tool_choice=tool_choice,
             **params,
-        )
+        ))
         _merge_used(tools_used_all, result.get("tools_used") or [], tool_context)
 
         calls = _function_calls(sink)

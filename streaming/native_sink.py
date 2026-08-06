@@ -70,7 +70,9 @@ class NativeStreamCoordinator:
         self.user_id = user_id
         self.char_limit = max(200, char_limit)
         self._log = logger or (lambda msg: None)
-        self.session = None
+        # The client's NativeStreamSession, minted by begin_native_stream; `_client` is duck-typed
+        # (real bot or a test double), so the session is too.
+        self.session: Any = None
         self.base = ""       # non-buffer prefix of the current part (part prefix + fence reopen)
         self.part = 1
         self.failed = False

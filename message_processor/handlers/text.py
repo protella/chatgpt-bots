@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Mapping, Optional
 from base_client import BaseClient, Message, Response
 from config import config, pipeline_status
 from message_processor import participation_telemetry
+from message_processor._host import _Host
 from message_processor.reconsideration import intercept_stale_send
 from message_processor.routing_facts import POSTURE_THREAD
 from message_processor.stale_send_guard import StaleSendSuppressed
@@ -516,7 +517,7 @@ def _prompt_tools_available(registry: Any) -> Optional[bool]:
     return False if registry is None else None
 
 
-class TextHandlerMixin:
+class TextHandlerMixin(_Host):
     @staticmethod
     def _turn_surface(message: Message) -> str:
         """Which tool surface this turn runs on (spec §8 surface ruling).
@@ -858,7 +859,7 @@ class TextHandlerMixin:
 
     async def _assemble_channel_attempt(self, client: BaseClient, message: Message,
                                         thread_state, turn: Any, thread_config: dict,
-                                        model: Optional[str], *, thread_key: str,
+                                        model: str, *, thread_key: str,
                                         tools_disabled: bool = False,
                                         exclude_mcp_server=None,
                                         with_estimate: bool = False):
@@ -1033,7 +1034,10 @@ class TextHandlerMixin:
                               message: Message, thinking_id: Optional[str] = None,
                               attachment_urls: Optional[List[str]] = None,
                               retry_count: int = 0,
-                              failed_mcp_server: Optional[str] = None,
+                              # None | str | iterable of str — an MCP failover retry passes the
+                              # accumulated SET of excluded labels. Normalized at every use by
+                              # `_as_mcp_exclusion_set`, so the annotation has to admit both.
+                              failed_mcp_server: Any = None,
                               _context_retry: bool = False,
                               _nonstreaming_fallback: bool = False,
                               visible_already_committed: bool = False,
@@ -1275,9 +1279,9 @@ class TextHandlerMixin:
         background_job_started = False  # F30.1: start_background_job fired — drop this reply
         sandbox_assets = []       # F34: images mounted into the sandbox as ingredients
         mounted_digests = []      # F35: files WE mounted — never publishable back
-        usage_info = {}           # response.usage lands here (usage-driven budgeting)
-        mcp_discovered = {}       # mcp_list_tools payloads land here (discovery cache)
-        mcp_results = []          # F12: completed mcp_call outputs land here (result memory)
+        usage_info: Dict[str, Any] = {}   # response.usage lands here (usage-driven budgeting)
+        mcp_discovered: Dict[str, Any] = {}  # mcp_list_tools payloads land here (discovery cache)
+        mcp_results: List[Any] = []       # F12: completed mcp_call outputs land here (result memory)
         # F32: shared across every attempt this turn — a container a FAILED attempt used still
         # holds files the model wrote, and they must still reach the user.
         artifacts = artifacts_acc if artifacts_acc is not None else []
@@ -1739,7 +1743,12 @@ class TextHandlerMixin:
             return result["ts"]
         return None
 
-    async def _handle_streaming_text_response(self, user_content: Any, thread_state, client: BaseClient,
+    # `client: Any`, not BaseClient: the streaming path drives the platform client's async
+    # streaming surface — send_message_get_ts / update_message_streaming, and send_message with
+    # the `lease`/`surface`/`on_first_accept` kwargs. None of that is on the ABC, which still
+    # declares the sync, lease-less signatures. Annotating BaseClient here would describe a
+    # contract this method does not use.
+    async def _handle_streaming_text_response(self, user_content: Any, thread_state, client: Any,
                                       message: Message, thinking_id: Optional[str] = None,
                                       attachment_urls: Optional[List[str]] = None,
                                       exclude_mcp_server=None,
@@ -2042,7 +2051,9 @@ class TextHandlerMixin:
         # Define tool event callback
         async def tool_callback(tool_type: str, status: str):
             """Handle tool events for status updates"""
-            nonlocal progress_task, pending_segment_break
+            # Both names are bound further down in the enclosing function (well before this
+            # callback can fire); mypy reads top-to-bottom and hasn't seen them yet.
+            nonlocal progress_task, pending_segment_break  # type: ignore[misc]
 
             # F38: stake the 👀 work claim — but only for the hosted tools that genuinely take
             # time. This hook fires for EVERY tool event, including fast lookups and calls the
@@ -2969,9 +2980,9 @@ class TextHandlerMixin:
         # Start streaming from OpenAI with the callback
         try:
             local_tool_calls = []  # [{"name","ok"}] record of local tool executions
-            usage_info = {}        # response.usage lands here (usage-driven budgeting)
-            mcp_discovered = {}    # mcp_list_tools payloads land here (discovery cache)
-            mcp_results = []       # F12: completed mcp_call outputs land here (result memory)
+            usage_info: Dict[str, Any] = {}   # response.usage lands here (usage-driven budgeting)
+            mcp_discovered: Dict[str, Any] = {}  # mcp_list_tools payloads land here (discovery cache)
+            mcp_results: List[Any] = []       # F12: completed mcp_call outputs land here (result memory)
             # F32: shared across every attempt this turn (see _handle_text_response).
             artifacts = artifacts_acc if artifacts_acc is not None else []
             containers_gone: List[str] = []   # F32 (see _handle_text_response)
@@ -3563,7 +3574,7 @@ class TextHandlerMixin:
 
                             # Send the rest as new messages
                             overflow_text = response_text[cut:].lstrip()
-                            overflow_meta = {}
+                            overflow_meta: Dict[str, Any] = {}
                             overflow_ts = await client.send_message(
                                 message.channel_id, reply_target,
                                 f"{CONTINUATION_HEAD}\n\n{overflow_text}",
@@ -3918,7 +3929,12 @@ class TextHandlerMixin:
             doomed = owned[1:] if keeper else owned
             survivors: List[str] = []
 
-            async def _drop_surface(ts: str) -> bool:
+            # NOTE: this shadows the turn-level `_drop_surface` defined earlier in this method
+            # (that one returns None and guards against a falsy ts; this one returns whether the
+            # delete landed, which the teardown below branches on). Same name, same function
+            # scope, so the checker sees a conditional redefinition — hence the suppressions here
+            # and on the two calls below.
+            async def _drop_surface(ts: str) -> bool:  # type: ignore[misc]
                 try:
                     gone = bool(await client.delete_message(message.channel_id, ts))  # unleased-ok: teardown — removing a surface can never be a stale answer
                     if gone and receipts is not None:
@@ -3929,7 +3945,7 @@ class TextHandlerMixin:
                     return False
 
             for dead_ts in doomed:
-                if await _drop_surface(dead_ts):
+                if await _drop_surface(dead_ts):  # type: ignore[func-returns-value]  # shadowed def, see above
                     self.log_debug(f"Deleted abandoned partial {dead_ts} before retrying")
                 else:
                     survivors.append(dead_ts)
@@ -3950,7 +3966,7 @@ class TextHandlerMixin:
                     # It still holds answer text and we could not blank it. Delete it and let
                     # the retry mint its own surface; if that fails too it is a survivor and we
                     # fail closed below.
-                    if not await _drop_surface(keeper):
+                    if not await _drop_surface(keeper):  # type: ignore[func-returns-value]  # shadowed def, see above
                         survivors.append(keeper)
                     keeper = None
 

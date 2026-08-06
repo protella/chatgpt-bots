@@ -52,7 +52,7 @@ import asyncio
 import time
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Set, Tuple, cast
 
 from config import config
 from logger import setup_logger
@@ -903,9 +903,12 @@ class TurnRuntime:
         stragglers = [f for f in self.pending_tool_flights if f.task is not None]
         if not stragglers:
             return ()
+        # cast: `stragglers` is filtered on `f.task is not None`, which the checker cannot carry
+        # past the comprehension that built it.
         for flight in stragglers:
-            flight.task.cancel()
-        _done, still = await asyncio.wait([f.task for f in stragglers], timeout=max(0.0, grace))
+            cast("asyncio.Task[Any]", flight.task).cancel()
+        _done, still = await asyncio.wait([cast("asyncio.Task[Any]", f.task) for f in stragglers],
+                                          timeout=max(0.0, grace))
         for task in _done:
             if not task.cancelled():
                 task.exception()  # consumed: a straggler's own error is not an exit warning
@@ -956,7 +959,9 @@ class TurnRuntime:
             if task.done():
                 self._effect_leases.pop(token, None)
             else:
-                task.add_done_callback(lambda t, k=token: self._release_lease(k, t))
+                # ignore[misc]: mypy can't infer a lambda that binds a default (the token capture).
+                task.add_done_callback(
+                    lambda t, k=token: self._release_lease(k, t))  # type: ignore[misc]
 
     def _release_lease(self, token: int, task: asyncio.Future) -> None:
         """The lease is over. Retrieve the body's exception even though nobody is waiting for it:

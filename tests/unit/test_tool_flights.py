@@ -245,9 +245,10 @@ async def _cancel_a_flight_mid_call(*, launched: bool):
     dispatch = asyncio.ensure_future(reg.dispatch_all(ctx, [_call()]))
     await started.wait()
     flight = turn.pending_tool_flights[0]
-    flight.task.cancel()
+    # dispatch_all has already started it, so `task` is set — the field is Optional in general.
+    flight.task.cancel()  # type: ignore[union-attr]
     with pytest.raises(asyncio.CancelledError):
-        await flight.task
+        await flight.task  # type: ignore[misc]
     dispatch.cancel()
     with pytest.raises(asyncio.CancelledError):
         await dispatch

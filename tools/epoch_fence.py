@@ -28,7 +28,7 @@ import json
 import os
 import sys
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, cast
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -84,8 +84,9 @@ def _read_state() -> Dict[str, Any]:
 def _submit(command: str, channel_id: str, **fields: Any) -> Dict[str, Any]:
     """Write the next command and block until the watcher acks it."""
     existing = _read_state()
-    acked = existing.get("acked_id") if isinstance(existing.get("acked_id"), int) else 0
-    previous = existing.get("command_id") if isinstance(existing.get("command_id"), int) else 0
+    acked = cast(int, existing.get("acked_id") if isinstance(existing.get("acked_id"), int) else 0)
+    previous = cast(
+        int, existing.get("command_id") if isinstance(existing.get("command_id"), int) else 0)
     command_id = max(acked, previous) + 1
     payload = {"command_id": command_id, "acked_id": acked, "command": command,
                "channel_id": channel_id, "start_ts": None, **fields}

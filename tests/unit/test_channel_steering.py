@@ -292,7 +292,7 @@ class TestStamp:
         with pytest.raises(Exception):
             snap.developer_policy = "y"   # type: ignore[misc]
         with pytest.raises(Exception):
-            snap.text = "y"               # type: ignore[misc]  — derived, so not settable either
+            snap.text = "y"               # type: ignore[misc]  # derived, so not settable either
 
     def test_a_foreign_value_on_the_key_is_ignored(self):
         msg = SimpleNamespace(metadata={channel_steering.STEERING_KEY: "not a snapshot"})

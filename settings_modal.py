@@ -2,7 +2,7 @@
 User Settings Modal for Slack Bot
 Handles the interactive settings configuration interface
 """
-from typing import Dict, Optional, List
+from typing import Any, Dict, List, Optional
 from config import config
 from logger import LoggerMixin
 import json
@@ -22,7 +22,7 @@ class SettingsModal(LoggerMixin):
                             is_new_user: bool = False,
                             thread_id: Optional[str] = None,
                             in_thread: bool = False,
-                            scope: str = None,
+                            scope: Optional[str] = None,
                             pending_message: Optional[Dict] = None) -> Dict:
         """
         Build the complete settings modal.
@@ -466,7 +466,7 @@ class SettingsModal(LoggerMixin):
 
     def _build_modal_blocks(self, settings: Dict, selected_model: str,
                            is_new_user: bool = False, in_thread: bool = False,
-                           scope: str = None) -> List[Dict]:
+                           scope: Optional[str] = None) -> List[Dict]:
         """Build the modal blocks based on current settings and model selection
         
         Args:
@@ -476,7 +476,7 @@ class SettingsModal(LoggerMixin):
             in_thread: Whether modal was opened from within a thread
             scope: The selected scope ('thread' or 'global')
         """
-        blocks = []
+        blocks: List[Dict[str, Any]] = []
         
         # Determine default scope if not provided
         if scope is None:
@@ -627,7 +627,7 @@ class SettingsModal(LoggerMixin):
 
         The 5.6 family offers the full ladder incl. `max` (verified live on all three
         tiers); gpt-5.5 tops out at `xhigh`."""
-        blocks = []
+        blocks: List[Dict[str, Any]] = []
 
         # Check if web search is enabled
         if 'enable_web_search' in settings:
@@ -660,7 +660,7 @@ class SettingsModal(LoggerMixin):
             self.log_warning(f"Current reasoning '{old_reasoning}' not in available options, clamped to '{current_reasoning}'")
 
         # Build the reasoning block
-        reasoning_block = {
+        reasoning_block: Dict[str, Any] = {
             "type": "section",
             "block_id": "reasoning_block_gpt54",
             "text": {
@@ -769,7 +769,7 @@ class SettingsModal(LoggerMixin):
 
     def _add_common_settings(self, settings: Dict) -> List[Dict]:
         """Add settings common to all models"""
-        blocks = []
+        blocks: List[Dict[str, Any]] = []
         
         # Custom Instructions section (available for all models)
         blocks.append({
@@ -851,7 +851,7 @@ class SettingsModal(LoggerMixin):
         block_id = "features_block_gpt5"
         action_id = "features_with_mcp"
 
-        features_block = {
+        features_block: Dict[str, Any] = {
             "type": "section",
             "block_id": block_id,
             "text": {"type": "mrkdwn", "text": "Enable features:"},

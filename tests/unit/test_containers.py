@@ -21,7 +21,7 @@ from message_processor.containers import AUTO_CONTAINER, ContainerManager, is_co
 
 def _api_error(status: int, message: str) -> Exception:
     exc = Exception(message)
-    exc.status_code = status
+    exc.status_code = status  # type: ignore[attr-defined]  # what is_container_gone reads
     return exc
 
 

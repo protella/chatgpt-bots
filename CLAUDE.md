@@ -154,6 +154,16 @@ adversarial. Details in `AGENTS.md` (codex reads that file every run).
   speaker comes from the fictional cast in `tests/fixtures/people.py` — add a character there
   rather than inventing one at the call site. `make pii` and the pre-commit hook
   (`make install-hooks`) enforce this; `tests/unit/test_no_real_identifiers.py` runs it in CI.
+- **`make lint` passes with ZERO errors. Keep it there.** Ruff and mypy are both clean across 298
+  files; 1114 type errors were cleared in one pass to get there, so a new one is a real signal,
+  not background noise. Write to the linters' taste as you go — annotate parameters and returns,
+  `Optional[X]` for anything defaulting to `None`, no unused imports — and **run `make lint`
+  before every commit** (the pre-commit hook runs it too, in under a second). Never silence a
+  finding you could fix: `# type: ignore[code]` is a last resort, always carries the specific
+  code, and always carries a `#` comment saying why. Never use `assert x is not None` to narrow a
+  type in production code — it changes runtime; use `typing.cast`, which does not. Mixins get
+  their host contract from `slack_client/_host.py` / `message_processor/_host.py`. Sub-agent
+  briefs must carry this rule — they write most of the code.
 - Prefer editing existing files over creating new ones; never create docs unless asked.
 - Absolute paths for file operations. **Test files go in `tests/`, not the repo root.**
 - Don't break working bot code — if a fix is needed outside the task, consult the user first.

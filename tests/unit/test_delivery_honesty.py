@@ -16,6 +16,7 @@ Three questions, one theme — a record that describes the intention rather than
 import asyncio
 import inspect
 from types import SimpleNamespace
+from typing import Any, Dict
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -532,20 +533,24 @@ async def _channel_turn_with_a_prior_timeout(*, admission_fails: bool, had_timeo
 
     p.thread_manager.acquire_thread_lock = AsyncMock(return_value=True)
     p.thread_manager.release_thread_lock = AsyncMock()
-    p._get_or_rebuild_thread_state = _state
-    p.get_or_create_channel_thread_state = _state
-    p._build_channel_turn_stream = _stream
-    p._admit_channel_request = _admit
-    p._handle_text_response = AsyncMock(return_value=Response(type="text", content="ok"))
-    p._build_channel_memory_text = AsyncMock(return_value="")
-    p._build_channel_info = AsyncMock(return_value="")
-    p._process_attachments = AsyncMock(return_value=([], [], list(unsupported)))
+    # Patching methods onto a real processor is the point of this harness, hence the
+    # [method-assign] ignores.
+    p._get_or_rebuild_thread_state = _state                      # type: ignore[method-assign]
+    p.get_or_create_channel_thread_state = _state                # type: ignore[method-assign]
+    p._build_channel_turn_stream = _stream                       # type: ignore[method-assign]
+    p._admit_channel_request = _admit                            # type: ignore[method-assign]
+    p._handle_text_response = AsyncMock(return_value=Response(type="text", content="ok"))  # type: ignore[method-assign]
+    # STALE: _build_channel_memory_text was removed from MessageProcessor in 75b49f1 (channel
+    # steering replaced it), so this patches an attribute nothing reads.
+    p._build_channel_memory_text = AsyncMock(return_value="")    # type: ignore[attr-defined]
+    p._build_channel_info = AsyncMock(return_value="")           # type: ignore[method-assign]
+    p._process_attachments = AsyncMock(return_value=([], [], list(unsupported)))  # type: ignore[method-assign]
 
     client = MagicMock()
     client.send_message = AsyncMock(side_effect=_send)
     client.update_message = AsyncMock()
     ts = "10.0"
-    meta = {"ts": ts}
+    meta: Dict[str, Any] = {"ts": ts}
     if gate_sources:
         meta["gate_sources"] = list(gate_sources)
     message = Message(text=trigger_text, user_id="U1", channel_id="C1",

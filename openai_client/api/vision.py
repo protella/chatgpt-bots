@@ -82,7 +82,7 @@ async def analyze_images(
 
     try:
         # Build request parameters with conversation history
-        input_messages = []
+        input_messages: List[Dict[str, Any]] = []
 
         # Add platform system prompt if provided (for consistent personality/formatting)
         if system_prompt:
@@ -173,9 +173,10 @@ async def analyze_images(
                                 output_text += text_chunk[:_MAX_ANALYSIS_CHARS - len(output_text)]
                                 break
                             output_text += text_chunk
-                            if stream_callback:
+                            # Defensive re-check; the outer branch already narrowed it non-None.
+                            if stream_callback:  # type: ignore[truthy-function]
                                 # Support both sync and async callbacks
-                                result = stream_callback(text_chunk)
+                                result: Any = stream_callback(text_chunk)
                                 # If the callback returns a coroutine, await it
                                 if hasattr(result, '__await__'):
                                     await result
@@ -203,10 +204,12 @@ async def analyze_images(
                         else:
                             self.log_debug("Vision stream completed")
                         # ALWAYS flush the terminal callback, whatever the terminal state.
-                        if stream_callback:
+                        # Defensive re-check; the outer branch already narrowed it non-None.
+                        if stream_callback:  # type: ignore[truthy-function]
                             try:
-                                # Support both sync and async callbacks
-                                result = stream_callback(None)
+                                # Support both sync and async callbacks. `None` is the terminal
+                                # flush signal, which the declared Callable[[str], ...] omits.
+                                result = stream_callback(None)  # type: ignore[arg-type]
                                 # If the callback returns a coroutine, await it
                                 if hasattr(result, '__await__'):
                                     await result

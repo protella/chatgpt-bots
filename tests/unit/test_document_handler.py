@@ -45,7 +45,8 @@ class TestDocumentHandler:
     
     def test_excel_parsing_available(self, handler):
         """Test that Excel parsing libraries are available"""
-        import openpyxl
+        # types-openpyxl is not in requirements.in (pandas-stubs covers the pandas side).
+        import openpyxl  # type: ignore[import-untyped]
         import pandas
         assert openpyxl is not None
         assert pandas is not None

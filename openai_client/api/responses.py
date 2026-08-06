@@ -567,7 +567,9 @@ async def create_text_response_with_tools(
             self.log_info(f"Generated response with tools: {len(output_text)} chars (no tools invoked)")
 
         if return_metadata:
-            return {"text": output_text, "tools_used": tools_actually_used}
+            # return_metadata=True hands back the metadata dict; the declared
+            # `-> str` describes only the common, text-only contract.
+            return {"text": output_text, "tools_used": tools_actually_used}  # type: ignore[return-value]
         return output_text
 
     except Exception as e:
@@ -746,7 +748,7 @@ async def create_streaming_response(
                     # Always signal completion so the callback flushes any buffered text — a
                     # failed/incomplete stream that skips this leaves the buffer stuck forever.
                     try:
-                        result = stream_callback(None)
+                        result = stream_callback(None)  # type: ignore[arg-type]  # None = the terminal flush signal
                         # If the callback returns a coroutine, await it
                         if hasattr(result, '__await__'):
                             await result
@@ -1098,7 +1100,7 @@ async def create_streaming_response_with_tools(
                     # any buffered text — a failed/incomplete stream that skips this leaves the
                     # buffer stuck forever.
                     try:
-                        result = stream_callback(None)
+                        result = stream_callback(None)  # type: ignore[arg-type]  # None = the terminal flush signal
                         # If the callback returns a coroutine, await it
                         if hasattr(result, '__await__'):
                             await result
@@ -1928,7 +1930,9 @@ async def _create_text_response_with_tools_with_timeout(
             self.log_info(f"Generated response with tools and custom timeout: {len(output_text)} chars (no tools invoked)")
 
         if return_metadata:
-            return {"text": output_text, "tools_used": tools_actually_used}
+            # return_metadata=True hands back the metadata dict; the declared
+            # `-> str` describes only the common, text-only contract.
+            return {"text": output_text, "tools_used": tools_actually_used}  # type: ignore[return-value]
         return output_text
 
     except asyncio.TimeoutError as e:

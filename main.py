@@ -8,7 +8,7 @@ import signal
 import asyncio
 import argparse
 import time
-from typing import Any, Optional
+from typing import Any, Dict, Optional, cast
 from config import config, dev_epoch_fence_requested
 from logger import log_session_start, log_session_end, main_logger
 from message_processor.base import MessageProcessor
@@ -43,7 +43,7 @@ from slack_client.event_handlers import registration
 # The predicate lives in `config` — a leaf this module already imports — because it must DECIDE
 # whether the fence module is imported, and a predicate cannot gate its own import.
 # `epoch_fence.fence_enabled()` delegates to the same function, so there is exactly one definition.
-epoch_fence = None
+epoch_fence: Any = None   # rebound to the module below when the fence is requested
 _epoch_import_error = None
 if dev_epoch_fence_requested():
     try:
@@ -202,12 +202,12 @@ class ChatBotV2:
     def __init__(self, platform: str = "slack"):
         self.platform = platform.lower()
         self.client: Optional[BaseClient] = None
-        self.processor = None  # Will be initialized after client
+        self.processor: Any = None  # Will be initialized after client
         self.participation_engine = None  # Phase F; set in initialize()
         self._watermarks = ConversationWatermarks()
         self.cleanup_task = None
         self.coverage_bootstrap = None  # spec §4 background coverage sweep
-        self.epoch_fence_watcher = None  # dev-only; stays None unless DEV_EPOCH_FENCE_ENABLE
+        self.epoch_fence_watcher: Any = None  # dev-only; stays None unless DEV_EPOCH_FENCE_ENABLE
         self.receipt_service = None  # spec §5 outbound receipts
         self.pending_share_recovery = False
         self._pending_share_task = None
@@ -1033,7 +1033,10 @@ class ChatBotV2:
             # put a placeholder somewhere the answer might not arrive.
             thinking_id = None
             if not already_processing and turn.progress_enabled:
-                thinking_id = await client.send_thinking_indicator(
+                # cast: the base declares the older, narrower seam (sync, no lease); the
+                # concrete platform client this always receives is the async one. No-op
+                # at runtime — same call, same object.
+                thinking_id = await cast(Any, client).send_thinking_indicator(
                     message.channel_id,
                     post_thread_id,
                     receipts=turn.receipt_ledger,
@@ -1045,7 +1048,7 @@ class ChatBotV2:
                     catch_up = f"Catching up on {batch_size} messages..."
                     try:
                         if thinking_id and hasattr(client, "update_message"):
-                            await client.update_message(  # unleased-ok: chrome — a placeholder/status write, never answer text
+                            await cast(Any, client).update_message(  # unleased-ok: chrome — a placeholder/status write, never answer text
                                 message.channel_id, thinking_id,
                                 f"{config.circle_loader_emoji} {catch_up}"
                             )
@@ -1111,7 +1114,7 @@ class ChatBotV2:
                                 except Exception as e:
                                     main_logger.debug(f"Footer block build failed: {e}")
                                     footer_blocks = None
-                            send_meta = {}
+                            send_meta: Dict[str, Any] = {}
                             # The reply is going out NOW, in this place: the destination stops
                             # being a preference and becomes a fact about Slack. The streaming
                             # paths lock when they bind their surface; this is the same moment
@@ -1143,7 +1146,7 @@ class ChatBotV2:
                                 StaleSendSuppressed propagates (a re-race is the next pass)."""
                                 _response.content = text
                                 _meta.clear()
-                                return await client.send_message(
+                                return await cast(Any, client).send_message(
                                     message.channel_id, _thread, _response.content,
                                     blocks=_blocks, meta_out=_meta, lease=lease,
                                     receipts=turn.receipt_ledger,
@@ -1162,7 +1165,7 @@ class ChatBotV2:
                             # delivery_exception endings, or rethrows the suppression to the
                             # terminal catch below.
                             try:
-                                sent_ts = await client.send_message(
+                                sent_ts = await cast(Any, client).send_message(
                                     message.channel_id,
                                     post_thread_id,
                                     response.content,

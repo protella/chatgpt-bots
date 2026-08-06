@@ -197,7 +197,9 @@ class _SchemaHost:
     """Enough of a Slack client for the real schema getters, and none of its I/O."""
 
     name = "Slack"
-    bot_user_id = BOT_ID
+    # Explicit `Any` so it stays compatible with the mixins' own declaration when Host below
+    # combines them.
+    bot_user_id: Any = BOT_ID
 
     def __init__(self):
         self.workspace_emojis = SimpleNamespace(

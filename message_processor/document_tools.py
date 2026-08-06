@@ -16,7 +16,7 @@ Executors never raise: every failure is an ``{"ok": False, ...}`` result.
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 from config import config
 from document_handler import DocumentHandler
@@ -236,7 +236,7 @@ async def execute_read_document(ctx: ToolContext, args: Dict[str, Any]) -> Dict[
         return {"ok": False, "error": "document_has_no_source_ref",
                 "hint": "This document predates on-demand access; only its summary is available."}
 
-    cache_key = doc_file_id or url_private
+    cache_key = cast(str, doc_file_id or url_private)  # one of the two is present (checked above)
     text = _extraction_cache.get(cache_key)
     if text is None:
         # F38: a cache MISS means a real download plus extraction (OCR on a scanned PDF is

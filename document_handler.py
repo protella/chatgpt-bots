@@ -11,7 +11,7 @@ import subprocess
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict, List, Optional, Sequence
 import pdfplumber
 import pypdf
 from pdf2image import convert_from_bytes
@@ -570,7 +570,7 @@ class DocumentHandler(LoggerMixin):
         return page_texts
     def _parse_pdf_with_pdfplumber(self, file_data: bytes, filename: str) -> Dict[str, Any]:
         """Parse PDF using pdfplumber for advanced structure extraction"""
-        pages = []
+        pages: List[Dict[str, Any]] = []
         total_pages = 0
         has_tables = False
         try:
@@ -579,7 +579,7 @@ class DocumentHandler(LoggerMixin):
                 # Sanity limit for very large PDFs
                 pages_to_process = min(total_pages, 1000)
                 for i, page in enumerate(pdf.pages[:pages_to_process]):
-                    page_data = {'page': i + 1}
+                    page_data: Dict[str, Any] = {'page': i + 1}
                     try:
                         # Extract tables if present
                         tables = page.extract_tables()
@@ -608,13 +608,13 @@ class DocumentHandler(LoggerMixin):
         except Exception as e:
             raise Exception(f"pdfplumber parsing failed: {e}")
         # Combine all content
-        all_content = []
-        for page in pages:
-            all_content.append(f"[Page {page['page']}]")
-            if page.get('tables'):
-                all_content.extend(page['tables'])
-            if page.get('content'):
-                all_content.append(page['content'])
+        all_content: List[str] = []
+        for page_entry in pages:   # not `page`: the loop above binds that to a pdfplumber Page
+            all_content.append(f"[Page {page_entry['page']}]")
+            if page_entry.get('tables'):
+                all_content.extend(page_entry['tables'])
+            if page_entry.get('content'):
+                all_content.append(page_entry['content'])
         return {
             'content': '\n'.join(all_content),
             'pages': pages,
@@ -627,14 +627,14 @@ class DocumentHandler(LoggerMixin):
         try:
             reader = pypdf.PdfReader(BytesIO(file_data))
             total_pages = len(reader.pages)
-            pages = []
-            content_parts = []
+            pages: List[Dict[str, Any]] = []
+            content_parts: List[str] = []
             # Limit pages for very large documents
             pages_to_process = min(total_pages, 100)
             for i, page in enumerate(reader.pages[:pages_to_process]):
                 try:
                     text = page.extract_text()
-                    page_data = {
+                    page_data: Dict[str, Any] = {
                         'page': i + 1,
                         'content': text or f'[Page {i+1} - no text extracted]'
                     }
@@ -775,7 +775,7 @@ class DocumentHandler(LoggerMixin):
         try:
             # First check if this is actually a ZIP file
             if not file_data.startswith(b'PK'):  # ZIP files start with 'PK'
-                self.log_error(f"File {filename} does not appear to be a ZIP/DOCX file. First bytes: {file_data[:4]}")
+                self.log_error(f"File {filename} does not appear to be a ZIP/DOCX file. First bytes: {file_data[:4]!r}")
                 # Likely a legacy .doc (OLE2 binary). Unsupported: its only
                 # extractor (docx2txt) requires a temp file on disk, which the
                 # no-disk rule forbids. Users should re-save as .docx.
@@ -1091,7 +1091,7 @@ class DocumentHandler(LoggerMixin):
             'format': 'ipynb',
             'total_cells': len(cells),
         }
-    def flexible_table_to_markdown(self, table_data: List[List[str]]) -> str:
+    def flexible_table_to_markdown(self, table_data: Sequence[Sequence[Optional[str]]]) -> str:
         """
         Convert variable table structures to markdown with error handling
         Args:
@@ -1251,8 +1251,8 @@ class DocumentHandler(LoggerMixin):
     def _split_into_sections(self, content: str) -> List[Dict[str, str]]:
         """Split content into sections based on headers"""
         lines = content.split('\n')
-        sections = []
-        current_section = {'title': 'Document Start', 'content': []}
+        sections: List[Dict[str, str]] = []
+        current_section: Dict[str, Any] = {'title': 'Document Start', 'content': []}
         for line in lines:
             if line.startswith('##'):
                 # New section

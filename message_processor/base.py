@@ -5,7 +5,7 @@ Client-agnostic message processing logic
 import asyncio
 import logging
 import time
-from typing import Optional
+from typing import Any, Optional, cast
 from base_client import BaseClient, ChannelStreamError, HistoryFetchError, Message, Response
 from thread_manager import AsyncThreadStateManager
 from openai_client import OpenAIClient
@@ -28,8 +28,14 @@ try:
     from document_handler import DocumentHandler
     DOCUMENT_HANDLER_AVAILABLE = True
 except ImportError:
-    DocumentHandler = None
+    DocumentHandler = None  # type: ignore[assignment,misc]  # optional dep: the flag below gates it
     DOCUMENT_HANDLER_AVAILABLE = False
+
+
+# A note on the `cast(Any, client)` at every send/update below. `client` is typed as the
+# platform-agnostic `BaseClient`, but the seam the concrete Slack client actually exposes is
+# ASYNC and takes the guard kwargs the abstract one has never declared (`lease`, `surface`).
+# The cast is a no-op at runtime and marks exactly where the two shapes disagree.
 
 
 # What a turn that ran out of time should actually say. The old copy ("Taking Too Long —
@@ -755,7 +761,9 @@ class MessageProcessor(ThreadManagementMixin,
 
             if should_retry:
                 # Mark as retry attempt to prevent infinite loops
-                e.already_retried = True
+                # ignore[attr-defined]: the flag is stamped ON the exception (read back via
+                # getattr above), which TimeoutError does not declare.
+                e.already_retried = True  # type: ignore[attr-defined]
 
                 # Update status to show retry
                 if thinking_id and hasattr(client, 'update_message'):
@@ -824,7 +832,7 @@ class MessageProcessor(ThreadManagementMixin,
                     # notice is terminal ("stopped waiting"), so it is awaited directly with the
                     # lease, like the other terminal notices. The rendering matches what
                     # _update_status would have produced for these arguments.
-                    await client.update_message(
+                    await cast(Any, client).update_message(
                         message.channel_id, thinking_id,
                         f"{config.error_emoji} {TIMEOUT_STATUS}",
                         lease=getattr(turn, "send_lease", None),
@@ -865,7 +873,7 @@ class MessageProcessor(ThreadManagementMixin,
 
             if thinking_id and hasattr(client, 'update_message'):
                 try:
-                    await client.update_message(
+                    await cast(Any, client).update_message(
                         message.channel_id, thinking_id,
                         f"{config.error_emoji} Couldn't load this conversation's history from Slack.",
                         lease=getattr(turn, "send_lease", None),
@@ -911,7 +919,7 @@ class MessageProcessor(ThreadManagementMixin,
 
             if thinking_id and hasattr(client, 'update_message'):
                 try:
-                    await client.update_message(
+                    await cast(Any, client).update_message(
                         message.channel_id, thinking_id,
                         f"{config.error_emoji} {notice['status']}",
                         lease=getattr(turn, "send_lease", None),
@@ -960,7 +968,7 @@ class MessageProcessor(ThreadManagementMixin,
                 if thinking_id and hasattr(client, 'update_message'):
                     timeout_msg = f"{config.error_emoji} {TIMEOUT_STATUS}"
                     try:
-                        await client.update_message(
+                        await cast(Any, client).update_message(
                             message.channel_id, thinking_id, timeout_msg,
                             lease=getattr(turn, "send_lease", None),
                             surface="timeout_notice",
@@ -984,7 +992,7 @@ class MessageProcessor(ThreadManagementMixin,
                 if thinking_id and hasattr(client, 'update_message'):
                     error_msg = f"{config.error_emoji} Something went wrong. Try again."
                     try:
-                        await client.update_message(
+                        await cast(Any, client).update_message(
                             message.channel_id, thinking_id, error_msg,
                             lease=getattr(turn, "send_lease", None),
                             surface="error_notice",
@@ -1297,7 +1305,7 @@ class MessageProcessor(ThreadManagementMixin,
         responder's evidence, since what that evidence may claim depends on it [r4-4].
         """
         try:
-            notice_ts = await client.send_message(
+            notice_ts = await cast(Any, client).send_message(
                 channel_id=message.channel_id,
                 text=text,
                 thread_id=message.thread_id,
@@ -1332,7 +1340,7 @@ class MessageProcessor(ThreadManagementMixin,
         alone in the thread. Notices were never exempt: the exemption is for CHROME (a thinking
         bubble), and this is prose.
         """
-        notice_ts = await client.send_message(
+        notice_ts = await cast(Any, client).send_message(
             channel_id=message.channel_id,
             text="⚠️ Heads up — my last answer in this thread never finished. Picking up from here.",
             thread_id=message.thread_id,

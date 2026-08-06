@@ -34,7 +34,7 @@ import asyncio
 import copy
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, cast
 from uuid import uuid4
 
 from config import clamp_effort, config
@@ -1059,10 +1059,12 @@ async def execute_start_background_job(ctx: ToolContext, args: Dict[str, Any]) -
         return {"ok": False, "error": "unavailable",
                 "message": "Background jobs aren't available right now."}
 
-    channel_id = ctx.channel_id
+    # cast: a tool call always arrives with a channel and a ts to answer under — Optional on
+    # ToolContext covers contexts that never reach an executor.
+    channel_id = cast(str, ctx.channel_id)
     # Post findings back into the thread this turn is in; if triggered top-level, thread under
     # the triggering message (its ts becomes the thread root).
-    thread_root = ctx.thread_ts or ctx.trigger_ts
+    thread_root = cast(str, ctx.thread_ts or ctx.trigger_ts)
     thread_key = f"{channel_id}:{thread_root}"
     tm = getattr(processor, "thread_manager", None)
 
@@ -1496,7 +1498,7 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
         elapsed = time.monotonic() - started
         if build:
             tools_used = list(tools_used) + ["code_interpreter"]
-        plan = await _plan_delivery(
+        delivery_plan = await _plan_delivery(
             processor, job_id=job_id, task=task, report=text, staged=staged,
             snapshot=snapshot, system_prompt=system_prompt, model=model,
             channel_id=channel_id, thread_root=thread_root,
@@ -1504,7 +1506,7 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
 
         delivered = await _transact_delivery(
             processor, client, channel_id=channel_id, thread_root=thread_root,
-            thread_key=thread_key, job_id=job_id, plan=plan, report=text, staged=staged,
+            thread_key=thread_key, job_id=job_id, plan=delivery_plan, report=text, staged=staged,
             label_source=label_source, deliverables=deliverables, card=card,
             ledger_key=(build or {}).get("ledger_key") or thread_key,
             elapsed=elapsed, effort=effort, tools_used=tools_used, receipts=receipts)

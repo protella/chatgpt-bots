@@ -3,7 +3,7 @@ Base Client Abstract Class
 Defines the interface that all chat clients must implement
 """
 from abc import ABC, abstractmethod
-from typing import Dict, Any, List, Optional
+from typing import TYPE_CHECKING, Callable, Dict, Any, List, Optional
 from dataclasses import dataclass
 from logger import LoggerMixin
 
@@ -15,8 +15,10 @@ class Message:
     user_id: str
     channel_id: str
     thread_id: str
-    attachments: List[Dict[str, Any]] = None
-    metadata: Dict[str, Any] = None
+    # `None` here is a placeholder __post_init__ replaces; the annotations are what every
+    # reader actually gets, so they stay non-Optional.
+    attachments: List[Dict[str, Any]] = None  # type: ignore[assignment]
+    metadata: Dict[str, Any] = None  # type: ignore[assignment]
     
     def __post_init__(self):
         if self.attachments is None:
@@ -30,7 +32,7 @@ class Response:
     """Universal response format"""
     type: str  # 'text', 'image', 'file', 'reaction', 'error', 'queued'
     content: Any
-    metadata: Dict[str, Any] = None
+    metadata: Dict[str, Any] = None  # type: ignore[assignment]  # __post_init__ fills it
 
     def __post_init__(self):
         if self.metadata is None:
@@ -87,7 +89,17 @@ def _require_receipt_class(site: str, receipts: Any, receipt_class: Optional[str
 
 class BaseClient(ABC, LoggerMixin):
     """Abstract base class for all chat clients"""
-    
+
+    if TYPE_CHECKING:
+        # Streaming seams the concrete platform client owns (SlackBot, via its messaging
+        # mixin), declared so callers holding a `BaseClient` are checked against the object
+        # they actually receive. TYPE_CHECKING-only and typed as `Callable` on purpose,
+        # exactly as slack_client/_host.py does it: nothing is added to the class at runtime
+        # (an @abstractmethod here would newly refuse to construct any client that does not
+        # implement them), and the real signatures stay the single source of truth.
+        send_message_get_ts: Callable[..., Any]
+        update_message_streaming: Callable[..., Any]
+
     def __init__(self, name: str):
         self.name = name
         self.log_info(f"{name} client initialized")
@@ -125,6 +137,7 @@ class BaseClient(ABC, LoggerMixin):
         `_require_receipt_class` guard), so a receipted post with no class raises ValueError
         even through `super()` (a programming error, never laundered into a class-less row)."""
         _require_receipt_class("send_message", receipts, receipt_class)
+        return None
 
     @abstractmethod
     async def send_message_async(self, channel_id: str, thread_id: str, text: str,
@@ -138,6 +151,7 @@ class BaseClient(ABC, LoggerMixin):
         contract, the receipts-require-a-class ValueError contract (§11.9/§11.23 — enforced
         by the base seam itself), and for `lease` (the stale-send guard)."""
         _require_receipt_class("send_message_async", receipts, receipt_class)
+        return None
 
     @abstractmethod
     async def send_image(self, channel_id: str, thread_id: str, image_data: bytes, filename: str,
@@ -155,6 +169,7 @@ class BaseClient(ABC, LoggerMixin):
         producers stamp the §4 inventory class (`artifact` for shares) — and the base seam
         itself raises ValueError on receipts-without-class, before any platform call."""
         _require_receipt_class("send_image", receipts, receipt_class)
+        return None
 
     @abstractmethod
     async def send_image_async(self, channel_id: str, thread_id: str, image_data: bytes, filename: str,
@@ -165,6 +180,7 @@ class BaseClient(ABC, LoggerMixin):
         the receipts-require-a-class ValueError contract (§11.9/§11.13/§11.23 — enforced by
         the base seam itself)."""
         _require_receipt_class("send_image_async", receipts, receipt_class)
+        return None
 
     async def send_file(self, channel_id: str, thread_id: str, file_data,
                         filename: str, title: Optional[str] = None,
@@ -197,6 +213,7 @@ class BaseClient(ABC, LoggerMixin):
         (producers stamp `chrome` — the placeholder is excluded scaffolding until promotion),
         and the base seam itself raises ValueError on receipts-without-class."""
         _require_receipt_class("send_thinking_indicator", receipts, receipt_class)
+        return None
 
     @abstractmethod
     async def send_thinking_indicator_async(self, channel_id: str, thread_id: str,
@@ -206,6 +223,7 @@ class BaseClient(ABC, LoggerMixin):
         for the receipts-require-a-class ValueError contract (§11.9/§11.13/§11.23 — enforced
         by the base seam itself)."""
         _require_receipt_class("send_thinking_indicator_async", receipts, receipt_class)
+        return None
 
     @abstractmethod
     def delete_message(self, channel_id: str, message_id: str) -> bool:
@@ -241,7 +259,7 @@ class BaseClient(ABC, LoggerMixin):
         return False
 
     @abstractmethod
-    def get_thread_history(self, channel_id: str, thread_id: str, limit: int = None,
+    def get_thread_history(self, channel_id: str, thread_id: str, limit: Optional[int] = None,
                            oldest: Optional[str] = None) -> List[Message]:
         """Get message history for a thread - fetches ALL messages by default.
 
@@ -252,7 +270,7 @@ class BaseClient(ABC, LoggerMixin):
         pass
 
     @abstractmethod
-    async def get_thread_history_async(self, channel_id: str, thread_id: str, limit: int = None,
+    async def get_thread_history_async(self, channel_id: str, thread_id: str, limit: Optional[int] = None,
                                        oldest: Optional[str] = None) -> List[Message]:
         """Get message history for a thread (async version)"""
         pass

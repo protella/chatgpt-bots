@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 
+from message_processor._host import _Host
 
-class ImageJobMixin:
+
+class ImageJobMixin(_Host):
     """The background half of an image generation job, plus its progress-surface teardown.
 
     Both methods are driven by the F34 image TOOLS (message_processor/image_tools.py) — the

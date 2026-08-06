@@ -4,7 +4,7 @@ Manages update intervals with exponential backoff and workspace protection
 """
 
 import time
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, cast
 from enum import Enum
 from logger import LoggerMixin
 
@@ -78,7 +78,8 @@ class RateLimitManager(LoggerMixin):
         
         # Check circuit breaker state
         if self.circuit_state == CircuitState.OPEN:
-            if current_time - self.circuit_open_time >= self.cooldown_seconds:
+            # OPEN is only ever set together with circuit_open_time (_trip_circuit_breaker).
+            if current_time - cast(float, self.circuit_open_time) >= self.cooldown_seconds:
                 self.circuit_state = CircuitState.HALF_OPEN
                 self.log_info("Circuit breaker moved to HALF_OPEN state")
             else:
