@@ -83,6 +83,11 @@ architecture notes.
   is no CI workflow in this repo — only Dependabot — so run the checks locally.
 
 ## Configuration & Secrets
+- **This repo is PUBLIC.** Never write a real person's name, a real internal channel name, or a
+  credential into any file — tests, fixtures, prompts, docs and CHANGELOG included. Scenarios
+  reconstructed from real Slack incidents keep the *shape* and lose the identifiers. Test
+  speakers come from the fictional cast in `tests/fixtures/people.py`; add a character there
+  rather than inventing one at the call site. `make pii` enforces it, and it runs in the suite.
 - Copy `.env.example` when onboarding; never commit secrets. Required keys are
   **`OPENAI_KEY`** (not `OPENAI_API_KEY`), plus `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN`.
 - Use `slack_app_manifest.example.yml` as the template for scopes and event

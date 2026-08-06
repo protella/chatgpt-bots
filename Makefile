@@ -1,4 +1,4 @@
-.PHONY: help install test test-verbose test-coverage test-unit test-integration test-fast test-report clean lint format check
+.PHONY: help install test test-verbose test-coverage test-unit test-integration test-fast test-report clean lint format check pii install-hooks
 
 # Default target
 help:
@@ -15,7 +15,9 @@ help:
 	@echo "  make clean         - Remove test artifacts and cache"
 	@echo "  make lint          - Run linting checks"
 	@echo "  make format        - Auto-format code"
-	@echo "  make check         - Run all checks (lint + test)"
+	@echo "  make check         - Run all checks (lint + pii + test)"
+	@echo "  make pii           - Scan tracked files for real names/channels/credentials"
+	@echo "  make install-hooks - Install the pre-commit PII guard into .git/hooks"
 
 # Install dependencies from the locked file
 install:
@@ -89,5 +91,14 @@ format:
 	@which black >/dev/null 2>&1 && black . || echo "Install black for formatting: pip install black"
 	@which isort >/dev/null 2>&1 && isort . || echo "Install isort for import sorting: pip install isort"
 
+# This repo is PUBLIC. Refuse to publish a real person, channel or credential.
+pii:
+	@python3 -m tools.pii_scan
+
+# One-time, per clone: git hooks are not tracked, so the guard has to be copied in.
+install-hooks:
+	@install -m 755 tools/hooks/pre-commit .git/hooks/pre-commit
+	@echo "pre-commit PII guard installed"
+
 # Run all checks
-check: lint test
+check: lint pii test
