@@ -148,6 +148,12 @@ adversarial. Details in `AGENTS.md` (codex reads that file every run).
 
 ## House rules
 
+- **This repo is PUBLIC.** Never write a real person's name, a real internal channel name, or a
+  credential into any file — tests, fixtures, prompts, docs and CHANGELOG included. Scenarios
+  reconstructed from real Slack incidents keep the *shape* and lose the identifiers. Every test
+  speaker comes from the fictional cast in `tests/fixtures/people.py` — add a character there
+  rather than inventing one at the call site. `make pii` and the pre-commit hook
+  (`make install-hooks`) enforce this; `tests/unit/test_no_real_identifiers.py` runs it in CI.
 - Prefer editing existing files over creating new ones; never create docs unless asked.
 - Absolute paths for file operations. **Test files go in `tests/`, not the repo root.**
 - Don't break working bot code — if a fix is needed outside the task, consult the user first.
