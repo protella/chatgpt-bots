@@ -82,7 +82,58 @@ def test_the_honesty_escape_survives_in_the_channel_paragraph():
     s = CHANNEL_ACTIVITY_NO_REPLY_SUFFIX
     assert 'consist only of "I haven\'t tried it,"' in s
     assert "do not suppress a substantive answer merely because it includes a limitation" in s
-    assert "addressed by name, prefer a brief honest answer over silence" in s
+    assert "being addressed by name outranks this whole test" in s
+    assert 'deserves a brief honest answer even when that answer is "I don\'t know."' in s
+
+
+def test_the_value_floor_is_earned_by_new_grounded_information():
+    """The incident the tightening is for: an open ownership question answered with the asker's
+    own guess handed back. A non-answer dressed as advice is still a non-answer, and speaking is
+    earned by grounding rather than by having a way to respond."""
+    s = CHANNEL_ACTIVITY_NO_REPLY_SUFFIX
+    assert "a non-answer dressed as advice is still that answer" in s
+    assert "new grounded information" in s
+    assert "knowledge you actually hold with confidence" in s
+    # The live loophole the first §7 probe found: an empty search reported as if it were a fact.
+    assert "reporting that you searched and found nothing" in s
+
+
+# ------------------------------------------------------- a reaction is a position, not a comment
+
+def test_the_reaction_endorsement_rule_reaches_both_paragraphs():
+    """One constant, both suffixes — the channel variant and the thread variant cannot say it
+    differently, and the shape that earned it was a thread reply."""
+    for s in BOTH:
+        assert prompts._BANTER_RESTRAINT in s
+
+
+def test_the_reaction_endorsement_rule_states_the_mechanism_and_its_limbs():
+    """The incident: an agreement emoji on a config tip framed as an opinion about a product.
+    Both limbs are pinned — factual business in the same message launders nothing, and a
+    judgment the bot has no standing to make is not one to take a side on at all."""
+    s = prompts._BANTER_RESTRAINT
+    assert "it is you taking the message's position in public" in s
+    assert "not yours to react to just because part of it is factual" in s
+    assert "do not take a side by emoji at all" in s
+    assert "agreeing with the insult" in s
+
+
+def test_the_voice_paragraph_carries_the_standing_rule():
+    """It rides the system prompt rather than the restraint paragraph because standing governs
+    every surface and every turn, addressed or not."""
+    s = prompts.SLACK_SYSTEM_PROMPT
+    assert "An opinion needs standing" in s
+    assert "never from experiences you do not have" in s
+    assert "not yours to endorse or dispute, in words or by reaction" in s
+
+
+def test_the_endorsement_sentence_survives_the_channel_derivation():
+    """CHANNEL_LOCAL_TOOLS_GUIDANCE is a line filter over the DM text; a dropped line would take
+    the rule off the channel surface silently."""
+    sentence = ("An agreement-shaped reaction on someone's opinion is an endorsement, not an "
+                "acknowledgment")
+    assert sentence in LOCAL_TOOLS_GUIDANCE
+    assert sentence in CHANNEL_LOCAL_TOOLS_GUIDANCE
 
 
 # ----------------------------------------------------- the trigger, not "whatever is newest"

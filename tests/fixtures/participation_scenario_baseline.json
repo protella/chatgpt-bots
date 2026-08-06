@@ -508,6 +508,32 @@
         "passes": 3,
         "trials": 3
       },
+      "opinion-tip-react": {
+        "bar": "hard",
+        "expected": [
+          "silence"
+        ],
+        "outcomes": [
+          "silence",
+          "silence",
+          "silence"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "org-ownership-question": {
+        "bar": "hard",
+        "expected": [
+          "silence"
+        ],
+        "outcomes": [
+          "silence",
+          "silence",
+          "silence"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
       "other-bot-already-answered": {
         "bar": "hard",
         "expected": [

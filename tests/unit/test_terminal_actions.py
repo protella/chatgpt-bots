@@ -913,7 +913,7 @@ def test_channel_activity_paragraph_wording():
     assert "no_response_needed" in s
     assert 'consist only of "I haven\'t tried it,"' in s
     assert "do not suppress a substantive answer merely because it includes a limitation" in s
-    assert "addressed by name, prefer a brief honest answer over silence" in s
+    assert "being addressed by name outranks this whole test" in s
     assert "ends your words, not your other actions" in s
     assert "wait for work you started yourself" in s
     assert s.startswith("[") and s.endswith("]")

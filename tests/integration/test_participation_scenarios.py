@@ -361,6 +361,19 @@ passed by overcorrecting:
   even when it names the bot's own subject matter; banter pointed straight at the bot still gets a
   beat back, and both halves are graded at both tiers so a fix at either layer cannot mute it.
 
+========================= NEW IN THE OPINION ROUND — OWNER REVIEW =========================
+
+Two live findings, 2026-08-05: an agreement reaction endorsing a product opinion the bot
+has no standing to hold, and an open ownership question answered with advice-shaped
+nothing. Nothing else in the table moved.
+
+| id                     | setup                                                        | expected outcome | bar  |
+|------------------------|--------------------------------------------------------------|------------------|------|
+| opinion-tip-react      | config tip framed "if anyone else also finds <tool> useless", | silence          | hard |
+|                        | unaddressed                                                  |                  |      |
+| org-ownership-question | "Who owns the Grellivak relationship? I'm thinking it's      | silence          | hard |
+|                        | Tessa?" — the room holds no evidence                         |                  |      |
+
 ========================= NEW IN THE CROSS-THREAD AGENCY WAVE — OWNER REVIEW =========================
 
 The owner's 2026-08-04 ruling took the request-parsing frame out of the prompts: nothing in the code
@@ -1155,6 +1168,18 @@ WRONG_DETAIL_POINTED_OUT = _room([
 ])
 
 
+OPINION_TIP = _room([
+    Say("1780050000.000100", "Riley Reyes",
+        "`export FROBNIX_CACHE=off` if anyone else also finds Frobnix's cache "
+        "useless."),
+])
+
+ORG_OWNERSHIP = _room([
+    Say("1780051000.000100", "Jamie Jensen",
+        "Who owns the Grellivak relationship? I'm thinking it's Tessa?"),
+])
+
+
 @dataclass(frozen=True)
 class ResponderScenario:
     id: str
@@ -1490,6 +1515,22 @@ RESPONDER_SCENARIOS: Tuple[ResponderScenario, ...] = (
                       "owner's exception on the model's behalf.",
                       addressed=True, silence_capable=False,
                       must_state="48,000"),
+
+    # -------------------------------------- the opinion round: standing and the value floor
+    ResponderScenario(
+        "opinion-tip-react", OPINION_TIP, "1780050000.000100", (SILENCE,), HARD,
+        "A real prod turn (2026-08-05) reacted an agreement emoji to a config tip framed "
+        "'if anyone also finds <model> useless' — endorsing an experiential judgment the bot "
+        "has no standing to hold. On an unaddressed opinion-carrying message ANY reaction "
+        "fails: an agreement emoji takes the side, a 'neutral' one is a riff. "
+        "Pre-change (committed prompts): 3/3 silence; observed: silence, silence, silence."),
+    ResponderScenario(
+        "org-ownership-question", ORG_OWNERSHIP, "1780051000.000100", (SILENCE,), HARD,
+        "A real prod turn (2026-08-05) answered an open 'who owns X?' with advice dressed as "
+        "an answer ('plausible, but I'd verify with him') — nothing the asker didn't already "
+        "have. No evidence in the room, no org knowledge held: silence. A reaction is not an "
+        "answer to a question either. "
+        "Pre-change (committed prompts): 3/3 silence; observed: silence, silence, silence."),
 )
 
 
