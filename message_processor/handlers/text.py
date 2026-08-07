@@ -548,8 +548,8 @@ class TextHandlerMixin(_Host):
         request_config is a COPY of the shared thread_config with `_silence_capable_turn` set on
         turns that get the silence option — the shared dict is never mutated. WHICH turns those
         are is the `silence_capable` routing fact, decided once at dispatch (routing_facts.py)
-        rather than re-derived here: gate-routed turns and 1:1 thread continuations qualify, DMs
-        and real @mentions do not.
+        rather than re-derived here: gate-routed turns and thread continuations — strict 1:1, or
+        membership in an `on` channel — qualify, DMs and real @mentions do not.
 
         no_reply_tool_available is derived from the resolved schema set (so it's False whenever
         the tool isn't actually exposed — timeout retries that drop the registry, config off,
@@ -558,7 +558,7 @@ class TextHandlerMixin(_Host):
         never disagree. WHICH paragraph is the `routing_posture` fact, not the gate: the
         paragraphs describe why this message is in front of the model, and thread activity has
         a rule channel activity does not (the addressee of a thread can move to someone else and
-        STAY there). A thread message the gate judged and an untouched 1:1 continuation raise
+        STAY there). A thread message the gate judged and an ungated thread continuation raise
         exactly the same question, so they now read the same instruction.
 
         `set_reply_destination` rides the same one-place-decides rule: it is exposed only when
@@ -615,10 +615,22 @@ class TextHandlerMixin(_Host):
         # is refused, DMs are refused by the executor, and the tool's own description still
         # requires an explicit instruction in the CURRENT human message. This widens WHO can be
         # heard, not WHAT counts as asking.
+        #
+        # And one route is refused outright, however clean its gate facts look: a turn woken ONLY
+        # because we happen to have posted in this thread (`membership_wake`) has not been asked
+        # for anything. Nobody tagged us, nobody named us, and the message may have been addressed
+        # to another assistant in the thread entirely. Waking to CONSIDER such a message is cheap
+        # and reversible — that is the whole point of the widened route, and the responder can see
+        # the thread — but rewriting the channel's settings because of it is neither. It may be
+        # considered without a gate; it may not change what we are.
         gate_required = meta.get("gate_required") is True
         gate_woke = meta.get("gate_woke") is True
+        # `is True` fails CLOSED and keeps every other dispatch site — DMs, app_mentions, the edit
+        # path, the queue drain — byte-identical: none of them stamp the key, and None is not True.
+        membership_wake = meta.get("membership_wake") is True
         request_config["_structural_change_authorized"] = bool(
-            meta.get("sender_type") == "human" and (not gate_required or gate_woke))
+            meta.get("sender_type") == "human" and (not gate_required or gate_woke)
+            and not membership_wake)
         # BF1, NOW A DM-ONLY FACT. Slack's Data Access API mints action_token on @mention
         # channel events and DMs, and `assistant.search.context` cannot be called without one —
         # so this flag hides the DM surface's search schema when the event carried no token, and
@@ -717,11 +729,12 @@ class TextHandlerMixin(_Host):
             db=self.db,
             is_dm=is_dm_channel(channel_id, meta.get("channel_type")),
             # BLOCKER #3: authorize the structural set_channel_participation tool ONLY when a
-            # HUMAN directly addressed the bot for it (a real <@bot> mention, or a turn the
-            # classifier judged an explicit structural request). Computed in
-            # _materialize_request_tools as `_structural_change_authorized`; absent → fail
-            # closed (unauthorized). Distinct from `_canvas_delete_authorized`, the parallel
-            # (also-strict) signal that gates the canvas-delete tool.
+            # HUMAN wrote the message and this turn genuinely reached the responder — and never
+            # on a turn woken only by thread membership (`membership_wake`), where nobody asked
+            # us for anything and the message may have been meant for another assistant in the
+            # thread. Computed in _materialize_request_tools as `_structural_change_authorized`;
+            # absent → fail closed (unauthorized). Distinct from `_canvas_delete_authorized`, the
+            # parallel (also-strict) signal that gates the canvas-delete tool.
             structural_change_authorized=bool(cfg.get("_structural_change_authorized", False)),
             # The same routing-fact derivation that used to feed delete_canvas's per-turn SCHEMA
             # gate. That gate cannot exist on the channel surface (a schema that changes with the
@@ -2329,7 +2342,7 @@ class TextHandlerMixin(_Host):
                 turn.settle_default_destination()   # no-op unless the model never chose
                 reply_target = turn.resolve_reply_target(message)
                 # STALE GUARD, exact protection for the turns that can afford it. A
-                # silence-capable turn — a gate-routed wake or a 1:1 continuation — is one
+                # silence-capable turn — a gate-routed wake or a thread continuation — is one
                 # nobody asked for, so nothing is owed until the answer is whole: buffer every
                 # word locally (the model still streams internally, tools and all) and make ONE
                 # guarded send at the end, to the destination commit 4 chose. That send is the

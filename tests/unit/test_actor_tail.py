@@ -1,15 +1,20 @@
 """The per-thread actor tail — who spoke in a thread, and the one decision that depends on it.
 
 ChannelPulse is retired: the channel stream is how a turn learns what was said. What survives is
-structural. A deterministic 1:1 thread continuation answers with no gate involved at all, and the
-replies fast path that finds those threads scans only Slack's oldest page — so a second agent
-further down a long thread is invisible to it. `thread_has_other_bot` is what sees that agent and
-cancels the fast path, and everything in this file exists to keep that answer correct:
+structural. A thread continuation answers with no gate involved at all, and the replies fast path
+that finds those threads scans only Slack's oldest page — so a second agent further down a long
+thread is invisible to it. `thread_has_other_bot` is what sees that agent.
+
+What it does with that sight narrowed when thread membership became the wake signal. It is no
+longer a veto on WAKING: in an `on` channel a thread we have posted in wakes us whoever else is
+in it. It decides STRICT status — the level-independent rule of us, one human, no other agents,
+which is what still reaches a `mentions_only` channel and what still carries structural
+authority. Everything in this file exists to keep that answer correct:
 
 - the ring's shape and bounds (a bound that silently narrowed would push a second agent out of
-  view and re-open the fast path);
+  view and call a crowded thread strictly 1:1);
 - the LIVE feed, which runs at the raw Slack listener rather than inside ambient ingest, because
-  the veto must not depend on whether ambient memory happens to be wired;
+  the strict test must not depend on whether ambient memory happens to be wired;
 - the FETCH feed (reconcile_window), which hydrates the same rings from a turn's own Slack pages,
   and the generation counter that makes live writes win over a stale fetch;
 - the mutation path: a deleted or tombstoned message stops counting as a speaker.
@@ -241,7 +246,7 @@ def test_reconcile_skips_when_a_live_event_landed_mid_fetch():
 
 def _feed_host():
     """The listener-level feed on a bare host: no ambient service, no DB, no Slack client — which
-    is the point. The veto must work in a process where none of those are wired."""
+    is the point. The strict test must work in a process where none of those are wired."""
     from slack_client.event_handlers.message_events import SlackMessageEventsMixin
 
     class Host(SlackMessageEventsMixin):
@@ -371,7 +376,7 @@ def test_a_re_post_after_a_deletion_is_recorded_again():
     assert tail_mod.thread_has_other_bot("C1", "100.0") is True
 
 
-# ---------------------------------------------------------------- the listeners + the veto
+# --------------------------------------------------------- the listeners + the strict test
 
 def test_both_raw_listeners_feed_the_tail_before_any_await():
     """The feed sits with the watermark admission at the top of each listener — synchronous, ahead
@@ -396,14 +401,22 @@ def test_both_raw_listeners_feed_the_tail_before_any_await():
     assert "_feed_actor_tail" not in ambient
 
 
-def test_the_veto_reads_the_actor_tail_at_the_continuation_decision():
+def test_the_actor_tail_is_read_at_the_continuation_decision():
     """Asserted on the source of the decision site: the surrounding handler needs a whole Slack
-    client to run, and what matters is that the tail is consulted at exactly the point that clears
-    `direct_continuation`."""
+    client to run, and what matters is that the tail is consulted at exactly the point that
+    decides STRICT status.
+
+    It is no longer a veto on WAKING. In an `on` channel a thread we have posted in wakes us
+    whoever else is in it, so a second agent no longer cancels the dispatch — it only
+    disqualifies the thread from the level-independent strict 1:1 rule. So what the call must
+    still gate is `strict_1to1`, and `strict_1to1` is what gates the direct continuation."""
     import inspect
 
     from slack_client.event_handlers.message_events import SlackMessageEventsMixin
 
     src = inspect.getsource(SlackMessageEventsMixin)
     idx = src.index("actor_tail.thread_has_other_bot(channel_id, thread_ts)")
-    assert "direct_continuation = False" in src[idx:idx + 120]
+    window = src[max(0, idx - 200):idx + 200]
+    assert "strict_1to1 = (" in window
+    assert "not actor_tail.thread_has_other_bot(channel_id, thread_ts)" in window
+    assert "if strict_1to1:" in window

@@ -153,8 +153,11 @@ async def execute_set_channel_participation(ctx: ToolContext, args: Dict[str, An
                 "message": "Settings storage is not available."}
     # A structural change may fire ONLY when a HUMAN wrote the message and this turn genuinely
     # reached the responder (handlers.text computes `structural_change_authorized` from
-    # sender_type + the gate_required/gate_woke routing facts; a bot sender or an unclassified
-    # one never qualifies, and a message that needed the gate and never woke it is refused).
+    # sender_type + the gate_required/gate_woke routing facts + `membership_wake`). THREE shapes
+    # are refused: a bot sender or an unclassified one; a message that needed the gate and never
+    # woke it; and a turn woken only because we happen to have posted in this thread — nobody
+    # asked us anything there, and the message may have been meant for another assistant in the
+    # thread, so it may be considered without a gate but may not rewrite the channel's settings.
     # The description already binds the model to an explicit instruction in the current human
     # message, but that is advisory; this is the hard, in-code gate — the injection /
     # hallucination / "being talked about ≠ talked to" vector is refused here even if the model

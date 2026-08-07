@@ -1252,7 +1252,8 @@ class TestAbsorbedObligationsTravelWithTheAnswer:
     def test_an_absorbed_thread_continuation_keeps_the_right_to_stay_silent(self):
         from message_processor import routing_facts
 
-        # A deterministic 1:1 continuation is UNGATED but silence-capable on purpose: no gate ran,
+        # A thread continuation (strict 1:1, or membership in an `on` channel) is UNGATED but
+        # silence-capable on purpose: no gate ran,
         # so the responder is the only decider and may decide there is nothing to say. Reading
         # "ungated" as "addressed" would take that decision away — the same class of mistake as
         # the blocker it sits next to, in the opposite direction: manufacturing words rather than
