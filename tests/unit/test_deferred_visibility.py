@@ -354,7 +354,6 @@ async def _timeout_notice_shown_for(turn, monkeypatch):
     p._admit_channel_request = AsyncMock()
     # Stop the turn the moment the notice decision is behind us.
     p._handle_text_response = AsyncMock(return_value=Response(type="text", content="ok"))
-    p._build_channel_memory_text = AsyncMock(return_value="")
     p._build_channel_info = AsyncMock(return_value="")
     p._process_attachments = AsyncMock(return_value=([], [], []))
 

@@ -540,9 +540,6 @@ async def _channel_turn_with_a_prior_timeout(*, admission_fails: bool, had_timeo
     p._build_channel_turn_stream = _stream                       # type: ignore[method-assign]
     p._admit_channel_request = _admit                            # type: ignore[method-assign]
     p._handle_text_response = AsyncMock(return_value=Response(type="text", content="ok"))  # type: ignore[method-assign]
-    # STALE: _build_channel_memory_text was removed from MessageProcessor in 75b49f1 (channel
-    # steering replaced it), so this patches an attribute nothing reads.
-    p._build_channel_memory_text = AsyncMock(return_value="")    # type: ignore[attr-defined]
     p._build_channel_info = AsyncMock(return_value="")           # type: ignore[method-assign]
     p._process_attachments = AsyncMock(return_value=([], [], list(unsupported)))  # type: ignore[method-assign]
 

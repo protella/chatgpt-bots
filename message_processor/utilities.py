@@ -3,10 +3,8 @@ from __future__ import annotations
 import asyncio
 import datetime
 import json
-import threading
-import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
 
 import base64
 import os
@@ -625,10 +623,7 @@ class MessageUtilitiesMixin(_Host):
     async def _process_attachments(
         self,
         message: Message,
-        # `Any`, not BaseClient: attachment handling awaits the platform client's async
-        # download_file, which every real client implements as a coroutine while the ABC
-        # still declares the sync signature.
-        client: Any,
+        client: BaseClient,
         thinking_id: Optional[str] = None,
         code_interpreter_enabled: Optional[bool] = None,
         defer_document_summaries: bool = False
@@ -687,8 +682,15 @@ class MessageUtilitiesMixin(_Host):
                         continue
 
                     # Download the image
+                    # cast: typing-only, a runtime no-op — the value is passed through
+                    # unchanged. `attachment` is `Dict[str, Any]`, so `.get` widens to
+                    # `Any | None`. The url is Slack's `url_private` (message_events.py) and is
+                    # present on every normal file_share, but it is NOT structurally guaranteed;
+                    # a None reaches download_file exactly as it does today and takes the same
+                    # failure path. The cast narrows the annotation, it asserts nothing at
+                    # runtime.
                     image_data = await client.download_file(
-                        attachment.get("url"),
+                        cast(str, attachment.get("url")),
                         file_id,
                         max_bytes=image_cap,
                     )
@@ -821,8 +823,11 @@ class MessageUtilitiesMixin(_Host):
                                           emoji=config.analyze_emoji, thread_id=message.thread_id)
 
                     # Download the document
+                    # cast: same as the image branch above — `Dict[str, Any].get` widens to
+                    # `Any | None`. Typing-only, a runtime no-op; a missing url is still
+                    # handled by download_file exactly as it is today.
                     document_data = await client.download_file(
-                        attachment.get("url"),
+                        cast(str, attachment.get("url")),
                         file_id,
                         max_bytes=doc_cap,
                     )
@@ -2127,106 +2132,6 @@ class MessageUtilitiesMixin(_Host):
         # Create and start the task
         task = asyncio.create_task(update_progress())
         return task
-
-    def _start_progress_updater(self, client: BaseClient, channel_id: str, thinking_id: Optional[str], operation: str = "request") -> Optional[threading.Thread]:
-        """Legacy threading version - kept for compatibility with sync code"""
-        if not thinking_id or not hasattr(client, 'update_message'):
-            return None
-
-        stop_event = threading.Event()
-        start_time = time.time()
-
-        def update_progress():
-            messages = [
-                f"Processing your {operation}...",
-                "Still working on this...",
-                "Still here, just thinking...",
-                "Bear with me a moment longer...",
-                "This is taking longer than I expected..."
-            ]
-
-            intervals = [10, 20, 30, 45, 60]  # Seconds before each message
-            message_index = 0
-
-            while not stop_event.is_set() and message_index < len(messages):
-                elapsed = int(time.time() - start_time)
-
-                # Wait for the next interval
-                if message_index < len(intervals):
-                    wait_time = intervals[message_index] - elapsed
-                    if wait_time > 0:
-                        stop_event.wait(wait_time)
-                        if stop_event.is_set():
-                            break
-
-                # Update message
-                progress_msg = messages[message_index]
-                try:
-                    self._update_status(client, channel_id, thinking_id, progress_msg, emoji=config.circle_loader_emoji)
-                except Exception as e:
-                    self.log_error(f"Failed to update progress: {e}")
-                    break
-
-                message_index += 1
-
-                # After initial messages, use random selection without repeats
-                if message_index >= len(messages):
-                    import random
-
-                    ongoing_messages = [
-                        "Still processing...",
-                        "This is a tough one...",
-                        "Haven't forgotten about you...",
-                        "Almost there... maybe...",
-                        "Quality takes time...",
-                        "Still working on it...",
-                        "Your request is important to us...",
-                        "Consulting the AI elders...",
-                        "Still thinking about this...",
-                        "Not ignoring you, promise...",
-                        "This deserves a thorough response...",
-                        "Taking the scenic route to the answer...",
-                        "Complex questions need time...",
-                        "Still here, still working...",
-                        "Patience is a virtue, they say...",
-                        "Crafting something special...",
-                        "Worth the wait, hopefully...",
-                        "Deep in thought...",
-                        "Processing intensifies...",
-                        "The gears are turning..."
-                    ]
-
-                    # Create a copy to track unused messages
-                    unused_messages = ongoing_messages.copy()
-
-                    while not stop_event.is_set():
-                        stop_event.wait(30)
-                        if stop_event.is_set():
-                            break
-                        try:
-                            # If we've used all messages, refill the pool (but avoid immediate repeat)
-                            if not unused_messages:
-                                last_msg = progress_msg if 'progress_msg' in locals() else None
-                                unused_messages = ongoing_messages.copy()
-                                # Remove the last used message to avoid immediate repeat
-                                if last_msg and last_msg in unused_messages:
-                                    unused_messages.remove(last_msg)
-
-                            # Pick a random message from unused pool
-                            progress_msg = random.choice(unused_messages)
-                            unused_messages.remove(progress_msg)
-                            self._update_status(client, channel_id, thinking_id,
-                                             progress_msg,
-                                             emoji=config.circle_loader_emoji)
-                        except Exception:
-                            break
-
-        thread = threading.Thread(target=update_progress, daemon=True)
-        # Attach stop event to thread for later access (an ad-hoc attribute on Thread, which
-        # is why the checker can't see it).
-        thread.stop_event = stop_event  # type: ignore[attr-defined]
-        thread.start()
-        return thread
 
     async def update_last_image_url(self, channel_id: str, thread_id: str, url: str):
         """Update the last assistant message with the image URL"""

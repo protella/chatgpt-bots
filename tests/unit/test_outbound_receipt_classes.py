@@ -833,7 +833,7 @@ async def test_transports_refuse_receipts_without_a_class():
     # in the base itself, not only in the concrete overrides.
     base = MagicMock()
     with pytest.raises(ValueError):
-        base_client.BaseClient.update_message(base, "C1", "1.0", "t", receipts=object())
+        await base_client.BaseClient.update_message(base, "C1", "1.0", "t", receipts=object())
     with pytest.raises(ValueError):
         await base_client.BaseClient.update_message_async(base, "C1", "1.0", "t",
                                                           receipts=object())
@@ -842,7 +842,7 @@ async def test_transports_refuse_receipts_without_a_class():
                                                "a.csv", receipts=object(),
                                                receipt_class=None)
     with pytest.raises(ValueError):
-        base_client.BaseClient.send_message(base, "C1", "1.0", "t", receipts=object())
+        await base_client.BaseClient.send_message(base, "C1", "1.0", "t", receipts=object())
     with pytest.raises(ValueError):
         await base_client.BaseClient.send_message_async(base, "C1", "1.0", "t",
                                                         receipts=object())
@@ -854,9 +854,9 @@ async def test_transports_refuse_receipts_without_a_class():
                                                       receipts=object(),
                                                       receipt_class=None)
     with pytest.raises(ValueError):
-        base_client.BaseClient.send_thinking_indicator(base, "C1", "1.0",
-                                                       receipts=object(),
-                                                       receipt_class=None)
+        await base_client.BaseClient.send_thinking_indicator(base, "C1", "1.0",
+                                                             receipts=object(),
+                                                             receipt_class=None)
     with pytest.raises(ValueError):
         await base_client.BaseClient.send_thinking_indicator_async(
             base, "C1", "1.0", receipts=object(), receipt_class=None)

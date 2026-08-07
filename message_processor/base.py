@@ -33,9 +33,11 @@ except ImportError:
 
 
 # A note on the `cast(Any, client)` at every send/update below. `client` is typed as the
-# platform-agnostic `BaseClient`, but the seam the concrete Slack client actually exposes is
-# ASYNC and takes the guard kwargs the abstract one has never declared (`lease`, `surface`).
-# The cast is a no-op at runtime and marks exactly where the two shapes disagree.
+# platform-agnostic `BaseClient`, and the two seams now agree on being async — what still
+# disagrees is the guard kwargs: every one of these calls passes `lease` and `surface`, which
+# are Slack-only extensions the ABC deliberately does not declare (they belong to the concrete
+# client, not the platform-agnostic contract). The cast is a no-op at runtime and marks exactly
+# where the two shapes still differ.
 
 
 # What a turn that ran out of time should actually say. The old copy ("Taking Too Long —

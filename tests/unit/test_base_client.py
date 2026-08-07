@@ -103,11 +103,16 @@ class TestBaseClient:
     class MockClient(BaseClient):
         """Concrete implementation for testing
 
-        The platform-method signatures below have drifted from BaseClient's (sync vs async,
-        `channel`/`thread_ts` vs `channel_id`/`thread_id`), hence the `# type: ignore[override]`
-        on each. Nothing here calls them through the BaseClient contract — the tests drive the
-        compatibility wrappers (post_message/upload_image/fetch_thread_history) — so the drift
-        is a typing fact only.
+        The platform-method signatures below carry legacy drift from BaseClient's in BOTH
+        parameter names and return contracts, hence the `# type: ignore[override]` on each:
+        `send_message` takes `channel`/`thread_ts` (not `channel_id`/`thread_id`) and returns
+        `Dict[str, Any]` where the base says `Optional[str]`; `send_image` differs in both
+        parameter order and return shape; `get_thread_history` returns
+        `List[Dict[str, Any]]` where the base says `List[Message]`;
+        `send_thinking_indicator` omits the receipt parameters entirely; and `download_file`
+        takes a single argument. Nothing here calls them through the BaseClient contract —
+        the tests drive the compatibility wrappers
+        (post_message/upload_image/fetch_thread_history) — so the drift is a typing fact only.
         """
 
         def __init__(self):
@@ -436,10 +441,11 @@ class TestBaseClientContract:
         formatted = client.format_error_message("Failed to process: Invalid JSON")
         assert formatted == "Error: Failed to process: Invalid JSON"
     
-    def test_update_message_default_implementation(self):
+    @pytest.mark.asyncio
+    async def test_update_message_default_implementation(self):
         """Test update_message returns False by default"""
         client = TestBaseClient.MockClient()
-        
+
         # Default implementation should return False
-        result = client.update_message("C123", "M456", "Updated text")
+        result = await client.update_message("C123", "M456", "Updated text")
         assert result is False
