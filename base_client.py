@@ -230,11 +230,6 @@ class BaseClient(ABC, LoggerMixin):
         """Delete a message"""
         pass
 
-    @abstractmethod
-    async def delete_message_async(self, channel_id: str, message_id: str) -> bool:
-        """Delete a message (async version)"""
-        pass
-
     async def update_message(self, channel_id: str, message_id: str, text: str,
                              receipts: Any = None, receipt_kind: Optional[str] = None,
                              receipt_class: Optional[str] = None) -> bool:
@@ -267,12 +262,6 @@ class BaseClient(ABC, LoggerMixin):
         summary-tail optimization). Raises HistoryFetchError on terminal fetch
         failure — an empty thread returns [] instead.
         """
-        pass
-
-    @abstractmethod
-    async def get_thread_history_async(self, channel_id: str, thread_id: str, limit: Optional[int] = None,
-                                       oldest: Optional[str] = None) -> List[Message]:
-        """Get message history for a thread (async version)"""
         pass
 
     @abstractmethod

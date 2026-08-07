@@ -196,17 +196,9 @@ class TestBaseClient:
             """Async version of send_image"""
             return await self.send_image(channel, image_data, filename, thread_ts, **kwargs)
 
-        async def get_thread_history_async(self, channel: str, thread_ts: str, **kwargs) -> List[Dict[str, Any]]:  # type: ignore[override]
-            """Async version of get_thread_history"""
-            return await self.get_thread_history(channel, thread_ts, **kwargs)
-
         async def send_thinking_indicator_async(self, channel: str, thread_ts: Optional[str] = None) -> Optional[str]:  # type: ignore[override]
             """Async version of send_thinking_indicator"""
             return await self.send_thinking_indicator(channel, thread_ts)
-
-        async def delete_message_async(self, channel: str, ts: str) -> bool:
-            """Async version of delete_message"""
-            return await self.delete_message(channel, ts)
 
         async def download_file_async(self, url: str) -> bytes:  # type: ignore[override]
             """Async version of download_file"""

@@ -181,7 +181,6 @@ class TestMessageProcessor:
         processor.thread_manager.get_or_create_thread_async = AsyncMock()
         mock_client.send_message_async = AsyncMock()
         mock_client.get_thread_history = AsyncMock(return_value=[])
-        mock_client.get_thread_history_async = AsyncMock(return_value=[])
         processor.openai_client.create_text_response = AsyncMock(return_value="Test response")
 
         # Mock thread state with previous timeout

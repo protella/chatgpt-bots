@@ -1,9 +1,9 @@
 """Slack Bot Client Implementation."""
-from typing import Any, Optional, Callable, List, cast
+from typing import Any, Optional, Callable, cast
 
 from slack_bolt.async_app import AsyncApp
 
-from base_client import BaseClient, Message
+from base_client import BaseClient
 from config import config
 from markdown_converter import MarkdownConverter
 from database import DatabaseManager
@@ -271,10 +271,6 @@ class SlackBot(SlackMessageEventsMixin,  # type: ignore[misc]
         return await self.send_thinking_indicator(channel_id, thread_id, receipts=receipts,
                                                   receipt_class=receipt_class)
 
-    async def delete_message_async(self, channel_id: str, message_id: str) -> bool:
-        """Delete a message (async version)"""
-        return await self.delete_message(channel_id, message_id)
-
     async def update_message_async(self, channel_id: str, message_id: str, text: str,
                                    receipts: Any = None,
                                    receipt_kind: Optional[str] = None,
@@ -283,12 +279,6 @@ class SlackBot(SlackMessageEventsMixin,  # type: ignore[misc]
         return await self.update_message(channel_id, message_id, text, receipts=receipts,
                                          receipt_kind=receipt_kind,
                                          receipt_class=receipt_class)
-
-    async def get_thread_history_async(self, channel_id: str, thread_id: str,
-                                       limit: Optional[int] = None,
-                                       oldest: Optional[str] = None) -> List[Message]:
-        """Get message history for a thread (async version)"""
-        return await self.get_thread_history(channel_id, thread_id, limit, oldest=oldest)
 
     async def download_file_async(self, file_url: str, file_id: Optional[str] = None,
                                   max_bytes: Optional[int] = None) -> Optional[bytes]:
