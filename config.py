@@ -605,8 +605,9 @@ class BotConfig:
     # --- Per-thread actor tail (slack_client/actor_tail.py) ---
     # Who spoke in a thread, never what they said — the content ring is gone; the channel stream
     # is the room. What survives is STRUCTURAL: it is how `thread_has_other_bot` knows a second
-    # agent is in a thread, which is the one thing that can cancel the deterministic 1:1
-    # continuation fast path — the route that answers with no gate involved at all.
+    # agent is in a thread — which is what disqualifies that thread from the STRICT 1:1 rule on
+    # the continuation fast path, the route that answers with no gate involved at all. It no
+    # longer cancels the wake: in an `on` channel, membership in the thread is enough on its own.
     # 0 disables recording.
     participation_thread_tail: int = field(default_factory=lambda: int(os.getenv("PARTICIPATION_THREAD_TAIL", "15")))
     # Max distinct threads whose actor rings are retained per channel (whole-thread LRU eviction).
@@ -667,7 +668,11 @@ class BotConfig:
     # Judgment layer for UNPROMPTED channel participation (channels at level `on`).
     # Replaces the wake classifier. When false, unaddressed channel messages are ignored
     # without any model call (every channel behaves like mentions_only/tag_only);
-    # @mentions, name-wakes, 1:1 threads, and DMs are unaffected either way.
+    # @mentions, name-wakes, thread continuations, and DMs are unaffected either way. Still true
+    # of thread continuations after the widening, and worth stating plainly because there are now
+    # two of them: the strict 1:1 rule and, in an `on` channel, membership in the thread. Both are
+    # decided before this switch is consulted, so an `on` channel with the engine OFF still
+    # answers an untagged reply in a thread we have posted in.
     enable_participation_engine: bool = field(default_factory=lambda: os.getenv("ENABLE_PARTICIPATION_ENGINE", "true").lower() == "true")
     # Append one JSON line per participation event to logs/participation.jsonl — gate entries,
     # DECLINES, verdicts, reactions (with which decision placed them) and the final visible

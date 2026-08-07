@@ -106,8 +106,9 @@ async def test_ambient_channel_message_is_gated_and_may_stay_silent(listening):
 @pytest.mark.asyncio
 async def test_direct_thread_continuation_skips_the_gate_but_keeps_the_silence_option(
         listening, monkeypatch):
-    """The 1:1 continuation runs no gate, so the model is the only decider — and it may still
-    decide there is nothing to add."""
+    """The strict 1:1 continuation runs no gate, so the model is the only decider — and it may
+    still decide there is nothing to add. Strict means strict: the bot, one human, no other
+    agents, and it holds at every participation level."""
     bot = _make_bot()
     bot._thread_participation = AsyncMock(return_value=(True, 1, 0))  # bot + one human
     await bot._handle_channel_message(
@@ -177,10 +178,14 @@ async def test_edit_redispatch_is_gated_ambient_traffic(listening, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_gated_thread_message_is_thread_activity(listening):
-    """A thread reply the gate judges (not a 1:1 continuation — another bot is in the thread)
-    is thread activity, and it is still gated."""
+    """A thread reply the gate judges is thread activity, and it is still gated.
+
+    The shape had to change with the membership widening. "Another bot is in the thread" used to
+    be enough to send a reply to the gate; in an `on` channel it no longer is, because we have
+    posted there and that is now the wake signal. What remains gated is a thread we are NOT part
+    of — no continuation rule reaches it, so only the gate can."""
     bot = _make_bot()
-    bot._thread_participation = AsyncMock(return_value=(True, 1, 1))  # another bot present
+    bot._thread_participation = AsyncMock(return_value=(False, 2, 1))  # a thread we never joined
     await bot._handle_channel_message(
         _evt(text="what do we think?", thread_ts="50.0", ts="60.0"), bot.app.client)
     md = _dispatched(bot)
@@ -198,6 +203,200 @@ async def test_a_name_hit_does_not_make_a_message_addressed(listening):
     assert md["routing_posture"] == "channel_activity"
     assert md["participation_name_hit"] is True
     assert md["wake_source"] == "name_mention"
+
+
+# -------------------------------------------------- thread membership is the wake signal
+#
+# The second rule that skips the gate. In a channel set to `on`, an untagged human reply in a
+# thread we have ALREADY POSTED IN goes straight to the responder, whoever else is in that
+# thread. Participation in a thread is itself the wake signal: a thread we have posted in is one
+# we are already part of, and the responder — which can see the thread, where the gate sees only
+# the trigger text — decides what the turn owes, including nothing.
+#
+# Two things it deliberately is not. It does not apply at `mentions_only`, where we tell the user
+# verbatim that nothing but a mention or a bare name wakes us (ruling 1A). And it carries no
+# structural authority, which `membership_wake` is stamped to record (ruling 2A) — see
+# test_structural_authorization.py.
+
+@pytest.mark.asyncio
+async def test_membership_wakes_us_ungated_when_another_bot_is_in_the_thread(listening):
+    """THE INCIDENT. In a thread where we had generated an image and named the dish, a person
+    said "thanks guys" and we did nothing: another assistant was in the thread, so the strict 1:1
+    rule failed, and the gate — which sees two words and no thread — could only say no. The
+    reaction rule lives in the responder, which never ran."""
+    bot = _make_bot()
+    bot._thread_participation = AsyncMock(return_value=(True, 1, 1))  # us + a human + another bot
+    await bot._handle_channel_message(
+        _evt(text="thanks guys", thread_ts="50.0", ts="60.0"), bot.app.client)
+    md = _dispatched(bot)
+    assert md["gate_required"] is False
+    assert md["silence_capable"] is True                 # reaction and silence stay terminal
+    assert md["routing_posture"] == "thread_activity"
+    assert md["wake_source"] == "thread_continuation"    # provenance does not split by rule
+    assert md["membership_wake"] is True                 # but this fact does
+
+
+@pytest.mark.asyncio
+async def test_membership_wakes_us_ungated_in_a_crowded_thread(listening):
+    """Several humans is the other way out of strict: same thread, same answer. Whether the reply
+    was meant for us is the responder's question now, not the gate's."""
+    bot = _make_bot()
+    bot._thread_participation = AsyncMock(return_value=(True, 3, 0))
+    await bot._handle_channel_message(
+        _evt(text="and what about friday?", thread_ts="50.0", ts="60.0"), bot.app.client)
+    md = _dispatched(bot)
+    assert md["gate_required"] is False
+    assert md["silence_capable"] is True
+    assert md["wake_source"] == "thread_continuation"
+    assert md["membership_wake"] is True
+
+
+@pytest.mark.asyncio
+async def test_mentions_only_does_not_widen_to_thread_membership(listening):
+    """RULING 1A. `mentions_only` tells the user, in the responder's own words, that an explicit
+    @-mention always reaches us, a bare name is weighed first, and nothing else wakes us. Waking
+    on every thread reply there would make that a lie about our own configuration."""
+    bot = _make_bot({"participation_level": "mentions_only"})
+    bot._thread_participation = AsyncMock(return_value=(True, 1, 1))  # the incident's thread
+    await bot._handle_channel_message(
+        _evt(text="thanks guys", thread_ts="50.0", ts="60.0"), bot.app.client)
+    bot.message_handler.assert_not_called()              # exactly as today: nothing wakes
+
+    # And the one thing that DID reach the gate here still does, still gated, still not a
+    # membership wake.
+    await bot._handle_channel_message(
+        _evt(text="ChatGPT what do we think?", thread_ts="50.0", ts="61.0"), bot.app.client)
+    md = _dispatched(bot)
+    assert md["gate_required"] is True
+    assert md["membership_wake"] is False
+
+
+@pytest.mark.asyncio
+async def test_mentions_only_still_honours_a_strict_one_to_one_continuation(listening):
+    """The narrow rule is level-INDEPENDENT and untouched by the widening: us, one human, no
+    other agents. It skips the gate at `mentions_only` exactly as it always did."""
+    bot = _make_bot({"participation_level": "mentions_only"})
+    bot._thread_participation = AsyncMock(return_value=(True, 1, 0))
+    await bot._handle_channel_message(
+        _evt(text="and what about friday?", thread_ts="50.0", ts="60.0"), bot.app.client)
+    md = _dispatched(bot)
+    assert md["gate_required"] is False
+    assert md["silence_capable"] is True
+    assert md["wake_source"] == "thread_continuation"
+    assert md["membership_wake"] is False               # strict, so authority is not withheld
+
+
+@pytest.mark.asyncio
+async def test_a_thread_we_never_posted_in_still_goes_to_the_gate(listening):
+    """The accepted limitation, stated as a test. Membership is what widened; a foreign thread
+    reaches neither rule and still gets only the gate, with only the trigger text."""
+    bot = _make_bot()
+    bot._thread_participation = AsyncMock(return_value=(False, 2, 1))
+    await bot._handle_channel_message(
+        _evt(text="thanks guys", thread_ts="50.0", ts="60.0"), bot.app.client)
+    md = _dispatched(bot)
+    assert md["gate_required"] is True
+    assert md["membership_wake"] is False
+
+    # Same at `mentions_only`, where a name hit is what buys a foreign thread its gate run.
+    quiet = _make_bot({"participation_level": "mentions_only"})
+    quiet._thread_participation = AsyncMock(return_value=(False, 2, 1))
+    await quiet._handle_channel_message(
+        _evt(text="ChatGPT any idea?", thread_ts="50.0", ts="61.0"), quiet.app.client)
+    md = _dispatched(quiet)
+    assert md["gate_required"] is True
+    assert md["membership_wake"] is False
+
+
+@pytest.mark.asyncio
+async def test_another_bots_reply_in_our_thread_is_ungated_in_an_on_channel(listening):
+    """Owner decision, UNCAPPED: two assistants discussing something is a thing people set up
+    deliberately, and the gate — one message, no thread — is the wrong judge of whether the
+    exchange is worth continuing. So a bot's reply in a thread we are part of takes the
+    membership route like anyone else's.
+
+    Nothing in code bounds the exchange. The only brake is each side deciding it has nothing to
+    add, which is why `silence_capable` on this turn is the load-bearing half of the decision."""
+    bot = _make_bot()
+    bot._thread_participation = AsyncMock(return_value=(True, 1, 1))
+    await bot._handle_channel_message(
+        _evt(user="UCLAUDE", bot_id="BCLAUDE", text="I agree with the plan.",
+             thread_ts="50.0", ts="60.0"), bot.app.client)
+    md = _dispatched(bot)
+    assert md["gate_required"] is False
+    assert md["silence_capable"] is True                 # the only brake there is
+    assert md["wake_source"] == "thread_continuation"
+    assert md["membership_wake"] is True                 # never strict, so never authoritative
+
+
+@pytest.mark.asyncio
+async def test_a_bot_sender_can_never_reach_the_strict_rule(listening):
+    """Strict is the route that answers with no gate AND full structural authority, so it stays
+    human-only however 1:1 the thread looks. A bot in an otherwise-strict thread gets the
+    membership route instead — `on`-only, and authority-free."""
+    bot = _make_bot()
+    bot._thread_participation = AsyncMock(return_value=(True, 1, 0))   # textbook strict shape
+    await bot._handle_channel_message(
+        _evt(user="UCLAUDE", bot_id="BCLAUDE", text="here's what I found.",
+             thread_ts="50.0", ts="60.0"), bot.app.client)
+    md = _dispatched(bot)
+    assert md["gate_required"] is False
+    assert md["membership_wake"] is True                 # NOT strict, despite the 1:1 counts
+
+    # `mentions_only` is where that distinction bites: membership does not apply there (1A), and
+    # strict is closed to a bot sender, so the reply falls through to the gate exactly as before.
+    quiet = _make_bot({"participation_level": "mentions_only"})
+    quiet._thread_participation = AsyncMock(return_value=(True, 1, 0))
+    await quiet._handle_channel_message(
+        _evt(user="UCLAUDE", bot_id="BCLAUDE", text="ChatGPT, what does the data say?",
+             thread_ts="50.0", ts="61.0"), quiet.app.client)
+    md = _dispatched(quiet)
+    assert md["gate_required"] is True
+    assert md["membership_wake"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_bots_message_outside_our_threads_is_still_gated(listening):
+    """The widening is about threads we are IN. A bot at top level, or in a thread we never
+    posted in, still reaches the gate — that is where the loop-seed guard still lives."""
+    bot = _make_bot()
+    bot._thread_participation = AsyncMock(return_value=(False, 2, 1))  # a thread we never joined
+    await bot._handle_channel_message(
+        _evt(user="UCLAUDE", bot_id="BCLAUDE", text="I agree with the plan.",
+             thread_ts="50.0", ts="60.0"), bot.app.client)
+    md = _dispatched(bot)
+    assert md["gate_required"] is True
+    assert md["membership_wake"] is False
+
+    top = _make_bot()
+    top._thread_participation = AsyncMock(return_value=(True, 1, 1))
+    await top._handle_channel_message(
+        _evt(user="UCLAUDE", bot_id="BCLAUDE", text="deploy finished.", ts="70.0"),
+        top.app.client)
+    md = _dispatched(top)
+    assert md["gate_required"] is True
+    assert md["membership_wake"] is False
+    top._thread_participation.assert_not_called()        # no thread, nothing to probe
+
+
+@pytest.mark.asyncio
+async def test_membership_wake_never_reaches_a_dm_or_a_mention(listening, mock_env, monkeypatch):
+    """The fact is stamped on the CHANNEL path only, and the predicate that reads it uses
+    `is True` — so every other dispatch site is byte-identical: absent is not True."""
+    monkeypatch.setattr(config, "enable_no_reply_tool", True, raising=False)
+    for channel, source in (("D1", "dm"), ("C1", "app_mention")):
+        bot = _make_bot()
+        await bot._handle_slack_message(_evt(channel=channel, text="<@UBOT> hi"),
+                                        bot.app.client, wake_source=source)
+        md = _dispatched(bot)
+        assert "membership_wake" not in md, source
+
+        host = _MatHost(_registry())
+        _, request_config, _, _ = host._materialize_request_tools(
+            host._client, {"model": "m"},
+            _msg(sender_type="human", **{k: v for k, v in md.items() if k != "ts"}),
+            tools_disabled=True)
+        assert request_config["_structural_change_authorized"] is True, source
 
 
 # ------------------------------------------------------------------ the helpers themselves
@@ -294,7 +493,7 @@ def test_the_config_switch_still_closes_the_silence_option(mock_env, monkeypatch
 
 def test_the_suffix_wording_follows_posture_not_the_gate(mock_env, monkeypatch):
     """The paragraphs describe why the message is in front of the model, so posture picks them.
-    A thread message the gate judged and an untouched 1:1 continuation raise the same question —
+    A thread message the gate judged and an ungated thread continuation raise the same question —
     is this still mine? — and now read the same instruction."""
     from prompts import (CHANNEL_ACTIVITY_NO_REPLY_SUFFIX,
                          THREAD_ACTIVITY_NO_REPLY_SUFFIX)

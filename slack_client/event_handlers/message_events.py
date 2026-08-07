@@ -311,10 +311,24 @@ class SlackMessageEventsMixin(_Host):
     async def _thread_participation(self, channel_id: str, thread_ts: str):
         """Best-effort (bot_present, distinct_human_count, other_bot_count) for a thread.
 
-        Lets an untagged reply count as 'for us' only in a genuinely 1:1 thread: the bot,
-        at most one human, and NO other bots/agents. Another agent in the thread (e.g. a
-        second assistant) means messages may be for it — only the engine can tell, so no
-        deterministic continuation there. On error → (False, 0, 0)."""
+        `bot_present` is what decides whether an untagged reply may skip the gate: participation
+        in a thread is itself the wake signal — a thread we have posted in is one we are already
+        part of, and the responder, which can see the thread, decides what the turn owes,
+        including nothing. `human_count` and `other_bots` now decide only STRICT status (the bot,
+        at most one human, no other agents), which is the level-independent rule; membership on
+        its own wakes us only in an `on` channel.
+
+        Three things this probe is not:
+        - It is `conversations_replies(limit=50)`, ascending from the root, so `bot_present` really
+          means "we posted within the thread's first 50 messages" and the two counts are FIRST-PAGE
+          counts. Accepted: it fails safe — a miss sends the reply to the gate, which is today's
+          behaviour.
+        - `bot_present` is set by `is_own_message` alone, so ANY post of ours establishes
+          membership, including chrome (a thinking placeholder, a settings footer, an error
+          notice). Accepted: chrome only appears in a thread because a turn ran for us there, so it
+          is weak evidence of the same thing rather than false evidence.
+        - On error → (False, 0, 0), which is indistinguishable from an empty first page. The
+          exception line logged below is where the two are told apart."""
         try:
             result = await self.app.client.conversations_replies(
                 channel=channel_id, ts=thread_ts, limit=50
@@ -385,8 +399,10 @@ class SlackMessageEventsMixin(_Host):
         """Record WHO spoke in a thread — never what they said (spec §8). SYNCHRONOUS.
 
         Called straight from the raw Slack listeners, deliberately NOT from ambient ingest: the
-        tail's one reader is the deterministic 1:1-thread continuation veto, and that route must
-        not depend on whether ambient memory happens to be wired. Both listeners call it, so a
+        tail's one reader is the thread-continuation fast path, where it decides STRICT status —
+        a second agent past the replies probe's first page means the thread is not 1:1, though in
+        an `on` channel membership still wakes us — and that route must not depend on whether
+        ambient memory happens to be wired. Both listeners call it, so a
         mention arrives twice; the (channel, ts) dedup keeps the second delivery from counting as
         a second speaker — and from bumping the generation a turn's stream reconcile is watching.
 
@@ -992,31 +1008,69 @@ class SlackMessageEventsMixin(_Host):
         # True @mentions stay deterministic via the app_mention event (deduped above).
         name_hit = self._text_mentions_bot_name(text)
 
-        # Thread replies: an untagged HUMAN reply in a genuinely 1:1 thread with the
-        # bot (one human, no other bots/agents) continues that conversation
-        # deterministically (cheap, and practically always right). A message from
-        # another bot is never a continuation — it goes to the engine or nowhere.
+        # Thread replies: an untagged reply in a thread we are already part of skips the gate.
+        # Two rules produce that, and they are not the same rule:
+        #   strict 1:1 — a HUMAN sender, the bot, at most one human, no other bots/agents.
+        #     Level-independent, and unchanged: cheap, and practically always right. It is also
+        #     the only one of the two that carries structural authority.
+        #   membership, `on` channels only — we have posted in this thread, whoever else is in it
+        #     and whoever wrote the reply, another bot included. Participation in a thread is
+        #     itself the wake signal: a thread we have posted in is one we are already part of,
+        #     and the responder, which can SEE the thread (the gate sees only the trigger text),
+        #     decides what the turn owes — including nothing.
+        #
+        # OTHER BOTS IN A THREAD ARE NOT GATED (owner decision, uncapped). Two assistants
+        # discussing something is a thing people here deliberately set up, and the gate — which
+        # sees one message and no thread — is the wrong judge of whether the exchange is worth
+        # continuing. Nothing bounds the exchange in code: the ONLY brake is each side deciding
+        # it has nothing to add, which for us is the responder's silence rule ("two assistants
+        # answering is worse than none") on a silence_capable turn. That is the accepted trade.
+        # A bot reply at TOP LEVEL is unchanged and still gated — this is about threads.
         ts = event.get("ts")
         thread_ts = event.get("thread_ts")
 
         sender_is_bot = self.classify_sender(event) != "human"
         direct_continuation = False
-        if not sender_is_bot and thread_ts and thread_ts != ts:
+        # True only when the WIDENED rule is the sole reason we skipped the gate. It withholds
+        # structural authority downstream (handlers/text.py) and nothing else. Always true for a
+        # bot sender, which can never reach the strict rule.
+        membership_wake = False
+        # What the thread probe said, or None when it never ran (not a thread reply). A bare 0
+        # would be ambiguous — a failed probe and a genuinely empty first page both produce it —
+        # so the log carries this string instead. Debug only.
+        thread_probe: Optional[str] = None
+        if thread_ts and thread_ts != ts:
             bot_present, human_count, other_bots = await self._thread_participation(channel_id, thread_ts)
-            if bot_present and human_count <= 1 and other_bots == 0:
-                direct_continuation = True
+            # NOTE: `_thread_participation` returns (False, 0, 0) on API failure, so
+            # "bot_present=False,humans=0,other_bots=0" reads the same for an empty probe and a
+            # failed one; it logs its own exception line, which is where the two are told apart.
+            thread_probe = f"bot_present={bot_present},humans={human_count},other_bots={other_bots}"
+            if bot_present:
                 # F5 fix (b): the replies fast path only scans the oldest page (limit=50) and can
                 # miss a SECOND bot later in a long thread. The actor tail knows who has spoken in
-                # this thread — if it shows another agent, drop the deterministic continuation and
-                # let the engine judge (a bot may be the real addressee).
-                if actor_tail.thread_has_other_bot(channel_id, thread_ts):
-                    direct_continuation = False
+                # this thread — if it shows another agent, this thread is not strictly 1:1. It is
+                # no longer a veto on waking, only on strict status.
+                #
+                # `not sender_is_bot` is part of strict on purpose: a judgment-free answer to a
+                # bot is a loop seed, and strict is the route that answers with no gate AND full
+                # structural authority. A bot reply takes the membership route instead, which is
+                # `on`-only and authority-free.
+                strict_1to1 = (not sender_is_bot and human_count <= 1 and other_bots == 0
+                               and not actor_tail.thread_has_other_bot(channel_id, thread_ts))
+                if strict_1to1:
+                    direct_continuation = True
+                elif level == "on":
+                    # Ruling 1A: the widening respects `mentions_only`, where we tell the user
+                    # verbatim that nothing but a mention or a bare name wakes us.
+                    direct_continuation = True
+                    membership_wake = True
 
-        # Decide: 1:1 thread continuation → respond directly; `on` → the gate judges every
-        # message; `mentions_only` → the gate judges ONLY name-bearing messages (zero model cost
-        # otherwise, and a real @mention never arrives here — it comes via app_mention); engine
-        # disabled → legacy deterministic name wake (humans only — a bot naming us must never
-        # trigger a judgment-free reply, that's a loop seed).
+        # Decide: a thread continuation (strict 1:1, or membership in an `on` channel) → respond
+        # directly; `on` → the gate judges every message; `mentions_only` → the gate judges ONLY
+        # name-bearing messages (zero model cost otherwise, and a real @mention never arrives here
+        # — it comes via app_mention); engine disabled → legacy deterministic name wake (humans
+        # only — a bot naming us at top level must never trigger a judgment-free reply, that's a
+        # loop seed; in a thread we are part of, the membership rule above has already decided).
         engine_on = getattr(config, "enable_participation_engine", True)
         gate_required = False
         if direct_continuation:
@@ -1038,19 +1092,26 @@ class SlackMessageEventsMixin(_Host):
         message.metadata["channel_listen"] = True
         message.metadata["participation_level"] = level
         # F3 wake source: a name-in-text hit reads as name_mention (engine-gated or the
-        # legacy deterministic wake); a 1:1 thread reply as thread_continuation; anything
-        # else the engine woke on is ambient.
+        # legacy deterministic wake); a thread reply we skipped the gate for — strict 1:1 or
+        # membership in an `on` channel alike — as thread_continuation; anything else the engine
+        # woke on is ambient. The value does NOT split by which of the two rules fired: it is
+        # provenance for the wake envelope, and both routes are the same provenance. What
+        # distinguishes them is `membership_wake`, stamped below for exactly that reason.
         if direct_continuation:
             message.metadata["wake_source"] = "thread_continuation"
         elif name_hit:
             message.metadata["wake_source"] = "name_mention"
         else:
             message.metadata["wake_source"] = "ambient"
+        # Which rule woke us, on EVERY dispatch out of this path, true or false — a consumer must
+        # never have to tell "not a membership wake" from "never stamped". Read only by the
+        # structural-authorization predicate (ruling 2A).
+        message.metadata["membership_wake"] = membership_wake
         # The routing facts, stamped on EVERY dispatch out of this path — including the two
         # routes that need no gate. A turn may end in silence when the gate judged it (the
-        # model that woke it can also decide there is nothing to add) or when it is a 1:1
-        # thread continuation (no gate ran, so the responder is the only decider); the
-        # engine-off legacy name wake is a deterministic answer and owes words.
+        # model that woke it can also decide there is nothing to add) or when it is a thread
+        # continuation (no gate ran, so the responder is the only decider); the engine-off
+        # legacy name wake is a deterministic answer and owes words.
         stamp_routing_facts(message, gate_required=gate_required,
                             silence_capable=gate_required or direct_continuation,
                             addressed=False, ts=ts, thread_ts=thread_ts)
@@ -1074,10 +1135,16 @@ class SlackMessageEventsMixin(_Host):
         # (set_reply_destination). Always stamped, true or false.
         message.metadata["channel_post_allowed"] = _channel_post_allowed(cs)
 
+        # A DEBUG LOG, and nothing more. A direct continuation mints no gate attempt — the ledger
+        # writes gate_start/gate_decision only when a gate runs — so these facts are not joinable
+        # to any gate row and no participation.jsonl gate row will carry them. The turn's outcome
+        # still lands in a `turn_outcome` row, joined to `turn_start` by turn_id; reading a live
+        # pass on this route means these lines plus that row.
         self.log_debug(
             f"Channel message dispatch: channel={channel_id}, ts={ts}, level={level}, "
             f"name_hit={name_hit}, direct_continuation={direct_continuation}, "
-            f"gate_required={gate_required}"
+            f"gate_required={gate_required}, membership_wake={membership_wake}, "
+            f"thread_probe={thread_probe}"
         )
         if self.message_handler:
             await self.message_handler(message, self)

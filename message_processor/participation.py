@@ -31,8 +31,12 @@ Authority order (cheap → expensive), enforced in code and not by prompt:
   prefilters (message_events: own message / subtype / level=off / addressed short-circuit /
   mentions_only) → debounce cohort → ONE utility-model call → one bit.
 
-@mentions, 1:1 thread continuations, and DMs NEVER reach this engine — they are answered
-directly. Told to be quiet is not the same as deaf.
+@mentions, thread continuations, and DMs NEVER reach this engine — they are answered directly.
+A thread continuation is either of two rules: a strict 1:1 thread (level-independent), or, in an
+`on` channel, a thread we have already posted in. Participation in a thread is itself the wake
+signal — a thread we have posted in is one we are already part of, and the responder, which can
+see the thread where this gate sees only the trigger text, decides what the turn owes, including
+nothing. Told to be quiet is not the same as deaf.
 
 Legacy compatibility — participation levels vs. response_mode:
   response_mode "off"          ≡ level "off"
@@ -71,8 +75,11 @@ logger = logging.getLogger(__name__)
 #
 #   off            — no channel response at all, INCLUDING an explicit @mention.
 #   mentions_only  — a real @mention goes straight to the responder; a bare-name message is
-#                    judged by the gate; a deterministic 1:1 continuation stays direct.
-#   on             — all otherwise-eligible ambient and name traffic is judged by the gate.
+#                    judged by the gate; a strict 1:1 continuation stays direct, and NOTHING
+#                    else skips the gate here (ruling 1A: the membership widening is `on`-only,
+#                    because this level promises the user that nothing else wakes us).
+#   on             — all otherwise-eligible ambient and name traffic is judged by the gate, and
+#                    an untagged human reply in a thread we have posted in skips it entirely.
 VALID_LEVELS = ("off", "mentions_only", "on")
 
 # The legacy response_mode column is still dual-written so a rollback can read it.

@@ -571,14 +571,19 @@ async def test_actor_tail_cancels_a_continuation_the_replies_scan_called_one_on_
 
 @pytest.mark.asyncio
 async def test_bot_sender_never_direct_continuation(tag_only):
-    # Another bot replying in our 1:1 thread must not get a judgment-free response.
+    # Another bot replying in our thread gets no judgment-free response HERE, at `mentions_only`.
+    # Two separate rules produce that and both are needed: strict 1:1 is closed to a bot sender
+    # however 1:1 the counts look, and membership — which WOULD wake us for this exact event in
+    # an `on` channel, uncapped and by design — does not apply at this level (ruling 1A).
     bot = _make_bot()
     bot._thread_participation = AsyncMock(return_value=(True, 1, 0))
     evt = _evt(user="UCLAUDE", bot_id="BCLAUDE", text="I agree with the plan.",
                thread_ts="50.0", ts="60.0")
     await bot._handle_channel_message(evt, bot.app.client)
     bot.message_handler.assert_not_called()
-    bot._thread_participation.assert_not_called()  # not even consulted for bot senders
+    # The probe DOES run now — a bot reply reaches the membership rule like anyone else's, and
+    # only the level turns it away. What must not happen is the dispatch, asserted above.
+    bot._thread_participation.assert_awaited_once()
 
 
 @pytest.mark.asyncio

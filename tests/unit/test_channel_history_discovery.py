@@ -580,7 +580,8 @@ async def test_actor_tail_is_hydrated_from_the_fetch(client):
 async def test_our_own_messages_are_not_hydrated_into_the_tail(client):
     """The tail answers "has another bot spoken in this thread". A self record does not count as
     another bot but does take a slot in a bounded ring, so hydrating them can evict the other-bot
-    record the continuation veto reads — and the veto silently stops holding."""
+    record the continuation's STRICT-1:1 test reads — and a thread quietly starts reading as 1:1
+    when it is not."""
     thread = "1700000100.000000"
     client.app.client.conversations_history.return_value = {"ok": True, "messages": [
         raw(thread, user="B9", bot_id="B9", reply_count=1, latest_reply="1700000900.000000")]}

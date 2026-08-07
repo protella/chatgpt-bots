@@ -14,12 +14,20 @@ lived precisely in how the flag was computed:
 
 The authorization expression is:
     structural_change_authorized =
-        (sender_type == "human") AND (NOT gate_required OR gate_woke)
+        (sender_type == "human") AND (NOT gate_required OR gate_woke) AND (NOT membership_wake)
 where `sender_type` is stamped in _event_to_message and the gate pair are routing facts
 (routing_facts.py). It asks the honest question — did a PERSON write this, and did this turn
 genuinely reach the responder — instead of the two proxies it replaced. The proxies failed in
 the direction that matters: "only reply when I tag you", said in plain words to a bot that is
 already listening, carries no <@bot> mention, and we told the person we could not hear them.
+
+`membership_wake` is the third clause, and it subtracts rather than adds (ruling 2A of the
+thread-membership widening). An untagged reply in an `on` channel now skips the gate purely
+because we have posted in that thread — nobody asked us anything, and the message may have been
+meant for another assistant in the thread. Waking to CONSIDER it is cheap and reversible;
+rewriting the channel's settings because of it is neither. It is stamped True or False on every
+channel dispatch and is absent everywhere else, so `is True` leaves DMs, @mentions, the edit path
+and the queue drain byte-identical.
 
 What the widening does NOT touch: a bot or self sender is refused, an unclassified sender is
 refused, DMs are refused by the executor, and the tool description still requires an explicit
@@ -158,6 +166,38 @@ async def test_an_ungated_human_turn_is_allowed_without_a_mention():
          "gate_required": False, "gate_woke": False}, db)
     assert ctx.structural_change_authorized is True
     assert res["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_membership_wake_may_not_rewrite_the_channels_settings():
+    """RULING 2A. The widened route stamps `gate_required=False`, so on the gate facts alone this
+    turn looks exactly like a DM or a strict 1:1 continuation — the shape the clause above
+    ALLOWS. It must not be allowed: nobody tagged us, nobody named us, we woke only because we
+    happen to have posted in this thread, and the aside may have been addressed to another
+    assistant in it. Considering it is cheap and reversible; rewriting the channel is neither.
+
+    The mirror is the same test's other half: a strict 1:1 continuation carries
+    `membership_wake=False` and keeps its authority, so the clause subtracts one route and
+    nothing else."""
+    db = _writable_db(before={"participation_level": "on"})
+    ctx, res = await _run(
+        {"sender_type": "human", "mentioned_self": False,
+         "gate_required": False, "gate_woke": False, "silence_capable": True,
+         "wake_source": "thread_continuation", "membership_wake": True}, db)
+    assert ctx.structural_change_authorized is False
+    assert res["ok"] is False and res["error"] == "not_addressed"
+    db.set_channel_settings_async.assert_not_awaited()
+
+    before = {"participation_level": "on", "reply_in_channel": True}
+    after = {"participation_level": "mentions_only", "reply_in_channel": True}
+    strict_db = _writable_db(before=before, after=after)
+    strict_ctx, strict_res = await _run(
+        {"sender_type": "human", "mentioned_self": False,
+         "gate_required": False, "gate_woke": False, "silence_capable": True,
+         "wake_source": "thread_continuation", "membership_wake": False}, strict_db)
+    assert strict_ctx.structural_change_authorized is True
+    assert strict_res["ok"] is True
+    strict_db.set_channel_settings_async.assert_awaited_once()
 
 
 def test_no_gate_authorized_structural_producers_or_consumers_remain():

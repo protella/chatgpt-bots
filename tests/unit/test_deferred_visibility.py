@@ -38,8 +38,9 @@ def test_ambient_channel_message_is_silence_capable(monkeypatch):
 
 
 def test_thread_continuation_is_silence_capable(monkeypatch):
-    """The one that bit the user live: a 1:1 thread reply skips the gate entirely, so the
-    model is the ONLY decider — and it can still bow out."""
+    """The one that bit the user live: a thread continuation — strict 1:1, or membership in an
+    `on` channel — skips the gate entirely, so the model is the ONLY decider, and it can still
+    bow out."""
     monkeypatch.setattr(config, "enable_no_reply_tool", True, raising=False)
     turn = TurnRuntime.for_message(_message(silence_capable=True, wake_source="thread_continuation"), channel_post_allowed=False)
     assert turn.silence_capable is True

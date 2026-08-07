@@ -2512,8 +2512,9 @@ async def build_channel_stream(*, client: Any, db: Any, team_id: str, channel_id
             logger.warning(f"window anchor for {channel_id} not advanced: {e}")
 
     # The actor tail is fed the PERIPHERY only, self messages filtered — feeding it the whole
-    # origin would let an old origin message evict the recent other-bot record the gate's
-    # continuation veto depends on.
+    # origin would let an old origin message evict the recent other-bot record the thread
+    # continuation's STRICT-1:1 test depends on. (It is no longer a veto on waking: in an `on`
+    # channel, membership in the thread wakes us whoever else is in it.)
     actor_tail_module.reconcile_window(
         channel_id,
         [actor_tail_module.tail_record(m) for m in shared.periphery

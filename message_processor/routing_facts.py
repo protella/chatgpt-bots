@@ -16,8 +16,11 @@ THE FOUR FACTS
 ``gate_required`` (bool)
     This message must pass the participation model before it may reach the responder. True for
     ambient/name/thread traffic the engine judges (including the edit path's re-dispatch); False
-    for a DM, a real @mention, a deterministic 1:1 thread continuation, and the engine-off legacy
-    name wake — those go straight to the responder.
+    for a DM, a real @mention, a thread continuation, and the engine-off legacy name wake — those
+    go straight to the responder. A thread continuation is either of two rules: a strict 1:1
+    thread (level-independent), or membership in an `on` channel — participation in a thread is
+    itself the wake signal, a thread we have posted in is one we are already part of, and the
+    responder, which can see the thread, decides what the turn owes, including nothing.
 
 ``gate_woke`` (bool)
     A required gate handed THIS attempt to the full responder — the gate said wake, and nothing
@@ -37,7 +40,7 @@ THE FOUR FACTS
 
 ``silence_capable`` (bool)
     The responder may end this turn without words — the same predicate that decides whether
-    `no_response_needed` is on the table. True on the gate-routed routes and on the 1:1 thread
+    `no_response_needed` is on the table. True on the gate-routed routes and on the thread
     continuation (which skips the gate, so the model is the only decider); False on a DM, a real
     @mention and the engine-off legacy name wake, where somebody asked us directly and an answer
     is owed. Route truth, not config truth: the `enable_no_reply_tool` switch is applied by the
@@ -59,8 +62,9 @@ SILENCE_CAPABLE = "silence_capable"
 # The bot was addressed: a DM (every message in one is for us) or a genuine @mention, including
 # the edit path's synthetic addressed wake, which routes through the same handler.
 POSTURE_ADDRESSED = "addressed_to_assistant"
-# A reply inside a thread that did not address us explicitly — the deterministic 1:1
-# continuation as well as any gate-routed thread message.
+# A reply inside a thread that did not address us explicitly — either ungated thread
+# continuation (strict 1:1, or membership in an `on` channel) as well as any gate-routed
+# thread message.
 POSTURE_THREAD = "thread_activity"
 # Top-level channel traffic that did not address us explicitly.
 POSTURE_CHANNEL = "channel_activity"
@@ -121,10 +125,12 @@ def owes_words(message: Any) -> bool:
     message a gate woke on is owed a TURN but not necessarily words — the responder can see the
     conversation and may legitimately find nothing worth adding.
 
-    BOTH facts, not just `gate_required`. "Ungated" is not a synonym for "addressed": a
-    deterministic 1:1 thread continuation skips the gate too, and is stamped silence_capable ON
-    PURPOSE — no gate ran, so the responder is the only decider, and it is allowed to decide there
-    is nothing to say. Reading the absence of a gate as an obligation to speak would absorb one of
+    BOTH facts, not just `gate_required`. "Ungated" is not a synonym for "addressed": a thread
+    continuation — strict 1:1, or membership in an `on` channel — skips the gate too, and is
+    stamped silence_capable ON PURPOSE. No gate ran, so the responder is the only decider, and it
+    is allowed to decide there is nothing to say; on the membership route that is the entire
+    point, since the reply may not have been meant for us at all. Reading the absence of a gate as
+    an obligation to speak would absorb one of
     those into a batch and take that decision away, which is the same class of mistake in the
     opposite direction: manufacturing words instead of losing them.
 

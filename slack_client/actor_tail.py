@@ -1,9 +1,13 @@
 """Per-thread actor tail — who spoke in a thread, not what they said (spec §2).
 
 Extracted from ChannelPulse, which is retired. The content ring is gone; the stream is the room
-now. What survives is structural and load-bearing: `thread_has_other_bot` is how the
-deterministic 1:1-thread continuation fast path — the route that answers with no gate involved
-at all — learns that a second agent is present beyond the replies fast path's first page.
+now. What survives is structural and load-bearing: `thread_has_other_bot` is how the thread
+continuation fast path — the route that answers with no gate involved at all — learns that a
+second agent is present beyond the replies fast path's first page. It decides STRICT status, not
+whether we wake: a second agent means the thread is not 1:1, and in an `on` channel membership
+alone still wakes us there, because participation in a thread is itself the wake signal — a
+thread we have posted in is one we are already part of, and the responder, which can see the
+thread, decides what the turn owes, including nothing.
 
 Two writers, and they must not fight. The live feed records events as they arrive; a turn's
 stream fetch hydrates the same window from Slack. A generation counter arbitrates: the fetch
