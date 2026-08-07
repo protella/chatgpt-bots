@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from base_client import Message
+from base_client import BaseClient, Message
 from config import config, pipeline_status
 from message_markers import (
     ends_with_continuation,
@@ -1078,11 +1078,7 @@ class ThreadManagementMixin(_Host):
     async def _get_or_rebuild_thread_state(
         self,
         message: Message,
-        # `Any`, not BaseClient: the rebuild path calls the platform client's ASYNC surface
-        # (get_thread_history, download_file), which every real client implements as a
-        # coroutine while the ABC still declares the sync signature. Annotating BaseClient
-        # here would describe a contract this method does not use.
-        client: Any,
+        client: BaseClient,
         thinking_id: Optional[str] = None
     ) -> Any:
         """Get existing thread state or rebuild from platform history"""

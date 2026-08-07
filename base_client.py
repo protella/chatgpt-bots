@@ -105,22 +105,22 @@ class BaseClient(ABC, LoggerMixin):
         self.log_info(f"{name} client initialized")
 
     @abstractmethod
-    def start(self):
+    async def start(self):
         """Start the client and begin listening for events"""
         pass
     
     @abstractmethod
-    def stop(self):
+    async def stop(self):
         """Stop the client gracefully"""
         pass
     
     @abstractmethod
-    def send_message(self, channel_id: str, thread_id: str, text: str,
-                     blocks: Optional[list] = None,
-                     meta_out: Optional[dict] = None,
-                     receipts: Any = None,
-                     receipt_kind: Optional[str] = None,
-                     receipt_class: Optional[str] = None) -> Optional[str]:
+    async def send_message(self, channel_id: str, thread_id: str, text: str, *,
+                           blocks: Optional[list] = None,
+                           meta_out: Optional[dict] = None,
+                           receipts: Any = None,
+                           receipt_kind: Optional[str] = None,
+                           receipt_class: Optional[str] = None) -> Optional[str]:
         """Send a text message. Returns the posted message ts (truthy on success) or None
         on failure.
 
@@ -140,7 +140,7 @@ class BaseClient(ABC, LoggerMixin):
         return None
 
     @abstractmethod
-    async def send_message_async(self, channel_id: str, thread_id: str, text: str,
+    async def send_message_async(self, channel_id: str, thread_id: str, text: str, *,
                                  blocks: Optional[list] = None,
                                  meta_out: Optional[dict] = None,
                                  lease: Any = None,
@@ -204,9 +204,9 @@ class BaseClient(ABC, LoggerMixin):
         return None
 
     @abstractmethod
-    def send_thinking_indicator(self, channel_id: str, thread_id: str,
-                                receipts: Any = None, *,
-                                receipt_class: Optional[str]) -> Optional[str]:
+    async def send_thinking_indicator(self, channel_id: str, thread_id: str,
+                                      receipts: Any = None, *,
+                                      receipt_class: Optional[str]) -> Optional[str]:
         """Send a thinking/processing indicator.
 
         Receipt contract (EDIT §4/§11.9/§11.13/§11.23): `receipt_class` is REQUIRED
@@ -226,7 +226,7 @@ class BaseClient(ABC, LoggerMixin):
         return None
 
     @abstractmethod
-    def delete_message(self, channel_id: str, message_id: str) -> bool:
+    async def delete_message(self, channel_id: str, message_id: str) -> bool:
         """Delete a message"""
         pass
 
@@ -235,9 +235,9 @@ class BaseClient(ABC, LoggerMixin):
         """Delete a message (async version)"""
         pass
 
-    def update_message(self, channel_id: str, message_id: str, text: str,
-                       receipts: Any = None, receipt_kind: Optional[str] = None,
-                       receipt_class: Optional[str] = None) -> bool:
+    async def update_message(self, channel_id: str, message_id: str, text: str,
+                             receipts: Any = None, receipt_kind: Optional[str] = None,
+                             receipt_class: Optional[str] = None) -> bool:
         """Update a message (optional - not all platforms support this).
 
         Receipt contract (§11.9/§11.13/§11.23): receipts-without-class raises ValueError via
@@ -259,8 +259,8 @@ class BaseClient(ABC, LoggerMixin):
         return False
 
     @abstractmethod
-    def get_thread_history(self, channel_id: str, thread_id: str, limit: Optional[int] = None,
-                           oldest: Optional[str] = None) -> List[Message]:
+    async def get_thread_history(self, channel_id: str, thread_id: str, limit: Optional[int] = None,
+                                 oldest: Optional[str] = None) -> List[Message]:
         """Get message history for a thread - fetches ALL messages by default.
 
         `oldest` (platform ts) fetches only messages strictly after it (Phase S
@@ -276,12 +276,14 @@ class BaseClient(ABC, LoggerMixin):
         pass
 
     @abstractmethod
-    def download_file(self, file_url: str, file_id: str, max_bytes: Optional[int] = None) -> Optional[bytes]:
+    async def download_file(self, file_url: str, file_id: Optional[str] = None,
+                            max_bytes: Optional[int] = None) -> Optional[bytes]:
         """Download a file/image from the platform, aborting past max_bytes when set"""
         pass
 
     @abstractmethod
-    async def download_file_async(self, file_url: str, file_id: str, max_bytes: Optional[int] = None) -> Optional[bytes]:
+    async def download_file_async(self, file_url: str, file_id: Optional[str] = None,
+                                  max_bytes: Optional[int] = None) -> Optional[bytes]:
         """Download a file/image from the platform (async version), aborting past max_bytes when set"""
         pass
     

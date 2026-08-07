@@ -1743,11 +1743,11 @@ class TextHandlerMixin(_Host):
             return result["ts"]
         return None
 
-    # `client: Any`, not BaseClient: the streaming path drives the platform client's async
-    # streaming surface — send_message_get_ts / update_message_streaming, and send_message with
-    # the `lease`/`surface`/`on_first_accept` kwargs. None of that is on the ABC, which still
-    # declares the sync, lease-less signatures. Annotating BaseClient here would describe a
-    # contract this method does not use.
+    # `client: Any`, not BaseClient: this method calls `send_message` with the Slack-only
+    # keywords `lease`, `surface` and `on_first_accept`, which the ABC deliberately does NOT
+    # declare — they are platform extensions and belong to the concrete client. Annotating
+    # BaseClient here would reject those calls; the honest fix is a streaming-client Protocol,
+    # which is a design change, not a typing cleanup.
     async def _handle_streaming_text_response(self, user_content: Any, thread_state, client: Any,
                                       message: Message, thinking_id: Optional[str] = None,
                                       attachment_urls: Optional[List[str]] = None,
@@ -3929,12 +3929,7 @@ class TextHandlerMixin(_Host):
             doomed = owned[1:] if keeper else owned
             survivors: List[str] = []
 
-            # NOTE: this shadows the turn-level `_drop_surface` defined earlier in this method
-            # (that one returns None and guards against a falsy ts; this one returns whether the
-            # delete landed, which the teardown below branches on). Same name, same function
-            # scope, so the checker sees a conditional redefinition — hence the suppressions here
-            # and on the two calls below.
-            async def _drop_surface(ts: str) -> bool:  # type: ignore[misc]
+            async def _delete_surface(ts: str) -> bool:
                 try:
                     gone = bool(await client.delete_message(message.channel_id, ts))  # unleased-ok: teardown — removing a surface can never be a stale answer
                     if gone and receipts is not None:
@@ -3945,7 +3940,7 @@ class TextHandlerMixin(_Host):
                     return False
 
             for dead_ts in doomed:
-                if await _drop_surface(dead_ts):  # type: ignore[func-returns-value]  # shadowed def, see above
+                if await _delete_surface(dead_ts):
                     self.log_debug(f"Deleted abandoned partial {dead_ts} before retrying")
                 else:
                     survivors.append(dead_ts)
@@ -3966,7 +3961,7 @@ class TextHandlerMixin(_Host):
                     # It still holds answer text and we could not blank it. Delete it and let
                     # the retry mint its own surface; if that fails too it is a survivor and we
                     # fail closed below.
-                    if not await _drop_surface(keeper):  # type: ignore[func-returns-value]  # shadowed def, see above
+                    if not await _delete_surface(keeper):
                         survivors.append(keeper)
                     keeper = None
 

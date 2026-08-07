@@ -35,11 +35,19 @@ from message_processor.people_tools import register_people_tools
 from message_processor.research_tools import register_research_tools
 
 
-# The ignore[misc] on the class statement: BaseClient still declares send_message,
-# update_message, delete_message, send_thinking_indicator, get_thread_history and download_file
-# as SYNC abstract methods, while every Slack implementation of them is `async def`. That
-# divergence lives in base_client.py's seam, not here, and narrowing it would mean changing what
-# those methods return at runtime.
+# The ignore[misc] on the class statement, narrowed to what is actually left: two mixin methods
+# insert SLACK-ONLY parameters into the MIDDLE of BaseClient's signature, so the positional
+# order diverges — SlackUtilitiesMixin.download_file puts `allow_html` before `max_bytes`, and
+# SlackMessagingMixin.update_message puts `lease`/`surface` before `receipts`. Those extensions
+# belong to the concrete client, not the ABC, and every caller passes them by keyword; moving
+# them would be a runtime change to the seam. mypy reports the mismatch HERE because the mixins
+# do not inherit BaseClient (they inherit `_Host`), so the class statement is the only place the
+# two definitions meet.
+#
+# This ignore IS removable, and ordering is verifiably the whole reason: making `allow_html` and
+# `lease`/`surface` keyword-only AFTER the parameters they currently precede clears both errors
+# and mypy goes green with the ignore deleted. Not done here — it is a signature change to two
+# live seams, which this typing round is not chartered to make.
 class SlackBot(SlackMessageEventsMixin,  # type: ignore[misc]
                SlackSettingsHandlersMixin,
                SlackRegistrationMixin,
@@ -231,10 +239,7 @@ class SlackBot(SlackMessageEventsMixin,  # type: ignore[misc]
         return registry
 
     # Async versions required by BaseClient
-    # ignore[override]: Slack's `surface` sits between `lease` and `receipts`, so the parameter
-    # ORDER differs from BaseClient's. Every caller passes these by keyword; moving it would be a
-    # runtime change to the seam for no type benefit.
-    async def send_message_async(self, channel_id: str, thread_id: str, text: str,  # type: ignore[override]
+    async def send_message_async(self, channel_id: str, thread_id: str, text: str,
                                  blocks: Optional[list] = None,
                                  meta_out: Optional[dict] = None,
                                  lease: Any = None,

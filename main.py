@@ -1033,12 +1033,15 @@ class ChatBotV2:
             # put a placeholder somewhere the answer might not arrive.
             thinking_id = None
             if not already_processing and turn.progress_enabled:
-                # cast: the base declares the older, narrower seam (sync, no lease); the
-                # concrete platform client this always receives is the async one. No-op
-                # at runtime — same call, same object.
-                thinking_id = await cast(Any, client).send_thinking_indicator(
+                # cast: typing-only, a runtime no-op — the value is passed through unchanged.
+                # `progress_enabled` is True only when the destination is not
+                # DESTINATION_CHANNEL and is already selected (turn_runtime.py), and
+                # resolve_reply_target returns None only on the CHANNEL branch; so in here it
+                # returns `message.thread_id`, which Message declares as `str`. Nothing between
+                # the turn's construction above and this line changes either field.
+                thinking_id = await client.send_thinking_indicator(
                     message.channel_id,
-                    post_thread_id,
+                    cast(str, post_thread_id),
                     receipts=turn.receipt_ledger,
                     receipt_class="chrome",
                 )
@@ -1048,7 +1051,7 @@ class ChatBotV2:
                     catch_up = f"Catching up on {batch_size} messages..."
                     try:
                         if thinking_id and hasattr(client, "update_message"):
-                            await cast(Any, client).update_message(  # unleased-ok: chrome — a placeholder/status write, never answer text
+                            await client.update_message(  # unleased-ok: chrome — a placeholder/status write, never answer text
                                 message.channel_id, thinking_id,
                                 f"{config.circle_loader_emoji} {catch_up}"
                             )

@@ -801,7 +801,6 @@ async def test_the_admitted_catch_up_turn_catalogues_the_carried_images():
     proc._build_channel_turn_stream = AsyncMock(return_value=None)
     proc._admit_channel_request = AsyncMock()
     proc._handle_text_response = AsyncMock(return_value=Response(type="text", content="ok"))
-    proc._build_channel_memory_text = AsyncMock(return_value="")
     proc._build_channel_info = AsyncMock(return_value="")
     proc._process_attachments = AsyncMock(return_value=([], [], []))
     proc._schedule_async_call = Mock()
