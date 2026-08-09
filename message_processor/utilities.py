@@ -2317,6 +2317,20 @@ def build_channel_topic_evidence(channel_info: Optional[Dict[str, Any]]) -> Opti
             + "\n".join(lines))
 
 
+def _is_mentionable_id(uid: Optional[str]) -> bool:
+    """True only for an id `<@…>` can actually name: a Slack USER id (U, or W on Enterprise Grid).
+
+    A bot OBJECT id (B…) or an app id (A…) renders as literal `<@B07ABC>` text in the channel —
+    which is exactly what leaked when a peer app posted in agent mode, with no `user` field, and
+    its B id became the actor's id upstream. The upstream fix resolves that id; this is the
+    guard that holds whatever upstream does, because the roster's whole contract is "ids you may
+    tag" and an id that cannot be tagged does not belong in it.
+
+    A prefix test only, never a length or character-class one: Slack has lengthened ids before
+    and tells apps not to assume their shape."""
+    return bool(uid) and str(uid)[0].upper() in ("U", "W")
+
+
 def build_taggable_roster_evidence(
         stream_actors: Optional[Sequence[StreamActor]] = None,
         origin_participants: Optional[Dict[str, str]] = None,
@@ -2333,8 +2347,10 @@ def build_taggable_roster_evidence(
     cache. Post-breakpoint evidence has no such constraint, so the split has no reason left.
 
     Other bots are KEPT — a peer agent has to be taggable. Ourselves and the id sentinels are
-    not. Recency comes from the stream window, so there is no age horizon to apply here: an actor
-    in the pinned stream is by construction recent enough to matter."""
+    not, and neither is anyone whose id is not a USER id (_is_mentionable_id): a B or A id in
+    this block instructs the model to write a mention Slack renders as raw text. Recency comes
+    from the stream window, so there is no age horizon to apply here: an actor in the pinned
+    stream is by construction recent enough to matter."""
     ordered: List[Tuple[Tuple[int, float, int], str, str]] = []
     seen = set()
     skip = {"bot", "unknown"}
@@ -2344,6 +2360,8 @@ def build_taggable_roster_evidence(
     for index, actor in enumerate(stream_actors or ()):
         uid = getattr(actor, "user_id", None)
         if not uid or uid in skip or uid in seen or getattr(actor, "sender_type", "") == "self":
+            continue
+        if not _is_mentionable_id(uid):
             continue
         seen.add(uid)
         name = _actor_name(getattr(actor, "name", None) or uid)
@@ -2356,7 +2374,7 @@ def build_taggable_roster_evidence(
     if requester_id:
         extras.append((requester_id, requester_name or requester_id))
     for offset, (uid, name) in enumerate(extras):
-        if not uid or uid in skip or uid in seen:
+        if not uid or uid in skip or uid in seen or not _is_mentionable_id(uid):
             continue
         seen.add(uid)
         ordered.append(((1, 0.0, tail_index + offset), _actor_name(name or uid), uid))

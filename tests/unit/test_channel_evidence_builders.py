@@ -181,6 +181,20 @@ class TestTaggableRoster:
              StreamActor("U1", "Alice", "human", "1.0")])
         assert out.count("→") == 1 and "<@U1>" in out
 
+    def test_an_id_that_is_not_a_user_id_is_never_offered_as_a_mention_target(self):
+        """A peer app in agent mode posts with no `user` field, so upstream can end up naming it
+        by its bot OBJECT id — and `<@B…>` reaches the channel as literal text."""
+        out = build_taggable_roster_evidence(
+            [StreamActor("B07AGENT", "Bot", "other_bot", "9.0"),
+             StreamActor("A07APP", "ChatGPT", "other_bot", "8.0"),
+             StreamActor("U1", "Alice", "human", "1.0"),
+             StreamActor("W2", "Bob", "human", "2.0")],
+            origin_participants={"B07OTHER": "Claude"},
+            requester_id="B07REQ", requester_name="Assistant")
+        assert "<@U1>" in out and "<@W2>" in out
+        assert "<@B" not in out and "<@A07APP>" not in out
+        assert out.count("→") == 2
+
     def test_participants_and_the_requester_join_the_stream_actors(self):
         out = build_taggable_roster_evidence(
             [StreamActor("U1", "Alice", "human", "1.0")],

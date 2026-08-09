@@ -19,7 +19,7 @@ from slack_client.history_fetch import (FetchBudget, HistoryPageError, iter_page
                                         slack_error_code)
 from slack_client.messaging import is_self_chrome_message
 from slack_client.normalizer import (ORIGIN_HISTORY, ORIGIN_REPLIES, TimestampError,
-                                     normalize_slack_message, parse_ts)
+                                     normalize_slack_message, parse_ts, prime_bot_actor_ids)
 from tool_registry import stage_discovered_edit_target, stage_discovered_root
 
 
@@ -1054,6 +1054,9 @@ class SlackSearchToolMixin(_Host):
         candidate goes through the canonical rule — and for a candidate from the current channel
         with our own team stamp the rule answers from memory, with no API call.
         """
+        # The sync normalizer below can only name a user-less peer bot by its B id unless this
+        # has already resolved it. Never raises, at most one bots.info per bot per process.
+        await prime_bot_actor_ids(self, page)
         for raw in page:
             normalized = self._normalize_scanned(raw, channel_id, origin)
             if normalized is _UNREADABLE:

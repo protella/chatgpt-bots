@@ -8,7 +8,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Mapping,
-                    Optional, cast)
+                    Optional, Tuple, cast)
 from uuid import uuid4
 
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
@@ -39,7 +39,7 @@ from slack_client.event_handlers.feedback import (
 )
 from slack_client._host import _Host
 from slack_client.formatting.blocks import extract_supplementary_text
-from slack_client.utilities import strip_citations
+from slack_client.utilities import is_user_shaped_id, strip_citations
 
 import re as _re
 
@@ -231,6 +231,172 @@ def _note_first_accept(callback: Optional[Callable[[str], None]], ts: Optional[s
         pass
 
 
+# A mention of a bot OBJECT id. Slack has no such mention: `<@B07ABC>` reaches the channel as
+# those literal characters, so the room reads an id instead of a name. The model only ever sees
+# one when an upstream surface offered it one (a peer app posting in agent mode names itself by
+# its B id and nothing else), which the roster guard and the resolver now prevent — this is the
+# last line, at the transport, where "never let it reach Slack" can actually be guaranteed.
+_BOT_OBJECT_MENTION_RE = re.compile(r"<@(B[A-Z0-9]+)(?:\|[^>]*)?>")
+
+# CODE IS QUOTED, NOT ADDRESSED. A fenced block or an inline span is content the model is showing
+# the room — a log line, a payload, the very id we are discussing — and rewriting inside it
+# changes what the answer says it saw. Slack's own link form `<http…|label>` needs no exemption:
+# the pattern above anchors on `<@`, which a link never has.
+_FENCE = "```"
+
+# The longest trailing fragment the native-stream guard will hold waiting for a `>`. A real
+# mention (`<@B` + id + optional `|label`) is far shorter; past this the text is prose that
+# happens to contain a `<`, and holding it back would stall the stream.
+_BOT_MENTION_HOLD_MAX = 128
+
+# An unfinished `<@B…` candidate: the id, and an optional label that has not closed yet.
+_OPEN_BOT_MENTION_RE = re.compile(r"<@B[A-Z0-9]*(?:\|[^>]*)?")
+
+
+def _code_spans(text: str, *, in_fence: bool = False, in_inline: bool = False,
+                terminal: bool = True) -> Tuple[List[Tuple[str, bool]], bool, bool]:
+    """Split `text` into `(chunk, is_code)` runs, carrying fence/inline state IN and OUT.
+
+    One definition of "what is quoted", used twice. A whole message answers the question by
+    itself (`terminal=True`: an unclosed fence or backtick is prose, exactly as Slack renders it).
+    A STREAM cannot: the fence opens in one delta and the mention arrives in the next, so the
+    state has to survive between calls, and an unclosed span is treated as open because the delta
+    that closes it has not arrived yet.
+    """
+    segments: List[Tuple[str, bool]] = []
+    end = len(text)
+    i = 0
+
+    def emit(chunk: str, is_code: bool) -> None:
+        if chunk:
+            segments.append((chunk, is_code))
+
+    while i < end:
+        if in_fence:
+            close = text.find(_FENCE, i)
+            if close < 0:
+                emit(text[i:], True)
+                i = end
+            else:
+                emit(text[i:close + len(_FENCE)], True)
+                i = close + len(_FENCE)
+                in_fence = False
+        elif in_inline:
+            close = i
+            while close < end and text[close] not in ("`", "\n"):
+                close += 1
+            if close >= end:
+                emit(text[i:], True)
+                i = end
+            elif text[close] == "`":
+                emit(text[i:close + 1], True)
+                i = close + 1
+                in_inline = False
+            else:
+                # A newline ends an inline span — Slack has no multi-line inline code.
+                emit(text[i:close], True)
+                emit("\n", False)
+                i = close + 1
+                in_inline = False
+        else:
+            tick = text.find("`", i)
+            if tick < 0:
+                emit(text[i:], False)
+                break
+            emit(text[i:tick], False)
+            if text.startswith(_FENCE, tick):
+                if terminal and text.find(_FENCE, tick + len(_FENCE)) < 0:
+                    emit(_FENCE, False)       # never closed: prose, not a block
+                else:
+                    emit(_FENCE, True)
+                    in_fence = True
+                i = tick + len(_FENCE)
+            else:
+                line_end = text.find("\n", tick + 1)
+                closes_here = text.find("`", tick + 1, end if line_end < 0 else line_end) >= 0
+                if terminal and not closes_here:
+                    emit("`", False)          # a lone backtick is punctuation, not a span
+                else:
+                    emit("`", True)
+                    in_inline = True
+                i = tick + 1
+    return segments, in_fence, in_inline
+
+
+def _mention_rewriter(client: Any) -> Callable[[str], str]:
+    """The substitution itself: `<@B…>` -> the cached USER id, or the plain word `@bot`, which
+    reads as a reference to some bot rather than as a machine id nobody can parse."""
+    lookup = getattr(client, "bot_user_id_for", None)
+
+    def _sub(match: "re.Match[str]") -> str:
+        resolved = None
+        if callable(lookup):
+            try:
+                resolved = lookup(match.group(1))
+            except Exception:  # noqa: BLE001 — a cache peek never breaks a send
+                resolved = None
+        # Only a genuine USER id may be written back: whatever the cache hands us, the one thing
+        # this function promises is that what reaches Slack is mentionable.
+        if isinstance(resolved, str) and is_user_shaped_id(resolved):
+            return f"<@{resolved}>"
+        return "@bot"
+
+    return lambda chunk: _BOT_OBJECT_MENTION_RE.sub(_sub, chunk)
+
+
+def rewrite_bot_object_mentions(client: Any, text: str) -> str:
+    """Outbound text with every `<@B…>` made postable: the bot's USER id when the cache knows it,
+    otherwise the plain word `@bot`. Code spans are left exactly as written, and text with no such
+    mention is returned untouched."""
+    if not text or "<@B" not in text:
+        return text
+    rewrite = _mention_rewriter(client)
+    segments, _fence, _inline = _code_spans(text)
+    return "".join(chunk if is_code else rewrite(chunk) for chunk, is_code in segments)
+
+
+def split_partial_code_delimiter(text: str) -> Tuple[str, str]:
+    """`(scannable, hold_back)` — hold a trailing run of ONE or TWO backticks.
+
+    A delimiter arrives in deltas too: a fence sent as "`" then "``\n" would open an inline span
+    in the first chunk and close nothing in the second, and every mention after it would be
+    classified against a code state that never existed. Three or more backticks are already a
+    complete delimiter and go out. The hold is two characters, so nothing can stall on it."""
+    run = 0
+    while run < len(text) and text[len(text) - 1 - run] == "`":
+        run += 1
+    if run in (1, 2):
+        return text[:len(text) - run], text[len(text) - run:]
+    return text, ""
+
+
+def split_streamable_bot_mention(text: str) -> Tuple[str, str]:
+    """`(release_now, hold_back)` for one streamed accumulation.
+
+    A native stream sends DELTAS, so `<@B07ABC>` can arrive as `<@B0` + `7ABC>` and a per-delta
+    rewrite would see neither half. The fragment that could still become a mention is held for the
+    delta that finishes it (the DestinationMarkerReader rule, applied to a different marker).
+
+    PAST THE BOUND the fragment is not held — but it is not released as written either. A
+    `<@B…` that goes out intact becomes a real mention the moment a later delta brings the `>`,
+    which is the whole failure this guard exists to prevent, so the opening bracket is dropped:
+    what reaches the room is literal text Slack cannot render as anything.
+    """
+    start = text.rfind("<")
+    if start < 0:
+        return text, ""
+    fragment = text[start:]
+    if ">" in fragment:
+        return text, ""
+    if len(fragment) < len("<@B"):
+        return (text[:start], fragment) if "<@B".startswith(fragment) else (text, "")
+    if not _OPEN_BOT_MENTION_RE.fullmatch(fragment):
+        return text, ""
+    if len(fragment) <= _BOT_MENTION_HOLD_MAX:
+        return text[:start], fragment
+    return text[:start] + fragment[1:], ""    # "<@B07…" -> "@B07…": nothing left to close
+
+
 # EDIT §11.21: announcement-send exceptions whose PHYSICAL outcome is ambiguous — the request
 # may already have reached Slack when they were raised. Timeouts and connection failures are
 # raised at/after dispatch (and a reconciliation miss re-raises exactly those, flagged via
@@ -343,8 +509,13 @@ class NativeStreamSession:
     """
 
     def __init__(self, client, channel_id: str, thread_id: str, logger=None,
-                 team_id: Optional[str] = None, user_id: Optional[str] = None):
+                 team_id: Optional[str] = None, user_id: Optional[str] = None,
+                 owner: Any = None):
         self._client = client
+        # The BOT (not the web client) — the only object that holds the bot_id -> user_id cache
+        # the outbound mention guard reads. Optional so a caller with no bot still works; the
+        # guard then falls back to "@bot", which is still never a raw `<@B…>`.
+        self._owner = owner
         self._channel = channel_id
         self._thread = thread_id
         self._log = logger
@@ -357,6 +528,14 @@ class NativeStreamSession:
         self.ts: Optional[str] = None
         self.active: bool = False
         self._sent: str = ""
+        # Raw text withheld from Slack because it could still become a `<@B…>` mention. Released
+        # by the next delta that resolves it, or by finish().
+        self._held: str = ""
+        # Where the code-span scanner stands, CUMULATIVELY. A fence opens in one delta and the
+        # mention lands in the next, so a per-chunk scan would rewrite inside a block it never
+        # saw open.
+        self._in_fence: bool = False
+        self._in_inline: bool = False
 
     async def start(self, initial_text: str = "", lease: Any = None) -> bool:
         """`lease` (stale guard): chat.startStream MINTS the reply message, so this is a first
@@ -395,10 +574,11 @@ class NativeStreamSession:
             self.active = False
             return False
         try:
+            opening = self._releasable(initial_text or "")
             resp = await self._client.chat_startStream(  # unleased-ok: inside NativeStreamSession.start, which authorized at its entry
                 channel=self._channel,
                 thread_ts=self._thread,
-                markdown_text=initial_text or None,
+                markdown_text=opening or None,
                 recipient_team_id=self._team_id,
                 recipient_user_id=self._user_id,
             )
@@ -414,6 +594,45 @@ class NativeStreamSession:
             self.active = False
             return False
 
+    def _releasable(self, raw: str) -> str:
+        """The part of `self._held + raw` that may go out NOW, rewritten; the rest is held.
+
+        THE ORDER IS THE POINT. Classification runs first, on text whose partial delimiters have
+        been held back, and only the trailing PROSE run is then split for an unfinished mention:
+        a `<@B…` the model is quoting inside a fence is code, and neutralizing its bracket would
+        edit what the answer says it saw. A held prose fragment can never contain a backtick —
+        any backtick would have started a code run — so holding it cannot desynchronize the
+        code state either.
+        """
+        scannable, ticks = split_partial_code_delimiter(self._held + (raw or ""))
+        segments, self._in_fence, self._in_inline = _code_spans(
+            scannable, in_fence=self._in_fence, in_inline=self._in_inline, terminal=False)
+        rewrite = _mention_rewriter(self._owner)
+        held = ""
+        out: List[str] = []
+        last = len(segments) - 1
+        for index, (chunk, is_code) in enumerate(segments):
+            if is_code:
+                out.append(chunk)               # quoted verbatim, mentions and all
+                continue
+            if index == last:
+                # Only the FINAL prose run can still grow: anything before it is already
+                # terminated by the code run that follows.
+                chunk, held = split_streamable_bot_mention(chunk)
+            out.append(rewrite(chunk))
+        self._held = held + ticks
+        return "".join(out)
+
+    def _flush(self) -> str:
+        """The stream is over: everything held goes out, since no delta can complete it now."""
+        pending, self._held = self._held, ""
+        if not pending:
+            return ""
+        segments, self._in_fence, self._in_inline = _code_spans(
+            pending, in_fence=self._in_fence, in_inline=self._in_inline, terminal=False)
+        rewrite = _mention_rewriter(self._owner)
+        return "".join(chunk if is_code else rewrite(chunk) for chunk, is_code in segments)
+
     async def update(self, cumulative_text: str) -> bool:
         """Append the new tail of ``cumulative_text`` since the last update."""
         if not self.active or self.ts is None:
@@ -421,8 +640,14 @@ class NativeStreamSession:
         delta = cumulative_text[len(self._sent):] if cumulative_text.startswith(self._sent) else cumulative_text
         if not delta:
             return True
+        outgoing = self._releasable(delta)
+        # The whole delta is a possible mention prefix: nothing may be appended yet, but the
+        # cumulative mark still advances or the next tick would resend it.
+        if not outgoing:
+            self._sent = cumulative_text
+            return True
         try:
-            await self._client.chat_appendStream(channel=self._channel, ts=self.ts, markdown_text=delta)
+            await self._client.chat_appendStream(channel=self._channel, ts=self.ts, markdown_text=outgoing)
             self._sent = cumulative_text
             return True
         except Exception as e:  # noqa: BLE001
@@ -435,13 +660,18 @@ class NativeStreamSession:
         if self.ts is None:
             return False
         try:
-            kwargs = {"channel": self._channel, "ts": self.ts}
+            kwargs: Dict[str, Any] = {"channel": self._channel, "ts": self.ts}
             if final_text is not None and final_text.startswith(self._sent):
                 tail = final_text[len(self._sent):]
-                if tail:
-                    kwargs["markdown_text"] = tail
             elif final_text is not None:
-                kwargs["markdown_text"] = final_text
+                tail = final_text
+            else:
+                tail = ""
+            # THE FLUSH. The stream is over, so a held fragment will never be completed by
+            # another delta: it goes out now, rewritten, rather than being lost.
+            released = self._releasable(tail) + self._flush()
+            if released:
+                kwargs["markdown_text"] = released
             if blocks is not None:
                 kwargs["blocks"] = blocks
             await self._client.chat_stopStream(**kwargs)
@@ -941,6 +1171,8 @@ class SlackMessagingMixin(_Host):
         try:
             # Strip MCP citations from text before sending to Slack
             text = strip_citations(text)
+            # A bot OBJECT id can never be mentioned; never let one reach the channel.
+            text = rewrite_bot_object_mentions(self, text)
             # Format text for Slack
             formatted_text = self.format_text(text)
 
@@ -1264,6 +1496,7 @@ class SlackMessagingMixin(_Host):
         try:
             # Strip MCP citations from text before sending to Slack
             text = strip_citations(text)
+            text = rewrite_bot_object_mentions(self, text)
             # Format text for Slack
             formatted_text = self.format_text(text)
             
@@ -1654,6 +1887,7 @@ class SlackMessagingMixin(_Host):
         try:
             # Strip MCP citations from text before sending to Slack
             text = strip_citations(text)
+            text = rewrite_bot_object_mentions(self, text)
             await self.app.client.chat_update(  # unleased-ok: inside update_message, which authorizes at its entry when a caller supplies a lease
                 channel=channel_id,
                 ts=message_id,
@@ -1955,7 +2189,7 @@ class SlackMessagingMixin(_Host):
         the handler) for channel streaming — both are threaded onto the session here."""
         return NativeStreamSession(
             self.app.client, channel_id, thread_id, logger=self.log_debug,
-            team_id=getattr(self, "self_team_id", None), user_id=user_id)
+            team_id=getattr(self, "self_team_id", None), user_id=user_id, owner=self)
 
     async def set_assistant_status(self, channel_id: str, thread_id: str,
                                    status: Optional[str] = None,
@@ -2971,7 +3205,7 @@ class SlackMessagingMixin(_Host):
                         "message": "new_text and correction_note must be strings."}
             # §11.17: citations are stripped BEFORE the emptiness checks — citation-only input
             # names nothing, and a disclosure must never post about it.
-            new_text = strip_citations(raw_text or "")
+            new_text = rewrite_bot_object_mentions(self, strip_citations(raw_text or ""))
             if not new_text.strip():
                 return {"ok": False, "error": "empty_new_text",
                         "message": "The complete corrected replacement text is required."}
@@ -3565,6 +3799,7 @@ class SlackMessagingMixin(_Host):
             # Strip MCP citations from text before sending to Slack
             # This is the single point of control for all streaming updates
             text = strip_citations(text)
+            text = rewrite_bot_object_mentions(self, text)
 
             # For messages that already contain Slack mrkdwn (like enhanced prompts with _italics_),
             # skip the markdown conversion to avoid double-processing

@@ -358,6 +358,49 @@ async def test_real_event_to_message_extracts_files(tag_only):
     assert [a["id"] for a in msg.attachments] == ["F1", "F2"]
 
 
+def _e2m_bot(bots_info_answer):
+    """The real _event_to_message over stubbed I/O, with bots.info answering as given."""
+    bot = _Bot.__new__(_Bot)
+    bot.bot_user_id = "UBOT"
+    bot.bot_id = "BBOT"
+    bot.app_id = None
+    bot.user_cache = {}
+    bot.db = MagicMock()
+    bot.db.get_user_info_async = AsyncMock(return_value=None)
+    bot._clean_mentions = lambda t: t
+    bot.get_username = AsyncMock(return_value="Bot")
+    bot.get_user_timezone = AsyncMock(return_value="UTC")
+    bot.app = MagicMock()
+    bot.app.client.bots_info = AsyncMock(return_value=bots_info_answer)
+    return bot
+
+
+def _agent_mode_event():
+    """A peer app posting in agent mode: username override, bot_id + app_id, NO `user` field."""
+    return _evt(subtype="bot_message", text="deploy finished", user=None,
+                bot_id="B07AGENT", app_id="A07AGENT", username="Bot")
+
+
+@pytest.mark.asyncio
+async def test_an_agent_mode_bot_is_the_actor_the_rest_of_the_turn_sees():
+    """One derivation for the live path and the stream: the participation cohort, the stale-send
+    scope and the roster must all name this bot the same way."""
+    bot = _e2m_bot({"ok": True, "bot": {"user_id": "U07PEER"}})
+    msg = await bot._event_to_message(_agent_mode_event(), bot.app.client)
+    assert msg.user_id == "U07PEER"
+    assert msg.metadata["sender_id"] == "U07PEER"
+    assert msg.metadata["sender_type"] == "other_bot"
+
+
+@pytest.mark.asyncio
+async def test_an_unresolvable_agent_bot_keeps_its_bot_id_and_costs_no_profile_lookup():
+    bot = _e2m_bot({"ok": True, "bot": {}})
+    msg = await bot._event_to_message(_agent_mode_event(), bot.app.client)
+    assert msg.user_id == "B07AGENT" and msg.metadata["sender_id"] == "B07AGENT"
+    bot.get_username.assert_not_awaited()      # users.info has no row for a B id
+    assert msg.metadata["username"] == "unknown"
+
+
 @pytest.mark.asyncio
 async def test_off_mode_never_responds(monkeypatch):
     monkeypatch.setattr(config, "channel_response_mode", "off", raising=False)

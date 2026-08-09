@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import aiohttp
+import asyncio
 import logging
 import re
 import time
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional
+from contextlib import contextmanager
+from typing import (TYPE_CHECKING, AbstractSet, Any, Dict, Iterable, Iterator, List,
+                    Optional, Set)
 
 from slack_sdk.errors import SlackApiError
 
@@ -31,6 +34,23 @@ def _is_resolvable_user_id(uid: str) -> bool:
     if uid in _SENTINEL_USER_IDS:
         return False
     return not uid.startswith("B")
+
+
+def is_user_shaped_id(uid: Optional[str]) -> bool:
+    """True only for an id that names a Slack USER — `U…`, or `W…` on Enterprise Grid.
+
+    THE one test for "can this id be mentioned, or looked up as a person": a bot OBJECT id (B…)
+    and an app id (A…) can be neither. A prefix test only, never a length or character-class one,
+    for the reason given above _SENTINEL_USER_IDS: Slack lengthens ids."""
+    return bool(uid) and str(uid)[0].upper() in ("U", "W")
+
+
+# The bot_id -> user_id cache's size bound. Mirrors PARTICIPATION_ACTIVITY_LRU_MAX's default
+# (config.participation_activity_lru_max = 1024) rather than inventing a number: same kind of
+# quantity — a per-process id map that is tiny in practice and must not be unbounded in theory.
+# Not configurable, because unlike the activity LRU nothing about a workspace's bot count varies
+# enough to tune.
+BOT_USER_ID_CACHE_MAX = 1024
 
 
 def is_dm_conversation(channel_id: Optional[str], channel_type: Optional[str] = None) -> bool:
@@ -129,6 +149,12 @@ class SlackUtilitiesMixin(_Host):
         bot_id: Optional[str]
         bot_handle: Optional[str]
         self_team_id: Optional[str]
+        # bot OBJECT id -> that bot's USER id, or None when Slack definitively has none. See
+        # _bot_user_ids() for why the negative entry is as important as the positive one, and
+        # _bot_id_flights() for the per-key single flight that fills them.
+        _bot_user_id_cache: Dict[str, Optional[str]]
+        _bot_user_id_flights: Dict[str, Any]
+        _bot_user_id_pins: Dict[str, int]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -205,6 +231,188 @@ class SlackUtilitiesMixin(_Host):
                 return "human"
             return "other_bot"
         return "human"
+
+    # --- bot OBJECT id -> bot USER id ----------------------------------------------------------
+    #
+    # A peer app posting in "agent mode" sends `subtype: bot_message` with a `username` override,
+    # `bot_id` + `app_id`, and NO `user` field at all — so every id we can name it by is a B id.
+    # A B id is not a mention target: `<@B…>` renders as raw text in the channel. The same app
+    # posting in its other mode carries its real bot USER id (a U id) and everything downstream
+    # already works, so the fix is to learn the U id for a B id and use it everywhere the B id
+    # would otherwise have stood in for an actor.
+    #
+    # bots.info answers that question, and the answer never changes for the life of a bot, so it
+    # is cached for the process. A DEFINITIVE "this bot has no user id" is cached too — that bot
+    # is re-encountered on every message it posts, and the negative entry is the difference
+    # between one wasted call and one per message forever. A TRANSIENT failure (an exception: a
+    # timeout, a rate limit, a socket) is NOT cached: caching it would blind the process to a
+    # perfectly resolvable bot until restart. The per-batch budget below is what stops the retry
+    # that implies from becoming a hammer.
+
+    def _bot_user_ids(self) -> Dict[str, Optional[str]]:
+        """The per-process bot_id -> user_id map, created on first use."""
+        cache = getattr(self, "_bot_user_id_cache", None)
+        if cache is None:
+            cache = {}
+            self._bot_user_id_cache = cache
+        return cache
+
+    def _bot_id_pins(self) -> Dict[str, int]:
+        """Reference counts of bot ids currently pinned against eviction — one entry per batch
+        that named the id, because two batches can pin the same id and the second must not be
+        unpinned by the first one finishing."""
+        pins = getattr(self, "_bot_user_id_pins", None)
+        if pins is None:
+            pins = {}
+            self._bot_user_id_pins = pins
+        return pins
+
+    @contextmanager
+    def _pinned_bot_ids(self, keys: AbstractSet[str]) -> Iterator[None]:
+        """Pin a batch's ids for the WHOLE prime call, waiting included.
+
+        The register is shared, not per-call, because a batch spends most of its time waiting on
+        somebody else's flight: a `protect` set carried only on its own resolve calls is not
+        consulted when the OTHER batch's resolution writes the cache, and the waiting batch's
+        already-known entry can be evicted out from under it."""
+        pins = self._bot_id_pins()
+        for key in keys:
+            pins[key] = pins.get(key, 0) + 1
+        try:
+            yield
+        finally:
+            for key in keys:
+                remaining = pins.get(key, 1) - 1
+                if remaining > 0:
+                    pins[key] = remaining
+                else:
+                    pins.pop(key, None)
+
+    def _cache_bot_user_id(self, key: str, user_id: Optional[str]) -> None:
+        """Write one entry, size-bounded, and NEVER over a positive one.
+
+        A resolved U id is permanent truth about that bot; a later miss (a rate-limited retry, a
+        bots.info that answered without the field) is not news, and letting it win would send an
+        already-correct actor back to being named by its B id mid-process."""
+        cache = self._bot_user_ids()
+        if cache.get(key):
+            return
+        if key not in cache:
+            # Oldest insertion first — dicts preserve it. Pinned ids are skipped, so a batch
+            # cannot evict an entry it (or a batch waiting beside it) already counted as known;
+            # when everything evictable is gone the bound is briefly exceeded instead. It is a
+            # PLATEAU, not a new ceiling: this drains back down to the cap on the next write that
+            # finds anything evictable, rather than treating the overflow as the size from then on.
+            pins = self._bot_id_pins()
+            for victim in list(cache):
+                if len(cache) < BOT_USER_ID_CACHE_MAX:
+                    break
+                if pins.get(victim):
+                    continue
+                cache.pop(victim, None)
+        cache[key] = user_id
+
+    def _bot_id_flights(self) -> Dict[str, Any]:
+        """In-flight bots.info lookups, keyed by bot id — the single-flight register."""
+        flights = getattr(self, "_bot_user_id_flights", None)
+        if flights is None:
+            flights = {}
+            self._bot_user_id_flights = flights
+        return flights
+
+    def bot_user_id_for(self, bot_id: Optional[str]) -> Optional[str]:
+        """SYNC peek at the cache — NEVER an API call.
+
+        `normalize_slack_message` cannot await, and the sync paths (the normalizer, the outbound
+        mention guard) must be able to ask this question without becoming async. An id nobody has
+        primed yet simply answers None, and the caller falls back to what it did before."""
+        if not bot_id:
+            return None
+        return self._bot_user_ids().get(str(bot_id))
+
+    async def resolve_bot_user_id(self, bot_id: Optional[str]) -> Optional[str]:
+        """The bot USER id behind a bot OBJECT id, via bots.info, single-flighted and cached.
+
+        Best-effort by construction: any failure returns None. A lookup that cannot answer must
+        never fail a fetch or a turn — the worst case is the pre-existing behavior, where the B id
+        stands in for the actor.
+
+        SINGLE FLIGHT IS PER CALL, NOT PER CACHE ENTRY. Two fetches of one channel run
+        concurrently (the shared window and the origin thread; the search fan-out likewise) and
+        must not each pay for the same answer — but a FAILURE is not cached, so waiters that
+        re-checked only the cache would have gone on to make N serialized calls after one timeout.
+        They share the outcome of the flight they queued behind instead, including its failure.
+        A call that starts AFTER that flight finished finds no flight and no entry, and retries:
+        the failure is scoped to the flight, not to the process.
+
+        ONLY a U/W-shaped answer is kept as a positive. bots.info returning something else is not
+        a mention target, and a B-shaped "user id" cached here would feed the outbound guard the
+        exact id it exists to keep out of the channel."""
+        if not bot_id:
+            return None
+        key = str(bot_id)
+        cache = self._bot_user_ids()
+        if key in cache:
+            return cache[key]
+        flights = self._bot_id_flights()
+        queued = flights.get(key)
+        if queued is not None:
+            try:
+                # Shielded: a waiter that is itself cancelled must not cancel the flight the
+                # other waiters are still reading.
+                return await asyncio.shield(queued)
+            except Exception:  # noqa: BLE001 — the flight's failure is this waiter's None
+                return None
+        flight = asyncio.get_running_loop().create_future()
+        flights[key] = flight
+        user_id: Optional[str] = None
+        try:
+            resp = await self.app.client.bots_info(bot=key)
+            raw = (resp.get("bot") or {}).get("user_id") if resp and resp.get("ok") else None
+            user_id = str(raw) if raw and is_user_shaped_id(str(raw)) else None
+            self._cache_bot_user_id(key, user_id)
+        except Exception as e:  # noqa: BLE001 — transient: NOT cached, never raised
+            self.log_debug(f"bots.info could not resolve {key}: {e}")
+            user_id = None
+        finally:
+            # Cleared BEFORE the result is published, so nobody can queue on a finished flight;
+            # a cancellation lands here too, and the waiters get None rather than hanging.
+            flights.pop(key, None)
+            if not flight.done():
+                flight.set_result(user_id)
+        return user_id
+
+    async def prime_bot_user_ids(self, payloads: Iterable[Any]) -> None:
+        """Warm the cache for a BATCH of raw Slack payloads before they are normalized.
+
+        The async fetch/event seams call this so the sync normalizer downstream can answer from
+        memory. Only payloads with a `bot_id` and NO `user` are interesting — anything carrying a
+        `user` already names its actor — and only ids the cache has never seen cost a call.
+
+        The budget is the SAME one the display-name resolver spends for a request
+        (ACTOR_REMOTE_LOOKUP_DEFAULT): both are "remote id lookups one batch may pay for", and a
+        transient failure leaves its id uncached, so without a ceiling a page full of an
+        unreachable bot's messages could turn one fetch into a bots.info ladder."""
+        cache = self._bot_user_ids()
+        unknown: List[str] = []
+        batch: Set[str] = set()
+        for payload in payloads or ():
+            if not isinstance(payload, dict) or payload.get("user"):
+                continue
+            bot_id = payload.get("bot_id")
+            if not bot_id:
+                continue
+            key = str(bot_id)
+            batch.add(key)
+            if key in cache or key in unknown:
+                continue
+            unknown.append(key)
+        # THE WHOLE BATCH is pinned for the whole call, not just the ids being resolved: an entry
+        # this batch already counted as known must still be there when the caller normalizes, or a
+        # bot resolved a moment ago comes back a B id because some batch evicted it meanwhile.
+        with self._pinned_bot_ids(batch):
+            for key in unknown[:ACTOR_REMOTE_LOOKUP_DEFAULT]:
+                await self.resolve_bot_user_id(key)
 
     async def get_channel_context(self, channel_id: Optional[str]) -> Optional[dict]:
         """Cached channel metadata (name/topic/purpose/num_members) for prompt context.
