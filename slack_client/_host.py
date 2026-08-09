@@ -48,6 +48,7 @@ class SlackBotHost:
     # --- provided by sibling mixins ------------------------------------------------------------
     _clean_mentions: Callable[..., Any]
     _maybe_set_assistant_thread_title: Callable[..., Any]
+    bot_user_id_for: Callable[..., Any]
     classify_sender: Callable[..., Any]
     format_text: Callable[..., Any]
     get_message_permalink_tool: Callable[..., Any]

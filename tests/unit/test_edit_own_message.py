@@ -344,6 +344,21 @@ async def test_success_row_announcement_first_then_update():
     assert landed[0].thread_root_ts == ROOT
 
 
+async def test_the_replacement_text_carries_no_bot_object_mention():
+    """A `<@B…>` is not a mention — Slack renders it as raw text. The model can be handed one by
+    a peer app that posts in agent mode, so the transaction that overwrites a live reply must not
+    be the path that publishes it."""
+    world = _World(_plain_message())
+    host = _host(world)
+    host.bot_user_id_for = lambda bot_id: {"B07KNOWN": "U07KNOWN"}.get(bot_id)
+    args = dict(ARGS, new_text="<@B07KNOWN> and <@B07STRANGER> both answered.")
+    out = await host.execute_edit_own_message(_ctx(host, turn=TurnRuntime()), args)
+    assert out["ok"] is True
+    written = world.update_kwargs[0]["text"]
+    assert "<@B" not in written
+    assert "<@U07KNOWN>" in written and "@bot" in written
+
+
 async def test_announcement_failed_row():
     """Row 1: Slack rejected the disclosure — no chat.update, no EditRecord, honest error."""
     world = _World(_plain_message())

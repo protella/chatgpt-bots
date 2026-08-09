@@ -142,6 +142,16 @@ From then on the database backs itself up nightly (7-day retention) as part of t
 cleanup, which it never did before. The three `pre-v3-*` backups are **exempt from that
 retention** — they're your rollback path, so nothing deletes them but you.
 
+### 🏷️ Fixed - Tagging a peer bot always renders as a real mention
+
+Some bots (Claude among them) can reply through an "agent" surface whose messages carry no
+user id, only an internal bot id. The bot used to pick that id up as the speaker's identity and
+write it into a mention, which Slack shows as raw ID text. It now resolves a bot id to the bot's
+real user id (cached, one lookup per bot), the mention roster only ever offers real user ids,
+and an outbound guard rewrites or neutralizes any bot-id mention before posting — including in
+streamed replies, without touching code blocks. Peer-bot messages also attribute consistently
+everywhere (history, live events, participation), whichever surface they posted from.
+
 ### 📝 Changed - Corrections to a built file edit it, not rewrite it
 
 When a background build is asked to fix a document it already produced, it now starts from the

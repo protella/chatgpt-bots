@@ -66,6 +66,7 @@ from slack_client.normalizer import (
     in_window,
     normalize_slack_message,
     parse_ts,
+    prime_bot_actor_ids,
     render_mentions,
     sanitize_field,
     sanitize_name,
@@ -1714,6 +1715,9 @@ async def _fetch_replies(client: Any, *, channel_id: str, team_id: str, root_ts:
     raw = await page_messages(method, channel_id=channel_id, oldest=floor_ts, latest=high,
                               inclusive=True, budget=budget,
                               extra_params={"ts": root_ts}, label="channel replies")
+    # A peer bot that posts without a `user` field is named by its B id unless the cache knows
+    # better, and the normalizer below cannot await. This is where the cache gets filled.
+    await prime_bot_actor_ids(client, raw)
     return _normalize_page(client, raw, channel_id=channel_id, team_id=team_id,
                            origin=ORIGIN_REPLIES, floor_ts=floor_ts,
                            floor_inclusive=floor_inclusive, high=high)
@@ -2018,6 +2022,7 @@ async def fetch_origin_thread(client: Any, channel_id: str, origin_root_ts: Opti
             f"origin thread {channel_id}/{origin_root_ts} could not be read completely: {e}",
             code=code) from e
 
+    await prime_bot_actor_ids(client, raw)
     messages = _dedup(_normalize_page(client, raw, channel_id=channel_id,
                                       team_id=getattr(client, "self_team_id", "") or "",
                                       origin=ORIGIN_REPLIES, floor_ts="0",
@@ -2118,6 +2123,7 @@ async def build_channel_pin(prepared: PreparedTurn, *, client: Any, db: Any,
         async for page in iter_pages(method, channel_id=channel_id,
                                      oldest=floor_read, latest=h, inclusive=True,
                                      budget=history_budget, label="channel history"):
+            await prime_bot_actor_ids(client, page)
             fresh = _normalize_page(client, page, channel_id=channel_id, team_id=team_id,
                                     origin=ORIGIN_HISTORY,
                                     floor_ts=floor_read or "0", floor_inclusive=True, high=h)

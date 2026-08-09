@@ -14,14 +14,17 @@ those five wrong and there would be no way to tell which.
 """
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from config import config
 from slack_client.formatting.blocks import extract_supplementary_text
 from slack_client.formatting.text import extract_mention_ids
 from slack_client.utilities import is_dm_conversation
+
+logger = logging.getLogger(__name__)
 
 TOMBSTONE_TEXT = "this message was deleted."
 
@@ -291,6 +294,55 @@ def _bot_name(payload: Dict[str, Any]) -> Optional[str]:
     return name or None
 
 
+def canonical_sender_id(client: Any, payload: Dict[str, Any]) -> Optional[str]:
+    """Who posted this, as an id — preferring one a mention can actually name.
+
+    A peer app in "agent mode" posts with no `user` field at all, so its only ids are the B
+    (bot OBJECT) and A (app) ones. Those used to become the actor id verbatim, and a B id offered
+    to the model as a mention target renders as raw `<@B…>` text in the channel. When the client
+    has already resolved that bot's USER id (bots.info, primed by the async fetch seams) the actor
+    is named by that instead, so the same app reads identically whichever mode it posted in.
+
+    The B id remains the fallback: an actor we cannot name properly is still an actor, and losing
+    it would be worse than naming it awkwardly. A client with no cache at all (a test double, a
+    non-Slack caller) keeps the original behavior exactly."""
+    user = payload.get("user")
+    if user:
+        return str(user)
+    bot_id = payload.get("bot_id")
+    if bot_id:
+        lookup = getattr(client, "bot_user_id_for", None)
+        if callable(lookup):
+            try:
+                resolved = lookup(bot_id)
+            except Exception:  # noqa: BLE001 — a cache peek must never break normalization
+                resolved = None
+            if isinstance(resolved, str) and resolved:
+                return resolved
+        return str(bot_id)
+    app_id = payload.get("app_id")
+    return str(app_id) if app_id else None
+
+
+async def prime_bot_actor_ids(client: Any, payloads: Iterable[Any]) -> None:
+    """THE ASYNC HALF of `canonical_sender_id`, for seams that fetch before they normalize.
+
+    `normalize_slack_message` is sync and can only read a cache someone else filled. This is the
+    call that fills it: hand it the raw payloads about to be normalized and every peer bot in the
+    batch that named itself only by a B id gets resolved once, for the process.
+
+    Never raises and never fails a fetch — a client without the cache (a test double, a non-Slack
+    caller) is a no-op, and a bots.info that errors leaves the batch normalizing exactly as it did
+    before this existed."""
+    primer = getattr(client, "prime_bot_user_ids", None)
+    if not callable(primer):
+        return
+    try:
+        await primer(payloads)
+    except Exception as e:  # noqa: BLE001 — priming is an optimization, never a precondition
+        logger.debug(f"bot actor id priming skipped: {e}")
+
+
 def _is_tombstone(payload: Dict[str, Any]) -> bool:
     if payload.get("subtype") == "tombstone":
         return True
@@ -356,8 +408,7 @@ def normalize_slack_message(client: Any, payload: Any, *, channel_id: Optional[s
         ts=str(ts),
         thread_root_ts=thread_root,
         subtype=str(subtype) if subtype else None,
-        sender_id=(payload.get("user") or payload.get("bot_id") or payload.get("app_id")
-                   or None),
+        sender_id=canonical_sender_id(client, payload),
         sender_type=sender_type,
         raw_bot_name=_bot_name(payload),
         text=text,

@@ -247,6 +247,38 @@ async def test_mention_added_routes_to_addressed_path(flag_on):
 
 
 @pytest.mark.asyncio
+async def test_the_redispatched_edit_names_its_bot_author_the_same_way(flag_on):
+    """The synthetic event goes back through the SHARED _event_to_message, so an edited
+    agent-mode bot message is the same actor on redispatch as it was live."""
+    bot = _make_bot()
+    bot._handle_slack_message = AsyncMock()
+    event = _changed(old="deploy running", new="deploy finished <@UBOT>",
+                     user=None, bot_id="B07AGENT")
+    event["message"]["app_id"] = "A07AGENT"
+    await bot._run_edit_triggered_reply(
+        event, bot.app.client, "C1", event["message"]["ts"],
+        "deploy running", "deploy finished <@UBOT>", is_dm=False, mention_added=True)
+    synthetic = bot._handle_slack_message.await_args.args[0]
+
+    # The REAL converter over the captured synthetic — the one seam both routes share.
+    real = _Bot.__new__(_Bot)
+    real.bot_user_id = "UBOT"
+    real.bot_id = "BBOT"
+    real.app_id = None
+    real.user_cache = {}
+    real.db = MagicMock()
+    real.db.get_user_info_async = AsyncMock(return_value=None)
+    real._clean_mentions = lambda t: t
+    real.get_username = AsyncMock(return_value="Bot")
+    real.get_user_timezone = AsyncMock(return_value="UTC")
+    real.app = MagicMock()
+    real.app.client.bots_info = AsyncMock(
+        return_value={"ok": True, "bot": {"user_id": "U07PEER"}})
+    message = await real._event_to_message(synthetic, real.app.client)
+    assert message.user_id == "U07PEER" and message.metadata["sender_id"] == "U07PEER"
+
+
+@pytest.mark.asyncio
 async def test_the_outer_event_ts_rides_the_addressed_route(flag_on):
     """An edit keeps its ORIGINAL message ts, which may be hours old. The listeners admitted the
     OUTER message_changed event_ts into the watermark, so that is what this turn must pin H

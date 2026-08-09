@@ -1,43 +1,43 @@
 # Core dependencies
-python-dotenv>=1.0.0
-openai>=2.45.0  # GPT-5.6 family support (max effort literal, prompt_cache_options)
-slack_bolt>=1.27.0
+python-dotenv>=1.2.2
+openai>=2.53.0  # GPT-5.6 family support (max effort literal, prompt_cache_options)
+slack_bolt>=1.30.0
 slack_sdk>=3.43.0  # imported directly (WebClient, SlackApiError); do not rely on slack_bolt's transitive pin
-Pillow>=11.0.0
-croniter>=6.0.0
-pytz>=2024.1
+Pillow>=12.3.0
+croniter>=6.2.4
+pytz>=2026.3
 tiktoken>=0.13.0  # Channel admission estimate counts real o200k tokens; degrades to a byte ratio if the vocab can't load
 
 # Logging dependencies
-concurrent-log-handler>=0.9.28
+concurrent-log-handler>=0.9.29
 
 # Async dependencies
-aiosqlite>=0.20.0
-aiohttp>=3.10.0
+aiosqlite>=0.22.1
+aiohttp>=3.14.3
 
 # Testing dependencies
-pytest>=8.0.0
-pytest-asyncio>=1.0.0
+pytest>=9.1.1
+pytest-asyncio>=1.4.0
 pytest-cov>=7.1.0
-pytest-mock>=3.14.0
-pytest-env>=1.0.0
-coverage[toml]>=7.4.0
+pytest-mock>=3.15.1
+pytest-env>=1.7.0
+coverage[toml]>=7.15.3
 
 # Type stubs — checked by `make lint`, never imported at runtime. Without them mypy cannot see
 # into these libraries and reports import-untyped. (pytesseract publishes no stubs at all and no
 # types-pytesseract exists; it is handled by a narrow per-module override in mypy.ini.)
-types-croniter>=6.0.0
-pandas-stubs>=2.2.0
+types-croniter>=6.2.4.20260711
+pandas-stubs>=3.0.5.260730
 
 # Document processing dependencies
-beautifulsoup4>=4.12.0  # Parse Slack canvas HTML back into markdown (canvas_tools); hard dependency
-pypdf>=5.0.0
-pdfplumber>=0.11.0
-python-docx>=1.0.0
-python-pptx>=1.0.0
+beautifulsoup4>=4.15.0  # Parse Slack canvas HTML back into markdown (canvas_tools); hard dependency
+pypdf>=6.15.0
+pdfplumber>=0.11.10
+python-docx>=1.2.0
+python-pptx>=1.0.2
 openpyxl>=3.1.5
-pandas>=2.2.0
+pandas>=3.0.5
 tabulate>=0.10.0
 pdf2image>=1.17.0  # For converting PDF pages to images (requires poppler-utils)
 pytesseract>=0.3.13  # OCR text from scanned PDFs (requires tesseract-ocr system package)
-striprtf>=0.0.29  # Strip RTF control codes to plain text (.rtf); BSD-3-licensed, pure-Python
+striprtf>=0.0.32  # Strip RTF control codes to plain text (.rtf); BSD-3-licensed, pure-Python

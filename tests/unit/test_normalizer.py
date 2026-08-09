@@ -386,6 +386,46 @@ def test_is_own_message_alone_yields_self():
     assert normalize_slack_message(_OwnOnlyClient(), _payload()).sender_type == "human"
 
 
+# ------------------------------------------------- the user-less peer bot (agent mode)
+
+
+class _CachingClient(_Client):
+    """A client whose bots.info cache has already answered for some bot object ids."""
+
+    def __init__(self, cache=None):
+        super().__init__()
+        self._cache = cache or {}
+
+    def bot_user_id_for(self, bot_id):
+        return self._cache.get(bot_id)
+
+
+def _agent_mode(**extra):
+    """A peer app posting in agent mode: a username override, bot_id + app_id, NO `user`."""
+    fields = {"user": None, "subtype": "bot_message", "username": "Bot",
+              "bot_id": "B999", "app_id": "A999"}
+    fields.update(extra)
+    return _payload(**fields)
+
+
+def test_agent_mode_bot_is_named_by_its_user_id_when_the_cache_knows_it():
+    rec = normalize_slack_message(_CachingClient({"B999": "UPEER"}), _agent_mode())
+    assert rec.sender_id == "UPEER"
+    assert rec.sender_type == "other_bot"
+
+
+def test_agent_mode_bot_falls_back_to_the_bot_id_when_the_cache_does_not(client):
+    assert normalize_slack_message(client, _agent_mode()).sender_id == "B999"
+    unknown = _CachingClient({"BOTHER": "UOTHER"})
+    assert normalize_slack_message(unknown, _agent_mode()).sender_id == "B999"
+
+
+def test_a_named_user_always_wins_over_the_cache():
+    rec = normalize_slack_message(_CachingClient({"B999": "UPEER"}),
+                                  _agent_mode(user="U1"))
+    assert rec.sender_id == "U1"
+
+
 # -------------------------------------------------------- supplementary fold
 
 

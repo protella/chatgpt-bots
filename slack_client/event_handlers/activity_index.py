@@ -26,7 +26,8 @@ from slack_client.history_fetch import (HistoryPageError, HistoryPageInvalid, Pa
                                         fetch_page, retry_after_seconds, slack_error_code)
 from slack_client.normalizer import (KIND_DELETE, KIND_EDIT, KIND_MESSAGE, KIND_TOMBSTONE,
                                      MUTATION_SUBTYPES, NormalizedEvent, TimestampError,
-                                     mutation_subject_ts, normalize_slack_event, parse_ts,
+                                     mutation_subject, mutation_subject_ts,
+                                     normalize_slack_event, parse_ts, prime_bot_actor_ids,
                                      secondary_ts)
 from slack_client.utilities import is_dm_conversation
 
@@ -299,6 +300,12 @@ async def feed_thread_activity_index(client: Any, event: Any, *, ticket: Any = N
     """
     normalized = None
     observation = None
+    # THE LIVE HALF of the bot-actor cache. A peer bot posting in agent mode names itself by a B
+    # id here first, and this is the only await between the event arriving and every sync
+    # normalization of it; the turn that follows then reads the same actor by its USER id without
+    # paying for the lookup. Never raises.
+    subject = mutation_subject(event) if isinstance(event, dict) else None
+    await prime_bot_actor_ids(client, (event, subject))
     try:
         normalized = normalize_slack_event(client, event)
         observation = observation_from_event(normalized) if normalized else None

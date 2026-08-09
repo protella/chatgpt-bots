@@ -13,6 +13,8 @@ from message_processor.routing_facts import stamp_routing_facts
 from slack_client import actor_tail
 from slack_client._host import _Host
 from slack_client.formatting.blocks import extract_supplementary_text
+from slack_client.normalizer import canonical_sender_id, prime_bot_actor_ids
+from slack_client.utilities import is_user_shaped_id
 
 
 # Slack's own text for a message deleted with replies (it tombstones the root rather than
@@ -215,8 +217,18 @@ class SlackMessageEventsMixin(_Host):
                 "size": file.get("size"),
             })
 
-        # Get username and timezone for logging
-        user_id = event.get("user")
+        # WHO POSTED THIS. The one canonical derivation — the same one the normalizer uses for
+        # the stream — so a peer bot in agent mode (no `user` field, only a B id) is the SAME
+        # actor everywhere: the stream, the stale-send guard's per-sender scope, and the
+        # participation cohort keyed on message.user_id. Deriving it here a second way is how
+        # those three came to disagree, with every userless bot sharing one anonymous cohort.
+        # Priming FIRST, because the derivation reads a cache it cannot fill itself.
+        await prime_bot_actor_ids(self, (event,))
+        sender_id = canonical_sender_id(self, event)
+
+        # Get username and timezone for logging. Profile lookups stay gated on a USER-shaped id:
+        # users.info has no row for a B or A id, and asking would mint a junk user row for it.
+        user_id = sender_id if is_user_shaped_id(sender_id) else None
         username = await self.get_username(user_id, client) if user_id else "unknown"
         user_timezone = await self.get_user_timezone(user_id, client) if user_id else "UTC"
 
@@ -243,7 +255,7 @@ class SlackMessageEventsMixin(_Host):
         # checker that, they neither test nor change anything.
         message = Message(
             text=text,
-            user_id=cast(str, user_id),
+            user_id=cast(str, sender_id),
             channel_id=cast(str, event.get("channel")),
             thread_id=cast(str, event.get("thread_ts") or event.get("ts")),
             attachments=attachments,
@@ -266,8 +278,7 @@ class SlackMessageEventsMixin(_Host):
                 # scope. A display name would be wrong twice over: people rename themselves,
                 # and two accounts can share one. Absent (an unattributed post) → the guard
                 # omits the top scope entirely rather than bucketing strangers together.
-                "sender_id": (event.get("user") or event.get("bot_id")
-                              or event.get("app_id")),
+                "sender_id": sender_id,
             }
         )
         return message
