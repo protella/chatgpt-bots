@@ -19,10 +19,15 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, Iterable, List, Optional, cast
 
 from config import config
+from logger import setup_logger
 from message_markers import join_segments
+from openai_client.container_errors import (adoption_blocked, demote_container_tools,
+                                            pin_container_tools)
 from tool_registry import ToolContext, ToolRegistry, serialize_tool_result
 
 from . import responses as responses_api
+
+logger = setup_logger(name="slack_bot.ToolLoop")
 
 
 def _call_ok(result: Any) -> bool:
@@ -161,6 +166,83 @@ def _replay_round_items(sink: List[Dict[str, Any]], input_items: List[Dict[str, 
             content.extend(reservation.get("parts") or [])
         if content:
             input_items.append({"role": "user", "content": content})
+
+
+def _observed_container(tool_context: Any, artifacts_sink: Any) -> Optional[str]:
+    """The container this turn's code actually ran in, ignoring any that has since DIED.
+
+    `_note_container` records every container a `code_interpreter_call` reports, so after a
+    mid-turn container death the sink holds both the corpse and the ephemeral sandbox the
+    recovery retry ran in. The corpse is in `container_gone_sink`; naming it again would 404 the
+    next request. Of what survives, the FIRST id wins: it is where the earliest files are.
+    """
+    from message_processor.artifacts import collect_container_ids
+    gone = set(getattr(tool_context, "container_gone_sink", None) or ())
+    return next((cid for cid in collect_container_ids(artifacts_sink) if cid not in gone), None)
+
+
+async def _adopt_and_pin(tool_context: Any, artifacts_sink: Any,
+                         tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """W3: bind the container this turn is really in, and name it from here on.
+
+    Turns start on `{"type": "auto"}`, so the first request asks for a sandbox without knowing
+    which one it will get. The id arrives during the round — `_note_container` puts it in the
+    artifacts sink as the `code_interpreter_call` streams — and from then on it must be named
+    explicitly. Leave the declaration on `auto` and the next request provisions a SECOND
+    container: the chart round 1 wrote would be in a sandbox round 2 cannot open.
+
+    Called TWICE per round, because the id can appear on either side of the dispatch and each
+    call is a cheap no-op once the holder is filled:
+
+      * After the response, before local calls dispatch. This is what stops a MIXED round — a
+        hosted `code_interpreter_call` in container A alongside a `mount_file` in the same
+        response — from binding the wrong sandbox: the bridge tool would otherwise find an empty
+        holder, mint container B, and strand A's files outside the thread's binding.
+      * Before the next request. A bridge tool that ran with no hosted call beside it fills the
+        holder DURING dispatch, after the response-side check has already run, and its container
+        still has to be named in the next declaration.
+
+    Three things happen, in this order:
+      * EVICT a corpse. A container that died mid-turn is in `container_gone_sink`, and the
+        recovery that rescued that one call demoted only ITS retry — the loop's array still names
+        the dead id. Left alone, every remaining round 404s and mints another recovery sandbox.
+      * ADOPT — the id becomes the thread's persistent binding, so tomorrow's "revise that deck"
+        finds the file. Skipped while the sink is flagged: after a recovery the surviving id
+        names a sandbox the API minted for one retried call, which must never outlive the turn.
+      * PIN — the id replaces `auto` in the array. Deliberately NOT conditional on adoption. A
+        recovery sandbox is where the model IS, so the rest of the turn belongs in it even though
+        the DB must never hear about it; likewise a bridge tool's own container, already in the
+        holder, and an id whose adoption lost the CAS race.
+
+    Returns the tools array to send next, the SAME object when nothing changed. Never raises:
+    losing continuity is a worse turn, not a failed one.
+    """
+    holder = getattr(tool_context, "sandbox", None)
+    if holder is None:
+        return tools
+    try:
+        current = holder.container_id
+        if isinstance(current, str) and current and tool_context.container_recycled():
+            logger.info(f"Container {current} died mid-turn — this turn moves off it")
+            holder.container_id = None
+            tools = demote_container_tools(tools)[0] or tools
+        if not holder.container_id:
+            container_id = _observed_container(tool_context, artifacts_sink)
+            if container_id is None:
+                return tools
+            if adoption_blocked(artifacts_sink):
+                # Pinned for the rest of the turn, never written down. One turn, one sandbox —
+                # even when the sandbox is one we would not choose to keep.
+                logger.debug(f"Staying in recovery container {container_id} without adopting it")
+            else:
+                manager = holder.manager
+                if manager is not None and holder.thread_key:
+                    await manager.adopt(holder.thread_key, container_id)
+            holder.container_id = container_id
+        return pin_container_tools(tools, holder.container_id) or tools
+    except Exception as e:  # noqa: BLE001 — never fail a round over bookkeeping
+        logger.warning(f"Container adoption skipped: {e}")
+        return tools
 
 
 def _merge_used(tools_used_all: List[str], round_used: List[Any],
@@ -480,6 +562,7 @@ async def create_text_response_with_tool_loop(
     tool_context: ToolContext,
     prior_committed: bool = False,
     free_tools: Optional[Iterable[str]] = None,
+    aggregate_segments: bool = False,
     **params: Any,
 ) -> Dict[str, Any]:
     """Non-streaming response with local tool execution.
@@ -491,8 +574,20 @@ async def create_text_response_with_tool_loop(
     nothing BUT free calls costs no round either, but free rounds have their own ceiling, so
     "free" can never mean "unbounded".
 
-    Returns {"text", "tools_used", "local_tool_calls"} — ``local_tool_calls`` is the
+    Returns {"text", "segments", "tools_used", "local_tool_calls"} — ``local_tool_calls`` is the
     ordered [{"name", "ok"}] record of every local call (e.g. for reaction-only detection).
+
+    ``aggregate_segments`` mirrors the streaming twin exactly: OPT-IN, and it makes ``text`` the
+    seam-joined whole turn instead of the terminal round alone. The chat handler opts in (owner
+    decision 2026-08-08), so a preamble written before a tool ran reaches the reader here as
+    well — it used to be dropped on the floor, and this path shows nothing until the end, so
+    there was never a half-written line on screen to give the loss away. It stays opt-in for the
+    same reason the twin's does: a caller that reads ``text`` as a finished ARTIFACT rather than
+    as a conversation wants the last round and not the "I'll go look…" in front of it, and the
+    default must not decide that for it.
+
+    ``segments`` is the rounds either way, so a caller that must TRANSFORM the text can work per
+    round and never meet a seam this loop inserted (W4's marker parser).
 
     ``prior_committed`` (F8): True when an EARLIER attempt this turn (e.g. a streaming
     attempt that failed mid-reply) already exposed visible text. A no_response_needed on
@@ -538,7 +633,14 @@ async def create_text_response_with_tool_loop(
         tool_context.system_prompt = params.get("system_prompt")
         tool_context.model = params.get("model")
 
+    # Every round's text, in order — the same list, and under `aggregate_segments` the same
+    # seam-joined result, as the streaming twin builds.
+    segments: List[str] = []
+
     while True:
+        # W3, request side: picks up a container a BRIDGE tool created during the previous
+        # round's dispatch, which lands in the holder after the response-side check has run.
+        tools = await _adopt_and_pin(tool_context, params.get("artifacts_sink"), tools)
         sink: List[Dict[str, Any]] = []
         # return_metadata=True makes this a metadata dict, which the declared `-> str` omits.
         result = cast(Dict[str, Any], await responses_api.create_text_response_with_tools(
@@ -551,11 +653,22 @@ async def create_text_response_with_tool_loop(
             **params,
         ))
         _merge_used(tools_used_all, result.get("tools_used") or [], tool_context)
+        if result.get("text"):
+            segments.append(result["text"])
+        # W3: after the response, before this round's local calls dispatch — so a bridge tool in
+        # a mixed round finds the hosted container instead of minting a rival one, and so the
+        # array the NEXT request sends already names it.
+        tools = await _adopt_and_pin(tool_context, params.get("artifacts_sink"), tools)
 
         calls = _function_calls(sink)
         if not calls or tool_choice == "none":
             return {
-                "text": result.get("text", ""),
+                "text": (join_segments(segments) if aggregate_segments
+                         else result.get("text", "")),
+                # The rounds this turn ran, in order. Under `aggregate_segments` these are the
+                # pieces `text` was joined from, BEFORE the seams went between them; otherwise
+                # `text` is the terminal one and these are the rest.
+                "segments": list(segments),
                 "tools_used": tools_used_all,
                 "local_tool_calls": local_tool_calls,
             }
@@ -730,6 +843,9 @@ async def create_streaming_response_with_tool_loop(
     segments: List[str] = []
 
     while True:
+        # W3, request side: picks up a container a BRIDGE tool created during the previous
+        # round's dispatch, which lands in the holder after the response-side check has run.
+        tools = await _adopt_and_pin(tool_context, params.get("artifacts_sink"), tools)
         sink: List[Dict[str, Any]] = []
         text = await responses_api.create_streaming_response_with_tools(
             self,
@@ -754,11 +870,27 @@ async def create_streaming_response_with_tool_loop(
             segments.append(text)
         if (text or "").strip():
             visible_committed = True
+        # W3: after the response, before this round's local calls dispatch — so a bridge tool in
+        # a mixed round finds the hosted container instead of minting a rival one, and so the
+        # array the NEXT request sends already names it.
+        tools = await _adopt_and_pin(tool_context, params.get("artifacts_sink"), tools)
 
         calls = _function_calls(sink)
         if not calls or tool_choice == "none":
             return {
                 "text": join_segments(segments) if aggregate_segments else text,
+                # The rounds this turn ran, in order — the SAME contract the non-streaming twin
+                # returns, so a caller reads one key and not two spellings of it. Under
+                # `aggregate_segments` these are exactly the pieces `text` was joined from,
+                # BEFORE the seams went between them; otherwise `text` is the terminal one and
+                # these are the rest.
+                #
+                # A consumer that has to transform the text — W4's marker parser is the one —
+                # must work per round and re-join, because the seams belong to no round: a
+                # transform applied to the joined string can consume a separator this loop
+                # inserted, and then the caller's own per-round rendering (the streaming buffer)
+                # and this text stop agreeing about the finished answer.
+                "segments": list(segments),
                 "tools_used": tools_used_all,
                 "local_tool_calls": local_tool_calls,
             }

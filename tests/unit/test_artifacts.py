@@ -788,6 +788,71 @@ class TestPersistentContainerWiring:
         h.container_manager.get_or_create.assert_awaited_once_with("C1:99.9")
 
     @pytest.mark.asyncio
+    async def test_the_turn_binds_the_container_it_actually_ran_in(self):
+        """W3's end-of-turn checkpoint. A single-round turn never reaches a round boundary, so
+        without this the `auto` container the model just charted in is never bound — and the
+        publisher, which keys the dedupe record on the binding, would let the NEXT turn re-post
+        the same chart."""
+        from message_processor.handlers.text import _adopt_turn_container
+
+        h = MagicMock()
+        h.container_manager = MagicMock(adopt=AsyncMock(return_value="cntr_auto"))
+
+        await _adopt_turn_container(h, [{"container_id": "cntr_auto"}], "C1:99.9")
+
+        h.container_manager.adopt.assert_awaited_once_with("C1:99.9", "cntr_auto")
+
+    @pytest.mark.asyncio
+    async def test_a_flagged_sink_refuses_the_end_of_turn_adoption_too(self):
+        """Both checkpoints obey the same veto — the round boundary and this one."""
+        from message_processor.handlers.text import _adopt_turn_container
+        from openai_client.container_errors import mark_adoption_blocked
+
+        artifacts: list = [{"container_id": "cntr_ephemeral"}]
+        mark_adoption_blocked(artifacts)
+        h = MagicMock()
+        h.container_manager = MagicMock(adopt=AsyncMock())
+
+        await _adopt_turn_container(h, artifacts, "C1:99.9")
+
+        h.container_manager.adopt.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_nothing_observed_means_nothing_to_bind(self):
+        from message_processor.handlers.text import _adopt_turn_container
+
+        h = MagicMock()
+        h.container_manager = MagicMock(adopt=AsyncMock())
+
+        await _adopt_turn_container(h, [], "C1:99.9")
+        await _adopt_turn_container(h, [{"container_id": "cntr_a"}], "")
+
+        h.container_manager.adopt.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_binding_never_costs_the_answer(self):
+        from message_processor.handlers.text import _adopt_turn_container
+
+        h = MagicMock()
+        h.container_manager = MagicMock(adopt=AsyncMock(side_effect=RuntimeError("db down")))
+
+        await _adopt_turn_container(h, [{"container_id": "cntr_a"}], "C1:1.1")  # must not raise
+
+        h.log_warning.assert_called()
+
+    def test_both_handlers_bind_before_the_publisher_reads_the_record(self):
+        """Ordering: `publish_artifacts` (main.py) runs on the container ids this handler hands
+        back, and it looks the dedupe record up by binding. Adoption has to have happened by
+        then, which means before the handler collects those ids and returns."""
+        import inspect
+        for fn in (TextHandlerMixin._handle_text_response,
+                   TextHandlerMixin._handle_streaming_text_response):
+            src = inspect.getsource(fn)
+            adopt_at = src.index("_adopt_turn_container(self, artifacts, thread_key)")
+            collect_at = src.index("collect_container_ids(artifacts)")
+            assert adopt_at < collect_at, f"{fn.__name__} collects ids before binding them"
+
+    @pytest.mark.asyncio
     async def test_resolver_degrades_to_auto_on_failure(self):
         h = MagicMock()
         h.log_warning = MagicMock()
@@ -1047,6 +1112,51 @@ class TestContainerGoneRecovery:
         assert len(calls) == 2, "must retry once rather than fail the turn"
         assert calls[1][0]["container"] == {"type": "auto"}
         assert sink == ["cntr_dead"], "the caller needs the dead id to drop its DB binding"
+
+    @pytest.mark.asyncio
+    async def test_recovery_vetoes_adoption_before_the_retry_goes_out(self):
+        """W3. The retry runs in a throwaway sandbox the API minted for one call. Binding an id
+        observed from it would leave the thread pointing at something that expires in minutes —
+        and an observed id cannot say which kind it is, so the RECOVERY raises the flag."""
+        from openai_client.api.responses import _create_with_container_recovery
+        from openai_client.container_errors import adoption_blocked
+
+        gone = Exception("Container with id 'cntr_dead' not found.")
+        gone.status_code = 404
+        artifacts: list = []
+        flag_at_retry = []
+
+        async def _safe(_create, operation_type=None, **params):
+            flag_at_retry.append(adoption_blocked(artifacts))
+            if len(flag_at_retry) == 1:
+                raise gone
+            return MagicMock(output=[], usage=None)
+
+        self_ = MagicMock()
+        self_._safe_api_call = AsyncMock(side_effect=_safe)
+
+        await _create_with_container_recovery(
+            self_,
+            {"tools": [{"type": "code_interpreter", "container": "cntr_dead"}], "model": "m"},
+            "text_normal", container_gone_sink=[], artifacts_sink=artifacts)
+
+        assert flag_at_retry == [False, True], "the veto must be up BEFORE the retry is issued"
+
+    def test_the_veto_marker_is_not_mistaken_for_an_artifact(self):
+        from message_processor.artifacts import collect_container_ids
+        from openai_client.container_errors import mark_adoption_blocked
+
+        sink: list = [{"container_id": "cntr_a"}]
+        mark_adoption_blocked(sink)
+
+        assert collect_container_ids(sink) == ["cntr_a"]   # the marker names no container
+
+    def test_an_unflagged_sink_permits_adoption(self):
+        from openai_client.container_errors import adoption_blocked
+
+        assert adoption_blocked(None) is False
+        assert adoption_blocked([]) is False
+        assert adoption_blocked([{"container_id": "cntr_a"}]) is False
 
     @pytest.mark.asyncio
     async def test_an_unrelated_error_is_not_retried(self):

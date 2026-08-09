@@ -113,6 +113,10 @@ TOKEN_CLEANUP_THRESHOLD = "0.5"    # was 0.9 — owner 2026-08-03: start thread 
 TOKEN_COMPACTION_TARGET = "0.4"    # was 0.7 — must stay BELOW the threshold or compaction never converges
 ```
 
+**`OPENAI_SERVICE_TIER` exists and ships `standard`.** `fast` buys up to 2.5x faster output on
+`gpt-5.6-sol` at **double the token cost**, on the user-facing responder call only. Leave it
+`standard` in prod unless the owner has decided to pay for it.
+
 **Leave `DEFAULT_DETAIL_LEVEL` at `auto`.** On the 5.6 family `auto` (and an omitted detail) is
 equivalent to `original`: the image is sent at its own dimensions with no resize. `high` and `low`
 both resize under a finite limit, so pinning `high` here would *cap* large screenshots rather than

@@ -59,18 +59,16 @@ def _err(code: str, message: str, **extra: Any) -> Dict[str, Any]:
 
 
 def get_mount_file_schema(thread_config: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-    """Offered only when there is somewhere to mount TO and something to mount.
+    """Offered whenever there is something to mount.
 
-    Returning ``None`` hides the tool, which is the honest state: with an ``auto`` container
-    we have no addressable id to push bytes into, and with no files there is nothing to name.
+    Returning ``None`` hides the tool, and with no files there is nothing to name. It used to
+    hide on an ``auto`` container too — no addressable id, nowhere to push bytes. W3 made every
+    turn start on ``auto``, so that test would have hidden the tool on the first turn of every
+    conversation, which is exactly the turn a user drops a spreadsheet into. The executor mints
+    an addressable container on demand instead (``ToolContext.ensure_sandbox``), and the tool
+    loop names it in the next round's declaration.
     """
     cfg = thread_config or {}
-    from message_processor.image_tools import CI_CONTAINER_KEY
-
-    container = cfg.get(CI_CONTAINER_KEY)
-    if not isinstance(container, str) or not container:
-        return None
-
     entries = cfg.get(FILES_KEY) or []
     ids = thread_files.valid_ids(entries)
     if not ids:
@@ -190,9 +188,12 @@ async def execute_mount_file(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str
 
     processor = getattr(ctx, "processor", None)
     client = getattr(ctx, "client", None)
-    container_id = getattr(ctx, "container_id", None)
     if processor is None or client is None:
         return _err("unavailable", "File mounting isn't available right now.")
+    # W3: the turn may have started on `auto`, in which case this mints the addressable
+    # container and shares it with the loop and with sibling calls. None means we genuinely
+    # could not get one — say so rather than uploading into nowhere.
+    container_id = await ctx.ensure_sandbox()
     if not container_id:
         return _err("sandbox_unavailable",
                     "There is no code sandbox to mount into on this turn.")
@@ -301,11 +302,28 @@ def mounted_digests(ctx: ToolContext) -> List[str]:
     return [m["digest"] for m in (getattr(ctx, "mounted_files", None) or []) if m.get("digest")]
 
 
+def sandbox_enabled(thread_config: Optional[Dict[str, Any]] = None) -> bool:
+    """Is the code sandbox switched on for THIS turn?
+
+    Resolved exactly the way `_build_tools_array` and `_resolve_ci_container` resolve it —
+    per-thread override first, then the global. Reading only the global was survivable while the
+    tool also required an addressable container id, because a turn with code interpreter off
+    never had one. W3 removed that second condition: `ensure_sandbox` will now happily mint and
+    BIND a container for a turn whose request carries no `code_interpreter` declaration at all,
+    so the file would go into a sandbox no model could ever open. This is the gate that stops it.
+
+    It deliberately does NOT ask whether the container is addressable yet. Sandbox on with an
+    `auto` container is the normal state of a first turn, and the tool belongs there.
+    """
+    cfg = thread_config or {}
+    return bool(cfg.get("enable_code_interpreter", config.enable_code_interpreter))
+
+
 def register_file_mount_tools(registry: ToolRegistry) -> None:
     """Register mount_file. A schema FACTORY (the legal ids depend on the thread), so the
     name is explicit. Generous timeout: a mount is a Slack download plus a container upload."""
     registry.register(get_mount_file_schema, execute_mount_file,
-                      name="mount_file",
+                      name="mount_file", enabled=sandbox_enabled,
                       timeout=float(getattr(config, "read_document_timeout", 60.0)) + 30.0,
                       dynamic=True, channel_schema=get_mount_file_schema_static,
-                      channel_enabled=lambda cfg: bool(config.enable_code_interpreter))
+                      channel_enabled=sandbox_enabled)

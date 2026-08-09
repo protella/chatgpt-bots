@@ -14,6 +14,7 @@ from logger import log_session_start, log_session_end, main_logger
 from message_processor.base import MessageProcessor
 from message_processor import (channel_steering, outbound_receipts,
                                participation_telemetry, routing_facts)
+from message_processor.destination_tools import consume_destination_marker
 from message_processor.participation import (ParticipationEngine,
                                              resolve_participation_level)
 from message_processor.reconsideration import intercept_stale_send
@@ -581,7 +582,13 @@ class ChatBotV2:
             # is conversation-scoped (message.thread_id is the thread root). F27: sender_id
             # scopes the top-level stream per author so different people's unrelated
             # top-level questions never collide.
-            engine.note_arrival(channel_id, ts, message.thread_id, message.user_id)
+            #
+            # W5c: the answer is KEPT and handed to evaluate() below. It says what this stream
+            # looked like at the instant this message arrived — which is the only moment that
+            # describes it. The steering load between here and there is real I/O, and during it
+            # another message in this stream can arrive or the arrival map can evict the stream;
+            # asking again down there would judge this message on somebody else's moment.
+            arrival = engine.note_arrival(channel_id, ts, message.thread_id, message.user_id)
 
             # THE channel-steering read for this turn — the only one. It is rendered once and
             # STAMPED on the message, so if this gate wakes, the responder builds its prompt from
@@ -626,6 +633,11 @@ class ChatBotV2:
                 # window of their own, so they join the cohort here rather than being decided for
                 # in absentia by whatever happened to arrive last.
                 carried_sources=(message.metadata or {}).get("carried_gate_sources"),
+                # …and that same drain already spent a coalescing window holding the lock, so the
+                # debounce below it would be a second one. The turn is not a fresh arrival.
+                queue_drained=bool((message.metadata or {}).get("queue_drained")),
+                # This message's own arrival record, from the note above — not re-derived.
+                arrival=arrival,
                 attempt_id=attempt_id,
             )
             gate_latency_ms = int((time.monotonic() - gate_started_at) * 1000)
@@ -1147,7 +1159,16 @@ class ChatBotV2:
                                 re-runs the site's OWN send (same target, F39 top-level None
                                 stays None). Returns send_message's native Optional ts;
                                 StaleSendSuppressed propagates (a re-race is the next pass)."""
-                                _response.content = text
+                                # W4: the revised text is FRESH model output — the runner asked
+                                # the model to rewrite its own draft — so it can mint a marker
+                                # the original never had. It goes through the same choke point
+                                # as every other piece of model text before it becomes
+                                # `response.content`, which is what this send posts, what F7
+                                # persists, and what the thread state and compaction inherit.
+                                # Selection is refused by here (the destination locked when this
+                                # site claimed it); the strip is what matters.
+                                _response.content = consume_destination_marker(
+                                    text, turn=turn, message=message)
                                 _meta.clear()
                                 return await cast(Any, client).send_message(
                                     message.channel_id, _thread, _response.content,

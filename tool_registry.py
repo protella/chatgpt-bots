@@ -35,6 +35,42 @@ SURFACE_CHANNEL = "channel"
 
 
 @dataclass
+class SandboxHolder:
+    """W3: the turn's addressable code-interpreter container, held BY REFERENCE.
+
+    Turns now start on `{"type": "auto"}` — no client-side `containers.create` on the critical
+    path — so the id is not known when the context is built. It arrives one of two ways, and both
+    happen mid-turn: the model runs code and the container id shows up in the artifacts sink
+    (adoption), or a bridge tool needs somewhere to push bytes and mints one (`ensure`).
+
+    It has to be an OBJECT, not a string field. A round's calls run on shallow per-call copies of
+    the ToolContext, so a string written by `mount_file` would land in that call's private copy
+    and be invisible to its siblings and to the loop that must pin the id into the next round's
+    declaration. One holder, shared by every copy, is the only version of the answer.
+
+    `manager` is a `message_processor.containers.ContainerManager` — duck-typed on purpose, since
+    message_processor imports this module and the reverse would cycle. Absent (a background job's
+    hand-built context, a test) simply means no bridge: `ensure` answers None and the executor
+    says so honestly.
+    """
+    container_id: Optional[str] = None
+    manager: Any = None
+    thread_key: Optional[str] = None
+
+    async def ensure(self) -> Optional[str]:
+        """The addressable container, minting one if this turn started on `auto`.
+
+        Single-flight per thread key inside the manager, so two bridge calls in the same round
+        produce ONE container: the winner fills this holder and the losers read it back.
+        """
+        if self.container_id:
+            return self.container_id
+        if self.manager is None or not self.thread_key:
+            return None
+        return await self.manager.bridge_container(self.thread_key, self)
+
+
+@dataclass
 class ToolContext:
     """Per-request state passed to every executor (built by the message processor)."""
     channel_id: Optional[str] = None
@@ -194,14 +230,36 @@ class ToolContext:
     # calls `tool_flight.mark_launched()` immediately before it issues the side-effect request it
     # cannot take back. None when the call carries no id, which is the legacy no-dedup path.
     tool_flight: Any = None
+    # W3: the turn-owned container reference (see SandboxHolder). It outranks `container_id`,
+    # which now only carries a container that was already bound when the context was built —
+    # a background job's own sandbox, a hand-built context. On a chat turn the holder starts
+    # empty and is filled by adoption or by the first bridge call.
+    sandbox: Optional[SandboxHolder] = None
+
+    def sandbox_container_id(self) -> Optional[str]:
+        """The addressable container this turn is ACTUALLY using, without creating one."""
+        holder = self.sandbox
+        if holder is not None and holder.container_id:
+            return holder.container_id
+        return self.container_id
+
+    async def ensure_sandbox(self) -> Optional[str]:
+        """…and mint one if the turn started on `auto`. None means there is nowhere to push to.
+
+        W3: `mount_file` / `create_image_asset` are now offered on auto turns, because refusing
+        them for want of an id the turn deliberately did not pay for would cost the feature to
+        save the latency. They call this instead; the tool loop pins whatever it produces into
+        the next round's declaration, so the model can see what was left there.
+        """
+        return await self.sandbox.ensure() if self.sandbox is not None else self.container_id
 
     def container_recycled(self) -> bool:
-        """F15: True when this turn's `container_id` died mid-turn and was recorded dead.
+        """F15: True when this turn's container died mid-turn and was recorded dead.
 
         A tool that pushes bytes into the persistent sandbox (mount_file, create_image_asset)
         checks this before uploading — a recycled container is a dead drop the model cannot
         read back, so failing fast is honest where a silent write is not."""
-        cid = self.container_id
+        cid = self.sandbox_container_id()
         return bool(cid and self.container_gone_sink and cid in self.container_gone_sink)
 
 

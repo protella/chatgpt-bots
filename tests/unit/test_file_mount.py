@@ -68,11 +68,12 @@ class TestContainerRecycled:
 
 @pytest.mark.unit
 class TestSchemaGating:
-    def test_hidden_without_an_addressable_container(self):
-        # Under {"type":"auto"} there is no id to push bytes into — offering the tool would
-        # promise something we cannot do.
+    def test_offered_without_an_addressable_container(self):
+        # W3: every turn now starts on {"type":"auto"}, so hiding the tool here would hide it on
+        # the first turn of every conversation — exactly the turn someone drops a spreadsheet in.
+        # The executor mints an addressable container on demand instead.
         cfg = {CI_CONTAINER_KEY: None, file_mount.FILES_KEY: [_entry()]}
-        assert file_mount.get_mount_file_schema(cfg) is None
+        assert file_mount.get_mount_file_schema(cfg)["name"] == "mount_file"
 
     def test_hidden_with_no_files(self):
         cfg = {CI_CONTAINER_KEY: "cntr_abc", file_mount.FILES_KEY: []}
@@ -90,6 +91,50 @@ class TestSchemaGating:
 
     def test_no_thread_config_hides_it(self):
         assert file_mount.get_mount_file_schema(None) is None
+
+
+@pytest.mark.unit
+class TestSandboxSwitchGating:
+    """W3 made the sandbox switch load-bearing for this tool. It used to need an addressable
+    container id, which a turn with code interpreter OFF could never have; now the executor
+    MINTS one, so a turn whose request carries no code_interpreter declaration would bind a
+    container nothing can open. The switch is resolved per-thread, exactly as the tools array
+    resolves it."""
+
+    def _names(self, cfg, surface=None):
+        from tool_registry import ToolRegistry
+        registry = ToolRegistry()
+        file_mount.register_file_mount_tools(registry)
+        kwargs = {"surface": surface} if surface else {}
+        return {s["name"] for s in registry.schemas(cfg, **kwargs)}
+
+    def test_hidden_on_both_surfaces_when_the_thread_turned_the_sandbox_off(self):
+        cfg = {"enable_code_interpreter": False, file_mount.FILES_KEY: [_entry()]}
+        assert "mount_file" not in self._names(cfg)
+        assert "mount_file" not in self._names(cfg, surface="channel")
+
+    def test_hidden_on_both_surfaces_when_the_sandbox_is_off_globally(self, monkeypatch):
+        from config import config as cfg_obj
+        monkeypatch.setattr(cfg_obj, "enable_code_interpreter", False)
+        cfg = {file_mount.FILES_KEY: [_entry()]}
+        assert "mount_file" not in self._names(cfg)
+        assert "mount_file" not in self._names(cfg, surface="channel")
+
+    def test_the_thread_override_beats_a_global_off(self, monkeypatch):
+        from config import config as cfg_obj
+        monkeypatch.setattr(cfg_obj, "enable_code_interpreter", False)
+        cfg = {"enable_code_interpreter": True, file_mount.FILES_KEY: [_entry()]}
+        assert "mount_file" in self._names(cfg)
+        assert "mount_file" in self._names(cfg, surface="channel")
+
+    def test_an_unaddressable_container_is_still_offered(self, monkeypatch):
+        """The gate asks whether the sandbox is ON, never whether it has an id yet — `auto` is
+        the normal state of a first turn and the tool belongs there."""
+        from config import config as cfg_obj
+        monkeypatch.setattr(cfg_obj, "enable_code_interpreter", True)
+        cfg = {CI_CONTAINER_KEY: None, file_mount.FILES_KEY: [_entry()]}
+        assert "mount_file" in self._names(cfg)
+        assert "mount_file" in self._names(cfg, surface="channel")
 
 
 @pytest.mark.unit
@@ -124,6 +169,37 @@ class TestExecute:
 
         assert result["ok"] is True
         raw.containers.files.create.assert_awaited_once()
+
+    async def test_an_auto_turn_mints_a_container_and_mounts_into_it(self):
+        """W3's bridge. The turn started on {"type":"auto"} — no addressable id — and mounting
+        is precisely what happens BEFORE the model runs any code, so waiting for adoption would
+        never resolve. The executor asks for a container, and the tool loop names it in the next
+        round's declaration so the model can open the file."""
+        from tool_registry import SandboxHolder
+
+        async def _fill(thread_key, h):
+            h.container_id = "cntr_made"      # what ContainerManager.bridge_container does
+            return "cntr_made"
+
+        ctx, raw = _ctx(container=None)
+        manager = MagicMock(bridge_container=AsyncMock(side_effect=_fill))
+        ctx.sandbox = SandboxHolder(manager=manager, thread_key="C1:123.45")
+
+        result = await file_mount.execute_mount_file(ctx, {"file_id": "file_doc_1"})
+
+        assert result["ok"] is True
+        assert raw.containers.files.create.call_args.kwargs["container_id"] == "cntr_made"
+        # SHARED, not copied: the loop and the sibling calls read the same answer.
+        assert ctx.sandbox.container_id == "cntr_made"
+
+    async def test_no_sandbox_available_is_refused_without_downloading(self):
+        ctx, raw = _ctx(container=None)   # no holder either — nothing can mint one
+
+        result = await file_mount.execute_mount_file(ctx, {"file_id": "file_doc_1"})
+
+        assert result["ok"] is False and result["error"] == "sandbox_unavailable"
+        ctx.client.download_file.assert_not_awaited()
+        raw.containers.files.create.assert_not_awaited()
 
     async def test_an_unadvertised_id_is_refused(self):
         ctx, raw = _ctx()

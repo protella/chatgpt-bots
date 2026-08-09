@@ -19,6 +19,7 @@ import ast
 import asyncio
 import json
 import pathlib
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -199,6 +200,38 @@ def _engine(wake=True, exc=None):
 async def _evaluate(engine, *, ts="10.0", text="deploy failed", channel="C1", **kw):
     return await engine.evaluate(channel_id=channel, ts=ts, text=text,
                                  sender_id=kw.pop("sender_id", "U1"), **kw)
+
+
+def _slow_engine(wake=True, delay=0.05):
+    """An engine whose classifier takes long enough to be CANCELLED while it is running.
+
+    The ordinary `_engine` fake returns without ever awaiting, so a call is over before anything
+    could interrupt it and every cancellation reads as a no-op. Anything asserting that a call was
+    aborted in flight needs a classifier that can actually be caught mid-call, and needs to count
+    calls STARTED and calls COMPLETED separately.
+
+    Returns the engine, its client, and the two lists — started cohorts and completed cohorts.
+    """
+    started, completed = [], []
+
+    async def _classify(*, sources, channel_steering_text=None):
+        started.append(tuple(sources))
+        await asyncio.sleep(delay)
+        completed.append(tuple(sources))
+        return wake
+
+    llm = MagicMock()
+    llm.classify_wake = AsyncMock(side_effect=_classify)
+    return ParticipationEngine(llm), llm, started, completed
+
+
+def _warm(engine, *, channel="C1", ts="0.5", thread_root=None, sender_id="U1"):
+    """Make a stream WARM, so the message under test still gets a debounce window to sit in.
+
+    W5c: a conversation with no arrival inside the last debounce window is judged immediately —
+    there is no burst to collect and nothing to wait for. Every test about what happens INSIDE the
+    window therefore needs the stream to be active first, which is exactly one prior arrival."""
+    engine.note_arrival(channel, ts, thread_root, sender_id)
 
 
 @pytest.fixture(autouse=True)
@@ -598,6 +631,9 @@ class TestCohortBecomesInput:
                      "attempt_id_for"):
             monkeypatch.setattr(participation_telemetry, name, lambda *a, **k: None)
         engine, _ = _engine(True)
+        # W5c: the CSV's dispatch only loses a debounce it actually waits, so the thread has to be
+        # warm — which it is in the live case this reconstructs, where the file lands mid-thread.
+        _warm(engine, ts="14.0", thread_root="10.0")
         app, client = _gate_app(None, None)
         app.participation_engine = engine
 
@@ -1028,6 +1064,722 @@ class TestQueuedBatchIsNotDecidedForInAbsentia:
         assert ev.sources[0].text == "mine"
 
 
+class TestQueueDrainsSkipTheDebounce:
+    """W5a. The debounce exists to let a burst finish arriving before the gate judges it. A
+    Phase-Q drain has already done exactly that — it lingered with the lock held so stragglers
+    could join, then popped the whole queue — so the redispatch arrives with its batch closed.
+    Sleeping the debounce again coalesces nothing and delays messages that have been waiting since
+    before the previous turn ended.
+
+    The signal is an explicit flag, NOT `carried_gate_sources`: that is stamped only for a batch of
+    more than one, so inferring from it would leave the single-message drain paying in full.
+    """
+
+    def _drain_proc(self, manager):
+        from message_processor.base import MessageProcessor
+
+        proc = SimpleNamespace()
+        proc.thread_manager = manager
+        proc.db = None
+        proc._format_user_content_with_username = lambda content, m: content
+        proc._add_message_with_token_management = MagicMock()
+        proc._schedule_async_call = MagicMock()
+        for name in ("log_info", "log_debug", "log_warning", "log_error"):
+            setattr(proc, name, lambda *a, **k: None)
+        proc._dispatch_pending_batch = MessageProcessor._dispatch_pending_batch.__get__(proc)
+        return proc
+
+    def _queued(self, ts):
+        return Message(text=f"msg {ts}", user_id="U1", channel_id="C1", thread_id="10.0",
+                       metadata={"ts": ts})
+
+    # -- the stamp
+
+    @pytest.mark.parametrize("size", [1, 3])
+    async def test_every_redispatch_is_stamped_whatever_the_batch_size(self, size):
+        from thread_manager import AsyncThreadStateManager
+
+        manager = AsyncThreadStateManager(db=None)
+        manager.get_thread_async = AsyncMock(return_value=MagicMock())
+        key = "C1:10.0"
+        for i in range(size):
+            manager.enqueue_pending(key, self._queued(f"{i + 1}.0"))
+        proc = self._drain_proc(manager)
+        client = MagicMock()
+        client.edit_dispatch_marker = None          # not the edit-stale path
+
+        with patch.object(config, "queue_drain_linger_seconds", 0.0):
+            await proc._dispatch_pending_batch(self._queued("9.0"), client, key)
+
+        trigger = client.message_handler.call_args.args[0]
+        assert trigger.metadata["queue_drained"] is True
+        # A batch of one carries the flag and no carried sources — the case the old signal missed.
+        if size == 1:
+            assert "carried_gate_sources" not in trigger.metadata
+
+    def test_an_ordinary_arrival_carries_no_flag(self):
+        assert "queue_drained" not in (self._queued("1.0").metadata or {})
+
+    async def test_a_trigger_whose_metadata_is_none_is_still_stamped(self):
+        """The stamp sits AFTER the `if trigger.metadata is None: trigger.metadata = {}` guard, and
+        that ordering is the whole reason it is where it is. Stamped any earlier — beside
+        `carried_gate_sources`, the obvious home — a trigger arriving without metadata would need
+        an isinstance check that silently skips it, and the drain would go back to paying the full
+        debounce with nothing failing to say so."""
+        from thread_manager import AsyncThreadStateManager
+
+        manager = AsyncThreadStateManager(db=None)
+        manager.get_thread_async = AsyncMock(return_value=MagicMock())
+        key = "C1:10.0"
+        queued = self._queued("1.0")
+        queued.metadata = None                  # __post_init__ fills it; something later cleared it
+        manager.enqueue_pending(key, queued)
+        proc = self._drain_proc(manager)
+        client = MagicMock()
+        client.edit_dispatch_marker = None
+
+        with patch.object(config, "queue_drain_linger_seconds", 0.0):
+            await proc._dispatch_pending_batch(self._queued("9.0"), client, key)
+
+        trigger = client.message_handler.call_args.args[0]
+        assert trigger.metadata["queue_drained"] is True
+
+    # -- the read, at the real call site
+
+    async def _gate_verdict(self, monkeypatch, **meta):
+        """main.py's own gate call, driven for real: the flag is stamped in one module and read in
+        another, and a rename on either side would leave every test above green."""
+        for name in ("finish_attempt", "gate_decision", "gate_declined"):
+            monkeypatch.setattr(participation_telemetry, name, lambda *a, **kw: None)
+        app, client = _gate_app(None, GateEvaluation(decision=WakeDecision(wake=True),
+                                                     sources=(_source(),)))
+        await app._gate_verdict(_gate_msg(**meta), client)
+        return app.participation_engine.evaluate.await_args.kwargs
+
+    async def test_the_call_site_passes_the_flag_through_on_a_drained_turn(self, monkeypatch):
+        kwargs = await self._gate_verdict(monkeypatch, queue_drained=True)
+        assert kwargs["queue_drained"] is True
+
+    async def test_an_ordinary_turn_reaches_the_gate_with_the_flag_false(self, monkeypatch):
+        """Nothing leaks. A turn that never went near the queue is judged exactly as before, and
+        `False` specifically — not a missing key the engine has to default for."""
+        kwargs = await self._gate_verdict(monkeypatch)
+        assert kwargs["queue_drained"] is False
+
+    # -- the wait
+
+    async def test_a_drained_redispatch_does_not_sleep(self, monkeypatch):
+        monkeypatch.setattr(config, "participation_debounce_seconds", 30, raising=False)
+        engine, _ = _engine(True)
+        # Warm, so the zero wait is the DRAIN's doing and not W5c's — a drain lands in a stream
+        # that has just been busy, which is the only reason the queue had anything in it.
+        _warm(engine)
+        with patch("message_processor.participation.asyncio.sleep", new=AsyncMock()) as slept:
+            ev = await _evaluate(engine, queue_drained=True)
+        slept.assert_not_awaited()
+        assert ev.decision == WakeDecision(wake=True)
+
+    async def test_an_ordinary_arrival_still_waits_the_configured_debounce(self, monkeypatch):
+        monkeypatch.setattr(config, "participation_debounce_seconds", 30, raising=False)
+        engine, _ = _engine(True)
+        _warm(engine)                                    # W5c: a WARM stream still waits
+        with patch("message_processor.participation.asyncio.sleep", new=AsyncMock()) as slept:
+            await _evaluate(engine)
+        slept.assert_awaited_once_with(30)
+
+    def test_the_flag_defaults_false(self):
+        import inspect
+        from message_processor.participation import ParticipationEngine as _Engine
+
+        assert inspect.signature(_Engine.evaluate).parameters["queue_drained"].default is False
+
+    # -- and nothing else changes
+
+    async def test_the_drained_cohort_is_judged_exactly_as_any_other(self, monkeypatch):
+        """Only the sleep is skipped. The batch the drain carried still reaches the classifier
+        whole, in order, and the verdict still comes back as a decision."""
+        monkeypatch.setattr(config, "participation_debounce_seconds", 30, raising=False)
+        engine, llm = _engine(True)
+        carried = [_source(ts="1.0", text="a"), _source(ts="2.0", text="b")]
+        with patch("message_processor.participation.asyncio.sleep", new=AsyncMock()):
+            ev = await _evaluate(engine, ts="3.0", text="the trigger",
+                                 carried_sources=carried, queue_drained=True)
+        assert [s.ts for s in ev.sources] == ["1.0", "2.0", "3.0"]
+        assert [s.ts for s in llm.classify_wake.await_args.kwargs["sources"]] == \
+            ["1.0", "2.0", "3.0"]
+
+    async def test_a_drained_turn_can_still_be_superseded(self, monkeypatch):
+        """Skipping the wait does not skip the supersession check — a newer arrival in the same
+        stream still owns the turn, and the drained one still declines rather than answering."""
+        monkeypatch.setattr(config, "participation_debounce_seconds", 30, raising=False)
+        engine, llm = _engine(True)
+        engine.note_arrival("C1", "9.0", None, "U1")     # someone newer is already waiting
+        with patch("message_processor.participation.asyncio.sleep", new=AsyncMock()):
+            ev = await _evaluate(engine, ts="3.0", queue_drained=True)
+        assert ev.decision is None and ev.decline_cause == "superseded"
+        llm.classify_wake.assert_not_awaited()
+
+
+class _Clock:
+    """Stands in for `time` inside participation.py, where only `monotonic` is ever read.
+
+    Patched onto the MODULE's name rather than onto the real `time` module, so the event loop's
+    own clock is left alone — a frozen loop clock hangs the test instead of failing it.
+    """
+
+    def __init__(self):
+        self.now = time.monotonic()
+
+    def monotonic(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+def _clock(monkeypatch):
+    from message_processor import participation as participation_module
+
+    clock = _Clock()
+    monkeypatch.setattr(participation_module, "time", clock)
+    return clock
+
+
+async def _until(predicate, timeout=2.0):
+    """Poll until `predicate()` holds. Returns whether it ever did, so a caller can assert on it
+    rather than hang: these tests race a background task against a real debounce."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(0.001)
+    return predicate()
+
+
+class TestSpeculativeClassification:
+    """W5b. The debounce is dead time we already spend, so the classifier runs inside it and the
+    verdict is waiting when the window closes — about a second of the gate's wall time, hidden.
+
+    Two invariants make that free rather than clever. The call starts only when the cohort AS IT
+    STANDS would earn a classifier call anyway, so nothing that skips the model today starts
+    spending on it; and the verdict counts only if the cohort that closes the window is the one it
+    judged. Everything else is cancelled and thrown away — one attempt, one decision.
+    """
+
+    async def test_the_verdict_is_already_in_hand_when_the_window_closes(self, monkeypatch):
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0.4, raising=False)
+        engine, llm = _engine(True)
+        _warm(engine)
+        task = asyncio.ensure_future(_evaluate(engine, ts="1.0"))
+        assert await _until(lambda: llm.classify_wake.await_count == 1)
+        assert not task.done()                       # asked DURING the window, not after it
+        ev = await asyncio.wait_for(task, timeout=5)
+        assert ev.decision == WakeDecision(wake=True)
+        assert llm.classify_wake.await_count == 1    # and the close spends nothing more
+
+    async def test_a_cold_stream_speculates_on_nothing(self, monkeypatch):
+        """The W5b/W5c seam, and the whole of the one-attempt guarantee: with no window to hide
+        in there is no speculation to reconcile, so the immediate path is the only path."""
+        monkeypatch.setattr(config, "participation_debounce_seconds", 30, raising=False)
+        engine, llm = _engine(True)
+        with patch("message_processor.participation.asyncio.sleep", new=AsyncMock()) as slept:
+            ev = await _evaluate(engine, ts="1.0")
+        slept.assert_not_awaited()
+        assert ev.decision == WakeDecision(wake=True)
+        assert llm.classify_wake.await_count == 1
+
+    async def test_a_drained_redispatch_speculates_on_nothing(self, monkeypatch):
+        monkeypatch.setattr(config, "participation_debounce_seconds", 30, raising=False)
+        engine, llm = _engine(True)
+        _warm(engine)
+        with patch("message_processor.participation.asyncio.sleep", new=AsyncMock()):
+            ev = await _evaluate(engine, ts="1.0", queue_drained=True)
+        assert ev.decision == WakeDecision(wake=True)
+        assert llm.classify_wake.await_count == 1
+
+    # -- ineligible at START never gains a call
+
+    async def test_a_captionless_image_cohort_is_never_speculated_on(self, monkeypatch):
+        """The rule that keeps this free: a shape that skips the model today must not start
+        paying for one because we guessed early. The window is waited in full and nobody is
+        asked."""
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
+        engine, llm = _engine(True)
+        _warm(engine)
+        ev = await _evaluate(engine, ts="1.0", text="", attachments=["photo.png (image)"])
+        assert ev.decline_cause == "image_only"
+        llm.classify_wake.assert_not_awaited()
+
+    async def test_an_already_edit_superseded_attempt_is_never_speculated_on(self, monkeypatch):
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
+        engine, llm = _engine(True)
+        _warm(engine)
+        engine.supersede("C1", "1.0", None, "U1")     # the edit landed before this attempt slept
+        ev = await _evaluate(engine, ts="1.0")
+        assert ev.decline_cause == "edit_superseded"
+        llm.classify_wake.assert_not_awaited()
+
+    async def test_the_peek_at_the_edit_mark_does_not_consume_it(self, monkeypatch):
+        """Eligibility PEEKS. Consuming the mark would let the stale original speak after all —
+        the real check at window close would find nothing and judge it an ordinary message."""
+        engine, _ = _engine(True)
+        key = engine._conv_key("C1", "1.0", None, "U1")
+        engine.supersede("C1", "1.0", None, "U1")
+        assert engine._is_edit_superseded(key, "1.0") is True
+        assert engine._is_edit_superseded(key, "1.0") is True     # still there to be consumed
+        assert engine._consume_edit_supersession(key, "1.0") is True
+        assert engine._is_edit_superseded(key, "1.0") is False
+
+    async def test_an_attempt_already_superseded_at_the_start_is_never_speculated_on(
+            self, monkeypatch):
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
+        engine, llm = _engine(True)
+        engine.note_arrival("C1", "9.0", None, "U1")   # newer already waiting; also warms the stream
+        ev = await _evaluate(engine, ts="3.0")
+        assert ev.decline_cause == "superseded"
+        llm.classify_wake.assert_not_awaited()
+
+    # -- discarded at COMMIT
+
+    async def test_a_cohort_that_changed_under_the_speculation_is_re_judged(self, monkeypatch):
+        """A source enrolling late — its own dispatch delayed by I/O — is the case F5 exists for.
+        The speculative verdict is about a burst that no longer exists, so it is dropped and the
+        ordinary post-debounce call runs on the cohort that actually closed the window."""
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0.3, raising=False)
+        engine, llm = _engine(True)
+        _warm(engine)
+        task = asyncio.ensure_future(_evaluate(engine, ts="2.0", text="the survivor"))
+        assert await _until(lambda: llm.classify_wake.await_count == 1)
+        key = engine._conv_key("C1", "2.0", None, "U1")
+        engine._enroll_source(key, _source(ts="1.0", text="joined late"))
+        ev = await asyncio.wait_for(task, timeout=5)
+        assert llm.classify_wake.await_count == 2      # the speculation was thrown away, not used
+        judged = llm.classify_wake.await_args.kwargs["sources"]
+        assert [s.text for s in judged] == ["joined late", "the survivor"]
+        assert [s.ts for s in ev.sources] == ["1.0", "2.0"]
+        assert ev.decision == WakeDecision(wake=True)   # ONE decision, from the second call
+
+    async def test_an_edit_payload_mutated_mid_window_discards_the_speculation(self, monkeypatch):
+        """The one part of a source that is not frozen. `SourceMessage.edit` is an ordinary dict,
+        so comparing the records alone would call two different before/after texts equal and commit
+        a verdict the model was never shown. The comparison is a deep value taken at speculation
+        start, so the mutation is visible and the cohort is re-judged."""
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0.3, raising=False)
+        engine, llm = _engine(True)
+        _warm(engine)
+        payload = {"old_text": "review", "new_text": "review the Q3 numbers",
+                   "already_replied": False}
+        key = engine._conv_key("C1", "1.0", None, "U1")
+        # An edited sibling already in the cohort — the survivor's own record is rebuilt by
+        # `evaluate`, so the mutable payload has to belong to a message that is only carried.
+        engine._enroll_source(key, _source(ts="0.9", text="review the Q3 numbers", edit=payload))
+        task = asyncio.ensure_future(_evaluate(engine, ts="1.0", text="and the margins?"))
+        assert await _until(lambda: llm.classify_wake.await_count == 1)
+        payload["new_text"] = "actually, cancel the Q3 review"      # the same dict, new meaning
+        ev = await asyncio.wait_for(task, timeout=5)
+        assert llm.classify_wake.await_count == 2      # the stale verdict was not committed
+        judged = llm.classify_wake.await_args.kwargs["sources"]
+        assert judged[0].edit["new_text"] == "actually, cancel the Q3 review"
+        assert [s.ts for s in ev.sources] == ["0.9", "1.0"]
+        assert ev.decision == WakeDecision(wake=True)
+
+    async def test_an_untouched_edit_payload_still_reuses_the_speculation(self, monkeypatch):
+        """The control for the test above: freezing the payload must not make every edit-carrying
+        cohort fail its own comparison."""
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0.3, raising=False)
+        engine, llm = _engine(True)
+        _warm(engine)
+        key = engine._conv_key("C1", "1.0", None, "U1")
+        engine._enroll_source(key, _source(ts="0.9", text="review the Q3 numbers",
+                                           edit={"old_text": "review", "already_replied": False}))
+        task = asyncio.ensure_future(_evaluate(engine, ts="1.0", text="and the margins?"))
+        assert await _until(lambda: llm.classify_wake.await_count == 1)
+        ev = await asyncio.wait_for(task, timeout=5)
+        assert llm.classify_wake.await_count == 1
+        assert [s.ts for s in ev.sources] == ["0.9", "1.0"]
+        assert ev.decision == WakeDecision(wake=True)
+
+    async def test_supersession_cancels_the_speculation_and_nothing_else(self, monkeypatch):
+        """`discard_source` stays the only path that withdraws a message. Being superseded cancels
+        one API task; the source it belongs to is still enrolled, because the survivor is going to
+        answer for it."""
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0.3, raising=False)
+        engine, llm = _engine(True)
+        _warm(engine)
+        task = asyncio.ensure_future(_evaluate(engine, ts="1.0", text="mine"))
+        assert await _until(lambda: llm.classify_wake.await_count == 1)
+        engine.note_arrival("C1", "2.0", None, "U1")
+        ev = await asyncio.wait_for(task, timeout=5)
+        assert ev.decline_cause == "superseded" and ev.decision is None
+        key = engine._conv_key("C1", "1.0", None, "U1")
+        assert list(engine._cohorts[key]) == ["1.0"]   # still enrolled for the survivor
+        assert engine._latest[key] == "2.0"
+        assert [s.text for s in engine._drain_cohort(key, "2.0")] == ["mine"]
+
+    async def test_a_discarded_speculation_mints_no_decision_row(self, monkeypatch):
+        """One attempt, one decision. A speculative call whose verdict nobody uses must leave no
+        trace in the ledger — the engine reports the decline and nothing else."""
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0.3, raising=False)
+        decisions, declines = [], []
+        monkeypatch.setattr(participation_telemetry, "gate_decision",
+                            lambda *a, **kw: decisions.append(kw))
+        monkeypatch.setattr(participation_telemetry, "gate_declined",
+                            lambda *a, **kw: declines.append(kw.get("cause")))
+        engine, llm = _engine(True)
+        _warm(engine)
+        task = asyncio.ensure_future(_evaluate(engine, ts="1.0"))
+        assert await _until(lambda: llm.classify_wake.await_count == 1)
+        engine.note_arrival("C1", "2.0", None, "U1")
+        ev = await asyncio.wait_for(task, timeout=5)
+        assert ev.decision is None
+        assert decisions == []                 # the verdict that came back was never scored
+        assert declines == ["superseded"]      # one attempt, one terminal event
+
+    async def test_a_cancelled_evaluation_takes_its_speculation_with_it(self, monkeypatch):
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0.3, raising=False)
+        engine, llm = _engine(True)
+        _warm(engine)
+        task = asyncio.ensure_future(_evaluate(engine, ts="1.0"))
+        assert await _until(lambda: llm.classify_wake.await_count == 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert engine._cohorts == {}           # the ordinary cancellation contract, unchanged
+        await asyncio.sleep(0)
+        assert llm.classify_wake.await_count == 1
+
+
+class TestOneLiveSpeculationPerStream:
+    """The cap (owner, 2026-08-08). A speculative call belongs to the message that started it, and
+    the moment a newer message enrolls, that message is superseded — by definition, since
+    enrollment is what advances the stream. Leaving the call running spends a whole judgment to
+    throw it away at the older attempt's own wake-up, which is how a five-message burst cost five
+    calls to use one. Cancelling it at enrollment aborts it within a message of starting.
+
+    What it may touch is exactly one API task. Not the cohort, not `_latest`, not the enrollment
+    the survivor is going to answer for.
+    """
+
+    async def test_a_newer_arrival_cancels_the_older_attempts_call_in_flight(self, monkeypatch):
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0.3, raising=False)
+        engine, _, started, completed = _slow_engine()
+        _warm(engine)
+        older = asyncio.ensure_future(_evaluate(engine, ts="1.0", text="first"))
+        assert await _until(lambda: len(started) == 1)
+        newer = asyncio.ensure_future(_evaluate(engine, ts="2.0", text="second"))
+        assert await _until(lambda: len(started) == 2)
+
+        ra, rb = await asyncio.gather(older, newer)
+        assert ra.decline_cause == "superseded" and ra.decision is None
+        assert rb.decision == WakeDecision(wake=True)
+        assert len(started) == 2 and len(completed) == 1     # the first was aborted, not finished
+        # And the cancellation took nothing else with it: the older message is in the cohort the
+        # survivor was judged on, which is the whole reason it stays enrolled.
+        assert [s.text for s in rb.sources] == ["first", "second"]
+        assert [s.text for s in completed[0]] == ["first", "second"]
+
+    async def test_a_five_message_burst_completes_one_call(self, monkeypatch):
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0.3, raising=False)
+        engine, _, started, completed = _slow_engine()
+        _warm(engine)
+        tasks = []
+        for i in range(1, 6):
+            tasks.append(asyncio.ensure_future(_evaluate(engine, ts=f"{i}.0", text=f"m{i}")))
+            assert await _until(lambda n=i: len(started) == n)
+        results = await asyncio.gather(*tasks)
+
+        assert len(started) == 5 and len(completed) == 1
+        decisions = [r for r in results if r.decision is not None]
+        assert len(decisions) == 1
+        assert [s.text for s in decisions[0].sources] == ["m1", "m2", "m3", "m4", "m5"]
+
+    async def test_the_stream_holds_at_most_one_speculation(self, monkeypatch):
+        """Three messages landing back to back, before the loop can dispatch any of the calls: the
+        first two speculations are cancelled before they ever run, so they cost NOTHING at all —
+        not an aborted request, not a token. Only the survivor's reaches the classifier."""
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0.3, raising=False)
+        engine, _, started, completed = _slow_engine()
+        _warm(engine)
+        key = engine._conv_key("C1", "1.0", None, "U1")
+        tasks = [asyncio.ensure_future(_evaluate(engine, ts=f"{i}.0")) for i in range(1, 4)]
+        assert await _until(lambda: len(started) == 1)
+
+        assert len(engine._speculations) == 1      # never two live in one conversation
+        assert engine._speculations[key].task is not None
+        results = await asyncio.gather(*tasks)
+        assert len(started) == 1 and len(completed) == 1
+        assert len([r for r in results if r.decision is not None]) == 1
+        assert engine._speculations == {}          # every attempt removed its own on the way out
+
+    async def test_an_older_arrival_cancels_nothing(self, monkeypatch):
+        """Only the stream's newest may cancel. An out-of-order older event is not the survivor,
+        and taking the live attempt's call would leave the turn that is going to answer with
+        nothing in hand."""
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0.3, raising=False)
+        engine, _, started, completed = _slow_engine()
+        _warm(engine)
+        survivor = asyncio.ensure_future(_evaluate(engine, ts="9.0", text="the newest"))
+        assert await _until(lambda: len(started) == 1)
+        late = asyncio.ensure_future(_evaluate(engine, ts="2.0", text="delayed by I/O"))
+        ev_late, ev = await asyncio.gather(late, survivor)
+        assert ev.decision == WakeDecision(wake=True)
+        assert ev_late.decline_cause == "superseded"
+        # NOTHING was aborted: every call that started also finished. The survivor's speculation
+        # ran to completion and was then discarded on its own merits — the late message joined its
+        # cohort, so the verdict was about a burst that had changed — and the re-judge is the
+        # second completed call. Had the late arrival been allowed to cancel, the first would have
+        # finished 0 times instead of 1.
+        assert len(started) == 2 and len(completed) == 2
+        assert [s.text for s in ev.sources] == ["delayed by I/O", "the newest"]
+
+    async def test_an_attempt_that_inherits_the_stream_back_classifies_normally(self, monkeypatch):
+        """The fallback, and the reason a cancelled speculation is a flag rather than a raised
+        exception. The newer attempt is withdrawn — cancelled mid-debounce, so `discard_source`
+        hands `_latest` back — and the older attempt wakes up as the survivor after all, holding a
+        speculation somebody else cancelled. It runs an ordinary post-debounce call and decides
+        once: never a missing verdict, never a second decision."""
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0.3, raising=False)
+        engine, _, started, completed = _slow_engine()
+        _warm(engine)
+        key = engine._conv_key("C1", "1.0", None, "U1")
+        older = asyncio.ensure_future(_evaluate(engine, ts="1.0", text="mine"))
+        assert await _until(lambda: len(started) == 1)
+        newer = asyncio.ensure_future(_evaluate(engine, ts="2.0", text="theirs"))
+        assert await _until(lambda: len(started) == 2)
+
+        newer.cancel()                              # withdrawn: discard_source hands the stream back
+        with pytest.raises(asyncio.CancelledError):
+            await newer
+        assert engine._latest[key] == "1.0"
+
+        ev = await asyncio.wait_for(older, timeout=5)
+        assert ev.decline_cause is None
+        assert ev.decision == WakeDecision(wake=True)          # one decision, from a fresh call
+        assert [s.text for s in ev.sources] == ["mine"]
+        assert [s.text for s in completed[-1]] == ["mine"]
+        assert engine._speculations == {}
+
+
+class TestAdaptiveDebounce:
+    """W5c. The debounce collects a burst, and a burst is — by the debounce's own definition —
+    messages inside one window of each other. A stream nobody has spoken in for that long has no
+    burst to collect, so the wait buys nothing but three seconds of someone watching a quiet
+    channel. No new constant: the activity window IS `participation_debounce_seconds`.
+    """
+
+    async def test_a_cold_stream_is_judged_immediately(self, monkeypatch):
+        monkeypatch.setattr(config, "participation_debounce_seconds", 30, raising=False)
+        engine, _ = _engine(True)
+        with patch("message_processor.participation.asyncio.sleep", new=AsyncMock()) as slept:
+            ev = await _evaluate(engine)
+        slept.assert_not_awaited()
+        assert ev.decision == WakeDecision(wake=True)
+
+    async def test_a_warm_stream_keeps_the_trailing_wait(self, monkeypatch):
+        monkeypatch.setattr(config, "participation_debounce_seconds", 30, raising=False)
+        engine, _ = _engine(True)
+        _warm(engine)
+        with patch("message_processor.participation.asyncio.sleep", new=AsyncMock()) as slept:
+            await _evaluate(engine)
+        slept.assert_awaited_once_with(30)
+
+    async def test_warmth_expires_with_the_window(self, monkeypatch):
+        """The window is the debounce, both ways: an arrival older than one window is not a burst
+        this message belongs to, and the stream is cold again."""
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
+        engine, _ = _engine(True)
+        _warm(engine)
+        await asyncio.sleep(0.12)              # longer ago than one window: warm, then not
+        with patch("message_processor.participation.asyncio.sleep", new=AsyncMock()) as slept:
+            await _evaluate(engine)
+        slept.assert_not_awaited()
+
+    async def test_a_second_sender_at_top_level_is_its_own_stream(self, monkeypatch):
+        """Coldness is per `_conv_key`, like everything else here: one person talking does not
+        make another person's unrelated top-level question part of a burst."""
+        monkeypatch.setattr(config, "participation_debounce_seconds", 30, raising=False)
+        engine, _ = _engine(True)
+        _warm(engine, sender_id="U1")
+        with patch("message_processor.participation.asyncio.sleep", new=AsyncMock()) as slept:
+            await _evaluate(engine, ts="1.0", sender_id="U2")
+        slept.assert_not_awaited()
+
+    # -- note_arrival's contract
+
+    def test_note_arrival_returns_the_arrival_before_it(self):
+        engine, _ = _engine(True)
+        first = engine.note_arrival("C1", "1.0", None, "U1")
+        assert first is not None and first.prior is None       # first one this stream has seen
+        second = engine.note_arrival("C1", "2.0", None, "U1")
+        assert second is not None and second.prior is not None
+        assert second.prior.ts == "1.0"
+
+    def test_note_arrival_is_idempotent_for_one_message(self):
+        """It is called twice for every message — at gate entry and inside `evaluate` — and both
+        callers have to be told the same thing about the same message. A reading taken after the
+        record was written would report the message's own arrival and call every stream warm."""
+        engine, _ = _engine(True)
+        engine.note_arrival("C1", "1.0", None, "U1")
+        first = engine.note_arrival("C1", "2.0", None, "U1")
+        second = engine.note_arrival("C1", "2.0", None, "U1")
+        assert first is not None and second is not None
+        assert first.prior is not None and second.prior is not None
+        assert first.prior.ts == second.prior.ts == "1.0"
+        assert first.prior.at == second.prior.at        # not re-timed, either
+        assert first.marker.at == second.marker.at
+
+    def test_a_message_arriving_between_the_two_calls_changes_neither_of_them(self):
+        """The double call is not two calls in a row — real messages land between them.
+
+        A is noted at gate entry, B arrives while A's turn is loading channel steering, and then A
+        notes itself again inside `evaluate`. That second call must not rewind the stream to A: B
+        is the newer message, its arrival time is what the NEXT message will be judged against, and
+        overwriting it with A's stale second look is how a live burst reads as cold.
+        """
+        engine, _ = _engine(True)
+        key = engine._conv_key("C1", "1.0", None, "U1")
+        a1 = engine.note_arrival("C1", "1.0", None, "U1")      # gate entry for A
+        b1 = engine.note_arrival("C1", "2.0", None, "U1")      # B arrives mid-turn
+        recorded = engine._activity[key]
+        a2 = engine.note_arrival("C1", "1.0", None, "U1")      # A again, inside evaluate
+
+        assert engine._activity[key] is recorded               # B is still the stream's marker…
+        assert engine._activity[key].marker.ts == "2.0"
+        assert engine._activity[key].marker.at == recorded.marker.at    # …and it was not re-timed
+        # A's second look cannot reconstruct A's own moment, so it answers the safe way: warm,
+        # which keeps the wait. A wrong "warm" costs one debounce; a wrong "cold" splits a burst.
+        assert a2 is not None and a2.prior is not None and a2.prior.ts == "2.0"
+        # …and the exact answer is still available, because the caller kept it from the first call.
+        assert a1 is not None and a1.prior is None
+        assert b1 is not None and b1.prior is not None and b1.prior.ts == "1.0"
+
+    async def test_the_carried_arrival_decides_coldness_not_the_map(self, monkeypatch):
+        """The production shape of the same interleaving: A's turn skips the wait because A was
+        cold when A arrived, no matter what has happened to the stream — or the clock — since."""
+        monkeypatch.setattr(config, "participation_debounce_seconds", 30, raising=False)
+        clock = _clock(monkeypatch)
+        engine, _ = _engine(True)
+        a1 = engine.note_arrival("C1", "1.0", None, "U1")      # cold: nothing before it
+        engine.note_arrival("C1", "2.0", None, "U1")           # B lands during A's steering load
+        clock.advance(120)                                     # ...and that load was slow
+        with patch("message_processor.participation.asyncio.sleep", new=AsyncMock()) as slept:
+            await _evaluate(engine, ts="1.0", arrival=a1)
+        slept.assert_not_awaited()
+
+    async def test_the_carried_arrival_also_keeps_a_wait_the_map_would_have_dropped(
+            self, monkeypatch):
+        """The other direction, and the two ways it can be lost: A arrived a moment after B, so A
+        waits — even though the LRU threw the whole stream away while A's turn was loading, and
+        even though that load took longer than the window itself.
+
+        The second half is why coldness is the gap between the two ARRIVALS rather than the gap
+        between the predecessor and now. Clocking from now, a slow steering read would age a
+        genuine burst into a cold stream and split it, which is exactly what carrying the record
+        is supposed to prevent."""
+        monkeypatch.setattr(config, "participation_debounce_seconds", 30, raising=False)
+        clock = _clock(monkeypatch)
+        engine, _ = _engine(True)
+        _warm(engine)
+        a1 = engine.note_arrival("C1", "1.0", None, "U1")
+        monkeypatch.setattr(config, "participation_activity_lru_max", 1, raising=False)
+        engine.note_arrival("C9", "5.0", None, "U9")           # evicts C1's stream entirely
+        assert engine._conv_key("C1", "1.0", None, "U1") not in engine._activity
+        clock.advance(120)                                     # four windows of steering I/O
+        with patch("message_processor.participation.asyncio.sleep", new=AsyncMock()) as slept:
+            await _evaluate(engine, ts="1.0", arrival=a1)
+        slept.assert_awaited_once_with(30)
+
+    def test_a_repeated_call_mutates_the_map_in_no_way(self):
+        """Not the record, not its timing, not even LRU recency. Nudging recency on a doubled
+        call would let a stream that spoke once outrank one that is speaking now, and eviction
+        order is the only thing standing between the map and unbounded growth."""
+        engine, _ = _engine(True)
+        k1 = engine._conv_key("C1", "1.0", None, "U1")
+        engine.note_arrival("C1", "1.0", None, "U1")
+        engine.note_arrival("C2", "1.0", None, "U2")
+        recorded = engine._activity[k1]
+        order = list(engine._activity)
+        again = engine.note_arrival("C1", "1.0", None, "U1")
+        assert again is recorded                    # the stored answer, not a rebuilt one
+        assert engine._activity[k1] is recorded
+        assert list(engine._activity) == order      # k1 is still the next one out
+
+    def test_a_stale_second_call_cannot_reinsert_an_evicted_stream(self, monkeypatch):
+        """The nastier half of the same rule. A's stream is evicted while A's turn loads, and A
+        then notes itself again inside `evaluate`. Reinserting there would re-time a stream from a
+        message that is no longer its newest AND evict a live stream to make room."""
+        engine, _ = _engine(True)
+        k9 = engine._conv_key("C9", "5.0", None, "U9")
+        engine.note_arrival("C1", "1.0", None, "U1")           # A's gate entry
+        engine.note_arrival("C1", "2.0", None, "U1")           # B, newer, same stream
+        monkeypatch.setattr(config, "participation_activity_lru_max", 1, raising=False)
+        engine.note_arrival("C9", "5.0", None, "U9")           # evicts A's stream
+        assert list(engine._activity) == [k9]
+
+        stale = engine.note_arrival("C1", "1.0", None, "U1")   # A again, inside evaluate
+        assert list(engine._activity) == [k9]                  # nothing displaced, nothing revived
+        assert stale is not None and stale.prior is not None
+        assert stale.prior.ts == "2.0"                         # warm: B is out there
+
+    async def test_the_gate_hands_evaluate_the_arrival_it_noted(self, monkeypatch):
+        """The wiring, at the real call site: noted in one place and read in another, so a rename
+        on either side would leave every test above green."""
+        for name in ("finish_attempt", "gate_decision", "gate_declined"):
+            monkeypatch.setattr(participation_telemetry, name, lambda *a, **kw: None)
+        app, client = _gate_app(None, GateEvaluation(decision=WakeDecision(wake=True),
+                                                     sources=(_source(),)))
+        await app._gate_verdict(_gate_msg(), client)
+        kwargs = app.participation_engine.evaluate.await_args.kwargs
+        assert kwargs["arrival"] is app.participation_engine.note_arrival.return_value
+
+    def test_a_missing_channel_or_ts_notes_nothing(self):
+        engine, _ = _engine(True)
+        assert engine.note_arrival("", "1.0") is None
+        assert engine.note_arrival("C1", None) is None
+        assert engine._activity == {}
+
+    # -- the activity map is its own structure
+
+    def test_a_drain_never_erases_the_activity_record(self):
+        """The reason this is not folded into `_cohorts`: a drain is precisely when a stream is at
+        its busiest, and forgetting it there would make the next message of a live burst look
+        cold."""
+        engine, _ = _engine(True)
+        key = engine._conv_key("C1", "1.0", None, "U1")
+        engine.note_arrival("C1", "1.0", None, "U1")
+        engine._enroll_source(key, _source(ts="1.0"))
+        engine._drain_cohort(key, "1.0")
+        assert engine._cohorts == {}
+        assert engine._activity[key].marker.ts == "1.0"
+
+    def test_a_discarded_source_never_erases_the_activity_record(self):
+        engine, _ = _engine(True)
+        key = engine._conv_key("C1", "1.0", None, "U1")
+        engine.note_arrival("C1", "1.0", None, "U1")
+        engine._enroll_source(key, _source(ts="1.0"))
+        engine.discard_source("C1", "1.0", None, "U1")
+        assert engine._cohorts == {} and key not in engine._latest
+        assert engine._activity[key].marker.ts == "1.0"
+
+    def test_the_activity_map_is_bounded(self, monkeypatch):
+        """Unlike the cohort map, this one holds timestamps and never a message, so evicting the
+        oldest key can lose nothing anybody said — the worst it costs is one extra debounce on a
+        stream nothing has touched in a thousand conversations."""
+        monkeypatch.setattr(config, "participation_activity_lru_max", 4, raising=False)
+        engine, _ = _engine(True)
+        for i in range(20):
+            engine.note_arrival("C1", "1.0", None, f"U{i}")
+        assert len(engine._activity) == 4
+        assert list(engine._activity) == [engine._conv_key("C1", "1.0", None, f"U{i}")
+                                          for i in range(16, 20)]
+
+    def test_the_default_bound_is_the_configured_one(self):
+        from message_processor.participation import _activity_lru_max
+
+        assert config.participation_activity_lru_max == 1024
+        assert _activity_lru_max() == 1024
+
+
 class TestImageOnlyIsImagesOnly:
     """A wordless PDF or spreadsheet is a document somebody may well want read — the responder can
     open it, and often should. Treating "no caption" as "nothing to do" for those skipped BOTH
@@ -1134,6 +1886,7 @@ class TestCancellationClearsTheCohort:
         # some later survivor's cohort as a message from the distant past.
         monkeypatch.setattr(config, "participation_debounce_seconds", 0.2, raising=False)
         engine, _ = _engine(True)
+        _warm(engine)                   # W5c: only a warm stream has a debounce to cancel
         task = asyncio.ensure_future(_evaluate(engine, ts="1.0"))
         await asyncio.sleep(0)          # let it enrol and reach the sleep
         assert engine._cohorts != {}
@@ -1156,6 +1909,7 @@ class TestCancellationWithdrawsOnlyItself:
         # both tasks are demonstrably asleep in it when the cancellation lands.
         monkeypatch.setattr(config, "participation_debounce_seconds", 0.2, raising=False)
         engine, llm = _engine(True)
+        _warm(engine)
         older = asyncio.ensure_future(_evaluate(engine, ts="1.0", text="the first thing I said"))
         await asyncio.sleep(0)
         newer = asyncio.ensure_future(_evaluate(engine, ts="2.0", text="and the second"))
@@ -1179,6 +1933,7 @@ class TestCancellationWithdrawsOnlyItself:
         # stream. Dropping the bucket would take its sources with it.
         monkeypatch.setattr(config, "participation_debounce_seconds", 0.2, raising=False)
         engine, llm = _engine(True)
+        _warm(engine)
         older = asyncio.ensure_future(_evaluate(engine, ts="1.0", text="mine"))
         await asyncio.sleep(0)
         newer = asyncio.ensure_future(_evaluate(engine, ts="2.0", text="theirs"))
@@ -1199,6 +1954,7 @@ class TestCancellationWithdrawsOnlyItself:
     async def test_the_last_one_out_clears_the_marker_too(self, monkeypatch):
         monkeypatch.setattr(config, "participation_debounce_seconds", 0.2, raising=False)
         engine, _ = _engine(True)
+        _warm(engine)
         task = asyncio.ensure_future(_evaluate(engine, ts="1.0"))
         await asyncio.sleep(0)
         task.cancel()

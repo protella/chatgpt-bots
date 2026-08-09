@@ -63,6 +63,66 @@ def persistent_container_ids(tools: Optional[List[Dict[str, Any]]]) -> List[str]
     return ids
 
 
+def pin_container_tools(
+    tools: Optional[List[Dict[str, Any]]],
+    container_id: str,
+) -> Optional[List[Dict[str, Any]]]:
+    """W3: bind every code_interpreter declaration to an explicit id — the inverse of demote.
+
+    A turn now starts on `{"type": "auto"}`. The moment we learn which container the model is
+    actually in (adoption) or make one for a bridge tool (mount_file / create_image_asset), the
+    NEXT round's declaration has to name it: left on `auto`, the following request would provision
+    a SECOND sandbox, and the file the model just wrote — or the one we just mounted for it —
+    would be in a container it can no longer reach.
+
+    Returns the SAME list object when nothing changed, so a caller can rebind unconditionally at
+    every round boundary without copying the array (and without disturbing prompt caching).
+    """
+    if not tools or not container_id:
+        return tools
+    out: List[Dict[str, Any]] = []
+    changed = False
+    for tool in tools:
+        if (isinstance(tool, dict) and tool.get("type") == "code_interpreter"
+                and tool.get("container") != container_id):
+            out.append({**tool, "container": container_id})
+            changed = True
+        else:
+            out.append(tool)
+    return out if changed else tools
+
+
+# W3: the recovery path's veto on adoption, written into the attempt's artifacts sink.
+#
+# When `_create_with_container_recovery` engages it retries the call against a fresh EPHEMERAL
+# sandbox. Any container id observed after that belongs to a throwaway the recovery minted, and
+# binding it would make the next turn's "chart that file again" reach for a container that
+# expires in minutes. An observed id cannot say which of the two it is, so the recovery raises a
+# FLAG instead — set before the retry is issued, read by both adoption checkpoints.
+_ADOPTION_BLOCKED_KEY = "adoption_blocked"
+
+
+def mark_adoption_blocked(artifacts_sink: Optional[List[Dict[str, Any]]]) -> None:
+    """Veto adoption for the rest of this turn. Never raises — bookkeeping, not delivery."""
+    if artifacts_sink is None:
+        return
+    try:
+        artifacts_sink.append({_ADOPTION_BLOCKED_KEY: True})
+    except Exception:  # noqa: BLE001 — a sink we cannot write to must not fail the retry
+        pass
+
+
+def adoption_blocked(artifacts_sink: Optional[List[Dict[str, Any]]]) -> bool:
+    """Has container recovery run on this turn? Then no observed id may be bound."""
+    for entry in (artifacts_sink or []):
+        try:
+            if entry.get(_ADOPTION_BLOCKED_KEY):
+                return True
+        except AttributeError:  # a malformed sink entry is not a veto
+            continue
+    return False
+
+
 def demote_container_tools(
     tools: Optional[List[Dict[str, Any]]],
 ) -> Tuple[Optional[List[Dict[str, Any]]], bool]:

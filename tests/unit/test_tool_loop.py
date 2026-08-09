@@ -3,6 +3,7 @@
 All stubbed I/O: no live Slack, no live OpenAI, no legacy suite.
 """
 import asyncio
+import copy
 from collections import Counter
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -1031,10 +1032,11 @@ class TestProcessorGlue:
                 "start_background_job"} <= names
         # …and the per-request gates still hide what this request doesn't qualify for:
         # no_response_needed needs an unprompted turn (F2), search_slack needs the event's
-        # action_token (BF1), and the image tools that depend on turn state — a sandbox
-        # container / a non-empty image catalog — have neither here (F34).
-        assert names.isdisjoint({"no_response_needed", "search_slack",
-                                 "create_image_asset", "edit_image"})
+        # action_token (BF1), and edit_image needs a non-empty image catalog (F34).
+        # create_image_asset is NOT in this list: W3 starts every turn on an `auto` container,
+        # so gating it on an addressable id would have retired it from ordinary conversation.
+        assert names.isdisjoint({"no_response_needed", "search_slack", "edit_image"})
+        assert "create_image_asset" in names
         # BF1: search_slack reappears the moment the request carries an action_token.
         with_token = {t["name"] for t in registry.schemas({"_slack_search_available": True})}
         assert "search_slack" in with_token
@@ -1156,3 +1158,427 @@ class TestCommittedTextReplay:
         assert out["text"] == "Making that now. Done."
         assert not any(i.get("role") == "assistant"
                        for i in fake.invocations[1]["messages"])
+
+
+# ------------------------------------------------------- W3: container adoption + pinning
+
+class _ContainerRounds:
+    """A scripted round runner that RECORDS the tools array each round was sent, and can drop a
+    container id into the artifacts sink the way a real `code_interpreter_call` does."""
+
+    def __init__(self, rounds, observed=None):
+        self.rounds = rounds                 # [(text, [calls])]
+        self.tools_seen = []
+        self.observed = observed or {}       # round index -> container id the model ran in
+
+    async def __call__(self, client, messages, tools, return_metadata=True,
+                       function_call_sink=None, tool_choice=None, artifacts_sink=None,
+                       **params):
+        index = len(self.tools_seen)
+        self.tools_seen.append(copy.deepcopy(tools))
+        cid = self.observed.get(index)
+        if cid and artifacts_sink is not None:
+            artifacts_sink.append({"container_id": cid})
+        text, calls = self.rounds[min(index, len(self.rounds) - 1)]
+        if tool_choice != "none" and function_call_sink is not None:
+            function_call_sink.extend(calls)
+        return {"text": text, "tools_used": []}
+
+
+def _auto_tools():
+    return [{"type": "function", "name": "echo", "parameters": {}},
+            {"type": "code_interpreter", "container": {"type": "auto"}}]
+
+
+def _ci_container(tools):
+    return next(t["container"] for t in tools if t["type"] == "code_interpreter")
+
+
+def _holder_ctx(manager=None, thread_key="C1:1.1", container_id=None):
+    from tool_registry import SandboxHolder
+    return ToolContext(sandbox=SandboxHolder(
+        container_id=container_id, manager=manager, thread_key=thread_key))
+
+
+@pytest.mark.asyncio
+class TestContainerAdoptionAtRoundBoundaries:
+    """W3. A turn starts on `{"type": "auto"}` — no blocking `containers.create` on the critical
+    path — so the first request asks for a sandbox without knowing which one it will get. The id
+    arrives mid-round, and from then on the declaration MUST name it: left on `auto`, the next
+    request provisions a second container and round 1's chart is somewhere round 2 cannot reach.
+    """
+
+    async def _run(self, monkeypatch, rounds, observed, ctx):
+        fake = _ContainerRounds(rounds, observed)
+        monkeypatch.setattr(tool_loop.responses_api, "create_text_response_with_tools", fake)
+        artifacts: list = []
+        await tool_loop.create_text_response_with_tool_loop(
+            _Client(), messages=[], tools=_auto_tools(), registry=_registry_with(),
+            tool_context=ctx, artifacts_sink=artifacts)
+        return fake, artifacts
+
+    async def test_the_observed_container_is_adopted_and_pinned(self, monkeypatch):
+        manager = MagicMock(adopt=AsyncMock(return_value="cntr_ran"))
+        ctx = _holder_ctx(manager)
+
+        fake, _ = await self._run(
+            monkeypatch, [("", [_call()]), ("done", [])], {0: "cntr_ran"}, ctx)
+
+        assert _ci_container(fake.tools_seen[0]) == {"type": "auto"}   # round 1 asked for auto
+        assert _ci_container(fake.tools_seen[1]) == "cntr_ran"         # round 2 names it
+        manager.adopt.assert_awaited_once_with("C1:1.1", "cntr_ran")
+        assert ctx.sandbox.container_id == "cntr_ran"
+
+    async def test_one_turn_never_wanders_into_a_second_sandbox(self, monkeypatch):
+        """Three rounds, and the id is adopted once — every round after the first names it."""
+        manager = MagicMock(adopt=AsyncMock(return_value="cntr_ran"))
+        ctx = _holder_ctx(manager)
+
+        fake, _ = await self._run(
+            monkeypatch,
+            [("", [_call()]), ("", [_call()]), ("done", [])],
+            {0: "cntr_ran"}, ctx)
+
+        assert [_ci_container(t) for t in fake.tools_seen] == [
+            {"type": "auto"}, "cntr_ran", "cntr_ran"]
+        assert manager.adopt.await_count == 1
+
+    async def test_a_turn_that_runs_no_code_adopts_nothing(self, monkeypatch):
+        """Declaring `auto` provisions a container server-side even when the model never runs
+        code, but no `code_interpreter_call` means no id ever reaches the sink — so there is
+        nothing to adopt and the orphan just ages out."""
+        manager = MagicMock(adopt=AsyncMock())
+        ctx = _holder_ctx(manager)
+
+        fake, _ = await self._run(monkeypatch, [("", [_call()]), ("done", [])], {}, ctx)
+
+        manager.adopt.assert_not_awaited()
+        assert all(_ci_container(t) == {"type": "auto"} for t in fake.tools_seen)
+
+    async def test_a_recovery_sandbox_is_pinned_but_never_adopted(self, monkeypatch):
+        """The id after a container-recovery retry names a sandbox the API minted for one call,
+        so it must never become the thread's binding. It IS still where the model is, though, so
+        the rest of the turn stays in it — one turn, one sandbox, even an unwanted one."""
+        from openai_client.container_errors import mark_adoption_blocked
+
+        manager = MagicMock(adopt=AsyncMock())
+        ctx = _holder_ctx(manager)
+        fake = _ContainerRounds([("", [_call()]), ("done", [])], {0: "cntr_ephemeral"})
+        monkeypatch.setattr(tool_loop.responses_api, "create_text_response_with_tools", fake)
+        artifacts: list = []
+        mark_adoption_blocked(artifacts)
+
+        await tool_loop.create_text_response_with_tool_loop(
+            _Client(), messages=[], tools=_auto_tools(), registry=_registry_with(),
+            tool_context=ctx, artifacts_sink=artifacts)
+
+        manager.adopt.assert_not_awaited()                      # nothing written down
+        assert _ci_container(fake.tools_seen[1]) == "cntr_ephemeral"   # …but still named
+
+    async def test_a_bridge_tools_container_is_pinned_without_being_re_adopted(self,
+                                                                              monkeypatch):
+        """mount_file / create_image_asset mint their own container mid-round and write it to
+        the SHARED holder. The loop's job is then only to name it — the bridge already bound it,
+        and re-adopting would be a second CAS for the same id."""
+        manager = MagicMock(adopt=AsyncMock())
+        ctx = _holder_ctx(manager)
+
+        async def _mounts(tool_ctx, args):
+            tool_ctx.sandbox.container_id = "cntr_bridge"     # what ensure_sandbox() does
+            return {"ok": True}
+
+        fake = _ContainerRounds([("", [_call("mount_file")]), ("done", [])])
+        monkeypatch.setattr(tool_loop.responses_api, "create_text_response_with_tools", fake)
+        await tool_loop.create_text_response_with_tool_loop(
+            _Client(), messages=[], tools=_auto_tools(),
+            registry=_registry_with(name="mount_file", executor=_mounts),
+            tool_context=ctx, artifacts_sink=[])
+
+        assert _ci_container(fake.tools_seen[1]) == "cntr_bridge"
+        manager.adopt.assert_not_awaited()
+
+    async def test_an_already_bound_thread_is_untouched(self, monkeypatch):
+        """A thread with a live container never went near `auto`; there is nothing to adopt and
+        the array it was given already names the right sandbox."""
+        manager = MagicMock(adopt=AsyncMock())
+        ctx = _holder_ctx(manager, container_id="cntr_bound")
+        fake = _ContainerRounds([("", [_call()]), ("done", [])], {0: "cntr_bound"})
+        monkeypatch.setattr(tool_loop.responses_api, "create_text_response_with_tools", fake)
+
+        await tool_loop.create_text_response_with_tool_loop(
+            _Client(), messages=[],
+            tools=[{"type": "function", "name": "echo", "parameters": {}},
+                   {"type": "code_interpreter", "container": "cntr_bound"}],
+            registry=_registry_with(), tool_context=ctx, artifacts_sink=[])
+
+        manager.adopt.assert_not_awaited()
+        assert [_ci_container(t) for t in fake.tools_seen] == ["cntr_bound", "cntr_bound"]
+
+    async def test_a_context_without_a_holder_behaves_exactly_as_before(self, monkeypatch):
+        """Background jobs and hand-built contexts carry no holder — they resolved an explicit
+        container up front and the loop must not touch their array."""
+        fake, _ = await self._run(
+            monkeypatch, [("", [_call()]), ("done", [])], {0: "cntr_x"}, ToolContext())
+
+        assert all(_ci_container(t) == {"type": "auto"} for t in fake.tools_seen)
+
+    async def test_a_single_round_turn_is_bound_before_the_loop_returns(self, monkeypatch):
+        """The check sits on the RESPONSE side, so a turn that runs code and answers in one
+        round is bound too. The handler's end-of-turn checkpoint still matters — it covers the
+        paths that never build a tool loop at all — but it is no longer the only thing standing
+        between a one-round chart and an unbound container."""
+        manager = MagicMock(adopt=AsyncMock(return_value="cntr_ran"))
+        ctx = _holder_ctx(manager)
+        fake = _ContainerRounds([("done", [])], {0: "cntr_ran"})
+        monkeypatch.setattr(tool_loop.responses_api, "create_text_response_with_tools", fake)
+
+        await tool_loop.create_text_response_with_tool_loop(
+            _Client(), messages=[], tools=_auto_tools(), registry=_registry_with(),
+            tool_context=ctx, artifacts_sink=[])
+
+        manager.adopt.assert_awaited_once_with("C1:1.1", "cntr_ran")
+
+    async def test_a_broken_manager_never_fails_the_round(self, monkeypatch):
+        manager = MagicMock(adopt=AsyncMock(side_effect=RuntimeError("db down")))
+        ctx = _holder_ctx(manager)
+
+        fake, _ = await self._run(
+            monkeypatch, [("", [_call()]), ("done", [])], {0: "cntr_ran"}, ctx)
+
+        assert len(fake.tools_seen) == 2, "the turn still answered"
+
+
+@pytest.mark.asyncio
+class TestStreamingLoopAdoptsToo:
+    """Same checkpoint, same place, on the path real chat turns actually take."""
+
+    async def test_the_streaming_loop_pins_the_adopted_id(self, monkeypatch):
+        manager = MagicMock(adopt=AsyncMock(return_value="cntr_ran"))
+        ctx = _holder_ctx(manager)
+        tools_seen = []
+
+        async def fake_stream(client, messages, tools, stream_callback, tool_callback=None,
+                              function_call_sink=None, tool_choice=None, artifacts_sink=None,
+                              **params):
+            index = len(tools_seen)
+            tools_seen.append(copy.deepcopy(tools))
+            if index == 0:
+                artifacts_sink.append({"container_id": "cntr_ran"})
+                function_call_sink.append(_call())
+                return ""
+            return "done"
+
+        monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
+                            fake_stream)
+
+        await tool_loop.create_streaming_response_with_tool_loop(
+            _Client(), messages=[], tools=_auto_tools(), registry=_registry_with(),
+            tool_context=ctx, stream_callback=lambda c: None, artifacts_sink=[])
+
+        assert _ci_container(tools_seen[0]) == {"type": "auto"}
+        assert _ci_container(tools_seen[1]) == "cntr_ran"
+        manager.adopt.assert_awaited_once_with("C1:1.1", "cntr_ran")
+
+
+# ------------------------------------------------- W3 round 2: recovery, and mixed rounds
+
+def _gone(container_id):
+    exc = Exception(f"Container with id '{container_id}' not found.")
+    exc.status_code = 404
+    return exc
+
+
+class _RecoveringRounds:
+    """Drives the REAL `_create_with_container_recovery` for each round.
+
+    Only the response PARSING is faked. The first wire request names the thread's explicit
+    container and 404s exactly the way a dead sandbox does, so the demote, the
+    `container_gone_sink` entry and the adoption veto are all produced by production code rather
+    than asserted into existence by the test.
+    """
+
+    def __init__(self, dead_id, recovery_id, rounds, dies_on=0, streaming=False):
+        self.dead_id = dead_id
+        self.recovery_id = recovery_id
+        self.rounds = rounds            # [(text, [calls])]
+        self.dies_on = dies_on          # the round the container idle-expires on
+        self.streaming = streaming
+        self.tools_seen = []            # what the LOOP handed the API layer, per round
+        self.sent = []                  # what actually went on the wire, per request
+
+    async def __call__(self, client, messages, tools, artifacts_sink=None,
+                       container_gone_sink=None, function_call_sink=None,
+                       tool_choice=None, **params):
+        index = len(self.tools_seen)
+        self.tools_seen.append(copy.deepcopy(tools))
+
+        async def _safe(_create, operation_type=None, **request_params):
+            declared = _ci_container(request_params["tools"])
+            self.sent.append(declared)
+            if declared == self.dead_id and index >= self.dies_on:
+                raise _gone(self.dead_id)
+            return MagicMock(output=[], usage=None)
+
+        transport = MagicMock()
+        transport._safe_api_call = AsyncMock(side_effect=_safe)
+        await responses_api._create_with_container_recovery(
+            transport, {"tools": tools, "model": "m"}, "text_normal",
+            container_gone_sink=container_gone_sink, artifacts_sink=artifacts_sink)
+
+        # The model ran code in whichever sandbox the SUCCESSFUL request used. An `auto`
+        # declaration means the API minted one and reported its real id back.
+        served = self.sent[-1]
+        if artifacts_sink is not None:
+            artifacts_sink.append({"container_id": self.recovery_id
+                                   if not isinstance(served, str) else served})
+
+        text, calls = self.rounds[min(index, len(self.rounds) - 1)]
+        if tool_choice != "none" and function_call_sink is not None:
+            function_call_sink.extend(calls)
+        return text if self.streaming else {"text": text, "tools_used": []}
+
+
+def _explicit_tools(container_id):
+    return [{"type": "function", "name": "echo", "parameters": {}},
+            {"type": "code_interpreter", "container": container_id}]
+
+
+@pytest.mark.asyncio
+class TestRecoveryDoesNotReForkEveryRound:
+    """A container confirmed alive at turn start can idle-expire between rounds. The recovery
+    demotes only its OWN retry, so without W3 evicting the corpse the loop keeps naming the dead
+    id: every remaining round 404s and mints yet another throwaway sandbox."""
+
+    async def _drive(self, monkeypatch, streaming, dies_on=0):
+        """`dies_on=1` is the case that also proves the OBSERVATION filter: round 1 succeeds in
+        the explicit container, so its id is in the artifacts sink when the container dies on
+        round 2 — and the first id in that sink is now a corpse."""
+        manager = MagicMock(adopt=AsyncMock())
+        gone_sink: list = []
+        ctx = _holder_ctx(manager, container_id="cntr_dead")
+        ctx.container_gone_sink = gone_sink
+        artifacts: list = []
+        rounds = [("", [_call()])] * (dies_on + 1) + [("done", [])]
+        fake = _RecoveringRounds("cntr_dead", "cntr_recovery", rounds,
+                                 dies_on=dies_on, streaming=streaming)
+
+        if streaming:
+            monkeypatch.setattr(tool_loop.responses_api,
+                                "create_streaming_response_with_tools", fake)
+            await tool_loop.create_streaming_response_with_tool_loop(
+                _Client(), messages=[], tools=_explicit_tools("cntr_dead"),
+                registry=_registry_with(), tool_context=ctx,
+                stream_callback=lambda c: None,
+                artifacts_sink=artifacts, container_gone_sink=gone_sink)
+        else:
+            monkeypatch.setattr(tool_loop.responses_api,
+                                "create_text_response_with_tools", fake)
+            await tool_loop.create_text_response_with_tool_loop(
+                _Client(), messages=[], tools=_explicit_tools("cntr_dead"),
+                registry=_registry_with(), tool_context=ctx,
+                artifacts_sink=artifacts, container_gone_sink=gone_sink)
+        return fake, manager, gone_sink, artifacts, ctx
+
+    @pytest.mark.parametrize("streaming", [False, True])
+    @pytest.mark.parametrize("dies_on", [0, 1])
+    async def test_the_turn_moves_into_the_recovery_sandbox_and_stays(self, monkeypatch,
+                                                                      streaming, dies_on):
+        fake, manager, gone_sink, artifacts, ctx = await self._drive(
+            monkeypatch, streaming, dies_on)
+
+        from openai_client.container_errors import adoption_blocked
+        assert gone_sink == ["cntr_dead"], "the real recovery ran"
+        assert adoption_blocked(artifacts) is True
+
+        # The death round sends the dead id, then the demoted retry; everything after it names
+        # the recovery sandbox.
+        assert fake.sent[dies_on:] == ["cntr_dead", {"type": "auto"}, "cntr_recovery"]
+        assert _ci_container(fake.tools_seen[-1]) == "cntr_recovery"
+
+    @pytest.mark.parametrize("streaming", [False, True])
+    @pytest.mark.parametrize("dies_on", [0, 1])
+    async def test_the_dead_id_is_never_sent_again(self, monkeypatch, streaming, dies_on):
+        """The defect this guards: the round after the death re-sends the corpse, 404s, and
+        recovery mints a SECOND ephemeral sandbox — repeatable for every round the turn has
+        left. With `dies_on=1` the corpse is also the FIRST id in the artifacts sink, so this
+        covers the observation filter too."""
+        fake, _, _, _, _ = await self._drive(monkeypatch, streaming, dies_on)
+
+        assert fake.sent.count("cntr_dead") == dies_on + 1, "never named after it died"
+        assert fake.sent.count({"type": "auto"}) == 1, "only ONE recovery sandbox this turn"
+
+    @pytest.mark.parametrize("streaming", [False, True])
+    @pytest.mark.parametrize("dies_on", [0, 1])
+    async def test_the_recovery_sandbox_is_never_written_down(self, monkeypatch, streaming,
+                                                              dies_on):
+        fake, manager, _, _, ctx = await self._drive(monkeypatch, streaming, dies_on)
+
+        manager.adopt.assert_not_awaited()
+        assert ctx.sandbox.container_id == "cntr_recovery"   # pinned for the turn only
+
+
+@pytest.mark.asyncio
+class TestMixedHostedAndBridgeRound:
+    """One response can carry BOTH a hosted `code_interpreter_call` and a local bridge call. The
+    observation is in the sink the moment the response is parsed, but the local calls dispatch
+    first — so unless the hosted container is adopted BEFORE dispatch, `mount_file` finds an
+    empty holder, mints a rival sandbox, and the hosted call's files are stranded outside the
+    container the thread ends up bound to."""
+
+    async def _drive(self, monkeypatch, streaming):
+        seen = {}
+
+        async def _bridge_create(thread_key, holder):
+            holder.container_id = "cntr_rival"
+            return "cntr_rival"
+
+        manager = MagicMock(adopt=AsyncMock(return_value="cntr_hosted"),
+                            bridge_container=AsyncMock(side_effect=_bridge_create))
+        ctx = _holder_ctx(manager)
+        ctx.container_gone_sink = []
+
+        async def _mount(tool_ctx, args):
+            seen["mounted_into"] = await tool_ctx.ensure_sandbox()
+            return {"ok": True}
+
+        registry = _registry_with(name="mount_file", executor=_mount)
+        fake = _ContainerRounds([("", [_call("mount_file")]), ("done", [])],
+                                {0: "cntr_hosted"})
+
+        if streaming:
+            async def _stream(client, messages, tools, stream_callback, tool_callback=None,
+                              function_call_sink=None, tool_choice=None, artifacts_sink=None,
+                              **params):
+                # Same scripted rounds, adapted to the streaming contract (text, not a dict).
+                result = await fake(client, messages, tools,
+                                    function_call_sink=function_call_sink,
+                                    tool_choice=tool_choice, artifacts_sink=artifacts_sink)
+                return result["text"]
+
+            monkeypatch.setattr(tool_loop.responses_api,
+                                "create_streaming_response_with_tools", _stream)
+            await tool_loop.create_streaming_response_with_tool_loop(
+                _Client(), messages=[], tools=_auto_tools(), registry=registry,
+                tool_context=ctx, stream_callback=lambda c: None, artifacts_sink=[])
+        else:
+            monkeypatch.setattr(tool_loop.responses_api,
+                                "create_text_response_with_tools", fake)
+            await tool_loop.create_text_response_with_tool_loop(
+                _Client(), messages=[], tools=_auto_tools(), registry=registry,
+                tool_context=ctx, artifacts_sink=[])
+        return fake, manager, ctx, seen
+
+    @pytest.mark.parametrize("streaming", [False, True])
+    async def test_the_bridge_joins_the_hosted_container(self, monkeypatch, streaming):
+        fake, manager, ctx, seen = await self._drive(monkeypatch, streaming)
+
+        assert seen["mounted_into"] == "cntr_hosted"
+        manager.bridge_container.assert_not_awaited()      # no rival sandbox was minted
+
+    @pytest.mark.parametrize("streaming", [False, True])
+    async def test_the_hosted_container_is_what_gets_bound(self, monkeypatch, streaming):
+        fake, manager, ctx, seen = await self._drive(monkeypatch, streaming)
+
+        manager.adopt.assert_awaited_once_with("C1:1.1", "cntr_hosted")
+        assert ctx.sandbox.container_id == "cntr_hosted"
+        assert _ci_container(fake.tools_seen[1]) == "cntr_hosted"

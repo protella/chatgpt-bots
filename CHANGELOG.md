@@ -142,6 +142,30 @@ From then on the database backs itself up nightly (7-day retention) as part of t
 cleanup, which it never did before. The three `pre-v3-*` backups are **exempt from that
 retention** — they're your rollback path, so nothing deletes them but you.
 
+### ⚡ Changed - Replies start seconds sooner, everywhere
+
+Three dead waits were cut out of every turn. The code sandbox is no longer created up front
+before a reply can start — the API builds one lazily and the bot adopts it the first time code
+actually runs, so the 1–15s pause that used to sit in front of DM replies is gone (and "chart
+that file again" still works across turns). Channel replies no longer spend a separate model
+round deciding thread-vs-channel — the answer carries its own placement and the router reads it
+in-stream. And the wake-up gate no longer sleeps a flat 3 seconds on every ambient message: a
+quiet conversation is judged immediately, queued catch-up batches skip the wait they already
+paid, and the classifier starts working during whatever wait remains. Measured on the dev bot:
+DMs 4–5s (was 4–18s), mentions 7–10s (was 8–20s), ambient replies ~12s (was 15–22s).
+
+### 🚀 Added - Optional fast mode for Sol (off by default)
+
+`OPENAI_SERVICE_TIER=fast` buys up to 2.5× faster output on gpt-5.6-sol at double the token
+price. Ships `standard` (the parameter is simply omitted); when fast is on, the bot logs
+whether each reply actually got the fast pool or was silently downgraded. Applies only to the
+user-facing reply — background jobs, research and utility calls never pay for it.
+
+### 🧵 Fixed - Non-streamed replies keep their opening words
+
+A reply that worked through tools in stages used to post only its final stage when streaming
+was off — the "checking that now…" opener was dropped. Both paths now deliver the same words.
+
 ### 🔎 Changed - Search that actually finds what the room said
 
 `search_slack` in a channel now reads the channel itself — its history and the replies inside

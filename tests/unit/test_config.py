@@ -656,3 +656,58 @@ class TestChannelWindowConfig:
                                      "CHANNEL_WINDOW_CEILING": "100"}):
             with pytest.raises(ValueError):
                 BotConfig()
+
+
+# ================================================================ W2 — fast service tier
+
+class TestServiceTier:
+    """`standard` is our name for "send nothing".
+
+    The API's own default is the literal `"default"` and it does not accept `"standard"`, so an
+    unusable value must never become a request parameter — it degrades to the tier we do not
+    send, loudly enough to find in the log.
+    """
+
+    def test_default_is_standard(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("OPENAI_SERVICE_TIER", None)
+            config = BotConfig()
+        assert config.openai_service_tier == "standard"
+
+    def test_fast_is_accepted(self):
+        with patch.dict(os.environ, {"OPENAI_SERVICE_TIER": "fast"}):
+            config = BotConfig()
+        assert config.openai_service_tier == "fast"
+
+    @pytest.mark.parametrize("raw", ["FAST", "Fast", " fast", "fast ", "  fast  ", "fast\n"])
+    def test_a_near_miss_spelling_of_fast_does_NOT_buy_the_fast_tier(self, raw):
+        """The one leniency we must not have. Trimming or case-folding here would switch on
+        double-cost billing off a value nobody spelled correctly, and the operator who typed it
+        would see the bill rather than the warning. Only the exact literal `fast` counts."""
+        with patch.dict(os.environ, {"OPENAI_SERVICE_TIER": raw}):
+            config = BotConfig()
+        assert config.openai_service_tier == "standard"
+
+    @pytest.mark.parametrize("raw", ["Standard", "STANDARD", " standard "])
+    def test_a_near_miss_spelling_of_standard_also_falls_back(self, raw):
+        """Same rule from the harmless side — the value is unrecognized, so it is reported."""
+        with patch.dict(os.environ, {"OPENAI_SERVICE_TIER": raw}):
+            config = BotConfig()
+        assert config.openai_service_tier == "standard"
+
+    @pytest.mark.parametrize("bad", ["priority", "default", "", "flex", "true", "FAST",
+                                     "  fast  ", "Standard"])
+    def test_an_unusable_value_falls_back_to_standard_with_a_warning(self, bad, caplog):
+        with patch.dict(os.environ, {"OPENAI_SERVICE_TIER": bad}):
+            with caplog.at_level("WARNING", logger="bot.config"):
+                config = BotConfig()
+        assert config.openai_service_tier == "standard"
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("OPENAI_SERVICE_TIER" in m for m in messages), (
+            f"an unusable tier must warn, got records: {messages}")
+
+    def test_a_good_value_warns_about_nothing(self, caplog):
+        with patch.dict(os.environ, {"OPENAI_SERVICE_TIER": "fast"}):
+            with caplog.at_level("WARNING", logger="bot.config"):
+                BotConfig()
+        assert not [r for r in caplog.records if "OPENAI_SERVICE_TIER" in r.getMessage()]

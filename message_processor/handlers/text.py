@@ -13,7 +13,9 @@ from message_processor.reconsideration import intercept_stale_send
 from message_processor.routing_facts import POSTURE_THREAD
 from message_processor.stale_send_guard import StaleSendSuppressed
 from message_processor.utilities import effective_request_model
-from message_processor.destination_tools import SET_REPLY_DESTINATION
+from message_processor.destination_tools import (SET_REPLY_DESTINATION,
+                                                 DestinationMarkerReader,
+                                                 consume_destination_marker)
 from message_processor.turn_runtime import (DEST_KIND_CORRECTION_ANNOUNCEMENT,
                                             DEST_KIND_POST_TO_THREAD, EDIT_STATE_COMMITTED,
                                             POST_TO_THREAD_TOOL, AuthorizedEditTarget,
@@ -30,12 +32,12 @@ from message_markers import (
     segment_separator,
 )
 from streaming import FenceHandler, NativeStreamCoordinator, RateLimitManager, StreamingBuffer
-from tool_registry import SURFACE_CHANNEL, SURFACE_DM, ToolContext
+from tool_registry import SURFACE_CHANNEL, SURFACE_DM, SandboxHolder, ToolContext
 from message_processor import (canvas_tools, file_mount, image_catalog, image_service,
                                image_tools, thread_files)
 from message_processor.artifacts import (collect_container_ids, stream_safe_text, strip_citation_markers,
                                          strip_sandbox_links)
-from message_processor.containers import AUTO_CONTAINER
+from message_processor.containers import AUTO_CONTAINER, adoption_blocked
 from message_processor.tool_provenance import (strip_provenance_echo,
                                                visible_attribution_tools)
 from openai_client.container_errors import is_container_gone, persistent_container_ids
@@ -434,6 +436,44 @@ async def _settle_tool_flights(turn: Any) -> None:
             raise TurnEffectsUnsettled(reason) from e
 
 
+async def _adopt_turn_container(processor: Any, artifacts: list, thread_key: str) -> None:
+    """W3 final checkpoint: bind the `auto` container this turn actually ran code in.
+
+    The tool loop adopts at its round boundaries, but a turn that runs code and then answers
+    never reaches another one — and the loop is not on every path here at all: a turn with
+    code_interpreter but no local tool registry makes a single plain API call.
+
+    It must run BEFORE `publish_artifacts` (main.py). The publisher reads and writes the thread's
+    published-file record through the ContainerManager, keyed on the binding; with no binding
+    there is no dedupe record, and the next turn to reuse this container would post its charts a
+    second time.
+
+    Refuses while container recovery has flagged the sink: those ids name the throwaway sandbox
+    the API minted for one retried call, and binding one would leave the thread pointing at
+    something that expires in minutes.
+
+    A module-level helper, not a handler method, for the same reason `_settle_tool_flights` is:
+    the handlers are driven against stand-in hosts, and a step whose whole contract is "this
+    always runs before publication" must not be silently absent because a stand-in did not
+    declare it.
+    """
+    manager = getattr(processor, "container_manager", None)
+    if manager is None or not thread_key:
+        return
+    if adoption_blocked(artifacts):
+        processor.log_debug("Container recovery ran this turn — not adopting an observed id")
+        return
+    observed = collect_container_ids(artifacts)
+    if not observed:
+        return
+    try:
+        # The CAS inside `adopt` is the guard for a thread that is already bound — it never
+        # overwrites a live binding — so there is no read to do first.
+        await manager.adopt(thread_key, observed[0])
+    except Exception as e:  # noqa: BLE001 — a binding is continuity, never the answer
+        processor.log_warning(f"Could not adopt container {observed[0]}: {e}")
+
+
 def _trusted_thread_roots(turn: Any) -> Optional[frozenset]:
     """The thread roots this turn may post into: what its SERIALIZED stream showed the model,
     plus what its own tool results have since proved (§2g), or None.
@@ -561,12 +601,14 @@ class TextHandlerMixin(_Host):
         STAY there). A thread message the gate judged and an ungated thread continuation raise
         exactly the same question, so they now read the same instruction.
 
-        `set_reply_destination` rides the same one-place-decides rule: it is exposed only when
-        the TURN says both destinations are still open (a top-level trigger in a channel that
-        allows top-level replies, before the model has chosen), and its contract paragraph is
-        appended to the same volatile suffix slot. A turn with no choice to make — a DM, a
-        thread, a channel that forbids top-level replies — never sees the tool or the
-        paragraph."""
+        The destination contract rides the same one-place-decides rule, read off the TURN: it is
+        appended to the same volatile suffix slot when both destinations are still open (a
+        top-level trigger in a channel that allows top-level replies, before the model has
+        chosen), and a turn with no choice to make — a DM, a thread, a channel that forbids
+        top-level replies — never sees it. W4: what it teaches is a first-token MARKER, not
+        `set_reply_destination`, which is retired from the channel surface entirely; so this one
+        paragraph is deliberately NOT conditioned on the schema set, because the thing it asks
+        for is text the model writes rather than a tool it calls."""
         meta = message.metadata or {}
         expose_no_reply = meta.get("silence_capable") is True
         thread_posture = meta.get("routing_posture") == POSTURE_THREAD
@@ -666,7 +708,11 @@ class TextHandlerMixin(_Host):
         # about NOT speaking, and the only one the turn can obey by doing nothing at all. (The
         # remeasurement found no support for the recency hypothesis on the row that tests it; the
         # order is chosen for coherence, not for a measured effect.)
-        if registry is not None and destination_open and SET_REPLY_DESTINATION in exposed:
+        # W4: keyed to the TURN alone. The paragraph teaches a marker the model writes into its
+        # own first tokens, so unlike every other contract here it names no tool and cannot be
+        # made a lie by a schema set that does not carry one — which the channel surface, where
+        # this paragraph actually rides, no longer does.
+        if destination_open:
             paragraphs.append(DESTINATION_CONTRACT_SUFFIX)
         # CROSS-THREAD CONDUCT (spec §9). Same one-place-decides rule as the paragraphs around it
         # — it rides only when the tool is genuinely in this attempt's schema set, so a timeout
@@ -713,7 +759,8 @@ class TextHandlerMixin(_Host):
                             request_config: Optional[dict] = None,
                             ci_container=None, turn=None,
                             container_gone_sink: Optional[List[str]] = None,
-                            current_image_urls: Optional[List[str]] = None) -> ToolContext:
+                            current_image_urls: Optional[List[str]] = None,
+                            thread_key: Optional[str] = None) -> ToolContext:
         """Per-request context handed to local tool executors."""
         meta = message.metadata or {}
         channel_id = message.channel_id
@@ -771,6 +818,15 @@ class TextHandlerMixin(_Host):
             # the tools array — an image mounted anywhere else is invisible to the model.
             thread_config=cfg,
             container_id=ci_container if isinstance(ci_container, str) else None,
+            # W3: the turn's container reference, shared by every per-call copy of this context
+            # and by the tool loop. It starts filled only when the thread ALREADY had a live
+            # binding; on an `auto` turn it stays empty until the model runs code (adoption) or
+            # a bridge tool mints one. Either way, whatever lands here is what the next round's
+            # code_interpreter declaration names.
+            sandbox=SandboxHolder(
+                container_id=ci_container if isinstance(ci_container, str) else None,
+                manager=getattr(self, "container_manager", None),
+                thread_key=thread_key or f"{channel_id}:{message.thread_id}"),
             # F15: the SAME list the API's container-recovery extends, so an executor can see
             # its container die mid-turn (container_recycled fail-fast) instead of retrying dead.
             container_gone_sink=container_gone_sink,
@@ -806,11 +862,14 @@ class TextHandlerMixin(_Host):
         """Shape the sandbox-facing tools to THIS turn (F34 images, F35 mount_file).
 
         Their schemas are factories, and a factory only ever sees thread_config — so the
-        turn-specific facts they need get stashed there: whether there is an addressable
-        sandbox container (no id → create_image_asset and mount_file are not offered, because
-        bytes pushed into an unknown container are invisible to the model), the catalog of
-        images edit_image may name, and the catalog of files mount_file may pull in. Both
-        catalogs become literal enums, so an invented id cannot even be emitted.
+        turn-specific facts they need get stashed there: the catalog of images edit_image may
+        name, and the catalog of files mount_file may pull in. Both become literal enums, so an
+        invented id cannot even be emitted.
+
+        The container id is recorded alongside them as the turn's declared sandbox. It no longer
+        GATES either tool: W3 starts every turn on `auto`, so hiding them for want of an id would
+        hide them on the first turn of every conversation. Both executors ask for a container
+        instead (`ToolContext.ensure_sandbox`).
         """
         request_config[image_tools.CI_CONTAINER_KEY] = (
             ci_container if isinstance(ci_container, str) else None)
@@ -1292,6 +1351,10 @@ class TextHandlerMixin(_Host):
         background_job_started = False  # F30.1: start_background_job fired — drop this reply
         sandbox_assets = []       # F34: images mounted into the sandbox as ingredients
         mounted_digests = []      # F35: files WE mounted — never publishable back
+        # W4: this turn's ROUNDS. The loop answers with its terminal round, so an earlier round
+        # is not in `response_text` — and the marker the model wrote in its opening tokens lives
+        # in exactly such a round whenever a tool ran before the answer.
+        response_segments: Optional[List[str]] = None
         usage_info: Dict[str, Any] = {}   # response.usage lands here (usage-driven budgeting)
         mcp_discovered: Dict[str, Any] = {}  # mcp_list_tools payloads land here (discovery cache)
         mcp_results: List[Any] = []       # F12: completed mcp_call outputs land here (result memory)
@@ -1310,13 +1373,20 @@ class TextHandlerMixin(_Host):
                 tool_context = self._build_tool_context(
                     message, client, request_config, ci_container, turn=turn,
                     container_gone_sink=containers_gone,
-                    current_image_urls=self._current_image_urls(user_content))
+                    current_image_urls=self._current_image_urls(user_content),
+                    thread_key=thread_key)
                 result = await self.openai_client.create_text_response_with_tool_loop(
                     messages=messages_for_api,
                     tools=tools,
                     registry=registry,
                     tool_context=tool_context,
                     prior_committed=visible_already_committed,
+                    # Chat wants the canonical whole-turn text, exactly as the streaming twin
+                    # does: a preamble the model wrote before calling a tool is part of its
+                    # answer, and returning only the terminal round dropped it on the floor —
+                    # unnoticed, because this path shows nothing until the end, so there was
+                    # never a half-written line on screen to give it away.
+                    aggregate_segments=True,
                     # Same free-tool accounting the streaming loop gets: bookkeeping must not
                     # spend the budget a real tool needs, on either path.
                     free_tools=(SET_REPLY_DESTINATION,),
@@ -1334,9 +1404,13 @@ class TextHandlerMixin(_Host):
                     mcp_tools_sink=mcp_discovered,
                     mcp_results_sink=mcp_results,
                     artifacts_sink=artifacts,
-                    container_gone_sink=containers_gone
+                    container_gone_sink=containers_gone,
+                    # W2: the user-facing responder call — the only one that may buy the fast
+                    # tier. Reconsideration, background and research calls never pass this.
+                    service_tier_eligible=True
                 )
                 response_text = result["text"]
+                response_segments = result.get("segments")
                 tools_actually_used = result["tools_used"]
                 local_tool_calls = result["local_tool_calls"]
                 terminal_action = result.get("terminal_action")
@@ -1373,7 +1447,8 @@ class TextHandlerMixin(_Host):
                         mcp_tools_sink=mcp_discovered,
                         mcp_results_sink=mcp_results,
                         artifacts_sink=artifacts,
-                        container_gone_sink=containers_gone
+                        container_gone_sink=containers_gone,
+                        service_tier_eligible=True
                     )
                     response_text = result["text"]
                     tools_actually_used = result["tools_used"]
@@ -1396,7 +1471,8 @@ class TextHandlerMixin(_Host):
                         mcp_tools_sink=mcp_discovered,
                         mcp_results_sink=mcp_results,
                         artifacts_sink=artifacts,
-                        container_gone_sink=containers_gone
+                        container_gone_sink=containers_gone,
+                        service_tier_eligible=True
                     )
                     response_text = result["text"]
                     tools_actually_used = result["tools_used"]
@@ -1417,7 +1493,8 @@ class TextHandlerMixin(_Host):
                         # where that parity gap is closed, so the key rides only there.
                         prompt_cache_key=cache_key if channel_turn else None,
                         layout=request_layout,
-                        attempt_sink=attempt_sink
+                        attempt_sink=attempt_sink,
+                        service_tier_eligible=True
                     )
                 else:
                     response_text = await self.openai_client.create_text_response(
@@ -1431,7 +1508,8 @@ class TextHandlerMixin(_Host):
                         prompt_cache_key=cache_key,
                         layout=request_layout,
                         usage_sink=usage_info,
-                        attempt_sink=attempt_sink
+                        attempt_sink=attempt_sink,
+                        service_tier_eligible=True
                     )
         except Exception as api_error:
             # Usage-estimator backstop: the API is the final authority on context
@@ -1493,10 +1571,29 @@ class TextHandlerMixin(_Host):
         # to the user — the real file arrives as a Slack upload. Strip them before the text is
         # stored, attributed, or posted, so the dead link never reaches anyone.
         await self._drop_dead_containers(containers_gone, thread_key)
+        # W3: bind what the model ran in, before the publisher goes looking for the dedupe record.
+        await _adopt_turn_container(self, artifacts, thread_key)
         artifact_containers = collect_container_ids(artifacts)
         # Unconditional: a stray sandbox link must never reach the user, even on a turn where
         # we captured no container (the strip is a cheap no-op when there's nothing to strip).
         # Same for a `[used tools: …]` line the model echoed back from its own context.
+        #
+        # W4 RUNS FIRST, and the order is load-bearing: the marker consumer may REBUILD the text
+        # from this turn's rounds, so anything cleaned before it would be reconstructed from the
+        # raw rounds and undone. Sanitizing the result instead keeps one sanitizer, on the whole
+        # answer, exactly as before — it only moves to the other side of the marker step.
+        #
+        # This path never streams, so the canonical text is where its marker lives, and the same
+        # rule applies: the first complete marker ANYWHERE selects, and every one is stripped.
+        # Unconditional, because a marker must not reach a reader even on a turn that had no
+        # choice to make; a text without one comes back byte-identical.
+        #
+        # Given this turn's ROUNDS it parses each alone and re-joins — the streaming twin's exact
+        # call, for the same two reasons: a marker the model wrote before calling a tool is in a
+        # round rather than at the head of the whole, and a marker that ENDED a round must not
+        # eat the seam that was put after it.
+        response_text = consume_destination_marker(response_text, turn=turn, message=message,
+                                                   segments=response_segments)
         response_text = strip_provenance_echo(strip_citation_markers(strip_sandbox_links(response_text)))
 
         # Record the API's authoritative context size on the thread
@@ -2101,9 +2198,28 @@ class TextHandlerMixin(_Host):
             # search) split the text too, but INSIDE one round, where no round boundary exists to
             # arm — their seam is inserted at the API layer instead (_segment_separator in
             # openai_client/api/responses.py), so they must not arm it here as well.
-            if (status == "started" and tool_type.startswith("local:")
-                    and buffer.get_complete_text().strip()):
-                pending_segment_break = True
+            if status == "started" and tool_type.startswith("local:"):
+                # W4, BEFORE the seam is armed and before the buffered-text test below reads it:
+                # a round's text segment ends HERE, so it has to be WHOLE here. The reader may be
+                # holding a tail that could still have grown into a marker — and a successful
+                # function-call round deliberately skips the terminal flush
+                # (openai_client/api/responses.py), so nothing else would release it until the
+                # next round's text had already arrived. The held characters would then land on
+                # the far side of the paragraph break, and the buffer the native finalize commits
+                # would disagree with the canonical `join_segments` text (which native success
+                # never corrects) about which side of the seam they belong on.
+                #
+                # A marker genuinely split across a round boundary is not a case worth keeping:
+                # the prompt asks for it at the very start of the reply, so a round-terminal
+                # partial is plain text and is released as such.
+                held = marker_reader.flush()
+                if held:
+                    buffer.add_chunk(held)
+                # Keyed on buffered text AFTER the flush: a round whose every character was held
+                # still produced text, and testing before the release would have read it as a
+                # tool-only round and left the next segment with no gap in front of it.
+                if buffer.get_complete_text().strip():
+                    pending_segment_break = True
 
             # HOSTED-TOOL ACCOUNTING, AND IT RUNS BEFORE THE NATIVE EARLY RETURN BELOW
             # (codex round-3 #1a). What follows that return is STATUS RENDERING, which a started
@@ -2301,6 +2417,22 @@ class TextHandlerMixin(_Host):
         # Structurally-placed turns (DM, in-thread, channel-posting forbidden) bind immediately
         # and behave exactly as they always have.
         destination_bound = False
+        # W4: the marker consumer, on EVERY streamed turn without exception.
+        #
+        # STRIPPING AND SELECTING ARE SEPARABLE, and only selecting is about this turn's route.
+        # `select_destination` refuses on its own whenever there is nothing to choose — a DM, a
+        # thread, a locked reply — so the reader can run everywhere and still never move a reply
+        # that was never open. Gating the READER on the route instead was a hole in the owner's
+        # ruling: the native finalize commits the raw BUFFER, not the cleaned canonical text, so
+        # a stray marker streamed on a structural turn would survive into the finished message.
+        # Two other paths reach the same buffer with the same consequence — the retry of an
+        # already-chosen turn (an MCP failover re-enters here and the model writes its marker
+        # again) and any turn whose destination was settled before the loop began.
+        #
+        # The cost of running it everywhere is one held character when a chunk happens to end on
+        # a marker prefix; no byte of output changes, because a text with no marker parses to
+        # itself.
+        marker_reader = DestinationMarkerReader(turn, message)
         reply_target = None
         # F39: a top-level channel reply cannot stream (chat.startStream REQUIRES thread_ts) and
         # must not be faked with an edit loop, which brands the message "(edited)". Write
@@ -2489,6 +2621,28 @@ class TextHandlerMixin(_Host):
                         pass
                     self.log_debug("Cancelled progress updater - streaming started")
 
+            # ---- W4: consume the destination marker before ANYTHING else reads the text ----
+            # This is the choke point. Downstream — the buffer, the native sink, Slack, the
+            # thread state, reconsideration — never sees a marker, because the only text that
+            # gets past here has already had every one removed. The reader holds back a tail that
+            # could still be growing into a marker, so a marker split across chunks is still one
+            # marker and nothing partial is ever shown.
+            if marker_reader is not None:
+                if text_chunk is None:
+                    # Terminal: release whatever was held. The destination may still be unchosen
+                    # — that verdict belongs to the terminal handling below, not to this reader.
+                    held = marker_reader.flush()
+                    if held:
+                        buffer.add_chunk(held)
+                else:
+                    text_chunk = marker_reader.feed(text_chunk)
+                    # The moment the marker parses, the answer's destination is known and a
+                    # surface may finally exist. Everything before it stayed unbound and buffered.
+                    if marker_reader.destination is not None and not destination_bound:
+                        _bind_destination()
+                    if not text_chunk:
+                        return
+
             # ---- Segment seam: a local tool ran, and this is the first visible text of the new
             # round. Append a paragraph break (if neither side already has whitespace) so the
             # preamble and the post-tool text don't jam into "Heavy.Fixed". Added to the buffer
@@ -2501,12 +2655,20 @@ class TextHandlerMixin(_Host):
                     buffer.add_chunk(sep)
 
             # ---- Bind the destination before ANY surface work ----
-            # The answer has started, so wherever it is going is now decided: either the model
-            # called set_reply_destination in an earlier round, or it never will and the default
-            # thread takes it. Runs before the branches below because each of them mints or
-            # edits a message, and one cannot be created until the target is known. A no-op for
-            # every turn whose route settled this before the loop began.
-            if text_chunk is not None and not destination_bound:
+            # Runs before the branches below because each of them mints or edits a message, and
+            # one cannot be created until the target is known. A no-op for every turn whose route
+            # settled this before the loop began.
+            #
+            # W4: a turn that is still CHOOSING does not bind here. Its marker is what binds it,
+            # above, and until that arrives the surface stays unbound and the words buffer — the
+            # answer has started, but where it goes has not been said yet, and guessing at the
+            # first word is exactly the wrong moment to decide. A turn whose marker never comes
+            # binds at the terminal instead (the default thread, one contract miss). The
+            # condition below is therefore the same one the pre-loop bind uses, which makes this
+            # a safety net for a destination settled after the loop began rather than a second
+            # policy: a turn with a live choice is never bound by the arrival of a word.
+            if (text_chunk is not None and not destination_bound
+                    and (turn is None or turn.destination_selected)):
                 _bind_destination()
 
             # ---- F39: final-post-only (top-level channel reply) ----
@@ -3004,6 +3166,10 @@ class TextHandlerMixin(_Host):
             background_job_started = False  # F30.1: start_background_job fired — drop this reply
             sandbox_assets = []            # F34: images mounted into the sandbox as ingredients
             mounted_digests = []       # F35: files WE mounted — never publishable back
+            # W4: this turn's ROUNDS, before the loop put seams between them. Only the tool loop
+            # has any (every other path is one round), and the marker parser needs them — see
+            # `consume_destination_marker`.
+            response_segments: Optional[List[str]] = None
             if tools and registry is not None:
                 # Local tools present — streaming function-call loop (intermediate tool
                 # rounds don't stream text; the final round streams normally). Hold the
@@ -3011,7 +3177,8 @@ class TextHandlerMixin(_Host):
                 tool_context = self._build_tool_context(
                     message, client, request_config, ci_container, turn=turn,
                     container_gone_sink=containers_gone,
-                    current_image_urls=self._current_image_urls(user_content))
+                    current_image_urls=self._current_image_urls(user_content),
+                    thread_key=thread_key)
                 loop_result = await self.openai_client.create_streaming_response_with_tool_loop(
                     messages=messages_for_api,
                     tools=tools,
@@ -3041,9 +3208,13 @@ class TextHandlerMixin(_Host):
                     mcp_tools_sink=mcp_discovered,
                     mcp_results_sink=mcp_results,
                     artifacts_sink=artifacts,
-                    container_gone_sink=containers_gone
+                    container_gone_sink=containers_gone,
+                    # W2: the user-facing responder call — the only one that may buy
+                    # the fast tier (see the non-streaming twin).
+                    service_tier_eligible=True
                 )
                 response_text = loop_result["text"]
+                response_segments = loop_result.get("segments")
                 local_tool_calls = loop_result["local_tool_calls"]
                 terminal_action = loop_result.get("terminal_action")
                 silence_reason = loop_result.get("silence_reason")
@@ -3082,7 +3253,8 @@ class TextHandlerMixin(_Host):
                     mcp_tools_sink=mcp_discovered,
                     mcp_results_sink=mcp_results,
                     artifacts_sink=artifacts,
-                    container_gone_sink=containers_gone
+                    container_gone_sink=containers_gone,
+                    service_tier_eligible=True
                 )
             else:
                 # Generate response without tools
@@ -3099,7 +3271,8 @@ class TextHandlerMixin(_Host):
                     prompt_cache_key=cache_key,
                     layout=request_layout,
                     usage_sink=usage_info,
-                    attempt_sink=attempt_sink
+                    attempt_sink=attempt_sink,
+                    service_tier_eligible=True
                 )
 
             # F32: artifacts the model produced this turn. The reply text may carry dead
@@ -3108,7 +3281,30 @@ class TextHandlerMixin(_Host):
             # rewrites the message with the clean text, and the system prompt tells the model
             # not to emit them in the first place.
             await self._drop_dead_containers(containers_gone, thread_key)
+            # W3: bind what the model ran in, before the publisher looks for the dedupe record.
+            await _adopt_turn_container(self, artifacts, thread_key)
             artifact_containers = collect_container_ids(artifacts)
+            # W4 RUNS BEFORE THE SANITIZERS, and the order is load-bearing: the marker consumer
+            # REBUILDS this text from the turn's rounds, so anything cleaned first would be
+            # reconstructed from the raw rounds and undone — a dead `sandbox:` link, live again,
+            # in the message, the thread state and the reconsideration input. Sanitizing the
+            # result keeps one sanitizer on the whole answer, exactly as before; it only moves to
+            # the other side of the marker step.
+            #
+            # The streaming reader already consumed the marker out of the live text, but the
+            # canonical answer is a separate object the API returns whole — and it is the one that
+            # reaches the thread state, reconsideration and the final correction. Same parser,
+            # same rule; on a turn whose marker the reader already accepted this is an idempotent
+            # no-op, and on one that produced text without ever streaming a chunk it is the only
+            # place the choice could be read.
+            #
+            # Given this turn's ROUNDS it parses each of them alone and re-joins, because the
+            # seams between rounds belong to no round and a marker that ended one must not eat
+            # the separator put after it. That is the same thing the streaming reader does — it
+            # is flushed at every round boundary — and on a native turn the two have to produce
+            # the same bytes, since the buffer is what Slack keeps and no correction follows.
+            response_text = consume_destination_marker(response_text, turn=turn, message=message,
+                                                       segments=response_segments)
             response_text = strip_provenance_echo(strip_citation_markers(strip_sandbox_links(response_text)))
 
             # Record the API's authoritative context size on the thread
@@ -3384,7 +3580,12 @@ class TextHandlerMixin(_Host):
                         Optional ts; StaleSendSuppressed propagates (a re-race re-enters the
                         runner's loop as the next pass)."""
                         nonlocal response_text
-                        response_text = text
+                        # W4: a reconsidered draft is fresh model output, so it goes through the
+                        # same choke point as the first one. Selection is refused by then (the
+                        # destination is locked, and this post is going where it was bound), but
+                        # the strip is not optional — this text is about to be the message.
+                        response_text = consume_destination_marker(text, turn=turn,
+                                                                   message=message)
                         direct_send_meta.clear()
                         return await client.send_message(
                             message.channel_id, effective_target, response_text,
@@ -3566,7 +3767,10 @@ class TextHandlerMixin(_Host):
                         behavior."""
                         nonlocal response_text, delivery_split, delivery_complete, \
                             delivered_text_override
-                        response_text = text
+                        # W4: same choke point as the direct post above — a reconsidered draft is
+                        # model output, and no marker survives into the message it becomes.
+                        response_text = consume_destination_marker(text, turn=turn,
+                                                                   message=message)
                         # Check if message is too long for a single update
                         if len(response_text) > 3900:  # Slack's approximate limit
                             # This shouldn't happen if streaming overflow worked correctly

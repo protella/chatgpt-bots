@@ -593,10 +593,14 @@ async def test_delete_canvas_runs_again_once_the_context_carries_the_authorizati
     assert out["error"] != "not_authorized"
 
 
-def test_the_channel_surface_exposes_the_static_terminal_and_destination_tools(mock_env):
+def test_the_channel_surface_is_static_about_the_terminal_tool_and_the_destination(mock_env):
     """Both used to be per-turn schema gates. The routes they guarded are per-turn facts, so
     the schemas went static and the executors took the decision (see
-    tests/unit/test_terminal_actions.py for the loop contract)."""
+    tests/unit/test_terminal_actions.py for the loop contract).
+
+    W4 answered the destination the other way and kept the same principle: rather than a per-turn
+    gate, `set_reply_destination` is STATICALLY absent here — the choice rides a marker in the
+    reply's first tokens, and this surface has no tool for it on any turn."""
     registry = _registry()
     quiet_turn = _channel_config(extras={"_silence_capable_turn": True,
                                          "_destination_choice_open": True})
@@ -604,7 +608,7 @@ def test_the_channel_surface_exposes_the_static_terminal_and_destination_tools(m
     for cfg in (quiet_turn, owed_turn):
         names = _names(registry.schemas(cfg, surface=SURFACE_CHANNEL))
         assert "no_response_needed" in names
-        assert "set_reply_destination" in names
+        assert "set_reply_destination" not in names
         assert "search_slack" in names
     # DM keeps the gates.
     assert "no_response_needed" not in _names(registry.schemas(owed_turn, surface=SURFACE_DM))

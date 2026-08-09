@@ -3247,6 +3247,31 @@ class DatabaseManager(LoggerMixin):
         """, (thread_id, container_id))
         self.conn.commit()
 
+    def adopt_thread_container(self, thread_id: str, container_id: str) -> Optional[str]:
+        """W3: bind a container the model ALREADY ran code in — but never over a live binding.
+
+        Compare-and-set, in one statement: the insert lands only when the thread has no binding
+        at all. Adoption observes an id that arrived mid-turn, so by the time we write it a
+        concurrent turn may already have bound a newer container of its own; overwriting that
+        would point the next turn at a sandbox its files are not in, and would reset the newer
+        binding's published-file record on the way past.
+
+        Returns the container_id the thread is bound to AFTER the attempt — ours when we won,
+        the incumbent's when we lost, None when the row could not be read back. The caller keeps
+        using the id it observed either way: that is where this turn's files actually are.
+        """
+        self.conn.execute("""
+            INSERT INTO thread_containers (thread_id, container_id, created_at, last_used_at,
+                                           published_files_json)
+            VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '[]')
+            ON CONFLICT(thread_id) DO NOTHING
+        """, (thread_id, container_id))
+        self.conn.commit()
+        cursor = self.conn.execute(
+            "SELECT container_id FROM thread_containers WHERE thread_id = ?", (thread_id,))
+        row = cursor.fetchone()
+        return row["container_id"] if row else None
+
     def touch_thread_container(self, thread_id: str, container_id: str):
         """Mark this container as used now (keeps it inside the reuse window)."""
         self.conn.execute("""
@@ -5966,6 +5991,10 @@ class DatabaseManager(LoggerMixin):
 
     async def save_thread_container_async(self, thread_id: str, container_id: str):
         return await asyncio.to_thread(self.save_thread_container, thread_id, container_id)
+
+    async def adopt_thread_container_async(self, thread_id: str,
+                                           container_id: str) -> Optional[str]:
+        return await asyncio.to_thread(self.adopt_thread_container, thread_id, container_id)
 
     async def touch_thread_container_async(self, thread_id: str, container_id: str):
         return await asyncio.to_thread(self.touch_thread_container, thread_id, container_id)

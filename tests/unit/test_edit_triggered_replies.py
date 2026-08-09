@@ -576,6 +576,8 @@ async def test_edit_supersedes_original_in_flight_evaluation(monkeypatch):
     monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
     client = _RecordingClient(wake=True)
     engine = ParticipationEngine(client)
+    # W5c: only a WARM stream waits, and this test is about what happens during the wait.
+    engine.note_arrival("C1", "100.0", None, "UHUMAN")
     # Kick off the original's evaluation, then supersede it mid-debounce (as the edit path does).
     task = asyncio.create_task(engine.evaluate(
         channel_id="C1", ts="100.1", text="does anyone remember the WAL default?",
@@ -585,7 +587,10 @@ async def test_edit_supersedes_original_in_flight_evaluation(monkeypatch):
     evaluation = await task
     assert evaluation.decision is None           # superseded — no second answer
     assert evaluation.decline_cause == "edit_superseded"
-    assert client.calls == 0          # the classifier was never even consulted
+    # W5b's stated cost, and the only place it is visible: this attempt was eligible when its
+    # window opened, so a speculative call went out and the edit invalidated it mid-window. The
+    # call is spent; its verdict is discarded unused, and no decision is manufactured from it.
+    assert client.calls == 1
 
 
 @pytest.mark.asyncio

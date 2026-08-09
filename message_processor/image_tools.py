@@ -689,7 +689,10 @@ async def execute_create_image_asset(ctx, args: Dict[str, Any]) -> Dict[str, Any
     if processor is None:
         return _err("unavailable", "Image generation is not available in this context.")
 
-    container_id = getattr(ctx, "container_id", None)
+    # W3: the turn may have started on `auto`, with no addressable id until something asks for
+    # one. This is that ask — it mints the container (once per turn, shared with the loop and
+    # with sibling calls) so the bytes land somewhere the model's code can open them.
+    container_id = await ctx.ensure_sandbox()
     if not container_id:
         return _err(
             "sandbox_unavailable",
@@ -1113,14 +1116,20 @@ def _tools_enabled(cfg: dict) -> bool:
 
 
 def _asset_tool_enabled(cfg: dict) -> bool:
-    """Only offered when image tools are enabled AND the sandbox exists with an addressable
-    container. Under ``{"type": "auto"}`` the id is unknown until after the call, so there is
-    nothing to push bytes into — offering the tool would guarantee a failed call."""
-    if not _tools_enabled(cfg):
-        return False
-    if not config.enable_code_interpreter:
-        return False
-    return isinstance(cfg.get(CI_CONTAINER_KEY), str) and bool(cfg.get(CI_CONTAINER_KEY))
+    """Offered when image tools and the code sandbox are both on for THIS turn.
+
+    It used to also require an addressable container id, because under ``{"type": "auto"}``
+    there was nothing to push bytes into. W3 starts every turn on ``auto``, so that condition
+    would have retired the tool from ordinary conversation altogether; the executor calls
+    ``ToolContext.ensure_sandbox`` and gets an addressable container made for it instead.
+
+    Which makes the sandbox switch load-bearing in a way it was not before, so it is resolved
+    the way the tools array resolves it — per-thread override, then the global. Read only the
+    global and a thread with code interpreter turned OFF would offer a tool that mints and binds
+    a container for a request carrying no ``code_interpreter`` declaration to open it with.
+    """
+    return _tools_enabled(cfg) and bool(
+        (cfg or {}).get("enable_code_interpreter", config.enable_code_interpreter))
 
 
 def register_image_tools(registry) -> None:
@@ -1131,16 +1140,14 @@ def register_image_tools(registry) -> None:
                       enabled=_tools_enabled, name="generate_image", dynamic=True,
                       channel_schema=get_generate_image_schema_static,
                       channel_enabled=_tools_enabled)
-    # The channel gate drops _asset_tool_enabled's container-id check: whether THIS thread has an
-    # addressable sandbox is per-thread, and the container is one of the four approved cache
-    # forks — the tools ARRAY may fork on it, the tool SET may not. The executor still refuses
-    # honestly when there is nowhere to mount to.
+    # One gate on both surfaces since W3. Whether THIS thread has an addressable sandbox is a
+    # per-thread fact the channel tool SET was never allowed to fork on, and the DM surface no
+    # longer needs to: the executor gets a container made for it when the turn started on `auto`.
     registry.register(get_create_image_asset_schema, execute_create_image_asset,
                       enabled=_asset_tool_enabled, timeout=sync_timeout,
                       name="create_image_asset", dynamic=True,
                       channel_schema=get_create_image_asset_schema_static,
-                      channel_enabled=lambda cfg: (_tools_enabled(cfg)
-                                                   and bool(config.enable_code_interpreter)))
+                      channel_enabled=_asset_tool_enabled)
     registry.register(get_edit_image_schema, execute_edit_image,
                       enabled=_tools_enabled, timeout=sync_timeout, name="edit_image",
                       dynamic=True, channel_schema=get_edit_image_schema_static,

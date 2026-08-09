@@ -8,7 +8,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from config import config, clamp_effort
 from openai_client.container_errors import (demote_container_tools, is_container_gone,
-                                            persistent_container_ids)
+                                            mark_adoption_blocked, persistent_container_ids)
 from prompts import (MEMORY_EXTRACTION_SYSTEM_PROMPT, TOOL_RESULT_SUMMARIZE_PROMPT,
                      WAKE_CLASSIFIER_SYSTEM_PROMPT)
 
@@ -214,6 +214,7 @@ async def _create_with_container_recovery(self, request_params: Dict[str, Any],
                                          container_gone_sink: Optional[List[str]] = None,
                                          attempt_sink: Optional[Any] = None,
                                          attempts: Optional[List[Any]] = None,
+                                         artifacts_sink: Optional[List[Dict[str, Any]]] = None,
                                          **safe_call_kwargs):
     """`responses.create`, surviving a container that died since we verified it.
 
@@ -226,6 +227,11 @@ async def _create_with_container_recovery(self, request_params: Dict[str, Any],
     container) and retry the SAME call once. Local tools already executed this turn are not
     replayed: only this one API call repeats. The dead id lands in `container_gone_sink` so the
     caller can drop its DB binding.
+
+    W3: the retry runs in a container OpenAI minted for this one call, so the ids observed from
+    here on are ephemeral. `mark_adoption_blocked` vetoes adoption for the rest of the turn
+    BEFORE the retry goes out — the flag is the signal, because an observed id cannot say which
+    kind of container it names.
 
     THE DEMOTED RETRY IS A SECOND ATTEMPT in the ledger, because it is a second request: the
     first is closed as the error it was, and the second is opened here and left live for the
@@ -252,6 +258,9 @@ async def _create_with_container_recovery(self, request_params: Dict[str, Any],
         dead = persistent_container_ids(request_params.get("tools"))
         if container_gone_sink is not None:
             container_gone_sink.extend(dead)
+        # W3: before the retry is issued, never after — whatever the ephemeral sandbox reports
+        # must already be un-adoptable by the time it can be observed.
+        mark_adoption_blocked(artifacts_sink)
         self.log_warning(
             f"Container {dead} died mid-turn — retrying this call with an ephemeral sandbox")
 
@@ -335,6 +344,27 @@ def _note_container(artifacts_sink, item):
         pass
 
 
+def _log_service_tier_echo(self, request_params: Dict[str, Any], response: Any) -> None:
+    """W2: what the API actually SERVED when we paid for the fast tier.
+
+    An honored fast request echoes `service_tier: "priority"`; a silent downgrade to the
+    standard pool echoes `"default"` — same 2x bill, none of the speed, and nothing else in the
+    stack would ever notice. Only logged when fast was actually requested, so a standard
+    deployment stays silent.
+
+    Called against the response object the path has in hand: the completed response on the
+    non-streaming paths, and `response.created` on the streaming ones — the tier is settled at
+    creation, and reading it at the terminal event would lose it on every stream that never
+    reaches one (interruption, stale-send suppression, a raising callback).
+    """
+    if request_params.get("service_tier") != "fast":
+        return
+    echoed = getattr(response, "service_tier", None)
+    verdict = ("honored" if echoed == "priority"
+               else "downgraded" if echoed == "default" else "unknown")
+    self.log_info(f"[service_tier] requested=fast echoed={echoed!r} ({verdict})")
+
+
 async def create_text_response(
     self,
     messages: List[Dict[str, Any]],
@@ -351,6 +381,7 @@ async def create_text_response(
     usage_sink: Optional[Dict[str, Any]] = None,
     attempt_sink: Optional[Any] = None,
     layout: str = "legacy",
+    service_tier_eligible: bool = False,
 ) -> str:
     """
     Create a text response using the Responses API
@@ -386,6 +417,7 @@ async def create_text_response(
         prompt_cache_options=prompt_cache_options,
         layout=layout,
         legacy_kind="plain",
+        service_tier_eligible=service_tier_eligible,
     )
 
     self.log_debug(f"Creating text response with model {model}, temp {temperature}")
@@ -406,6 +438,7 @@ async def create_text_response(
         )
 
         usage_captured = _capture_usage(usage_sink, response)
+        _log_service_tier_echo(self, request_params, response)
         _close_attempt(attempt_sink, attempts, status="ok", usage=usage_captured)
 
         output_text = _join_output_text(response)
@@ -442,7 +475,8 @@ async def create_text_response_with_tools(
     mcp_results_sink: Optional[List[Dict[str, Any]]] = None,
     artifacts_sink: Optional[List[Dict[str, Any]]] = None,
     container_gone_sink: Optional[List[str]] = None,
-    layout: str = "legacy"
+    layout: str = "legacy",
+    service_tier_eligible: bool = False,
 ) -> str:
     """
     Create text response with tools (e.g., web search)
@@ -486,6 +520,7 @@ async def create_text_response_with_tools(
         prompt_cache_options=prompt_cache_options,
         layout=layout,
         legacy_kind="tools",
+        service_tier_eligible=service_tier_eligible,
     )
 
     self.log_debug(f"Creating text response with tools using model {model}, tools: {tools}")
@@ -502,9 +537,11 @@ async def create_text_response_with_tools(
             self, request_params, operation_type,
             container_gone_sink=container_gone_sink,
             attempt_sink=attempt_sink, attempts=attempts,
+            artifacts_sink=artifacts_sink,
         )
 
         usage_captured = _capture_usage(usage_sink, response)
+        _log_service_tier_echo(self, request_params, response)
         _close_attempt(attempt_sink, attempts, status="ok", usage=usage_captured)
 
         # Text first (seams and all — see _join_output_text); the loop below is tool bookkeeping.
@@ -596,6 +633,7 @@ async def create_streaming_response(
     usage_sink: Optional[Dict[str, Any]] = None,
     attempt_sink: Optional[Any] = None,
     layout: str = "legacy",
+    service_tier_eligible: bool = False,
 ) -> str:
     """
     Create a streaming text response using the Responses API
@@ -634,6 +672,7 @@ async def create_streaming_response(
         prompt_cache_options=prompt_cache_options,
         layout=layout,
         legacy_kind="plain",
+        service_tier_eligible=service_tier_eligible,
     )
 
     self.log_debug(f"Creating streaming response with model {model}, temp {temperature}")
@@ -669,6 +708,12 @@ async def create_streaming_response(
                 
                 if event_type == "response.created":
                     self.log_info("Stream started")
+                    # W2: the served tier is known at CREATION, not at the terminal event. A
+                    # stream that is interrupted, suppressed by the stale-send guard, or ended
+                    # by a callback failure never reaches its terminal — and a downgrade we
+                    # were billed for would go unrecorded. Read it here, once per request.
+                    _log_service_tier_echo(self, request_params,
+                                           getattr(event, "response", None))
                     continue
                 elif event_type == "response.output_item.added":
                     continue  # Skip without logging
@@ -862,7 +907,8 @@ async def create_streaming_response_with_tools(
     tool_event_callback: Optional[Callable[[Dict[str, Any]], Any]] = None,
     artifacts_sink: Optional[List[Dict[str, Any]]] = None,
     container_gone_sink: Optional[List[str]] = None,
-    layout: str = "legacy"
+    layout: str = "legacy",
+    service_tier_eligible: bool = False,
 ) -> str:
     """
     Create streaming text response with tools (e.g., web search)
@@ -913,6 +959,7 @@ async def create_streaming_response_with_tools(
         prompt_cache_options=prompt_cache_options,
         layout=layout,
         legacy_kind="tools",
+        service_tier_eligible=service_tier_eligible,
     )
 
     self.log_debug(f"Creating streaming response with tools using model {model}")
@@ -931,6 +978,7 @@ async def create_streaming_response_with_tools(
             self, request_params, operation_type,
             container_gone_sink=container_gone_sink,
             attempt_sink=attempt_sink, attempts=attempts,
+            artifacts_sink=artifacts_sink,
         )
 
         complete_text = ""
@@ -966,6 +1014,12 @@ async def create_streaming_response_with_tools(
 
                 if event_type == "response.created":
                     self.log_info("Stream started")
+                    # W2: the served tier is known at CREATION, not at the terminal event. A
+                    # stream that is interrupted, suppressed by the stale-send guard, or ended
+                    # by a callback failure never reaches its terminal — and a downgrade we
+                    # were billed for would go unrecorded. Read it here, once per request.
+                    _log_service_tier_echo(self, request_params,
+                                           getattr(event, "response", None))
                     continue
                 elif event_type == "response.output_item.added":
                     if (function_call_sink is not None and hasattr(event, 'item')
@@ -1699,6 +1753,7 @@ async def _create_text_response_with_timeout(
     prompt_cache_options: Optional[Dict[str, Any]] = None,
     attempt_sink: Optional[Any] = None,
     layout: str = "legacy",
+    service_tier_eligible: bool = False,
 ) -> str:
     """
     Create a text response with custom timeout (for retry scenarios)
@@ -1737,6 +1792,7 @@ async def _create_text_response_with_timeout(
         # This twin has never sent cache params — not even 5.5's retention. Keeping the gap
         # is what makes the legacy request byte-identical; the channel layout fixes it.
         legacy_cache_params=False,
+        service_tier_eligible=service_tier_eligible,
     )
 
     self.log_debug(f"Creating text response with custom timeout {timeout_seconds}s, model {model}")
@@ -1761,6 +1817,7 @@ async def _create_text_response_with_timeout(
         # one would change what the caller budgets against. `_capture_usage(None, …)` writes
         # nothing anywhere; it just hands back the numbers.
         usage_captured = _capture_usage(None, response)
+        _log_service_tier_echo(self, request_params, response)
         _close_attempt(attempt_sink, attempts, status="ok", usage=usage_captured)
 
         output_text = _join_output_text(response)
@@ -1802,7 +1859,8 @@ async def _create_text_response_with_tools_with_timeout(
     mcp_results_sink: Optional[List[Dict[str, Any]]] = None,
     artifacts_sink: Optional[List[Dict[str, Any]]] = None,
     container_gone_sink: Optional[List[str]] = None,
-    layout: str = "legacy"
+    layout: str = "legacy",
+    service_tier_eligible: bool = False,
 ) -> str:
     """
     Create text response with tools and custom timeout (for retry scenarios)
@@ -1844,6 +1902,7 @@ async def _create_text_response_with_tools_with_timeout(
         prompt_cache_options=prompt_cache_options,
         layout=layout,
         legacy_kind="tools",
+        service_tier_eligible=service_tier_eligible,
     )
 
     self.log_debug(f"Creating text response with tools and custom timeout {timeout_seconds}s, model {model}, tools: {tools}")
@@ -1860,12 +1919,14 @@ async def _create_text_response_with_tools_with_timeout(
             self, request_params, operation_type,
             container_gone_sink=container_gone_sink,
             attempt_sink=attempt_sink, attempts=attempts,
+            artifacts_sink=artifacts_sink,
             timeout_seconds=timeout_seconds,
         )
 
         # Usage-driven context budgeting must not degrade on the retry path — parity with the
         # non-timeout twin. Without this, a retried turn silently falls back to chars/4.
         usage_captured = _capture_usage(usage_sink, response)
+        _log_service_tier_echo(self, request_params, response)
         _close_attempt(attempt_sink, attempts, status="ok", usage=usage_captured)
 
         # Text first (seams and all — see _join_output_text); the loop below is tool bookkeeping.

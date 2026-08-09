@@ -12,9 +12,10 @@ The properties worth defending, in rough order of how much they'd hurt to get wr
    get a turn that posts nothing: generate_image DETACHES (posts itself later),
    create_image_asset BLOCKS and posts NOTHING (the bytes go into the sandbox), edit_image
    BLOCKS and posts.
-4. **create_image_asset is only offered when there is an addressable container.** Under
-   `{"type": "auto"}` the container id is unknown until after the call, so bytes pushed
-   anywhere would be invisible to the model — offering the tool guarantees a failed call.
+4. **create_image_asset does not wait for an addressable container, it asks for one.** W3 starts
+   every turn on `{"type": "auto"}`, so gating the tool on a known id would have retired it from
+   ordinary conversation; the executor calls `ToolContext.ensure_sandbox`, and the bytes go into
+   a container the tool loop then names in the next round's declaration.
 5. **No executor may raise into the tool loop.** A moderation block is a result, not an
    exception.
 """
@@ -273,14 +274,13 @@ def test_generate_image_is_always_offered():
     assert "generate_image" in _registry_names(_cfg())
 
 
-def test_create_image_asset_needs_an_addressable_container():
-    # No sandbox at all → hidden.
-    assert "create_image_asset" not in _registry_names(_cfg())
-    # An EPHEMERAL sandbox ({"type": "auto"}) → still hidden: its id is unknown until after
-    # the call, so bytes pushed into it would be invisible to the code the model runs.
-    assert "create_image_asset" not in _registry_names(
+def test_create_image_asset_does_not_need_an_addressable_container():
+    # W3 inverted this gate. Every turn starts on {"type": "auto"} now, so requiring an id here
+    # would have retired the tool from ordinary conversation; the executor calls
+    # ToolContext.ensure_sandbox and gets a container made for it.
+    assert "create_image_asset" in _registry_names(_cfg())
+    assert "create_image_asset" in _registry_names(
         _cfg(**{it.CI_CONTAINER_KEY: AUTO_CONTAINER}))
-    # A real persistent container → offered.
     assert "create_image_asset" in _registry_names(_cfg(**{it.CI_CONTAINER_KEY: "cntr_abc123"}))
 
 
@@ -288,6 +288,34 @@ def test_create_image_asset_hidden_when_code_interpreter_is_off(monkeypatch):
     monkeypatch.setattr(config, "enable_code_interpreter", False)
     assert "create_image_asset" not in _registry_names(
         _cfg(**{it.CI_CONTAINER_KEY: "cntr_abc123"}))
+
+
+def test_create_image_asset_reads_the_threads_own_sandbox_switch(monkeypatch):
+    """W3 made this switch load-bearing. The tool used to need an addressable container id,
+    which a thread with code interpreter OFF could never have; now the executor MINTS one, so
+    reading only the global would bind a container for a request that declares no sandbox to
+    open it with. Resolved per-thread, the way the tools array resolves it."""
+    monkeypatch.setattr(config, "enable_code_interpreter", True)
+    assert "create_image_asset" not in _registry_names(
+        _cfg(**{"enable_code_interpreter": False}))
+
+    # …and the override works the other way too.
+    monkeypatch.setattr(config, "enable_code_interpreter", False)
+    assert "create_image_asset" in _registry_names(
+        _cfg(**{"enable_code_interpreter": True}))
+
+
+def test_the_channel_surface_gates_on_the_same_switch(monkeypatch):
+    """Both surfaces, one predicate — a per-thread sandbox setting is an approved fork (the
+    hosted-tool digest already names it), but the two must never disagree about it."""
+    monkeypatch.setattr(config, "enable_code_interpreter", True)
+    registry = ToolRegistry()
+    it.register_image_tools(registry)
+    off = {s["name"] for s in registry.schemas(_cfg(**{"enable_code_interpreter": False}),
+                                               surface="channel")}
+    on = {s["name"] for s in registry.schemas(_cfg(), surface="channel")}
+    assert "create_image_asset" not in off
+    assert "create_image_asset" in on
 
 
 def test_edit_image_appears_only_with_a_catalog():
@@ -687,6 +715,42 @@ async def test_create_asset_refuses_a_recycled_container():
     assert "generate_image" in res["message"]     # pointed at the tool that still works
     oc.generate_image.assert_not_awaited()        # nothing spent finding out
     assert ctx.sandbox_image_assets == []         # no slot reserved
+
+
+@pytest.mark.asyncio
+async def test_create_asset_on_an_auto_turn_mints_a_container():
+    """W3's bridge. The asset is an INGREDIENT for code that has not run yet, so on an `auto`
+    turn there is no id to wait for — the executor asks for one, and the tool loop names it in
+    the next round's declaration."""
+    from tool_registry import SandboxHolder
+
+    async def _fill(thread_key, holder):
+        holder.container_id = "cntr_made"     # what ContainerManager.bridge_container does
+        return "cntr_made"
+
+    oc = _openai(create_path="/mnt/data/cover.png")
+    ctx = _ctx(_FakeProcessor(openai_client=oc), container_id=None)
+    ctx.sandbox = SandboxHolder(manager=MagicMock(bridge_container=AsyncMock(side_effect=_fill)),
+                                thread_key="C1:100.0")
+
+    res = await it.execute_create_image_asset(
+        ctx, {"prompt": "a cover", "filename": "cover.png"})
+
+    assert res["ok"] is True and res["path"] == "/mnt/data/cover.png"
+    assert oc.client.containers.files.create.await_args.kwargs["container_id"] == "cntr_made"
+    assert ctx.sandbox.container_id == "cntr_made"    # shared, so siblings reuse it
+
+
+@pytest.mark.asyncio
+async def test_create_asset_refuses_when_no_sandbox_can_be_had():
+    oc = _openai()
+    ctx = _ctx(_FakeProcessor(openai_client=oc), container_id=None)   # and no holder
+
+    res = await it.execute_create_image_asset(
+        ctx, {"prompt": "a cover", "filename": "cover.png"})
+
+    assert res["ok"] is False and res["error"] == "sandbox_unavailable"
+    oc.generate_image.assert_not_awaited()
 
 
 @pytest.mark.asyncio

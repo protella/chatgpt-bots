@@ -1071,7 +1071,8 @@ def turn_outcome(channel_id: Optional[str], trigger_ts: Optional[str], *,
                  stream_build_present: bool = False,
                  attempt_id: Optional[str] = None,
                  reconsider: Optional[Dict[str, Any]] = None,
-                 edits: Optional[List[Dict[str, Any]]] = None) -> None:
+                 edits: Optional[List[Dict[str, Any]]] = None,
+                 destination_contract_miss: Optional[bool] = None) -> None:
     """What one channel turn ended up doing. Exactly one per `turn_start`.
 
     `destinations` is the OBSERVED set — every surface Slack accepted, whether or not it reached
@@ -1111,6 +1112,16 @@ def turn_outcome(channel_id: Optional[str], trigger_ts: Optional[str], *,
     a FRESH row carrying one is a violation the checker reports.
     `stream_build_present` says whether the room was actually rendered — a turn that failed before
     the fetch answered from nothing, and its `kind` must not be read as a judgment.
+
+    `destination_contract_miss` (W4) is the battery metric for the first-token marker: the model
+    was offered both destinations, produced words, and wrote no marker — so the answer went to
+    the default thread and this says the PROMPT missed, not the delivery. Written ONLY when
+    true, the same convention the `visible_action` copy of this field follows and for the same
+    reason: a column that is false on nearly every row costs bytes on every line to say nothing.
+    It rides HERE as well as on `finish_attempt` because the two populations do not overlap where
+    it matters — `finish_attempt` belongs to the gate population, and the ungated channel turns
+    that make up most of the selectable ones never emit one, so a miss rate read from the
+    terminal alone would be blind to exactly the turns the marker was built for.
     """
     _soft_check(kind, KINDS, "turn_outcome kind")
     record("turn_outcome", channel_id=channel_id, trigger_ts=trigger_ts, turn_id=turn_id,
@@ -1118,7 +1129,8 @@ def turn_outcome(channel_id: Optional[str], trigger_ts: Optional[str], *,
            destinations=list(destinations or []),
            chars=chars, detached_started=bool(detached_started), error=error, H=H,
            stream_build_present=bool(stream_build_present), reconsider=reconsider,
-           edits=list(edits or []))
+           edits=list(edits or []),
+           destination_contract_miss=True if destination_contract_miss else None)
 
 
 def emit_turn_outcome(turn: Any, *, channel_id: Optional[str], trigger_ts: Optional[str],
@@ -1162,7 +1174,11 @@ def emit_turn_outcome(turn: Any, *, channel_id: Optional[str], trigger_ts: Optio
             chars=sum(sizes) if sizes else None, detached_started=detached_started,
             error=getattr(turn, "turn_error", None), H=getattr(turn, "H", None),
             stream_build_present=bool(getattr(turn, "stream_build_present", False)),
-            attempt_id=attempt_id, reconsider=reconsider, edits=edits)
+            attempt_id=attempt_id, reconsider=reconsider, edits=edits,
+            # W4. Read off the runtime like everything else here, so the row cannot disagree
+            # with the turn that settled it.
+            destination_contract_miss=bool(
+                getattr(turn, "destination_contract_miss", False)))
         return True
     except Exception as e:  # noqa: BLE001 — a lost line is never worth a lost turn
         logger.debug(f"Participation turn outcome not written: {e}")
