@@ -225,7 +225,7 @@ async def test_no_reaction_counts_as_a_successful_removal(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_claim_work_is_idempotent_across_many_tools(monkeypatch):
-    """A turn that searches the web, runs code AND calls MCP places exactly one 👀."""
+    """A turn that runs code, searches files AND calls MCP places exactly one 👀."""
     monkeypatch.setattr(config, "enable_reactions", True)
     monkeypatch.setattr(config, "enable_ack_reaction", True, raising=False)
     monkeypatch.setattr(config, "ack_reaction_emoji", "eyes", raising=False)
@@ -263,7 +263,6 @@ async def test_claim_work_respects_the_feature_flag(monkeypatch):
 
 def test_only_slow_hosted_tools_claim_work():
     # Real work, genuinely slow: claim.
-    assert _claims_work("web_search", "started")
     assert _claims_work("file_search", "started")
     assert _claims_work("code_interpreter", "started")
     assert _claims_work("image_generation", "started")
@@ -285,6 +284,39 @@ def test_plumbing_and_unvalidated_calls_never_claim_work():
     assert not _claims_work("local:read_document", "started")
     assert not _claims_work("local:save_memory", "started")
     assert not _claims_work("local:react_to_message", "started")
+
+
+def test_web_search_never_claims_work():
+    """Owner ruling 2026-08-09: a conversational reply that fact-checks with web search is fast,
+    and the model reaches for it often enough that the eye landed on nearly every message."""
+    assert not _claims_work("web_search", "started")
+
+
+@pytest.mark.asyncio
+async def test_a_turn_that_searches_and_runs_code_still_acks(monkeypatch):
+    """The exclusion is web_search alone: the sandbox in the same turn still stakes the claim,
+    and the turn ends with exactly one 👀."""
+    monkeypatch.setattr(config, "enable_reactions", True)
+    monkeypatch.setattr(config, "enable_ack_reaction", True, raising=False)
+    monkeypatch.setattr(config, "ack_reaction_emoji", "eyes", raising=False)
+    host = _Host()
+    turn = TurnRuntime(silence_capable=True, progress_enabled=False)
+    msg = _msg()
+
+    # The tool_callback's gate, replayed over one turn's event stream.
+    for tool_type, status in [
+        ("web_search", "started"),
+        ("web_search", "completed"),
+        ("code_interpreter", "started"),
+        ("code_interpreter", "completed"),
+    ]:
+        if _claims_work(tool_type, status):
+            await turn.claim_work(host, msg)
+        if tool_type == "web_search" and status == "started":
+            assert host.added == []          # the search alone put nothing on the message
+
+    assert len(host.added) == 1
+    assert turn.ack_lease is not None
 
 
 # --------------------------------------------------------------- settle: did we do the thing?

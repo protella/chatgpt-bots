@@ -525,6 +525,14 @@ def test_prompts_bullet_updated():
     from prompts import LOCAL_TOOLS_GUIDANCE
     assert "will NOT be posted" in LOCAL_TOOLS_GUIDANCE
     assert "write NOTHING after the call" in LOCAL_TOOLS_GUIDANCE
+    # Rejected work leaves the request open, and conceding is not a next step — so the bullet has
+    # to name one: the retry, or what specifically gets fixed.
+    assert "conceding does not close the request" in LOCAL_TOOLS_GUIDANCE
+    assert "start the corrected attempt right away, or say concretely what you will fix" in \
+        LOCAL_TOOLS_GUIDANCE
+    # ...and the general restraint principle must not license stopping at the concession.
+    from prompts import _LET_THE_EXCHANGE_END
+    assert "not for work you still owe" in _LET_THE_EXCHANGE_END
 
 
 # --------------------------------------------- streaming consumption
@@ -873,6 +881,27 @@ def test_job_instruction_hands_the_model_its_plan():
     assert "{todos}" in rt._RESEARCH_JOB_INSTRUCTION       # the plan is injected, not re-derived
     assert "{todos}" in rt._BUILD_JOB_INSTRUCTION          # ...and carried across the phase gap
     assert "REVISE it, do not restart it" in rt._BUILD_JOB_INSTRUCTION
+
+
+def test_build_instruction_edits_the_prior_file_and_invents_nothing():
+    """Two ways a build phase destroys work that was already correct: rebuilding a file it was
+    asked to CORRECT (losing everything right about the old one), and filling gaps with plausible
+    claims it has no source for — it cannot search from in here."""
+    assert "Revising or correcting a file this thread already produced" in rt._BUILD_JOB_INSTRUCTION
+    assert "mount_file it, change ONLY what was flagged" in rt._BUILD_JOB_INSTRUCTION
+    # Editing the prior file is only half of it: the untouched parts must stay untouched, and
+    # each touched one must be checked — a partial fix reads as a finished correction.
+    assert "leave everything else exactly as it was" in rt._BUILD_JOB_INSTRUCTION
+    assert "check each change against the source material" in rt._BUILD_JOB_INSTRUCTION
+    assert "NO web access here" in rt._BUILD_JOB_INSTRUCTION
+    assert "mark it unverified" in rt._BUILD_JOB_INSTRUCTION
+
+
+def test_research_instruction_requires_a_source_opened_this_run():
+    """A claim inherited from the conversation is not a finding — the report has to open a source
+    for it, or it launders a guess into a sourced-looking document."""
+    assert "a source you actually opened THIS run supports it" in rt._RESEARCH_JOB_INSTRUCTION
+    assert "verified, not repeated" in rt._RESEARCH_JOB_INSTRUCTION
 
 
 @pytest.mark.asyncio

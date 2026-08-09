@@ -109,14 +109,19 @@ def _legacy_fallback_target(overflow: Optional[str], native_current_ts: Optional
 # would flash an eye on a call that never happened. Slow local tools claim from inside their
 # own executors, once they know they are really going to do the work.
 #
+# `web_search` is EXCLUDED (owner ruling 2026-08-09). A web search inside a conversational reply
+# is fast — the whole turn lands in seconds — and the model fact-checks with it often enough that
+# the eye ended up on nearly every message in a working thread, which is noise rather than a
+# claim. The sandbox, research/background jobs and image builds are the slow work that earns it.
+#
 # KNOWN GAP, and it is structural rather than an oversight: these events only exist while
 # STREAMING. A non-streaming turn resolves its hosted tools server-side inside one response,
-# emitting nothing to react to, so a non-streaming web search claims no 👀. Local slow tools
+# emitting nothing to react to, so a non-streaming file search claims no 👀. Local slow tools
 # still claim on both paths (their executors run in both loops). Streaming is the default, and
 # the alternative — polling, or claiming optimistically before the tools run — would put the
 # eye back on a guess, which is the thing we just removed.
 _WORK_CLAIM_HOSTED_TOOLS = frozenset({
-    "web_search", "file_search", "code_interpreter", "image_generation",
+    "file_search", "code_interpreter", "image_generation",
 })
 
 # Local tools whose round emits a real pre-tool preamble ("Making that…") that must not freeze.

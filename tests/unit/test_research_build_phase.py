@@ -130,6 +130,29 @@ class TestBuildPhase:
         ci = [t for t in captured["tools"] if t.get("type") == "code_interpreter"]
         assert ci and ci[0]["container"] == "cntr_job1"
 
+    async def test_the_build_phase_really_has_no_web_access(self, monkeypatch):
+        # Its instruction tells the model it cannot search and must not write a claim its source
+        # material doesn't establish. If a web tool ever gets wired in here, that becomes a lie
+        # the model has no way to detect — and honest sourcing turns into a guess.
+        processor = _processor()
+        captured = {}
+
+        async def fake_stream(_proc, **kw):
+            captured["tools"] = kw["tools"]
+            return {"text": "", "tools_used": []}
+
+        monkeypatch.setattr(rt, "_consume_research_stream", fake_stream)
+
+        await rt._run_build_phase(
+            processor=processor, client=MagicMock(), channel_id="C1", thread_root="1.0",
+            thread_key="C1:1.0", job_id="j", task="t", findings="f",
+            deliverables=[{"type": "pdf", "description": "d", "filename": "d.pdf"}],
+            snapshot=[], thread_config={}, system_prompt=None, model="gpt-5.6-sol",
+            card=_card())
+
+        assert not any("search" in str(t.get("type", "")) or "search" in str(t.get("name", ""))
+                       for t in captured["tools"]), captured["tools"]
+
     async def test_no_addressable_container_fails_honestly(self, monkeypatch):
         # An `auto` container has no id: nothing can be mounted into it and its listing cannot
         # be read back. A build phase without those isn't degraded, it's a lie.

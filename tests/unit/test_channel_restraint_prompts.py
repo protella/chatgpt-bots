@@ -312,6 +312,17 @@ def test_the_concede_once_line_is_in_both_paragraphs():
         assert "Never work to keep the last word." in s
 
 
+def test_a_closing_addressed_to_us_is_still_acknowledged():
+    """OWNER RULING (2026-08-09): a correction aimed at us closed a bot-to-bot exchange and the
+    model answered with nothing at all — the value floor read as license to ignore. Letting the
+    exchange end may not become leaving a directed message hanging, and the floor itself is
+    unchanged: what nobody put to us still gets silence."""
+    for s in BOTH:
+        assert "when the message that closes it was put to you, it still earns" in s
+        assert "the acknowledgment a teammate would give, and a reaction is enough of one" in s
+        assert "Silence is for what nobody put to you." in s
+
+
 def test_the_two_paragraphs_cannot_say_it_differently():
     """One text, carried by both. Two copies of a principle this soft would diverge on the next
     edit and nothing would notice — the paragraphs read fine either way."""
