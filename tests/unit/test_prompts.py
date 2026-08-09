@@ -48,6 +48,13 @@ class TestPrompts:
         assert "several queued messages" in SLACK_SYSTEM_PROMPT
         assert "one coherent reply" in SLACK_SYSTEM_PROMPT
 
+    def test_slack_prompt_makes_the_reply_deliver_a_failed_file(self):
+        """Model-first failure delivery: nothing is posted ahead of the answer for a file that
+        couldn't be read, so the reply itself owes the user the news."""
+        assert "couldn't be read" in SLACK_SYSTEM_PROMPT
+        assert "which file, why in a word, and what they can do about it" in SLACK_SYSTEM_PROMPT
+        assert "never guess at what was in it" in SLACK_SYSTEM_PROMPT
+
     def test_slack_prompt_no_mrkdwn_coaching(self):
         """The converter handles markdown->mrkdwn mechanically; the prompt must not
         teach Slack mrkdwn syntax (old '*bold*' style coaching)."""

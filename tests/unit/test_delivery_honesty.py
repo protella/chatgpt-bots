@@ -481,7 +481,8 @@ def test_the_streaming_fallback_pop_is_guarded_by_the_surface():
 async def _channel_turn_with_a_prior_timeout(*, admission_fails: bool, had_timeout: bool = True,
                                             unsupported=(), open_top_level: bool = False,
                                             trigger_text: str = "what happened to the Q3 numbers",
-                                            gate_sources=(), notice_lands: bool = True):
+                                            gate_sources=(), reply=None,
+                                            reply_destination=None):
     """Drive the real process_message for a CHANNEL turn that owes prose, and report
     (the order of the steps that matter, the response, what admission saw)."""
     from unittest.mock import patch
@@ -514,10 +515,7 @@ async def _channel_turn_with_a_prior_timeout(*, admission_fails: bool, had_timeo
         seen["destination_selected"] = turn_arg.destination_selected
         seen["destination_locked"] = turn_arg.destination_locked
         seen["reply_destination"] = turn_arg.reply_destination
-        seen["failed_attachment_names"] = k.get("failed_attachment_names")
-        # base.py pins the turn context here, and the notice's delivery is recorded ON it [r4-4].
-        turn_arg.channel_turn_context = SimpleNamespace(notice_delivery={})
-        seen["ctx"] = turn_arg.channel_turn_context
+        seen["failed_attachments"] = k.get("failed_attachments")
         if admission_fails:
             raise StreamOverBudgetError("C1: more than fits in one request")
 
@@ -525,10 +523,12 @@ async def _channel_turn_with_a_prior_timeout(*, admission_fails: bool, had_timeo
         text = kwargs.get("text") or ""
         if "never finished" in text:
             order.append("notice")
-        elif "I'll process your text/image/document request now" in text:
-            order.append("failed_files")
-            # A SlackApiError swallowed by send_message comes back as None, not an exception.
-            return "posted.1" if notice_lands else None
+        # Any other prose the turn posts is recorded so a re-introduced failure card would show
+        # up here rather than passing unnoticed.
+        elif "⚠️" in text:
+            order.append(f"card:{text[:40]}")
+            # WHERE it landed, which is the thing an open top-level turn can get wrong.
+            seen["card_thread_id"] = kwargs.get("thread_id")
         return "posted.1"
 
     p.thread_manager.acquire_thread_lock = AsyncMock(return_value=True)
@@ -539,7 +539,8 @@ async def _channel_turn_with_a_prior_timeout(*, admission_fails: bool, had_timeo
     p.get_or_create_channel_thread_state = _state                # type: ignore[method-assign]
     p._build_channel_turn_stream = _stream                       # type: ignore[method-assign]
     p._admit_channel_request = _admit                            # type: ignore[method-assign]
-    p._handle_text_response = AsyncMock(return_value=Response(type="text", content="ok"))  # type: ignore[method-assign]
+    p._handle_text_response = AsyncMock(  # type: ignore[method-assign]
+        return_value=reply if reply is not None else Response(type="text", content="ok"))
     p._build_channel_info = AsyncMock(return_value="")           # type: ignore[method-assign]
     p._process_attachments = AsyncMock(return_value=([], [], list(unsupported)))  # type: ignore[method-assign]
 
@@ -559,8 +560,11 @@ async def _channel_turn_with_a_prior_timeout(*, admission_fails: bool, had_timeo
                            destination_selected=False, destination_source="default")
     else:
         turn = TurnRuntime(silence_capable=False, progress_enabled=True, reply_thread_id=ts)
+    if reply_destination is not None:
+        turn.reply_destination = reply_destination
 
     response = await p.process_message(message, client, None, turn=turn)
+    seen["turn"] = turn
     return order, response, seen
 
 
@@ -612,57 +616,91 @@ async def test_an_unowed_turn_keeps_its_destination_choice_open_through_admissio
     assert seen["destination_locked"] is False
 
 
-@pytest.mark.asyncio
-async def test_the_mixed_failed_file_notice_also_waits_for_admission():
-    """[r3-4] "I'll process your text/image/document request now" is the same kind of promise as the
-    recovery notice, and it was posted before the stream was even built."""
-    order, _, seen = await _channel_turn_with_a_prior_timeout(
-        admission_fails=False, had_timeout=False,
-        unsupported=[{"name": "budget.numbers", "reason": "unsupported"}])
-    assert order == ["stream", "admission", "failed_files"], order
-    assert seen["destination_selected"] is True and seen["destination_locked"] is True
-
+# -------------------- model-first delivery: the mixed turn's failure card is gone entirely
 
 @pytest.mark.asyncio
-async def test_a_failed_file_promise_never_stands_alone_on_an_over_budget_turn():
-    order, response, _ = await _channel_turn_with_a_prior_timeout(
-        admission_fails=True, had_timeout=False,
-        unsupported=[{"name": "budget.numbers", "reason": "unsupported"}])
-    assert "failed_files" not in order, "the promise outlived the turn that made it"
-    assert response.type == "error"
+async def test_a_mixed_channel_turn_posts_no_failure_card_at_all():
+    """The card used to arrive ahead of the answer, so one turn read as a system error report
+    followed by an unrelated reply. The reply says it now — nothing is posted before it."""
+    order, response, seen = await _channel_turn_with_a_prior_timeout(
+        admission_fails=False, had_timeout=False, open_top_level=True,
+        unsupported=[{"name": "budget.numbers", "mimetype": "application/x-thing"}])
+    assert order == ["stream", "admission"], order
+    assert response.content == "ok"
+    # Nothing is posted, so nothing forces the answer into a thread: the destination choice that
+    # the owed card used to settle stays with the model.
+    assert seen["destination_selected"] is False
+    assert seen["destination_locked"] is False
 
 
 @pytest.mark.asyncio
-async def test_the_responder_is_told_which_attachments_failed():
+async def test_the_responder_is_told_which_attachments_failed_and_why():
     """[r3-4] The channel transcript is Slack, so the failure notice was deliberately kept out of
     ThreadState — and then nothing put it anywhere else. The stream says a file was attached, so
-    silence about the failure reads to the model as "I have that file"."""
+    silence about the failure reads to the model as "I have that file". With no card posted, the
+    REASON has to travel too, or the reply cannot say anything a user can act on."""
     _, _, seen = await _channel_turn_with_a_prior_timeout(
         admission_fails=False, had_timeout=False,
-        unsupported=[{"name": "budget.numbers", "reason": "unsupported"},
-                     {"name": "scan.tif", "reason": "unsupported"}])
-    assert seen["failed_attachment_names"] == ("budget.numbers", "scan.tif")
-
-
-# ------------------------------- r4-4: the evidence may not assert a delivery that did not happen
-
-@pytest.mark.asyncio
-async def test_a_landed_failed_file_notice_is_recorded_as_delivered():
-    _, _, seen = await _channel_turn_with_a_prior_timeout(
-        admission_fails=False, had_timeout=False,
-        unsupported=[{"name": "budget.numbers", "reason": "unsupported"}])
-    assert seen["ctx"].notice_delivery == {"failed_attachments": True}
+        unsupported=[{"name": "budget.numbers", "mimetype": "application/x-thing"},
+                     {"name": "scan.tif", "error": "download_failed"}])
+    assert seen["failed_attachments"] == (
+        ("budget.numbers", "is an unsupported file type (application/x-thing)"),
+        ("scan.tif", "could not be downloaded — re-uploading it may work"))
 
 
 @pytest.mark.asyncio
-async def test_a_dropped_failed_file_notice_is_recorded_as_undelivered():
-    """[r4-4] `send_message` swallows a SlackApiError and returns None. The evidence then told the
-    responder "the user has been told they failed", so the failure went unmentioned by both of us —
-    the bot answered around a file nobody had been told about."""
-    _, _, seen = await _channel_turn_with_a_prior_timeout(
-        admission_fails=False, had_timeout=False, notice_lands=False,
-        unsupported=[{"name": "budget.numbers", "reason": "unsupported"}])
-    assert seen["ctx"].notice_delivery == {"failed_attachments": False}
+async def test_a_channel_turn_that_ends_without_words_falls_back_to_the_card():
+    """Model-first delivery assumes a reply exists to carry the news. A background job's status
+    card owns its turn — the prompt forbids a preamble and the handler discards the text — so on
+    that ending nothing would ever mention the file."""
+    order, _, _ = await _channel_turn_with_a_prior_timeout(
+        admission_fails=False, had_timeout=False,
+        unsupported=[{"name": "budget.numbers", "mimetype": "application/x-thing"}],
+        reply=Response(type="text", content="",
+                       metadata={"background_job_started": True, "posted": False}))
+    assert order[:2] == ["stream", "admission"], order
+    assert len(order) == 3 and "Unsupported File Type" in order[2], order
+
+
+@pytest.mark.asyncio
+async def test_the_fallback_card_follows_the_destination_the_turn_chose():
+    """It used to be hard-coded to `message.thread_id` and then settle the turn structurally to
+    that thread. On a turn that chose to answer in the CHANNEL, that put the card somewhere the
+    model had explicitly declined and dragged every artifact after it in there too."""
+    from message_processor.turn_runtime import DESTINATION_CHANNEL
+
+    order, _, seen = await _channel_turn_with_a_prior_timeout(
+        admission_fails=False, had_timeout=False, open_top_level=True,
+        reply_destination=DESTINATION_CHANNEL,
+        unsupported=[{"name": "budget.numbers", "mimetype": "application/x-thing"}],
+        reply=Response(type="text", content="",
+                       metadata={"background_job_started": True, "posted": False}))
+    assert len(order) == 3 and "Unsupported File Type" in order[2], order
+    assert seen["card_thread_id"] is None, "the card was forced into a thread"
+    # A top-level surface settles nothing about threading — only that a surface exists.
+    turn = seen["turn"]
+    assert turn.reply_destination == DESTINATION_CHANNEL
+    assert turn.destination_locked is True
+
+
+@pytest.mark.asyncio
+async def test_a_threaded_fallback_card_still_settles_the_turn_to_the_thread():
+    order, _, seen = await _channel_turn_with_a_prior_timeout(
+        admission_fails=False, had_timeout=False, open_top_level=True,
+        unsupported=[{"name": "budget.numbers", "mimetype": "application/x-thing"}],
+        reply=Response(type="text", content="",
+                       metadata={"background_job_started": True, "posted": False}))
+    assert len(order) == 3 and "Unsupported File Type" in order[2], order
+    assert seen["card_thread_id"] == "10.0"
+    assert seen["turn"].destination_locked is True
+
+
+@pytest.mark.asyncio
+async def test_a_channel_turn_that_answers_normally_gets_no_card():
+    order, _, _ = await _channel_turn_with_a_prior_timeout(
+        admission_fails=False, had_timeout=False,
+        unsupported=[{"name": "budget.numbers", "mimetype": "application/x-thing"}])
+    assert order == ["stream", "admission"], order
 
 
 # ------------------- r4-5: the unsupported-only shortcut is about the TURN, not just the trigger
@@ -674,22 +712,27 @@ async def test_a_failed_file_only_trigger_still_answers_the_cohort_behind_it():
     and stopped, and every sender in the accepted cohort got silence."""
     order, response, _ = await _channel_turn_with_a_prior_timeout(
         admission_fails=False, had_timeout=False, trigger_text="",
-        unsupported=[{"name": "budget.numbers", "reason": "unsupported"}],
+        unsupported=[{"name": "budget.numbers", "mimetype": "application/x-thing"}],
         gate_sources=[SimpleNamespace(ts="9.0", text="what about Q3?", sender_name="Bob",
                                       sender_id="U2", attachments=())])
-    assert order == ["stream", "admission", "failed_files"], order
+    assert order == ["stream", "admission"], order
     assert response.content == "ok", "the cohort was dropped with the trigger's failed file"
 
 
 @pytest.mark.asyncio
 async def test_a_failed_file_only_trigger_with_nothing_behind_it_still_shortcuts():
     """The counterpart: no cohort, nothing else to answer, so the notice IS the turn. Proceeding
-    here would call the model with a request whose only content is a file it cannot read."""
+    here would call the model with a request whose only content is a file it cannot read.
+
+    No model runs here, so nothing else can ever speak: the static card posts, and because it
+    posted the Response carries the fact instead of a duplicate of the text.
+    """
     order, response, _ = await _channel_turn_with_a_prior_timeout(
         admission_fails=False, had_timeout=False, trigger_text="",
-        unsupported=[{"name": "budget.numbers", "reason": "unsupported"}])
+        unsupported=[{"name": "budget.numbers", "mimetype": "application/x-thing"}])
     assert "admission" not in order, order
-    assert "budget.numbers" in response.content, response.content
+    assert any(o.startswith("card:") and "Unsupported File Type" in o for o in order), order
+    assert response.content == "" and response.metadata.get("posted") is True
 
 
 # ------------------------------------------------- a FOREIGN post is not this exchange (§2c)

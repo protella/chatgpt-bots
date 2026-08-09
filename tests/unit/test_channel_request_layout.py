@@ -469,19 +469,43 @@ class TestAFailedAttachmentIsVisibleToTheResponder:
     kept out of ThreadState — and then nothing put it anywhere the responder could see. The stream
     records that a file was attached, so silence about the failure is the one outcome that reads as
     "I have that file".
+
+    Model-first delivery raises the bar: no card is posted at all now, so this evidence is not a
+    supplement to something the user already read — it is the whole basis of the sentence they
+    will get. It has to carry WHY, and it has to say the news is the reply's job.
     """
 
     @pytest.mark.asyncio
-    async def test_the_names_are_rendered_as_explicit_failure_evidence(self):
+    async def test_the_failures_are_rendered_with_a_reason_the_model_can_use(self):
         turn = TurnRuntime()
         pin_channel_turn(turn, prepared=no_tools_prepared(),
-                         failed_attachment_names=("budget.numbers", "scan.tif"))
+                         failed_attachments=(
+                             ("budget.numbers", "is an unsupported file type "
+                                                "(application/x-iwork-numbers-sffnumbers)"),
+                             ("scan.tif", "is too large (60.0MB, max 50.0MB)")))
         request = await _assemble(_host(), turn)
         rendered = "\n".join(item_texts(request.input_items))
-        assert "FAILED to load" in rendered
+        assert "Attachments that failed to load" in rendered
         assert "budget.numbers" in rendered and "scan.tif" in rendered
-        # And it says what to do about it, because a model told only "not present" invents contents.
-        assert "do not guess" in rendered
+        # The REASONS, not just the names: a reply can only say something useful with them.
+        assert "is an unsupported file type" in rendered
+        assert "is too large (60.0MB, max 50.0MB)" in rendered
+
+    @pytest.mark.asyncio
+    async def test_the_evidence_is_facts_only_and_carries_no_instructions(self):
+        """It sits beside untrusted user content and it is DURABLE — the DM copy rides the
+        recorded user turn — so a shouted imperative here is both a thing to leak and a sentence
+        that goes stale the moment the reply does acknowledge the file. What to do about a failed
+        file is the system prompt's job."""
+        turn = TurnRuntime()
+        pin_channel_turn(turn, prepared=no_tools_prepared(),
+                         failed_attachments=(("scan.tif", "could not be downloaded"),))
+        rendered = "\n".join(item_texts((await _assemble(_host(), turn)).input_items))
+        # The one neutral statement of delivery, in no particular tense of obligation.
+        assert "Not otherwise announced to the thread" in rendered
+        for imperative in ("NOBODY HAS TOLD THE USER", "say so plainly", "do not guess",
+                           "has been told they failed", "acknowledge the failure"):
+            assert imperative not in rendered, imperative
 
     @pytest.mark.asyncio
     async def test_a_turn_whose_every_attachment_failed_still_says_so(self):
@@ -489,11 +513,28 @@ class TestAFailedAttachmentIsVisibleToTheResponder:
         broken file rendered nothing at all."""
         turn = TurnRuntime()
         pin_channel_turn(turn, prepared=no_tools_prepared(),
-                         failed_attachment_names=("scan.tif",))
+                         failed_attachments=(("scan.tif", "is too large (60.0MB, max 50.0MB)"),))
         rendered = "\n".join(item_texts((await _assemble(_host(), turn)).input_items))
         assert "scan.tif" in rendered
         # No "their contents are here" header, which would be flatly untrue here.
         assert "their contents are here" not in rendered
+
+    @pytest.mark.asyncio
+    async def test_the_failure_evidence_rides_post_breakpoint_with_the_trigger(self):
+        """It is evidence about the requester's own message, so it belongs below the cache
+        breakpoint with the rest of the trigger supplement — putting it in the channel-stable
+        prefix would both mis-file it and break the prefix for every other turn in the room."""
+        turn = TurnRuntime()
+        pin_channel_turn(turn, prepared=no_tools_prepared(),
+                         failed_attachments=(("scan.tif", "could not be downloaded"),))
+        items = to_input_items(await _assemble(_host(), turn))
+        marker = _breakpoint_index(items)
+        assert marker >= 0
+        prefix = "\n".join(item_texts(items[:marker + 1]))
+        assert "scan.tif" not in prefix
+        supplement = items[marker + 1]
+        assert supplement["role"] == "user"
+        assert "scan.tif" in supplement["content"][0]["text"]
 
     @pytest.mark.asyncio
     async def test_a_turn_with_no_failures_renders_nothing_extra(self):
@@ -503,56 +544,18 @@ class TestAFailedAttachmentIsVisibleToTheResponder:
         assert "FAILED to load" not in rendered
 
     @pytest.mark.asyncio
-    async def test_the_evidence_claims_the_notice_only_when_slack_confirmed_it(self):
-        """[r4-4] "The user has been told they failed" was asserted unconditionally, and
-        `send_message` returns None on a SlackApiError it swallowed. A responder that believes the
-        failure is already acknowledged does not acknowledge it either, so a dropped notice meant
-        nobody mentioned the file at all. The wording follows the delivery."""
-        host = _host()
-
-        posted = TurnRuntime()
-        ctx = pin_channel_turn(posted, prepared=no_tools_prepared(),
-                               failed_attachment_names=("scan.tif",))
-        ctx.notice_delivery["failed_attachments"] = True
-        rendered = "\n".join(item_texts((await _assemble(host, posted)).input_items))
-        assert "The user has been told they failed" in rendered
-
-        dropped = TurnRuntime()
-        ctx = pin_channel_turn(dropped, prepared=no_tools_prepared(),
-                               failed_attachment_names=("scan.tif",))
-        ctx.notice_delivery["failed_attachments"] = False
-        rendered = "\n".join(item_texts((await _assemble(host, dropped)).input_items))
-        assert "has been told" not in rendered
-        assert "may NOT have been notified" in rendered
-        assert "acknowledge the failure in your reply" in rendered
-
-    @pytest.mark.asyncio
-    async def test_an_unknown_delivery_renders_the_wording_admission_charged(self):
-        """The notice posts AFTER the request is measured, so at admission neither outcome is known.
-        The longer wording is what gets charged, and both real outcomes fit inside it."""
-        host = _host()
-        unknown = TurnRuntime()
-        pin_channel_turn(unknown, prepared=no_tools_prepared(),
-                         failed_attachment_names=("scan.tif",))
-        charged = await _assemble(host, unknown, with_estimate=True)
-        assert "may NOT have been notified" in "\n".join(item_texts(charged.input_items))
-
-        for landed in (True, False):
-            turn = TurnRuntime()
-            ctx = pin_channel_turn(turn, prepared=no_tools_prepared(),
-                                   failed_attachment_names=("scan.tif",))
-            ctx.notice_delivery["failed_attachments"] = landed
-            sent = await _assemble(host, turn, with_estimate=True)
-            assert sent.estimate.total_tokens <= charged.estimate.total_tokens, landed
-
-    @pytest.mark.asyncio
     async def test_the_failure_evidence_is_charged_by_admission(self):
-        """It is bytes in the request like any other evidence, so it has to be paid for."""
+        """It is bytes in the request like any other evidence, so it has to be paid for.
+
+        And there is exactly one wording now — no notice posts after the estimate — so what
+        admission measures is what gets sent, byte for byte.
+        """
         plain = TurnRuntime()
         pin_channel_turn(plain, prepared=no_tools_prepared())
         failed = TurnRuntime()
         pin_channel_turn(failed, prepared=no_tools_prepared(),
-                         failed_attachment_names=("budget.numbers",))
+                         failed_attachments=(("budget.numbers",
+                                              "is an unsupported file type (application/x-thing)"),))
         host = _host()
         bare = await _assemble(host, plain, with_estimate=True)
         with_note = await _assemble(host, failed, with_estimate=True)

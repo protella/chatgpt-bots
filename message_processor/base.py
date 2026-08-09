@@ -381,11 +381,16 @@ class MessageProcessor(ThreadManagementMixin,
             # Files that were accepted but couldn't be fetched/processed create an
             # obligation: use them or tell the user they failed — never answer as
             # if they were never attached.
-            failed_files_notice_owed = None
+            #
+            # MODEL-FIRST DELIVERY. A mixed turn no longer pre-posts a static "⚠️ Couldn't
+            # Download File" card ahead of its answer. Two messages for one turn read as a system
+            # error report followed by an unrelated reply; one message, in the bot's own voice,
+            # saying "couldn't open budget.numbers — it's a Numbers file — but here's the rest",
+            # is what a teammate would send. So the FACTS (name + why) go into this turn's model
+            # context and the reply carries the news. The static card survives only where the
+            # model never speaks: the all-failed branch below, which returns it pre-model.
+            failed_file_facts: tuple = ()
             if unsupported_files:
-                files_str = ", ".join(f"*{f['name']}*" for f in unsupported_files)
-                unsupported_msg = self._build_failed_files_notice(unsupported_files)
-
                 # Is there anything left to answer? On a DM the trigger IS the turn, so its own text
                 # and attachments settle it. On a CHANNEL turn they do not [r4-5]: a catch-up is
                 # answering earlier messages too, and their images ride the request as their own
@@ -402,53 +407,53 @@ class MessageProcessor(ThreadManagementMixin,
 
                 # If there's also text, images, or documents, continue processing those
                 if anything_else:
-                    unsupported_msg += "\n\nI'll process your text/image/document request now."
-                    # The MIXED path continues on to generate the real reply, so — unlike the
-                    # all-failed branch below, which RETURNS the notice for main.py to post — it
-                    # must deliver this notice itself. Recording it only in thread state (as it
-                    # used to) left the model believing it had acknowledged the failed files while
-                    # the user saw nothing.
+                    # NOTHING is posted here and NOTHING is written to history. The turn's model
+                    # context carries the failures instead — post-breakpoint supplement on a
+                    # channel (ChannelTurnContext.failed_attachments, passed at admission below),
+                    # this turn's own user content on a DM (folded into `enhanced_text` below).
                     #
-                    # A CHANNEL turn holds the words until the request has been admitted [r3-4],
-                    # for the same reason the prior-timeout notice does: this promises "I'll
-                    # process your request now", and a coverage, history, timestamp or budget
-                    # failure after it would leave that promise standing alone as the turn's only
-                    # visible output. A DM has no admission step, so it posts here as it always has.
-                    thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
-                    message_ts = message.metadata.get("ts") if message.metadata else None
-                    if channel_turn:
-                        failed_files_notice_owed = unsupported_msg
-                    else:
-                        await self._post_failed_files_notice(message, client, turn,
-                                                             unsupported_msg)
-                    # Add the unsupported files warning to conversation. DM/legacy only: a
-                    # channel turn's transcript is Slack, and this notice is a real message in it
-                    # — next turn's stream carries it with a finalized receipt. Writing it into
-                    # ThreadState.messages would put it in a list the channel request never sends.
-                    # The channel responder learns about the failure from the trigger supplement
-                    # instead (ChannelTurnContext.failed_attachment_names).
-                    if not channel_turn:
-                        formatted_content = self._format_user_content_with_username(f"[File(s) not processed: {files_str}]", message)
-                        self._add_message_with_token_management(thread_state, "user", formatted_content, db=self.db, thread_key=thread_key, message_ts=message_ts)
-                        self._add_message_with_token_management(thread_state, "assistant", unsupported_msg, db=self.db, thread_key=thread_key)
-                    # Continue processing if we have text or images
+                    # The rule the old code learned the hard way still holds, and now points at
+                    # the synthetic assistant message this branch used to write: history may
+                    # record what FAILED, but never an acknowledgment that was not actually
+                    # posted. Recording one left the model believing it had already told the user
+                    # while the user saw nothing. The DM's failure facts ride the USER turn, which
+                    # is a record of what happened, not a claim about what was said.
+                    #
+                    # The reply is not GUARANTEED to carry the news, though — several endings post
+                    # no words at all — so the obligation is discharged after the model runs, at
+                    # the fallback seam below.
+                    failed_file_facts = self._failed_file_reasons(unsupported_files)
                 else:
-                    # Only unsupported files were uploaded, nothing else to process
+                    # Only unsupported files were uploaded, nothing else to process. No model call
+                    # is made on this path, so there is never a reply to carry the news: the
+                    # static card IS the turn.
+                    files_str = ", ".join(f"*{f['name']}*" for f in unsupported_files)
+                    unsupported_msg = self._build_failed_files_notice(unsupported_files)
                     thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
                     message_ts = message.metadata.get("ts") if message.metadata else None
+                    # The breadcrumb records what FAILED, which is true the moment it happened.
+                    # The card's own text is NOT recorded here — that write claims the user was
+                    # told, and only a confirmed send can claim that (see the helper).
                     if not channel_turn:
                         formatted_content = self._format_user_content_with_username(f"[File(s) not processed: {files_str}]", message)
                         self._add_message_with_token_management(thread_state, "user", formatted_content, db=self.db, thread_key=thread_key, message_ts=message_ts)
-                        self._add_message_with_token_management(thread_state, "assistant", unsupported_msg, db=self.db, thread_key=thread_key)
+                    card_ts = await self._post_failed_files_card(
+                        message, client, turn, unsupported_files, thread_state,
+                        channel_turn=channel_turn)
                     elapsed = time.time() - request_start_time
                     self.log_info("")
                     self.log_info("="*100)
                     self.log_info(f"REQUEST END | Thread: {thread_key} | Status: UNSUPPORTED_FILE | Time: {elapsed:.2f}s")
                     self.log_info("="*100)
                     self.log_info("")
+                    # Landed: the words are already in the room, so the Response carries the fact
+                    # rather than the text (main.py would post a duplicate). Did NOT land: hand
+                    # main.py the text so its own send gets a shot — a user told nothing at all is
+                    # the outcome worth a second attempt.
                     return Response(
                         type="text",
-                        content=unsupported_msg
+                        content="" if card_ts else unsupported_msg,
+                        metadata={"posted": True} if card_ts else {},
                     )
             
             # Build user content
@@ -487,6 +492,16 @@ class MessageProcessor(ThreadManagementMixin,
                             "file_data": f"data:{mimetype};base64,{doc['file_data_b64']}",
                         })
 
+            # The files that failed, in the words the reply will be written from. DM/legacy only:
+            # a channel turn's copy of this note rides the post-breakpoint trigger supplement,
+            # rendered by the assembler from the same helper, and `user_content` is not what that
+            # request is built from. Nothing was posted about these files, so this note is the
+            # only thing standing between the user and an answer that talks around a file it
+            # never saw.
+            if failed_file_facts and not channel_turn:
+                from message_processor.channel_request import failed_attachments_note
+                enhanced_text += "\n" + failed_attachments_note(failed_file_facts)
+
             # T2-10: if the per-turn image cap dropped some earlier-batch images, say so — the
             # model must not answer as if it saw every image in the catch-up.
             if batched_images_omitted:
@@ -511,7 +526,7 @@ class MessageProcessor(ThreadManagementMixin,
                 # yet. The cost if the notice then fails to post is a reply in the thread rather
                 # than at top level; the cost of the other order is an estimate that measured a
                 # different request.
-                if (prior_timeout_owed or failed_files_notice_owed) and turn is not None:
+                if prior_timeout_owed and turn is not None:
                     turn.settle_structural_thread()
                 # Steps 3 + 11 pre-flight. A channel turn does not trim: the request is the
                 # pinned window, and there is nothing in it a trim could drop without answering
@@ -523,25 +538,12 @@ class MessageProcessor(ThreadManagementMixin,
                     file_inputs=file_inputs, document_inputs=document_inputs,
                     batched_image_inputs=batched_image_inputs,
                     batched_images_omitted=batched_images_omitted,
-                    failed_attachment_names=tuple(
-                        str(f.get("name") or "") for f in (unsupported_files or [])))
+                    failed_attachments=failed_file_facts)
                 # The window exists and the request fits. NOW the owed prose can be said: every
                 # fail-closed condition that would have contradicted it is behind us, so these are
-                # promises the turn is in a position to keep. Chronological order — the failure
-                # that already happened, then the work about to start.
+                # promises the turn is in a position to keep.
                 if prior_timeout_owed:
                     await self._post_prior_timeout_notice(message, client, turn, thread_key)
-                if failed_files_notice_owed:
-                    notice_ts = await self._post_failed_files_notice(
-                        message, client, turn, failed_files_notice_owed)
-                    # What the responder's evidence may CLAIM depends on this landing [r4-4]. The
-                    # request the model actually gets is assembled after this line, so it says
-                    # "the user has been told" only when Slack confirmed the notice, and otherwise
-                    # asks the reply to carry the acknowledgement itself. Admission already charged
-                    # the longer of the two wordings, so neither outcome exceeds what was paid.
-                    ctx = getattr(turn, "channel_turn_context", None)
-                    if ctx is not None:
-                        ctx.notice_delivery["failed_attachments"] = bool(notice_ts)
             else:
                 # Check if adding this message would exceed limits and trim if needed
                 # We temporarily add the message to check, then remove it
@@ -706,6 +708,24 @@ class MessageProcessor(ThreadManagementMixin,
                 user_content, thread_state, client, message, thinking_id, retry_count=0,
                 artifacts_acc=turn_artifacts, turn=turn,
                 channel_steering_text=channel_steering_text)
+
+            # THE ACKNOWLEDGMENT OF LAST RESORT — one seam, covering every ending both handlers
+            # have. Model-first delivery leans on the reply to carry the news about a file that
+            # would not load, and several endings post no reply at all: a background job whose
+            # status card owns the turn (the prompt forbids a preamble and both handlers discard
+            # the model's text), an honored no_reply, a reaction-only answer, artifacts-only,
+            # words that went to another thread. On any of those the failure would vanish
+            # silently — the exact bug model-first delivery was supposed to fix, wearing a
+            # different hat. So: by the end of the turn either visible reply text existed (and
+            # the system prompt's obligation applies to it) or this card posts.
+            #
+            # Deliberately NOT conditioned on whether the reply mentioned the file. Parsing the
+            # model's prose for an acknowledgment is a guess, and a wrong guess either
+            # double-tells the user or tells them nothing.
+            if failed_file_facts and not self._response_posted_text(response):
+                await self._post_failed_files_card(
+                    message, client, turn, unsupported_files, thread_state,
+                    channel_turn=channel_turn)
 
             # DEBUG: log conversation history after processing (with truncated content).
             # log_debug, not print — conversation content must not leak to stdout
@@ -1197,7 +1217,7 @@ class MessageProcessor(ThreadManagementMixin,
                                      image_inputs: list, file_inputs: list,
                                      document_inputs: list, batched_image_inputs: list,
                                      batched_images_omitted: int,
-                                     failed_attachment_names: tuple = ()) -> None:
+                                     failed_attachments: tuple = ()) -> None:
         """Step 11's pre-flight: pin the turn's context, ADMIT the request, then summarize.
 
         The ordering is the whole point [r3-4]. The estimate is the last thing that happens before
@@ -1244,7 +1264,8 @@ class MessageProcessor(ThreadManagementMixin,
             trigger_attachment_names=tuple(
                 str(a.get("name") or a.get("filename") or "")
                 for a in (message.attachments or []) if a),
-            failed_attachment_names=tuple(n for n in (failed_attachment_names or ()) if n),
+            failed_attachments=tuple((str(name), str(reason))
+                                     for name, reason in (failed_attachments or ()) if name),
             image_parts=tuple(image_inputs or ()),
             file_parts=tuple(file_inputs or ()),
             document_inputs=tuple(document_inputs or ()),
@@ -1296,42 +1317,105 @@ class MessageProcessor(ThreadManagementMixin,
             await self.finalize_deferred_documents(
                 list(carried_documents), client, message, thinking_id, turn=turn)
 
-    async def _post_failed_files_notice(self, message: Message, client: BaseClient, turn,
-                                        text: str) -> Optional[str]:
-        """"These files failed; I'll do the rest now" — the mixed-attachment notice.
+    @staticmethod
+    def _response_posted_text(response: Optional[Response]) -> bool:
+        """Did this turn put visible WORDS in the room?
 
-        GUARDED like any first surface: it promises work that takes time, and a newer message
-        during that window must not leave the promise standing on its own.
+        The same derivation main.py uses to decide whether a turn counts as a reply, INCLUDING
+        its `interrupted` exception, and for main.py's own stated reason: a cut-off streaming
+        attempt that could not be deleted overwrites its partial with "I got cut off partway
+        through that answer" and returns `posted: True` with empty content — `posted` is True
+        only because a Slack surface exists to carry the notice, not because an answer reached
+        anyone. Reading that as words would suppress the fallback card deterministically, on the
+        one ending where the user has been told the least.
 
-        Returns the notice's ts, or None if it did not land — which the channel caller feeds to the
-        responder's evidence, since what that evidence may claim depends on it [r4-4].
+        Everything else stays conservative-false (image and audio Responses, errors): a spurious
+        card is a small cost, and a swallowed failure is the bug this whole seam exists to stop.
         """
+        if response is None or response.type != "text":
+            return False
+        meta = response.metadata or {}
+        if meta.get("interrupted"):
+            return False
+        posted = meta.get("posted")
+        if posted is None:
+            posted = bool(meta.get("streamed") or (response.content or "").strip())
+        return bool(posted)
+
+    async def _post_failed_files_card(self, message: Message, client: BaseClient, turn,
+                                      unsupported_files: list, thread_state, *,
+                                      channel_turn: bool) -> Optional[str]:
+        """The static failed-files card, posted as the FALLBACK the model could not carry.
+
+        Two callers, one obligation: the all-failed turn (no model call is ever made, so there is
+        nothing else that could speak) and the post-model seam (the turn ended without words).
+
+        DESTINATION is resolved the way main.py resolves a real reply's — `resolve_reply_target`,
+        which returns None for a turn that chose to answer at channel top level. Hard-coding
+        `message.thread_id` put the card in the thread of a turn that had chosen the channel, and
+        then settled the turn structurally to that thread, dragging every artifact after it into
+        a place the model had explicitly declined.
+
+        Recording follows DELIVERY, never precedes it — the prior-timeout notice's rule. The
+        assistant-side write claims "the user has been told", so only a ts back from Slack earns
+        it; a swallowed SlackApiError returns None and writes nothing. DM/legacy only, as ever:
+        a channel turn's transcript is Slack, which already has this message.
+
+        Returns the ts, or None if nothing landed.
+        """
+        text = self._build_failed_files_notice(unsupported_files)
+        reply_target = (turn.resolve_reply_target(message) if turn is not None
+                        else message.thread_id)
         try:
             notice_ts = await cast(Any, client).send_message(
                 channel_id=message.channel_id,
                 text=text,
-                thread_id=message.thread_id,
+                thread_id=reply_target,
                 lease=getattr(turn, "send_lease", None),
                 surface="failed_files_notice",
                 receipts=getattr(turn, "receipt_ledger", None),
                 receipt_class="system_notice",
             )
-            # A notice that LANDED is a visible surface, so the answer belongs with it. Only on a
-            # confirmed send: send_message swallows SlackApiError and returns None. A channel turn
-            # has already settled this before its request was measured [r3-3], and settling is
-            # idempotent, so this is the DM/legacy rule surviving unchanged.
-            if notice_ts and turn is not None:
-                turn.settle_structural_thread()
-            return notice_ts
-        except StaleSendSuppressed:
-            # Not a notice failure: the guard declined to post it. Swallowed here the turn carries
-            # on, and if the responder then ends silently the suppression is never recorded
-            # anywhere — the one outcome that leaves us unable to tell a working guard from a
-            # broken one.
-            raise
-        except Exception as notice_err:  # noqa: BLE001 — never fail the turn over the notice
-            self.log_warning(f"Failed to post mixed-path failed-files notice: {notice_err}")
+        except StaleSendSuppressed as suppressed:
+            # The guard declined it because the conversation moved on. CONSUMED here rather than
+            # re-raised: this runs at the END of a turn that may already have answered, and
+            # turning a finished turn into a suppression at process_message's boundary would
+            # discard that answer over a notice. Consumed means ACCOUNTED (§5 single-owner rule) —
+            # the row is emitted here and the exception marked, so nothing counts it twice and no
+            # suppression goes unrecorded, which is the one outcome that leaves a working guard
+            # indistinguishable from a broken one.
+            suppressed.telemetry_recorded = True
+            participation_telemetry.stale_send(
+                message.channel_id, (message.metadata or {}).get("ts"),
+                turn_id=getattr(turn, "turn_id", None),
+                last_seen_ts=suppressed.last_seen_ts,
+                observed_latest_ts=suppressed.observed_latest_ts,
+                scope=suppressed.scope[0] if suppressed.scope else None,
+                surface=suppressed.surface)
+            self.log_warning("Failed-files card suppressed by the stale-send guard; nobody was "
+                             "told the attachments failed")
             return None
+        except Exception as notice_err:  # noqa: BLE001 — never fail the turn over the notice
+            self.log_warning(f"Failed to post the failed-files card: {notice_err}")
+            return None
+        if not notice_ts:
+            self.log_warning("Failed-files card did not post; nobody was told the attachments "
+                             "failed")
+            return None
+        # A notice that LANDED is a visible surface, so the answer belongs with it — but only
+        # when "with it" means the thread. A card posted at channel top level settles nothing
+        # about threading; all that is true there is that a surface now exists, which is what
+        # `lock_destination` says and all main.py claims when it posts a top-level reply.
+        if turn is not None:
+            if reply_target is not None:
+                turn.settle_structural_thread()
+            else:
+                turn.lock_destination()
+        if not channel_turn:
+            self._add_message_with_token_management(
+                thread_state, "assistant", text, db=self.db,
+                thread_key=f"{thread_state.channel_id}:{thread_state.thread_ts}")
+        return notice_ts
 
     async def _post_prior_timeout_notice(self, message: Message, client: BaseClient, turn,
                                          thread_key: str) -> None:
@@ -1385,8 +1469,47 @@ class MessageProcessor(ThreadManagementMixin,
             self.log_error(f"Failed to post drain-failure notice for {thread_key}: {notify_error}")
 
     @staticmethod
+    def _failed_file_reasons(unsupported_files: list) -> tuple:
+        """The same four failures `_build_failed_files_notice` distinguishes, as (name, reason)
+        pairs for the MODEL rather than a card for the user.
+
+        Reasons are verb phrases so a renderer can write "{name} {reason}" and get a sentence.
+        Substance is the whole point: the reply is now the only place the user hears about these
+        files, and "budget.numbers failed" cannot be turned into a useful sentence while
+        "budget.numbers is too large (60.0MB, max 50.0MB)" can. Kept beside the card builder so
+        the two never drift into telling different stories about the same file.
+        """
+        from image_validation import rejection_text
+
+        def _mb(n: Any) -> str:
+            return f"{n / (1024 * 1024):.1f}MB" if isinstance(n, (int, float)) else "?"
+
+        pairs = []
+        for f in unsupported_files or []:
+            name = str(f.get("name") or "")
+            if not name:
+                continue
+            if f.get("too_large"):
+                reason = (f"is too large ({_mb(f.get('size_bytes'))}, "
+                          f"max {_mb(f.get('limit_bytes'))})")
+            elif f.get("error") == "download_failed":
+                reason = "could not be downloaded — re-uploading it may work"
+            elif f.get("reason"):
+                # An image we FETCHED and then turned away (F50) says exactly what was wrong;
+                # the generic explainer would print "GIF is supported" under a rejected GIF.
+                reason = rejection_text(f.get("reason"))
+            else:
+                reason = f"is an unsupported file type ({f.get('mimetype') or 'unknown type'})"
+            pairs.append((name, reason))
+        return tuple(pairs)
+
+    @staticmethod
     def _build_failed_files_notice(unsupported_files: list) -> str:
-        """User notice for files that were accepted but not processed.
+        """The static failure card, now a FALLBACK rather than the default.
+
+        A mixed turn's failures go to the model instead (`_failed_file_reasons`) and come back as
+        one reply in the bot's own voice. This text posts only where no reply carries the news:
+        an all-failed turn (no model call at all) or a turn that ended without words.
 
         Four different failures, four different things worth saying. Oversized documents
         (fix-a1's `too_large` flag) get an honest size-vs-limit line — routing them through the
