@@ -456,10 +456,38 @@ class AsyncThreadStateManager(LoggerMixin):
 
     def attach_generation_task(self, thread_key: str, generation_id: str, task: asyncio.Task):
         """Store the scheduled task handle (minted after the id, needed for shutdown).
-        ID-conditional so a stale job can't overwrite a newer registration."""
+        ID-conditional so a stale job can't overwrite a newer registration.
+
+        Also attaches the same belt-and-braces done-callback the research registry carries.
+        A generation's cleanup all lives in its coroutine's except/finally — which never runs
+        if the task is cancelled BEFORE its body starts. Now that a user can cancel one on
+        demand that stopped being a shutdown-only curiosity: the entry would claim a
+        generation is running here forever, and its upload token would never drain, leaving
+        every later turn waiting on an upload that will never land."""
         entry = self._active_generations.get(thread_key, {}).get(generation_id)
-        if entry is not None:
-            entry["task"] = task
+        if entry is None:
+            return
+        entry["task"] = task
+        if hasattr(task, "add_done_callback"):
+            # cast: the lambda's default-arg capture makes it a 3-parameter callable to the
+            # checker, which cannot be matched against the 1-argument callback signature.
+            task.add_done_callback(cast(
+                Callable[["asyncio.Task[Any]"], object],
+                lambda _t, k=thread_key, g=generation_id: self._clear_generation(k, g)))
+
+    def _clear_generation(self, thread_key: str, generation_id: str) -> None:
+        """Registry entry + upload token, both sync and both idempotent — the coroutine's own
+        `finally` normally does this and the double call is free.
+
+        The progress surface (checklist) is deliberately NOT chased here: clearing it is an
+        await, and a done-callback cannot await. A generation cancelled before its first tick
+        posted no surface anyway; one cancelled later runs its own `except CancelledError`,
+        which aborts the checklist properly."""
+        self.finish_generation(thread_key, generation_id)
+        try:
+            self.mark_upload_finished(thread_key, generation_id)
+        except Exception as e:  # noqa: BLE001 — a cleanup callback never raises into the loop
+            self.log_debug(f"Upload token clear failed for {generation_id}: {e}")
 
     def finish_generation(self, thread_key: str, generation_id: str) -> bool:
         """Clear ONE in-flight generation by id. A stale/superseded job clears only its
@@ -583,6 +611,110 @@ class AsyncThreadStateManager(LoggerMixin):
     def research_in_flight_count(self, thread_key: str) -> int:
         """How many research jobs are currently in flight for this thread (for the cap)."""
         return len(self._active_research.get(thread_key) or {})
+
+    def cancellable_in_flight(self, thread_key: str) -> List[Dict[str, Any]]:
+        """Everything in this thread the cancel tool can reach — background jobs first, then
+        detached image generations — as id + gist + kind, nothing else. The model is choosing
+        WHICH piece of work to stop, so mode, filenames and timings are noise here; `kind` is
+        not, because it is how the model says what it stopped."""
+        out: List[Dict[str, Any]] = [
+            {"job_id": j.get("job_id"), "task_summary": j.get("task_summary"),
+             "kind": "job"}
+            for j in self.research_jobs_in_flight(thread_key)]
+        out.extend({"job_id": g.get("generation_id"),
+                    "task_summary": g.get("prompt_summary"),
+                    "kind": "image_generation"}
+                   for g in self.generations_in_flight(thread_key))
+        return out
+
+    def request_background_cancel(self, thread_key: str, job_id: Optional[str],
+                                  reason: str) -> Dict[str, Any]:
+        """Ask ONE piece of this thread's background work to stop — a research/build job or a
+        detached image generation. Returns the tool result the model reads.
+
+        Entirely synchronous, and that is load-bearing twice over. A round's tool calls are
+        dispatched under `asyncio.gather`, so any await between "read the entry" and "cancel
+        the task" lets a sibling call interleave and cancel the same work twice. And
+        FIRST-CANCEL-WINS: an entry already marked as cancelling is refused rather than
+        overwritten, so a job's card finalizes with the reason the first caller gave.
+
+        The task itself is never awaited — each side's own CancelledError handler does its
+        cleanup (the job finalizes its card, the generation clears its progress surface)."""
+        research = self._active_research.get(thread_key) or {}
+        generations = {g["generation_id"]: g for g in self.generations_in_flight(thread_key)}
+        if not research and not generations:
+            return {"ok": False, "error": "no_job_running"}
+        if job_id is None:
+            # An omitted id is only unambiguous across BOTH registries: with a deck building
+            # and an image rendering, "stop it" names neither.
+            if len(research) + len(generations) > 1:
+                return {"ok": False, "error": "job_id_required",
+                        "in_flight": self.cancellable_in_flight(thread_key)}
+            job_id = next(iter(research or generations))
+        entry = research.get(job_id)
+        if entry is not None:
+            return self._cancel_research_entry(entry, reason)
+        entry = generations.get(job_id)
+        if entry is not None:
+            return self._cancel_generation_entry(entry)
+        return {"ok": False, "error": "job_not_found",
+                "in_flight": self.cancellable_in_flight(thread_key)}
+
+    def _cancel_research_entry(self, entry: dict, reason: str) -> Dict[str, Any]:
+        """Cancel one background job. The reason is stored because the job's status card
+        renders it as its final line."""
+        if entry.get("cancel_reason"):
+            return {"ok": False, "error": "already_cancelling"}
+        if entry.get("delivery_started"):
+            return {"ok": False, "error": "delivery_in_progress",
+                    "hint": "the job is already posting its results; too late to cancel"}
+        task = entry.get("task")
+        if task is None or task.done():
+            return {"ok": False, "error": "job_already_finished"}
+        entry["cancel_reason"] = reason
+        if not task.cancel():
+            # Past cancelling after all — clear the reason so a retry isn't answered
+            # `already_cancelling` by a cancel that never landed.
+            entry.pop("cancel_reason", None)
+            return {"ok": False, "error": "job_already_finished"}
+        return {"ok": True, "kind": "job", "job_id": entry.get("job_id"),
+                "task_summary": entry.get("task_summary")}
+
+    def _cancel_generation_entry(self, entry: dict) -> Dict[str, Any]:
+        """Cancel one detached image generation.
+
+        No reason is stored and there is no delivery guard, both ruled: a generation has no
+        status card to write a reason onto — its progress surface is REMOVED by the
+        coroutine's abort path — and its upload window is seconds, short enough that the
+        handler cleaning up honestly whichever side wins is the better trade than a guard."""
+        if entry.get("cancel_requested"):
+            return {"ok": False, "error": "already_cancelling"}
+        task = entry.get("task")
+        if task is None or task.done():
+            return {"ok": False, "error": "job_already_finished"}
+        entry["cancel_requested"] = True
+        if not task.cancel():
+            entry.pop("cancel_requested", None)
+            return {"ok": False, "error": "job_already_finished"}
+        return {"ok": True, "kind": "image_generation",
+                "job_id": entry.get("generation_id"),
+                "task_summary": entry.get("prompt_summary")}
+
+    def mark_research_delivery_started(self, thread_key: str, job_id: str) -> None:
+        """The job has begun posting its terminal output; cancelling is no longer honest.
+
+        Sync, and called with NO await between it and the first post — otherwise a cancel
+        landing in that gap would finalize the card as cancelled over a thread that is about
+        to receive the findings anyway."""
+        entry = (self._active_research.get(thread_key) or {}).get(job_id)
+        if entry is not None:
+            entry["delivery_started"] = True
+
+    def research_cancel_reason(self, thread_key: str, job_id: str) -> Optional[str]:
+        """Why this job was cancelled, for the card's terminal line. None on the shutdown path
+        (nobody asked; `cancel_research_jobs` sets no reason)."""
+        entry = (self._active_research.get(thread_key) or {}).get(job_id)
+        return (entry or {}).get("cancel_reason")
 
     async def cancel_research_jobs(self, timeout: float = 5.0):
         """Cancel and await all registered research tasks (shutdown). Bounded so a wedged

@@ -18,6 +18,7 @@ from pdf2image import convert_from_bytes
 from docx import Document
 from pptx import Presentation
 import pandas as pd
+from canvas_content import CANVAS_MARKER, CANVAS_MIMETYPE, html_to_markdown
 from config import config
 from logger import LoggerMixin
 
@@ -176,6 +177,8 @@ SUPPORTED_DOCUMENT_MIMETYPES = {
     "text/html",  # .html
     # Log files
     "text/x-log",  # .log
+    # Slack canvases — a canvas is a file, and its body is HTML that IS the content
+    CANVAS_MIMETYPE,
 }
 # MIME type routing handlers — declared-mimetype fallback for extensionless files.
 # (Dispatch is extension-first; see safe_extract_content.)
@@ -202,6 +205,7 @@ MIME_TYPE_HANDLERS = {
     'application/xml': 'parse_text',
     'text/html': 'parse_text',
     'text/x-log': 'parse_text',
+    CANVAS_MIMETYPE: 'parse_canvas',
 }
 class DocumentHandler(LoggerMixin):
     """Handles document parsing and content extraction with error recovery"""
@@ -330,7 +334,16 @@ class DocumentHandler(LoggerMixin):
             # route to parse_notebook — NOT dump raw JSON (a context bomb) at the model.
             # The central EXTENSION_HANDLERS map is the same one admission uses, so an
             # admitted extension can never resolve to a different handler here.
-            handler_name = self._handler_for_filename(filename)
+            #
+            # A canvas is the ONE exception to extension-first: it keeps whatever name its
+            # author typed, so `notes.md` is an ordinary canvas name and would route to
+            # parse_text — dumping raw canvas HTML at the model. The mimetype is the only
+            # honest signal, so it wins here.
+            handler_name: Optional[str] = None
+            if mime_type == CANVAS_MIMETYPE:
+                handler_name = 'parse_canvas'
+            else:
+                handler_name = self._handler_for_filename(filename)
             if handler_name is None:
                 handler_name = MIME_TYPE_HANDLERS.get(mime_type, 'parse_text')
             # Zip-bomb guard for office-XML formats (they are ZIP archives)
@@ -364,6 +377,18 @@ class DocumentHandler(LoggerMixin):
             return result
         except Exception as e:
             self.log_error(f"Failed to parse {filename}: {e}", exc_info=True)
+            # A canvas never falls back. force_text_extraction would hand back the sign-in
+            # page as truthy "partial" content, and every caller reads truthy content as
+            # success — the failure has to stay a failure.
+            if mime_type == CANVAS_MIMETYPE:
+                return {
+                    'content': '',
+                    'filename': filename,
+                    'mime_type': mime_type,
+                    'size_bytes': len(file_data),
+                    'error': f'canvas_parse_failed: {e}',
+                    'format': 'error',
+                }
             # Fallback: try basic text extraction
             try:
                 raw_text = self.force_text_extraction(file_data, mime_type, filename)
@@ -1011,6 +1036,40 @@ class DocumentHandler(LoggerMixin):
             'encoding': 'utf-8_with_errors',
             'lines': len(text.splitlines()),
             'warning': 'Some characters may not have been decoded correctly'
+        }
+    def parse_canvas(self, file_data: bytes, filename: str) -> Dict[str, Any]:
+        """Read a Slack canvas: its downloaded body is HTML, and that HTML IS the content.
+
+        The bytes only reach here when the download opted out of the login-page guard
+        (``allow_html=True``), so this parser owns the check the guard would have made: a body
+        with no ``CANVAS_MARKER`` is Slack's sign-in page, not a canvas.
+
+        Never raises. A raise would land in ``safe_extract_content``'s fallback, and
+        ``force_text_extraction`` would return the sign-in page as truthy "partial" content —
+        which ``read_document`` and the arrival path both read as success. An empty-content
+        error result is the only thing that reads as the failure it is.
+        """
+        text = file_data.decode('utf-8', errors='replace')
+        if CANVAS_MARKER not in text:
+            return {
+                'content': '',
+                'error': 'canvas_unavailable: Slack returned a sign-in page instead of the canvas',
+                'format': 'error',
+            }
+        try:
+            markdown = html_to_markdown(text)
+        except Exception as e:
+            self.log_error(f"Canvas HTML conversion failed for {filename}: {e}")
+            return {
+                'content': '',
+                'error': f'canvas_conversion_failed: {e}',
+                'format': 'error',
+            }
+        return {
+            'content': markdown,
+            'format': 'canvas',
+            'encoding': 'utf-8',
+            'lines': len(markdown.splitlines()),
         }
     def parse_rtf(self, file_data: bytes, filename: str) -> Dict[str, Any]:
         """Extract prose from an RTF document, stripping control words.

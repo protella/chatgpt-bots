@@ -31,6 +31,7 @@ Errors/timeouts finalize the card and post an honest one-line failure note — n
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import time
 from dataclasses import dataclass
@@ -150,6 +151,9 @@ _FREE_JOB_TOOLS = "update_todos"
 _TODO_TEXT_CHARS = 80
 _TODO_STATUSES = ("pending", "in_progress", "done")
 _TODO_GLYPH = {"pending": "◦", "done": "✓"}          # in_progress uses the live loader emoji
+# What an in_progress item renders as once the card is TERMINAL. The loader keeps animating
+# forever in Slack, so a cancelled or failed card that kept it would show work still in flight.
+_STOPPED_GLYPH = "⏹"
 
 
 @dataclass
@@ -383,6 +387,58 @@ def get_start_background_job_schema() -> dict:
                 },
             },
             "required": ["task", "plan"],
+        },
+    }
+
+
+def get_cancel_background_job_schema() -> dict:
+    """Function-tool schema for cancel_background_job — the stop button the model never had.
+
+    Live 2026-08-09: asked to stand down on a doc job, the bot agreed in words and the job ran
+    on for eight more minutes, because agreeing was the only thing it could do. The job posts
+    its own deliverable, so a verbal stand-down that leaves it running is not a stand-down.
+
+    Reaches BOTH detached registries — background jobs and in-flight image generations — since
+    the requirement is stopping unwanted work, not stopping one implementation of it."""
+    return {
+        "type": "function",
+        "name": "cancel_background_job",
+        "description": (
+            "Stop background work that is still running in this thread — a deep-research or "
+            "build job, or an image still being generated — when its output is no longer "
+            "wanted: the person who asked has said stop or changed direction, or someone else "
+            "is already delivering the same thing and you have agreed to leave it to them.\n\n"
+            "It finishes and posts on its own, minutes from now. Saying you will stand down "
+            "does NOT stop it: only this call does. So if you agree to drop the work, call "
+            "this in the same turn.\n\n"
+            "Do NOT cancel merely because the user asked a question about the work, refined "
+            "it, or went quiet — a follow-up is not a withdrawal. And a job that is already "
+            "posting its results is past the point of cancelling; the result will say so."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "job_id": {
+                    "type": "string",
+                    "description": (
+                        "Which piece of work to stop, as shown in the in-flight note for this "
+                        "thread — a job id ('[job a1b2c3d4e5f6]') or an image generation id "
+                        "('[gen a1b2c3d4e5f6]'); either kind is accepted here. Required "
+                        "whenever more than one is running; omit it only when there is "
+                        "exactly one."
+                    ),
+                },
+                "reason": {
+                    "type": "string",
+                    "description": (
+                        "Short, plain reason the work is being dropped, in the user's terms "
+                        "('the user asked me to stand down', 'a teammate is already writing "
+                        "it'). A job's status card ends on this line, so whoever reads the "
+                        "thread later can see why it stopped."
+                    ),
+                },
+            },
+            "required": ["reason"],
         },
     }
 
@@ -766,9 +822,13 @@ class _ResearchCard:
 
     # --- rendering ---
     def _todo_lines(self) -> List[str]:
-        """The todo list, one rendered line each: ◦ pending, {loader} in_progress, ✓ done."""
-        return [f"{_TODO_GLYPH.get(t.status) or self._loader_emoji} {t.text}"
-                for t in self.todos.items()]
+        """The todo list, one rendered line each: ◦ pending, {loader} in_progress, ✓ done.
+
+        Once the card is TERMINAL the in-flight item renders ⏹ instead of the loader. A failed
+        or cancelled card KEEPS that item (it says where the job stopped), and the loader is an
+        animated emoji — left on a dead card it shows work still spinning forever."""
+        live = self._loader_emoji if self._terminal is None else _STOPPED_GLYPH
+        return [f"{_TODO_GLYPH.get(t.status) or live} {t.text}" for t in self.todos.items()]
 
     def _visible_lines(self) -> List[str]:
         """The todo list, plus a tail line ONLY when the list can't speak for itself.
@@ -905,8 +965,12 @@ class _ResearchCard:
     async def finalize_failure(self, reason: str) -> None:
         await self._finalize(f"hit a wall: {_gist(reason, 80)}", "❌", failed=True)
 
-    async def finalize_cancelled(self) -> None:
-        await self._finalize("cancelled (bot shutting down)", "❌", failed=True)
+    async def finalize_cancelled(self, reason: Optional[str] = None) -> None:
+        """Terminal render for a cancelled job. A reason means somebody ASKED for the stop
+        (cancel_background_job) and the card should say what they said; without one this is
+        the shutdown path, where nobody did."""
+        line = f"cancelled — {_gist(reason, 80)}" if reason else "cancelled (bot shutting down)"
+        await self._finalize(line, "❌", failed=True)
 
     # --- throttled update machinery ---
     async def _request_update(self) -> None:
@@ -1202,6 +1266,54 @@ async def execute_start_background_job(ctx: ToolContext, args: Dict[str, Any]) -
     return result
 
 
+async def execute_cancel_background_job(ctx: ToolContext,
+                                        args: Dict[str, Any]) -> Dict[str, Any]:
+    """Executor: resolve which piece of background work the model means and ask the thread
+    manager to stop it — a research/build job or a detached image generation.
+
+    Decides nothing itself — the resolution and the cancel are one synchronous step inside
+    `request_background_cancel`, because two sibling cancel calls in the same round would
+    otherwise race between the lookup and the `task.cancel()`. Never raises."""
+    processor = getattr(ctx, "processor", None)
+    tm = getattr(processor, "thread_manager", None) if processor is not None else None
+    channel_id = getattr(ctx, "channel_id", None)
+    if (processor is None or tm is None or not channel_id
+            or not hasattr(tm, "request_background_cancel")):
+        return {"ok": False, "error": "unavailable",
+                "message": "background jobs are not available here"}
+    thread_key = f"{channel_id}:{ctx.thread_ts or ctx.trigger_ts}"
+
+    raw_id = args.get("job_id")
+    if raw_id is None:
+        # Omitted and explicit null are the SAME intent — models routinely serialize an unset
+        # optional as null — and a blank string is no more of an id than either. All three
+        # mean "I didn't name one", which is legal only when there is exactly one candidate.
+        job_id: Optional[str] = None
+    elif isinstance(raw_id, str):
+        job_id = raw_id.strip() or None
+    else:
+        # A non-string id names nothing. Same answer as an id that doesn't exist, so the model
+        # gets the roster back and can pick from it.
+        return {"ok": False, "error": "job_not_found",
+                "in_flight": cast(List[Dict[str, Any]],
+                                  tm.cancellable_in_flight(thread_key))}
+
+    # `required` in a schema is a request, not a guarantee (see start's own plan check), and the
+    # reason becomes the card's last line — an empty one would read as a job that stopped for
+    # no reason at all.
+    raw_reason = args.get("reason")
+    reason = " ".join(raw_reason.split()) if isinstance(raw_reason, str) else ""
+    if not reason:
+        reason = "cancelled by request"
+
+    result = cast(Dict[str, Any], tm.request_background_cancel(thread_key, job_id, reason))
+    if result.get("ok"):
+        kind = result.get("kind") or "background job"
+        processor.log_info(
+            f"Cancelled {kind} {result.get('job_id')} for {thread_key}: {reason!r}")
+    return result
+
+
 def _make_update_todos(card: "_ResearchCard"):
     """The update_todos executor, shared by both phases.
 
@@ -1259,7 +1371,7 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
 
     # Its own container, and its own publication ledger to go with it (see above). The DB rows
     # still land under the real thread_key, so tomorrow's "revise that deck" can find the file.
-    ledger_key = f"{thread_key}#job:{job_id}"
+    ledger_key = _build_ledger_key(thread_key, job_id)
     manager = getattr(processor, "container_manager", None)
     # W3: `create_explicit`, never `get_or_create` — a chat turn is happy to start on `auto` and
     # adopt whatever it lands in, but a build has files to mount in and a listing to read back
@@ -1402,6 +1514,15 @@ async def _stage_build(processor, *, job_id: str, build: Dict[str, Any]) -> List
     return staged
 
 
+def _build_ledger_key(thread_key: str, job_id: str) -> str:
+    """The build phase's own publication-ledger / container-binding key.
+
+    Derived, not stored, so the JOB can name the binding without having received it back from
+    the build phase — a cancel landing inside the build or the staging never returns one, and
+    the binding still has to be released."""
+    return f"{thread_key}#job:{job_id}"
+
+
 async def _release_build_container(processor, *, ledger_key: str) -> None:
     """The job is over; drop the binding so the row doesn't outlive it. The container itself
     expires on its own idle timer. Best-effort."""
@@ -1474,11 +1595,34 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
                          thread_root=thread_root, task=task, todos=_TodoState(plan),
                          label=_research_label(processor, label_source),
                          receipts=receipts)
+    # Set the moment the build phase's container binding could exist, cleared once released.
+    # Read by the `finally`, so it must exist before the try.
+    build_ledger_key: Optional[str] = None
+
+    def _mark_delivering() -> None:
+        """Cancelling stops being honest the moment terminal output starts going out. Sync, and
+        called with NO await between it and the post that follows — a cancel landing in that gap
+        would finalize the card as cancelled over a thread that receives the findings anyway."""
+        if tm is not None and hasattr(tm, "mark_research_delivery_started"):
+            tm.mark_research_delivery_started(thread_key, job_id)
+
     try:
-        await card.start()
-    except Exception as e:  # noqa: BLE001 — a card failure must never kill the research
-        processor.log_debug(f"Research card start failed: {e}")
-    try:
+        # The card post has to survive a cancel that lands mid-flight. `_finalize` returns early
+        # while `ts` is None, so a cancel arriving after Slack accepted the post but before the
+        # ts came back would leave `finalize_cancelled` a silent no-op — a card spinning forever
+        # over a job that is gone. Shield the post; on a cancel, give it a bounded moment to hand
+        # back a real ts before re-raising into the handler that finalizes against it.
+        start_task = asyncio.ensure_future(card.start())
+        try:
+            await asyncio.shield(start_task)
+        except asyncio.CancelledError:
+            if not start_task.done():
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(asyncio.shield(start_task), timeout=10)
+            raise
+        except Exception as e:  # noqa: BLE001 — a card failure must never kill the research
+            processor.log_debug(f"Research card start failed: {e}")
+
         # Phase 1 — RESEARCH. Skipped entirely in `build` mode: the material already exists
         # (files in the thread, or what the dispatching model already knew), so a research pass
         # would burn ten minutes rediscovering it.
@@ -1492,6 +1636,7 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
                 effort=effort, verbosity=verbosity, timeout_s=timeout_s, card=card)
             if not text:
                 processor.log_warning(f"Background job {job_id} produced no findings")
+                _mark_delivering()
                 await card.finalize_failure("the research came back empty")
                 await _deliver_failure(client, channel_id, thread_root,
                                        "the research came back empty", receipts=receipts)
@@ -1502,6 +1647,12 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
         staged: List[Any] = []
         build: Optional[Dict[str, Any]] = None
         if deliverables:
+            # Claim the binding's key BEFORE the phase that creates it. A cancel landing inside
+            # the build or the staging never returns a `build` dict to read it from, and the
+            # binding would then outlive the job — stranded in the manager until it expires on
+            # its own. Now that a user can cancel on demand that is a normal ending, not a
+            # shutdown curiosity.
+            build_ledger_key = _build_ledger_key(thread_key, job_id)
             build = await _run_build_phase(
                 processor=processor, client=client, channel_id=channel_id,
                 thread_root=thread_root, thread_key=thread_key, job_id=job_id,
@@ -1510,7 +1661,8 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
                 card=card)
             if build:
                 staged = await _stage_build(processor, job_id=job_id, build=build)
-                await _release_build_container(processor, ledger_key=build["ledger_key"])
+            await _release_build_container(processor, ledger_key=build_ledger_key)
+            build_ledger_key = None
 
         # Phase 3 — the HANDOFF. The model that started this job decides what the user sees.
         elapsed = time.monotonic() - started
@@ -1522,6 +1674,7 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
             channel_id=channel_id, thread_root=thread_root,
             build_notes=(build or {}).get("notes") or "")
 
+        _mark_delivering()
         delivered = await _transact_delivery(
             processor, client, channel_id=channel_id, thread_root=thread_root,
             thread_key=thread_key, job_id=job_id, plan=delivery_plan, report=text, staged=staged,
@@ -1534,21 +1687,33 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
         return
     except asyncio.CancelledError:
         try:
-            await card.finalize_cancelled()
+            # The entry is still in the registry — it is popped in `finally` and by the task's
+            # done-callback, both of which run after this. A reason means someone asked for the
+            # stop; None is the shutdown path.
+            reason = (tm.research_cancel_reason(thread_key, job_id)
+                      if tm is not None and hasattr(tm, "research_cancel_reason") else None)
+            await card.finalize_cancelled(reason)
         except Exception:  # noqa: BLE001
             pass
         raise
     except asyncio.TimeoutError:
+        _mark_delivering()
         processor.log_warning(f"Background job {job_id} timed out after {timeout_s:.0f}s")
         await card.finalize_failure("it ran past the time limit before finishing")
         await _deliver_failure(client, channel_id, thread_root,
                                "it ran past the time limit before finishing", receipts=receipts)
     except Exception as e:  # noqa: BLE001 — a job failure must post an honest note, never crash
+        _mark_delivering()
         processor.log_error(f"Background job {job_id} failed for {thread_key}: {e}", exc_info=True)
         reason = str(e)[:200] or "an unexpected error"
         await card.finalize_failure(reason)
         await _deliver_failure(client, channel_id, thread_root, reason, receipts=receipts)
     finally:
+        # Whatever the ending — cancelled mid-build, timed out, crashed — the build phase's
+        # container binding is this job's to drop. The success path already released it and
+        # cleared the key; anything else lands here.
+        if build_ledger_key is not None:
+            await _release_build_container(processor, ledger_key=build_ledger_key)
         await outbound_receipts.settle_ledger(receipts)
         if tm is not None and hasattr(tm, "finish_research"):
             tm.finish_research(thread_key, job_id)
@@ -1903,6 +2068,7 @@ async def _deliver_failure(client, channel_id: str, thread_root: str, reason: st
 
 
 def register_research_tools(registry: ToolRegistry) -> None:
-    """Register start_background_job. Default (short) tool timeout — the executor only spawns
-    the detached task, it doesn't run the job itself."""
+    """Register start_background_job and its stop button. Default (short) tool timeout — both
+    executors only touch the registry, they don't run the job itself."""
     registry.register(get_start_background_job_schema(), execute_start_background_job)
+    registry.register(get_cancel_background_job_schema(), execute_cancel_background_job)

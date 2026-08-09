@@ -183,6 +183,17 @@ class TestPrompts:
         assert "minutes rather than seconds" in desc
         assert "frozen half-sentence" in desc
 
+    def test_guidance_tells_the_model_a_job_can_be_stopped(self):
+        """Live 2026-08-09: the bot agreed to stand down on a doc job and the job ran on for
+        eight more minutes, then delivered the doc. The tool now exists; the guidance has to
+        say that agreeing is not stopping, or the model keeps agreeing and nothing happens."""
+        from prompts import LOCAL_TOOLS_GUIDANCE
+        assert "- cancel_background_job:" in LOCAL_TOOLS_GUIDANCE
+        assert "no longer wanted" in LOCAL_TOOLS_GUIDANCE
+        assert "still drops a deliverable nobody wants" in LOCAL_TOOLS_GUIDANCE
+        # ...without turning every follow-up question into a cancel.
+        assert "a follow-up, not a withdrawal" in LOCAL_TOOLS_GUIDANCE
+
     @pytest.mark.critical
     def test_critical_prompts_structure(self):
         """Critical: the pieces production behavior depends on"""

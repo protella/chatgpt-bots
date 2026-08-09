@@ -266,12 +266,19 @@ class BaseClient(ABC, LoggerMixin):
 
     @abstractmethod
     async def download_file(self, file_url: str, file_id: Optional[str] = None,
+                            allow_html: bool = False,
                             max_bytes: Optional[int] = None) -> Optional[bytes]:
-        """Download a file/image from the platform, aborting past max_bytes when set"""
+        """Download a file/image from the platform, aborting past max_bytes when set.
+
+        `allow_html` accepts an HTML body instead of treating it as the platform's sign-in
+        page. Only a canvas (`application/vnd.slack-docs`) wants it: its content genuinely
+        IS html, and the caller then has to tell a canvas apart from a login screen itself.
+        """
         pass
 
     @abstractmethod
     async def download_file_async(self, file_url: str, file_id: Optional[str] = None,
+                                  allow_html: bool = False,
                                   max_bytes: Optional[int] = None) -> Optional[bytes]:
         """Download a file/image from the platform (async version), aborting past max_bytes when set"""
         pass

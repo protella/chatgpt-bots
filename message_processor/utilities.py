@@ -830,6 +830,9 @@ class MessageUtilitiesMixin(_Host):
                         cast(str, attachment.get("url")),
                         file_id,
                         max_bytes=doc_cap,
+                        # A canvas IS html — the downloader's login-page guard would otherwise
+                        # reject the content itself.
+                        allow_html=(mimetype == "application/vnd.slack-docs"),
                     )
 
                     if document_data:
@@ -1724,17 +1727,22 @@ class MessageUtilitiesMixin(_Host):
             entries = self.thread_manager.generations_in_flight(f"{channel_id}:{thread_ts}")
             if not entries:
                 return None
-            summaries = [self._escape_suffix_text(e.get("prompt_summary")) for e in entries]
-            if len(summaries) == 1:
-                subject, pronoun = f'An image for "{summaries[0]}" is', "it is"
+            # The id rides on every entry, same as the research note: it is what
+            # cancel_background_job takes, and with two images rendering nothing else says
+            # which one to stop. Stays ONE line — this note has always been a sentence.
+            items = [f'"{self._escape_suffix_text(e.get("prompt_summary"))}" '
+                     f'[gen {self._escape_suffix_text(e.get("generation_id") or "?")}]'
+                     for e in entries]
+            if len(items) == 1:
+                subject, pronoun = f"An image for {items[0]} is", "it is"
             else:
-                subject = (f"{len(summaries)} images ("
-                           + ", ".join(f'"{s}"' for s in summaries) + ") are")
+                subject = f"{len(items)} images (" + ", ".join(items) + ") are"
                 pronoun = "they are"
             return (
                 f"[{subject} currently being generated in this thread and will be posted "
                 f"automatically when ready. Don't claim {pronoun} done and don't start "
-                "another image unless asked.]"
+                "another image unless asked. An image that is no longer wanted can be "
+                "stopped with cancel_background_job(job_id, reason).]"
             )
         except Exception as e:
             self.log_debug(f"in-flight note build failed: {e}")
@@ -1768,9 +1776,12 @@ class MessageUtilitiesMixin(_Host):
             for j in jobs:
                 gist = self._escape_suffix_text(j.get("task_summary") or "background work")
                 mode = self._escape_suffix_text(j.get("mode") or "research")
+                # The id is what cancel_background_job takes, so it rides on every line — with
+                # two jobs running the tool cannot resolve which one without it.
+                job_id = self._escape_suffix_text(j.get("job_id") or "?")
                 files = [self._escape_suffix_text(f) for f in (j.get("deliverables") or [])]
                 tail = f" → {', '.join(files)}" if files else ""
-                lines.append(f"- {mode}: \"{gist}\"{tail}")
+                lines.append(f"- {mode} [job {job_id}]: \"{gist}\"{tail}")
             body = "\n".join(lines)
             return (
                 "[Background work already running in this thread:\n"
@@ -1778,7 +1789,8 @@ class MessageUtilitiesMixin(_Host):
                 "It posts its own status card and delivers its own files when it finishes. "
                 "Treat questions or comments about that work as follow-ups — do NOT call "
                 "start_background_job for it again. Start another job only if the user has "
-                "explicitly asked for separate, additional work.]"
+                "explicitly asked for separate, additional work. Work that is no longer "
+                "wanted can be stopped with cancel_background_job(job_id, reason).]"
             )
         except Exception as e:
             self.log_debug(f"research in-flight note build failed: {e}")

@@ -283,6 +283,12 @@ class ImageURLHandler:
                 # and a bogus "Couldn't Download File" card in the channel.
                 elif parsed.path.startswith("/archives/"):
                     continue
+                # /docs/ is a canvas, not an image. Same failure as a permalink — the download
+                # returns HTML and the channel gets a bogus "Couldn't Download File" card.
+                # Extension-matched URLs were collected above, so a real /docs/example.png
+                # still extracts.
+                elif parsed.path.startswith("/docs/"):
+                    continue
                 # Check for common image hosting patterns (including Slack)
                 elif any(host in parsed.netloc for host in ['imgur.com', 'cloudinary.com', 'cdn.discordapp.com', 'slack.com', 'slack-files.com']):
                     urls.append(url)
