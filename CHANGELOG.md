@@ -142,6 +142,14 @@ From then on the database backs itself up nightly (7-day retention) as part of t
 cleanup, which it never did before. The three `pre-v3-*` backups are **exempt from that
 retention** — they're your rollback path, so nothing deletes them but you.
 
+### 🔗 Fixed - A link to a Slack conversation is not a file
+
+A message permalink (an `/archives/…` link to a thread or message) pasted in chat was treated
+as a possible image and downloaded, producing a bogus "Couldn't Download File" card — including
+when a peer bot linked a since-deleted thread. Permalinks are now recognized as conversation
+references and skipped, and a markdown link's closing parenthesis no longer rides along on the
+captured URL.
+
 ### 🏷️ Fixed - Tagging a peer bot always renders as a real mention
 
 Some bots (Claude among them) can reply through an "agent" surface whose messages carry no

@@ -266,14 +266,23 @@ class ImageURLHandler:
         
         # Check each URL to see if it might be an image
         for url in all_urls:
+            # Markdown link syntax leaves the closing paren glued to the capture —
+            # `[thread](https://…/p123)` must not download `…/p123)`.
+            while url.endswith(")") and url.count("(") < url.count(")"):
+                url = url[:-1]
             if url not in urls:
                 # Parse URL and check path
                 parsed = urlparse(url)
                 path = unquote(parsed.path.lower())
-                
+
                 # Check if the path ends with an image extension
                 if any(path.endswith(ext.lower()) for ext in IMAGE_EXTENSIONS):
                     urls.append(url)
+                # A Slack message permalink is a conversation reference, never a file —
+                # downloading one yields the login page (or a 404 for a deleted thread)
+                # and a bogus "Couldn't Download File" card in the channel.
+                elif parsed.path.startswith("/archives/"):
+                    continue
                 # Check for common image hosting patterns (including Slack)
                 elif any(host in parsed.netloc for host in ['imgur.com', 'cloudinary.com', 'cdn.discordapp.com', 'slack.com', 'slack-files.com']):
                     urls.append(url)
