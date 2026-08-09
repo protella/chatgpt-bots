@@ -289,14 +289,19 @@ class _MergeHarness:
 
     process_message = MessageProcessor.process_message
     _dispatch_pending_batch = MessageProcessor._dispatch_pending_batch
-    # The real sender, so "the notice genuinely reaches the user" is still what these assert.
-    _post_failed_files_notice = MessageProcessor._post_failed_files_notice
+    # The real reason builder, so what the model is handed is the production text.
+    _failed_file_reasons = staticmethod(MessageProcessor._failed_file_reasons)
+    # The real fallback seam and the real card sender: whether the acknowledgment of last resort
+    # fires is exactly what several of these tests are about.
+    _response_posted_text = staticmethod(MessageProcessor._response_posted_text)
+    _post_failed_files_card = MessageProcessor._post_failed_files_card
 
-    def __init__(self, manager, thread_state, attach_result):
+    def __init__(self, manager, thread_state, attach_result, reply=None):
         self.thread_manager = manager
         self.db = None
         self._thread_state = thread_state
         self._attach_result = attach_result           # (images, docs, unsupported)
+        self._reply = reply                            # what the model turn "returns", if not "ok"
         self._schedule_async_call = Mock()
         self.added = []                                # (role, content)
         self.captured = {}
@@ -350,7 +355,7 @@ class _MergeHarness:
 
     async def _handle(self, user_content, thread_state, client, message, thinking_id, **kw):
         self.captured["user_content"] = user_content
-        return Response(type="text", content="ok")
+        return self._reply if self._reply is not None else Response(type="text", content="ok")
 
 
 def _mk_image(i):
@@ -405,7 +410,7 @@ class TestBatchedImageMerge:
         assert "2 image(s) from earlier messages" in _text_part(uc)
 
     @pytest.mark.asyncio
-    async def test_earlier_failures_reach_failed_files_notice(self, manager):
+    async def test_earlier_failures_reach_this_turns_model_context(self, manager):
         # trigger has text but no own attachments; the earlier failure must still be acknowledged
         proc = _MergeHarness(manager, _TState(), ([], [], []))
         fail = {"name": "broken.pdf", "error": "download_failed"}
@@ -413,16 +418,17 @@ class TestBatchedImageMerge:
         client.send_message = AsyncMock()
         await proc.process_message(_trigger(batched_unsupported=[fail]),
                                    client=client, thinking_id=None)
-        assistant_msgs = [c for (r, c) in proc.added if r == "assistant"]
-        assert any("broken.pdf" in m and "Couldn't Download" in m for m in assistant_msgs)
+        text = _text_part(proc.captured["user_content"])
+        assert "broken.pdf" in text and "could not be downloaded" in text
         # the turn still proceeds to answer (text present)
         assert "user_content" in proc.captured
 
     @pytest.mark.asyncio
-    async def test_mixed_request_actually_posts_notice_to_user(self, manager):
-        """Residual T2-10: on a MIXED request (some files OK, some failed) the notice was only
-        recorded in thread state, never delivered — the model believed it acknowledged the
-        failure while the user saw nothing. It must genuinely reach the user."""
+    async def test_mixed_request_hands_the_failure_to_the_model_not_a_card(self, manager):
+        """Model-first delivery. This used to pre-post a static "⚠️ Couldn't Download File" card
+        and record a matching assistant message, so the user got a system error report followed by
+        a reply that never mentioned the file. Now nothing is posted ahead of the answer: the
+        turn's own context carries name + reason and the reply does the telling."""
         own = [_mk_image(0)]                          # one image processed OK
         fail = {"name": "broken.pdf", "error": "download_failed"}  # one file failed
         proc = _MergeHarness(manager, _TState(), (own, [], [fail]))
@@ -432,15 +438,58 @@ class TestBatchedImageMerge:
                       attachments=[], metadata={"ts": "1000.0", "username": "Alice"})
         await proc.process_message(msg, client=client, thinking_id=None)
 
-        # The notice was POSTED to the user, not merely recorded in-memory.
-        client.send_message.assert_awaited_once()
-        posted = client.send_message.await_args.kwargs["text"]
-        assert "broken.pdf" in posted and "Couldn't Download" in posted
-        # Recorded in state too, so the model's context matches what was delivered.
-        assert any("broken.pdf" in c for (r, c) in proc.added if r == "assistant")
+        # NOTHING was posted ahead of the reply.
+        client.send_message.assert_not_awaited()
+        # The model was told what failed and why, in this turn's own user content.
+        text = _text_part(proc.captured["user_content"])
+        assert "broken.pdf" in text
+        assert "could not be downloaded — re-uploading it may work" in text
+        assert "Not otherwise announced to the thread" in text
+        # History records the FAILURE, never an acknowledgment nobody posted.
+        assert not [c for (r, c) in proc.added if r == "assistant"]
         # The turn still proceeds to generate the real reply (image was fine).
-        assert "user_content" in proc.captured
         assert len(_image_parts(proc.captured["user_content"])) == 1
+
+    @pytest.mark.asyncio
+    async def test_an_all_failed_dm_gets_the_static_card_recorded_after_delivery(self, manager):
+        """No model call is made here, so nothing else can ever speak: the card IS the turn.
+
+        And the assistant-side record follows the ts, never precedes it — the write claims the
+        user was told, which only Slack can settle.
+        """
+        fail = {"name": "broken.pdf", "error": "download_failed"}
+        proc = _MergeHarness(manager, _TState(), ([], [], [fail]))
+        client = Mock()
+        client.send_message = AsyncMock(return_value="posted.1")
+        msg = Message(text="", user_id="U1", channel_id="D1", thread_id="1000.0",
+                      attachments=[], metadata={"ts": "1000.0", "username": "Alice"})
+        response = await proc.process_message(msg, client=client, thinking_id=None)
+
+        posted = client.send_message.await_args.kwargs["text"]
+        assert "Couldn't Download" in posted and "broken.pdf" in posted
+        assert client.send_message.await_args.kwargs["receipt_class"] == "system_notice"
+        assert "user_content" not in proc.captured, "the model was called with nothing to read"
+        # It landed, so the Response carries the fact rather than a duplicate of the text.
+        assert response.content == "" and response.metadata.get("posted") is True
+        assert any("broken.pdf" in c for (r, c) in proc.added if r == "assistant")
+
+    @pytest.mark.asyncio
+    async def test_an_all_failed_dm_records_nothing_when_the_card_does_not_land(self, manager):
+        """`send_message` swallows a SlackApiError and returns None. Recording the card anyway
+        left the model certain it had told the user about a file nobody heard about."""
+        fail = {"name": "broken.pdf", "error": "download_failed"}
+        proc = _MergeHarness(manager, _TState(), ([], [], [fail]))
+        client = Mock()
+        client.send_message = AsyncMock(return_value=None)
+        msg = Message(text="", user_id="U1", channel_id="D1", thread_id="1000.0",
+                      attachments=[], metadata={"ts": "1000.0", "username": "Alice"})
+        response = await proc.process_message(msg, client=client, thinking_id=None)
+
+        assert not [c for (r, c) in proc.added if r == "assistant"]
+        # The breadcrumb still records what FAILED — that happened whatever Slack did.
+        assert any("broken.pdf" in c for (r, c) in proc.added if r == "user")
+        # And main.py gets the text so its own send has a shot.
+        assert "broken.pdf" in response.content
 
     @pytest.mark.asyncio
     async def test_normal_message_without_batched_metadata_is_unaffected(self, manager):
@@ -453,3 +502,140 @@ class TestBatchedImageMerge:
         uc = proc.captured["user_content"]
         assert len(_image_parts(uc)) == 1
         assert "couldn't be attached" not in _text_part(uc)
+
+
+# ---------- the acknowledgment of last resort: endings that post no words still tell the user ----
+
+async def _mixed_turn_ending_in(manager, reply):
+    """A DM with one good image and one failed file, whose model turn ends the given way.
+    Returns (what was posted to Slack, what was written to history)."""
+    own = [_mk_image(0)]
+    fail = {"name": "broken.pdf", "error": "download_failed"}
+    proc = _MergeHarness(manager, _TState(), (own, [], [fail]), reply=reply)
+    client = Mock()
+    client.send_message = AsyncMock(return_value="posted.1")
+    msg = Message(text="here you go", user_id="U1", channel_id="D1", thread_id="1000.0",
+                  attachments=[], metadata={"ts": "1000.0", "username": "Alice"})
+    await proc.process_message(msg, client=client, thinking_id=None)
+    posted = [c.kwargs.get("text") or "" for c in client.send_message.await_args_list]
+    return posted, proc.added
+
+
+class TestTheFallbackCardCoversWordlessEndings:
+    """Model-first delivery assumes there IS a reply to carry the news. Several endings post no
+    words at all, and on those the failure would vanish silently — the very bug this design was
+    meant to fix. The card is the acknowledgment of last resort."""
+
+    @pytest.mark.asyncio
+    async def test_a_background_job_dispatch_still_tells_the_user(self, manager):
+        """The worst case, because it is deterministic: the prompt forbids a preamble and both
+        handlers discard the model's text once a job starts, so the reply CANNOT carry it."""
+        posted, added = await _mixed_turn_ending_in(
+            manager, Response(type="text", content="",
+                              metadata={"background_job_started": True, "posted": False}))
+        assert any("broken.pdf" in p and "Couldn't Download" in p for p in posted)
+        # And it was delivered, so recording it is honest.
+        assert any("broken.pdf" in c for (r, c) in added if r == "assistant")
+
+    @pytest.mark.asyncio
+    async def test_a_reaction_only_turn_still_tells_the_user(self, manager):
+        posted, _ = await _mixed_turn_ending_in(
+            manager, Response(type="text", content="",
+                              metadata={"reaction_only": True, "posted": False}))
+        assert any("broken.pdf" in p for p in posted)
+
+    @pytest.mark.asyncio
+    async def test_an_honored_no_reply_still_tells_the_user(self, manager):
+        posted, _ = await _mixed_turn_ending_in(
+            manager, Response(type="text", content="",
+                              metadata={"terminal_action": "no_reply", "posted": False,
+                                        "silence_reason": "nothing to add"}))
+        assert any("broken.pdf" in p for p in posted)
+
+    @pytest.mark.asyncio
+    async def test_artifacts_only_still_tells_the_user(self, manager):
+        posted, _ = await _mixed_turn_ending_in(
+            manager, Response(type="text", content="",
+                              metadata={"posted": False, "artifact_containers": ["cont-1"]}))
+        assert any("broken.pdf" in p for p in posted)
+
+    @pytest.mark.asyncio
+    async def test_an_interrupted_stream_still_tells_the_user(self, manager):
+        """A cut-off streaming attempt whose partial could not be deleted overwrites it with
+        "I got cut off partway through that answer" and reports `posted: True` with empty
+        content — a Slack surface exists, but no answer reached anyone. Trusting that flag
+        suppressed the card deterministically, on the ending where the user knows the least."""
+        posted, _ = await _mixed_turn_ending_in(
+            manager, Response(type="text", content="",
+                              metadata={"streamed": True, "posted": True, "interrupted": True}))
+        assert any("broken.pdf" in p for p in posted)
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_reply_gets_no_card(self, manager):
+        """The reply exists, so the prompt's obligation applies to it. Posting a card here would
+        double-tell the user — and deciding by parsing the prose for a mention is a guess."""
+        posted, added = await _mixed_turn_ending_in(
+            manager, Response(type="text", content="here's the image analysis"))
+        assert posted == []
+        assert not [c for (r, c) in added if r == "assistant"]
+
+    @pytest.mark.asyncio
+    async def test_a_streamed_reply_gets_no_card(self, manager):
+        """Streaming already put the words in the room; `content` is not how you can tell."""
+        posted, _ = await _mixed_turn_ending_in(
+            manager, Response(type="text", content="streamed answer",
+                              metadata={"streamed": True}))
+        assert posted == []
+
+
+# ------------------------------- the four failure classifications, verbatim -------------------
+
+class TestFailedFileReasons:
+    """What the model is handed. Each bucket says something a user could act on — the whole point
+    of sending reasons rather than names."""
+
+    @staticmethod
+    def _reason(f):
+        pairs = MessageProcessor._failed_file_reasons([f])
+        assert len(pairs) == 1
+        return pairs[0][1]
+
+    def test_too_large_reports_size_against_the_limit(self):
+        assert self._reason({"name": "big.pdf", "too_large": True,
+                             "size_bytes": 60 * 1024 * 1024,
+                             "limit_bytes": 50 * 1024 * 1024}) == \
+            "is too large (60.0MB, max 50.0MB)"
+
+    def test_missing_sizes_degrade_rather_than_lie(self):
+        assert self._reason({"name": "big.pdf", "too_large": True}) == "is too large (?, max ?)"
+
+    def test_a_download_failure_carries_the_re_upload_hint(self):
+        assert self._reason({"name": "x.pdf", "error": "download_failed"}) == \
+            "could not be downloaded — re-uploading it may work"
+
+    def test_a_rejected_image_carries_its_own_reason(self):
+        """Routing these through the generic explainer printed "GIF is supported" underneath a
+        rejected animated GIF."""
+        reason = self._reason({"name": "loop.gif", "reason": "animated_gif"})
+        assert "animated GIF" in reason
+        assert "Currently supported" not in reason
+
+    def test_an_unknown_rejection_reason_still_says_something(self):
+        assert "format I can read" in self._reason({"name": "photo.heic", "reason": "who_knows"})
+
+    def test_an_unsupported_type_names_the_mimetype(self):
+        assert self._reason({"name": "q3.numbers", "mimetype": "application/x-thing"}) == \
+            "is an unsupported file type (application/x-thing)"
+
+    def test_a_missing_mimetype_does_not_render_none(self):
+        assert self._reason({"name": "q3.numbers"}) == "is an unsupported file type (unknown type)"
+
+    def test_a_nameless_failure_is_dropped_rather_than_rendered_blank(self):
+        assert MessageProcessor._failed_file_reasons([{"mimetype": "application/x-thing"}]) == ()
+
+    def test_too_large_beats_the_other_buckets(self):
+        """fix-a1: an oversized file routed through the download bucket read "try re-uploading",
+        which is misleading advice for a file that arrived fine and was simply too big."""
+        reason = self._reason({"name": "big.pdf", "too_large": True, "error": "download_failed",
+                               "size_bytes": 60 * 1024 * 1024, "limit_bytes": 50 * 1024 * 1024})
+        assert reason.startswith("is too large")

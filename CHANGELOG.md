@@ -142,6 +142,14 @@ From then on the database backs itself up nightly (7-day retention) as part of t
 cleanup, which it never did before. The three `pre-v3-*` backups are **exempt from that
 retention** — they're your rollback path, so nothing deletes them but you.
 
+### 🗣️ Changed - A failed attachment is mentioned in the reply, not a warning card
+
+When some files in a message can't be read (unsupported type, too large, download failure), the
+bot no longer posts a separate warning card before answering. The failure facts go to the model
+instead, and the reply itself says which file failed, why, and what to do — one message in the
+bot's own voice. The static card still appears where no reply can carry the news: every uploaded
+file failed (nothing to answer), or the turn ended without posting any text.
+
 ### 🔗 Fixed - A link to a Slack conversation is not a file
 
 A message permalink (an `/archives/…` link to a thread or message) pasted in chat was treated

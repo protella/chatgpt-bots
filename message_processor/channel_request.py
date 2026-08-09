@@ -114,16 +114,14 @@ _BATCHED_IMAGES_OMITTED = (
     "\n\n[Note: {n} image(s) from earlier messages in this catch-up could not be attached — the "
     "per-turn image limit was reached.]")
 
+# Purely factual, for two reasons. It is UNTRUSTED-ADJACENT evidence sitting next to user content,
+# so shouted imperatives in it are a thing to leak, not a thing to obey; and it is durable — the
+# DM copy rides the recorded user turn — so any sentence written in the present tense about what
+# has or has not been said goes stale the moment the reply says it. The behavioural obligation
+# lives in the system prompt (prompts.py), which is where instructions belong.
 _FAILED_ATTACHMENTS_NOTE = (
-    "\n[These attachments FAILED to load and their contents are NOT in this request: {names}. "
-    "They exist on the message; you cannot read them. The user has been told they failed — do not "
-    "answer as though they were never attached, and do not guess at what they contained.]")
-
-_FAILED_ATTACHMENTS_NOTE_UNCONFIRMED = (
-    "\n[These attachments FAILED to load and their contents are NOT in this request: {names}. "
-    "They exist on the message; you cannot read them. The user may NOT have been notified — "
-    "acknowledge the failure in your reply, do not answer as though they were never attached, and "
-    "do not guess at what they contained.]")
+    "\n[Attachments that failed to load: {items}. Their contents are not in this request and "
+    "cannot be read. Not otherwise announced to the thread.]")
 
 _BATCHED_IMAGES_NONE_CARRIED = (
     "[Note: {n} image(s) from earlier messages in this catch-up could not be attached at all — the "
@@ -192,10 +190,11 @@ class ChannelTurnContext:
     origin_thread_ts: Optional[str]
     trigger_text: str = ""
     trigger_attachment_names: Tuple[str, ...] = ()
-    # Attachments Slack accepted that we could not fetch or extract. The user is told out loud;
-    # the RESPONDER has to be told too, or it answers a question about a file it never saw and has
-    # no way of knowing it is missing. On a DM this evidence rides ThreadState instead.
-    failed_attachment_names: Tuple[str, ...] = ()
+    # Attachments Slack accepted that we could not fetch or extract, as (name, reason) pairs.
+    # NOBODY posts a card about these any more: the reply itself is where the user hears about
+    # them, so the responder needs the reason as well as the name or it cannot write the sentence.
+    # On a DM the same pairs ride the turn's own user content instead.
+    failed_attachments: Tuple[Tuple[str, str], ...] = ()
     image_parts: Tuple[Dict[str, Any], ...] = ()
     file_parts: Tuple[Dict[str, Any], ...] = ()
     document_inputs: Tuple[Dict[str, Any], ...] = ()
@@ -213,10 +212,6 @@ class ChannelTurnContext:
     # a fallback would be harmless and wasteful; memoizing also makes their bytes provably
     # identical across the retry, which is what the pinned-state rule asks for.
     memo: Dict[str, Any] = field(default_factory=dict, repr=False)
-    # Whether a notice this turn owed actually LANDED, per surface. Deliberately not pinned: the
-    # notices post AFTER admission [r3-3/r3-4], so the estimate measures this unknown and the
-    # evidence charges the longer wording, while the request finally sent says what really happened.
-    notice_delivery: Dict[str, bool] = field(default_factory=dict, repr=False)
 
     @property
     def stream_actors(self) -> Tuple[StreamActor, ...]:
@@ -686,23 +681,27 @@ def _attachment_note(names: Sequence[str]) -> str:
     return f"\n[attached: {', '.join(n for n in names if n)}]" if names else ""
 
 
-def failed_attachments_note(names: Sequence[str], *, notified: Optional[bool]) -> str:
-    """The failed-attachment evidence, in the tense its delivery actually supports [r4-4].
+def failed_attachments_note(items: Sequence[Tuple[str, str]]) -> str:
+    """The failed-attachment evidence: what failed, and enough of WHY to say something useful.
 
-    "The user has been told" was asserted unconditionally, and `send_message` returns None on a
-    SlackApiError it swallowed — so the responder could be told to build on an acknowledgement
-    nobody ever saw, and neither of us would mention the failure. When the notice is confirmed the
-    original phrasing stands; when it is not, the reply itself has to carry the acknowledgement.
+    Model-first delivery — no static card is posted on a mixed turn any more, so this evidence is
+    the only thing standing between the user and a reply that answers around a file it never saw.
+    It therefore carries the same distinctions the static card draws (too large with sizes, a
+    download failure with the re-upload hint, a rejected image's actual reason, an unsupported
+    type with its mimetype), because "budget.numbers failed" is not something the model can turn
+    into a helpful sentence and "budget.numbers is too large (60.0MB, max 50.0MB)" is.
 
-    `notified=None` is "not known YET", which is the state admission measures in: the notice posts
-    after the request is admitted. The LONGER wording is charged there, so whichever one is finally
-    rendered fits inside what was paid for.
+    One wording, unconditionally, and no instruction in it: what to DO about a file that failed is
+    the system prompt's job. That also means admission measures exactly the bytes that get sent —
+    there is no longer a second, longer template whose delivery outcome the tense has to follow.
+
+    Shared with the DM path (message_processor/base.py), whose failures ride the turn's own user
+    content rather than a post-breakpoint supplement — the words are the same either way.
     """
-    template = (max(_FAILED_ATTACHMENTS_NOTE, _FAILED_ATTACHMENTS_NOTE_UNCONFIRMED,
-                    key=lambda t: len(t.encode("utf-8"))) if notified is None
-                else _FAILED_ATTACHMENTS_NOTE if notified
-                else _FAILED_ATTACHMENTS_NOTE_UNCONFIRMED)
-    return template.format(names=", ".join(n for n in names if n))
+    # The trailing full stop comes off: these are clauses in a semicolon list, and
+    # `image_validation.rejection_text` ends its sentences ("a static image works.").
+    rendered = "; ".join(f"{name} {reason}".strip().rstrip(".") for name, reason in items if name)
+    return _FAILED_ATTACHMENTS_NOTE.format(items=rendered)
 
 
 def _quote_source(source: CohortSource) -> str:
@@ -723,17 +722,15 @@ def build_trigger_supplement(ctx: ChannelTurnContext, processor: Any) -> Optiona
     to the model as "I have that file" [r3-4].
     """
     carried = bool(ctx.image_parts or ctx.file_parts or ctx.document_inputs)
-    if not (carried or ctx.failed_attachment_names):
+    if not (carried or ctx.failed_attachments):
         return None
     # No header when nothing was carried: "their contents are here" would be flatly untrue of a
     # turn whose every attachment failed, and the note below says all there is to say.
     header = _TRIGGER_SUPPLEMENT_HEADER.format(ts=ctx.trigger_ts) if carried else ""
     if ctx.document_inputs:
         header = processor._build_message_with_documents(header, list(ctx.document_inputs))
-    if ctx.failed_attachment_names:
-        header += failed_attachments_note(
-            ctx.failed_attachment_names,
-            notified=ctx.notice_delivery.get("failed_attachments"))
+    if ctx.failed_attachments:
+        header += failed_attachments_note(ctx.failed_attachments)
     parts: List[Dict[str, Any]] = [api_part({"type": "input_text",
                                              "text": header.lstrip("\n")})]
     parts.extend(api_part(part) for part in ctx.image_parts)
