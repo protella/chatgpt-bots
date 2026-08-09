@@ -75,18 +75,19 @@ class TestIsContainerGone:
 
 @pytest.mark.asyncio
 class TestGetOrCreate:
+    """W3: this resolves the tools array's container on the CRITICAL PATH of a chat turn, so it
+    never blocks on `containers.create` (0.7–4.0s, measured). An unbound thread starts on `auto`
+    and the id is adopted once the model has actually used one."""
 
-    async def test_creates_and_persists_when_thread_has_none(self, temp_db):
+    async def test_unbound_thread_gets_auto_without_creating(self, temp_db):
         client, raw = _openai("cntr_a")
         cm = ContainerManager(client, db=temp_db)
 
         got = await cm.get_or_create("C1:111.1")
 
-        assert got == "cntr_a"
-        raw.containers.create.assert_awaited_once()
-        # Persisted, so the NEXT turn can find it.
-        row = temp_db.get_fresh_thread_container("C1:111.1", 15)
-        assert row["container_id"] == "cntr_a"
+        assert got == AUTO_CONTAINER
+        raw.containers.create.assert_not_awaited()      # the whole point: no blocking create
+        assert temp_db.get_thread_container("C1:111.1") is None   # and nothing bound yet
 
     async def test_reuses_a_live_container(self, temp_db):
         client, raw = _openai("cntr_new")
@@ -99,16 +100,18 @@ class TestGetOrCreate:
         raw.containers.create.assert_not_awaited()
         raw.containers.retrieve.assert_awaited_once_with("cntr_existing")
 
-    async def test_expired_container_is_replaced_not_reused(self, temp_db):
-        """The whole point: never hand the API an id it will 404 on."""
+    async def test_expired_container_is_dropped_not_replaced(self, temp_db):
+        """Never hand the API an id it will 404 on. Under W3 the replacement is `auto`, not a
+        blocking create — the dead binding still goes."""
         client, raw = _openai("cntr_fresh", retrieve_error=CONTAINER_GONE)
         temp_db.save_thread_container("C1:111.1", "cntr_dead")
         cm = ContainerManager(client, db=temp_db)
 
         got = await cm.get_or_create("C1:111.1")
 
-        assert got == "cntr_fresh"
-        assert temp_db.get_fresh_thread_container("C1:111.1", 15)["container_id"] == "cntr_fresh"
+        assert got == AUTO_CONTAINER
+        raw.containers.create.assert_not_awaited()
+        assert temp_db.get_thread_container("C1:111.1") is None
 
     async def test_expired_container_drops_its_published_file_record(self, temp_db):
         """A stale cfile id must not suppress a NEW artifact in the replacement container."""
@@ -122,20 +125,20 @@ class TestGetOrCreate:
         assert await cm.get_published_files("C1:111.1", "cntr_dead") == []
 
     async def test_unverifiable_container_is_treated_as_dead(self, temp_db):
-        """A timeout/5xx means we don't KNOW it's alive. A wasted create costs one API call;
-        a wrong 'alive' costs the user's turn."""
+        """A timeout/5xx means we don't KNOW it's alive. `auto` costs nothing; a wrong 'alive'
+        costs the user's turn."""
         client, raw = _openai("cntr_fresh", retrieve_error=_api_error(503, "upstream timeout"))
         temp_db.save_thread_container("C1:111.1", "cntr_unknown")
         cm = ContainerManager(client, db=temp_db)
 
-        assert await cm.get_or_create("C1:111.1") == "cntr_fresh"
+        assert await cm.get_or_create("C1:111.1") == AUTO_CONTAINER
 
     async def test_non_running_status_is_not_reused(self, temp_db):
         client, _ = _openai("cntr_fresh", status="expired")
         temp_db.save_thread_container("C1:111.1", "cntr_stopped")
         cm = ContainerManager(client, db=temp_db)
 
-        assert await cm.get_or_create("C1:111.1") == "cntr_fresh"
+        assert await cm.get_or_create("C1:111.1") == AUTO_CONTAINER
 
     async def test_stale_row_outside_reuse_window_is_not_reused(self, temp_db):
         """Row exists but we last used it too long ago — the DB won't even hand it back."""
@@ -146,21 +149,62 @@ class TestGetOrCreate:
         client, raw = _openai("cntr_fresh")
         cm = ContainerManager(client, db=temp_db)
 
-        assert await cm.get_or_create("C1:111.1") == "cntr_fresh"
+        assert await cm.get_or_create("C1:111.1") == AUTO_CONTAINER
         raw.containers.retrieve.assert_not_awaited()   # never even asked about the dead one
+
+    async def test_no_db_yields_auto(self):
+        client, raw = _openai("cntr_a")
+        cm = ContainerManager(client, db=None)
+
+        assert await cm.get_or_create("C1:111.1") == AUTO_CONTAINER
+        raw.containers.create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+class TestCreateExplicit:
+    """The pre-W3 resolve-or-mint behaviour, kept for callers that cannot work without an
+    addressable id — a research build has files to mount in and a listing to read back out."""
+
+    async def test_creates_and_persists_when_thread_has_none(self, temp_db):
+        client, raw = _openai("cntr_a")
+        cm = ContainerManager(client, db=temp_db)
+
+        got = await cm.create_explicit("C1:111.1")
+
+        assert got == "cntr_a"
+        raw.containers.create.assert_awaited_once()
+        # Persisted, so the NEXT turn can find it.
+        row = temp_db.get_fresh_thread_container("C1:111.1", 15)
+        assert row["container_id"] == "cntr_a"
+
+    async def test_reuses_a_live_container_without_creating(self, temp_db):
+        temp_db.save_thread_container("C1:111.1", "cntr_existing")
+        client, raw = _openai("cntr_new")
+        cm = ContainerManager(client, db=temp_db)
+
+        assert await cm.create_explicit("C1:111.1") == "cntr_existing"
+        raw.containers.create.assert_not_awaited()
+
+    async def test_expired_container_is_replaced(self, temp_db):
+        client, _ = _openai("cntr_fresh", retrieve_error=CONTAINER_GONE)
+        temp_db.save_thread_container("C1:111.1", "cntr_dead")
+        cm = ContainerManager(client, db=temp_db)
+
+        assert await cm.create_explicit("C1:111.1") == "cntr_fresh"
+        assert temp_db.get_fresh_thread_container("C1:111.1", 15)["container_id"] == "cntr_fresh"
 
     async def test_create_failure_falls_back_to_auto(self, temp_db):
         """Degrade to an ephemeral container — code interpreter must still WORK."""
         client, _ = _openai(create_error=_api_error(500, "no capacity"))
         cm = ContainerManager(client, db=temp_db)
 
-        assert await cm.get_or_create("C1:111.1") == AUTO_CONTAINER
+        assert await cm.create_explicit("C1:111.1") == AUTO_CONTAINER
 
     async def test_no_db_still_yields_a_working_container(self):
         client, raw = _openai("cntr_a")
         cm = ContainerManager(client, db=None)
 
-        assert await cm.get_or_create("C1:111.1") == "cntr_a"
+        assert await cm.create_explicit("C1:111.1") == "cntr_a"
         raw.containers.create.assert_awaited_once()
 
     async def test_ttl_request_is_within_the_api_ceiling(self, temp_db):
@@ -168,7 +212,7 @@ class TestGetOrCreate:
         client, raw = _openai("cntr_a")
         cm = ContainerManager(client, db=temp_db)
 
-        await cm.get_or_create("C1:111.1")
+        await cm.create_explicit("C1:111.1")
 
         expires = raw.containers.create.await_args.kwargs["expires_after"]
         assert expires["anchor"] == "last_active_at"
@@ -178,7 +222,7 @@ class TestGetOrCreate:
         client, raw = _openai("cntr_a")
         cm = ContainerManager(client, db=temp_db)
 
-        await cm.get_or_create("C1:111.1")
+        await cm.create_explicit("C1:111.1")
 
         assert "C1:111.1" in raw.containers.create.await_args.kwargs["name"]
 
@@ -189,8 +233,182 @@ class TestGetOrCreate:
             side_effect=[MagicMock(id="cntr_1"), MagicMock(id="cntr_2")])
         cm = ContainerManager(client, db=temp_db)
 
-        assert await cm.get_or_create("C1:111.1") == "cntr_1"
-        assert await cm.get_or_create("C1:222.2") == "cntr_2"
+        assert await cm.create_explicit("C1:111.1") == "cntr_1"
+        assert await cm.create_explicit("C1:222.2") == "cntr_2"
+
+    async def test_the_research_build_uses_it(self):
+        """A build phase resolves through `create_explicit`, never `get_or_create` — `auto` gives
+        it neither a mount target nor a readable listing, and it would fail honestly instead."""
+        import inspect
+
+        from message_processor import research_tools
+        src = inspect.getsource(research_tools._run_build_phase)
+        assert "manager.create_explicit(ledger_key)" in src
+        assert "manager.get_or_create(" not in src
+
+
+@pytest.mark.asyncio
+class TestAdopt:
+    """W3: an `auto` turn learns its container id mid-flight, and binding it is what makes
+    'now chart that file again' work on the NEXT turn — auto reuse needs the prior
+    code_interpreter_call in context, which rebuild-from-Slack does not preserve."""
+
+    async def test_binds_an_unbound_thread(self, temp_db):
+        client, _ = _openai()
+        cm = ContainerManager(client, db=temp_db)
+
+        assert await cm.adopt("C1:111.1", "cntr_auto") == "cntr_auto"
+        assert temp_db.get_thread_container("C1:111.1")["container_id"] == "cntr_auto"
+
+    async def test_never_overwrites_a_live_binding(self, temp_db):
+        """CAS. A concurrent turn may have bound a newer container while this id was in flight;
+        overwriting would point the next turn at a sandbox its files are not in."""
+        temp_db.save_thread_container("C1:111.1", "cntr_newer")
+        temp_db.add_published_container_files("C1:111.1", "cntr_newer", ["cfile_1"])
+        client, _ = _openai()
+        cm = ContainerManager(client, db=temp_db)
+
+        assert await cm.adopt("C1:111.1", "cntr_ours") == "cntr_newer"
+
+        row = temp_db.get_thread_container("C1:111.1")
+        assert row["container_id"] == "cntr_newer"
+        assert row["published_files"] == ["cfile_1"]   # nor reset on the way past
+
+    async def test_adopted_baseline_is_empty(self, temp_db):
+        """We were in this container from birth, so everything in it is THIS turn's output.
+        A baseline listing would cost a round-trip to mark nothing — and on a slow listing it
+        would mark the turn's own chart as pre-existing and drop it."""
+        client, raw = _openai()
+        cm = ContainerManager(client, db=temp_db)
+
+        await cm.adopt("C1:111.1", "cntr_auto")
+
+        raw.containers.files.list.assert_not_called()
+        assert await cm.get_published_files("C1:111.1", "cntr_auto") == []
+
+    async def test_is_single_flight_per_thread(self, temp_db):
+        """Two checkpoints can observe the same unbound thread in the same instant."""
+        import asyncio as aio
+
+        client, _ = _openai()
+        cm = ContainerManager(client, db=temp_db)
+        overlap = {"peak": 0, "live": 0}
+        real = temp_db.adopt_thread_container_async
+
+        async def _watched(thread_id, container_id):
+            overlap["live"] += 1
+            overlap["peak"] = max(overlap["peak"], overlap["live"])
+            await aio.sleep(0)
+            try:
+                return await real(thread_id, container_id)
+            finally:
+                overlap["live"] -= 1
+
+        temp_db.adopt_thread_container_async = _watched
+        results = await aio.gather(*(cm.adopt("C1:111.1", f"cntr_{i}") for i in range(4)))
+
+        assert overlap["peak"] == 1, "the CAS must not run concurrently for one thread key"
+        assert len(set(results)) == 1, "every caller sees the same winner"
+
+    async def test_db_failure_is_swallowed(self, temp_db):
+        client, _ = _openai()
+        cm = ContainerManager(client, db=MagicMock(
+            adopt_thread_container_async=AsyncMock(side_effect=RuntimeError("db down"))))
+
+        assert await cm.adopt("C1:111.1", "cntr_auto") is None
+
+    async def test_missing_pieces_are_noops(self, temp_db):
+        client, _ = _openai()
+        assert await ContainerManager(client, db=temp_db).adopt("", "cntr_a") is None
+        assert await ContainerManager(client, db=temp_db).adopt("C1:1.1", "") is None
+        assert await ContainerManager(client, db=None).adopt("C1:1.1", "cntr_a") is None
+
+    async def test_the_lock_registry_does_not_leak(self, temp_db):
+        client, _ = _openai()
+        cm = ContainerManager(client, db=temp_db)
+        before = len(ContainerManager._sandbox_locks)
+
+        for i in range(50):
+            await cm.adopt(f"C1:{i}", f"cntr_{i}")
+
+        assert len(ContainerManager._sandbox_locks) == before
+
+
+@pytest.mark.asyncio
+class TestBridgeContainer:
+    """The addressable-sandbox bridge: `mount_file` / `create_image_asset` are offered on `auto`
+    turns now, so the first one to need an id pays for the create and everyone else reuses it."""
+
+    async def test_creates_adopts_and_fills_the_holder(self, temp_db):
+        from tool_registry import SandboxHolder
+
+        client, raw = _openai("cntr_bridge")
+        cm = ContainerManager(client, db=temp_db)
+        holder = SandboxHolder(manager=cm, thread_key="C1:111.1")
+
+        assert await holder.ensure() == "cntr_bridge"
+
+        raw.containers.create.assert_awaited_once()
+        assert holder.container_id == "cntr_bridge"
+        assert temp_db.get_thread_container("C1:111.1")["container_id"] == "cntr_bridge"
+
+    async def test_a_filled_holder_costs_nothing(self, temp_db):
+        from tool_registry import SandboxHolder
+
+        client, raw = _openai("cntr_new")
+        cm = ContainerManager(client, db=temp_db)
+        holder = SandboxHolder(container_id="cntr_already", manager=cm, thread_key="C1:111.1")
+
+        assert await holder.ensure() == "cntr_already"
+        raw.containers.create.assert_not_awaited()
+
+    @pytest.mark.parametrize("with_db", [True, False])
+    async def test_concurrent_calls_get_one_container(self, temp_db, with_db):
+        """A round's tool calls run in parallel (dispatch_all gathers them). Two containers for
+        one turn means one of them is orphaned the moment it is made.
+
+        Run BOTH with and without a DB on purpose. With one, the fresh binding would converge the
+        losers anyway; without one, the re-read of the shared holder inside the lock is the only
+        thing standing between three tool calls and three containers."""
+        import asyncio as aio
+
+        from tool_registry import SandboxHolder
+
+        client, raw = _openai()
+        minted = iter(["cntr_1", "cntr_2", "cntr_3"])
+
+        async def _slow_create(**kwargs):
+            # A create that actually SUSPENDS. A bare AsyncMock returns without yielding, so the
+            # first caller would run start-to-finish before the second even began and the test
+            # would prove nothing about concurrency at all.
+            await aio.sleep(0)
+            return MagicMock(id=next(minted))
+
+        raw.containers.create = AsyncMock(side_effect=_slow_create)
+        cm = ContainerManager(client, db=temp_db if with_db else None)
+        holder = SandboxHolder(manager=cm, thread_key="C1:111.1")
+
+        got = await aio.gather(*(holder.ensure() for _ in range(3)))
+
+        assert got == ["cntr_1", "cntr_1", "cntr_1"]     # one winner, losers read it back
+        raw.containers.create.assert_awaited_once()
+        assert holder.container_id == "cntr_1"
+
+    async def test_no_manager_means_no_bridge(self):
+        from tool_registry import SandboxHolder
+
+        assert await SandboxHolder(thread_key="C1:111.1").ensure() is None
+        assert await SandboxHolder(manager=MagicMock()).ensure() is None
+
+    async def test_a_failed_create_answers_none(self, temp_db):
+        from tool_registry import SandboxHolder
+
+        client, _ = _openai(create_error=_api_error(500, "no capacity"))
+        cm = ContainerManager(client, db=temp_db)
+        holder = SandboxHolder(manager=cm, thread_key="C1:111.1")
+
+        assert await holder.ensure() is None      # AUTO is not an addressable id
+        assert holder.container_id is None
 
 
 @pytest.mark.asyncio
@@ -200,7 +418,7 @@ class TestPublishedFileRecord:
     async def test_roundtrip(self, temp_db):
         client, _ = _openai()
         cm = ContainerManager(client, db=temp_db)
-        await cm.get_or_create("C1:111.1")
+        await cm.create_explicit("C1:111.1")
 
         await cm.remember_published("C1:111.1", "cntr_new", ["cfile_1", "cfile_2"])
 
@@ -209,7 +427,7 @@ class TestPublishedFileRecord:
     async def test_survives_a_new_process(self, temp_db):
         """The in-memory dedupe dies with the process; this must not."""
         client, _ = _openai()
-        await ContainerManager(client, db=temp_db).get_or_create("C1:111.1")
+        await ContainerManager(client, db=temp_db).create_explicit("C1:111.1")
         await ContainerManager(client, db=temp_db).remember_published("C1:111.1", "cntr_new", ["cfile_1"])
 
         reborn = ContainerManager(_openai()[0], db=temp_db)
@@ -442,7 +660,7 @@ class TestBaselineSnapshot:
         client, raw = _openai("cntr_new")
         cm = ContainerManager(client, db=temp_db)
 
-        await cm.get_or_create("C1:111.1")   # no prior row -> create, nothing to baseline
+        await cm.create_explicit("C1:111.1")   # no prior row -> create, nothing to baseline
 
         raw.containers.files.list.assert_not_called()
 

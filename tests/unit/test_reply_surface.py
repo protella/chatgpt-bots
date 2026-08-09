@@ -701,6 +701,10 @@ class FakeToolLoopOpenAI:
         pre, post = "".join(self.preamble), "".join(self.post_tool)
         text = join_segments([pre, post]) if aggregate_segments else post
         return {"text": text,
+                # …including the rounds BEFORE the seam went between them (W4). A consumer that
+                # transforms the text has to work per round, so a fake that omitted this would
+                # quietly send every caller down the joined-string path the real loop does not.
+                "segments": [pre, post] if aggregate_segments else None,
                 "local_tool_calls": [{"name": self.tool.split(":", 1)[-1], "ok": True}],
                 "tools_used": [], "terminal_action": None, "reason": None}
 

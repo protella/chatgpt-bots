@@ -131,6 +131,13 @@ MODEL_KNOWLEDGE_CUTOFFS = {
 # The full user-selectable model set (order = modal display order)
 SUPPORTED_CHAT_MODELS = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"]
 
+# What OPENAI_SERVICE_TIER may say. `standard` is OUR name for "send no service_tier at all" —
+# the API's own default is the literal `"default"` and it does not accept `"standard"`, so the
+# parameter is omitted rather than sent. `fast` buys up to 2.5x faster output at 2x price and is
+# honored only on the model below; everything else pays standard rates for nothing.
+SUPPORTED_SERVICE_TIERS = ("standard", "fast")
+FAST_SERVICE_TIER_MODEL = "gpt-5.6-sol"
+
 # The image models a channel or a person may select. Promoted here from the literal that used to
 # live inside the personal modal so the modal's option list and the channel resolver's allowlist
 # are the same object and cannot drift apart. Deliberately NOT a schema CHECK on
@@ -259,7 +266,14 @@ class BotConfig:
     gpt_model: str = field(default_factory=lambda: os.getenv("GPT_MODEL", "gpt-5.6-sol"))
     utility_model: str = field(default_factory=lambda: os.getenv("UTILITY_MODEL", "gpt-5.6-luna"))
     image_model: str = field(default_factory=lambda: os.getenv("GPT_IMAGE_MODEL", "gpt-image-2"))
-    
+
+    # Service tier. `standard` (the default, and what prod ships) omits the parameter entirely;
+    # `fast` attaches `service_tier: "fast"` to the user-facing responder call ONLY, and only on
+    # FAST_SERVICE_TIER_MODEL. Normalized in __post_init__ — an unusable value warns and falls
+    # back to `standard` rather than 400ing every turn.
+    openai_service_tier: str = field(
+        default_factory=lambda: os.getenv("OPENAI_SERVICE_TIER", "standard"))
+
     # Default parameters for text generation
     default_temperature: float = field(default_factory=lambda: float(os.getenv("DEFAULT_TEMPERATURE", "0.8")))
     default_max_tokens: int = field(default_factory=lambda: int(os.getenv("DEFAULT_MAX_TOKENS", "32768")))
@@ -683,6 +697,12 @@ class BotConfig:
     # Rapid-fire messages in the same channel within this window collapse into ONE engine
     # evaluation of the latest state (someone typing four short lines ≠ four verdicts).
     participation_debounce_seconds: float = field(default_factory=lambda: float(os.getenv("PARTICIPATION_DEBOUNCE_SECONDS", "3")))
+    # W5c: how many conversation streams remember WHEN they last saw a message, which is how the
+    # gate tells a burst (keep the debounce) from a cold stream (classify immediately). A resource
+    # cap in the actor-tail-bounds family, not a behaviour tunable — the activity window itself is
+    # PARTICIPATION_DEBOUNCE_SECONDS above, and there is deliberately no second time constant.
+    # Eviction can lose nothing anyone said: the map holds timestamps, never messages.
+    participation_activity_lru_max: int = field(default_factory=lambda: int(os.getenv("PARTICIPATION_ACTIVITY_LRU_MAX", "1024")))
     # F52: an EDIT to a recent human message can also drive a reply. A forgotten @mention ADDED
     # by an edit routes as an addressed wake (Slack fires no app_mention for edits); every other
     # channel edit goes through the participation engine's full typo-vs-meaning judgment, so a
@@ -1070,6 +1090,16 @@ class BotConfig:
     LONG_CONTEXT_BILLING_THRESHOLD: int = 272_000
 
     def __post_init__(self):
+        # Service tier is the one setting that must NOT refuse to boot: an unusable value here
+        # only means "we do not buy the fast pool", which is exactly the safe default anyway.
+        # The match is on the EXACT literal — no trimming, no case folding. `FAST` is not a
+        # typo we get to forgive: forgiving it would switch on double-cost billing that nobody
+        # spelled correctly, and the safe reading of an unrecognized value is always "standard".
+        if self.openai_service_tier not in SUPPORTED_SERVICE_TIERS:
+            logging.getLogger("bot.config").warning(
+                f"OPENAI_SERVICE_TIER {self.openai_service_tier!r} is not one of "
+                f"{list(SUPPORTED_SERVICE_TIERS)}; falling back to 'standard'")
+            self.openai_service_tier = "standard"
         # A non-integer env value raises ValueError out of int() at construction, which is the
         # loud failure we want; the check below covers everything int() accepts.
         if not (0 < self.channel_window_target < self.channel_window_ceiling):

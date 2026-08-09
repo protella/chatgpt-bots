@@ -30,15 +30,16 @@ Three failure modes drive the shape of this module:
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Dict, List, Optional, Union
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Dict, List, Optional, Union, cast
 
 from config import config
 from logger import setup_logger
 # Canonical home is openai_client (message_processor imports it, so the reverse would cycle).
 # Re-exported here because this is where callers naturally look for it.
-from openai_client.container_errors import AUTO_CONTAINER, is_container_gone
+from openai_client.container_errors import AUTO_CONTAINER, adoption_blocked, is_container_gone
 
-__all__ = ["AUTO_CONTAINER", "ContainerManager", "is_container_gone",
+__all__ = ["AUTO_CONTAINER", "ContainerManager", "adoption_blocked", "is_container_gone",
            "publication_lock", "wait_for_publication"]
 
 # Must go through setup_logger: the app attaches handlers to `slack_bot.*` loggers and sets
@@ -194,15 +195,17 @@ class ContainerManager:
             await self.remember_published(thread_key, container_id, existing)
             logger.debug(f"Baselined {len(existing)} pre-existing file(s) in {container_id}")
 
-    async def get_or_create(self, thread_key: str) -> Union[str, Dict[str, str]]:
-        """The container to hand the code_interpreter tool for this thread.
+    async def _live_binding(self, thread_key: str) -> Optional[str]:
+        """This thread's persistent container, if it has one that is still alive.
 
-        Returns a container id, or `AUTO_CONTAINER` when we could not get a persistent one —
-        the tool stays enabled either way.
+        The reuse path in full: settle the previous turn's publication, read the binding, prove
+        the container still exists, touch it, baseline what it already holds. Returns None when
+        the thread is unbound or its container is gone (the dead binding is dropped on the way
+        out, so the published-file record dies with the container it describes).
         """
         if not thread_key or self.db is None:
             # No thread identity (or no DB) means nothing to scope a container TO.
-            return await self._create_or_auto(thread_key or "")
+            return None
 
         # The previous turn may still be uploading out of this very container. Let it finish, so
         # our baseline sees a settled container and we cannot race it into publishing twice.
@@ -229,11 +232,130 @@ class ContainerManager:
             # would let a stale cfile id suppress a genuinely new artifact in the replacement.
             await self.invalidate(thread_key, container_id)
 
-        return await self._create_or_auto(thread_key)
+        return None
 
-    async def _create_or_auto(self, thread_key: str) -> Union[str, Dict[str, str]]:
-        created = await self._create(thread_key)
+    async def get_or_create(self, thread_key: str) -> Union[str, Dict[str, str]]:
+        """The container to hand the code_interpreter tool for this thread.
+
+        W3 — **an unbound thread is NOT worth a create here.** The client-side
+        `containers.create` this used to run costs 0.7–4.0s of dead time before the request is
+        even sent, on every first turn of every conversation, whether or not the model ends up
+        running a line of code. `{"type": "auto"}` costs the API ~0.3s and blocks nothing, so a
+        thread with no live binding starts there and the id is ADOPTED the moment the model
+        actually runs something (`adopt`, driven from the tool loop's round boundaries).
+
+        Reuse is unchanged: a thread that already has a live container still gets it back, which
+        is what makes "now chart that file again" work across turns.
+
+        Callers that genuinely need an addressable sandbox up front — a research job with files
+        to mount — want `create_explicit`, not this.
+        """
+        return await self._live_binding(thread_key) or AUTO_CONTAINER
+
+    async def create_explicit(self, thread_key: str) -> Union[str, Dict[str, str]]:
+        """Reuse this thread's container, or MINT one now — the pre-W3 `get_or_create`.
+
+        Blocking and worth it only where the caller cannot proceed without an addressable id:
+        a build phase has files to mount into the sandbox and a listing to read back out of it,
+        and `auto` gives it neither. Still degrades to `AUTO_CONTAINER` rather than raising —
+        losing sandbox continuity is a bad turn, losing the sandbox is a broken feature.
+        """
+        bound = await self._live_binding(thread_key)
+        if bound:
+            return bound
+        created = await self._create(thread_key or "")
         return created if created else AUTO_CONTAINER
+
+    # --- W3 adoption ----------------------------------------------------------------------
+    #
+    # Per-thread single flight. Adoption races two ways: a round boundary and a bridge tool can
+    # both discover an unbound thread in the same instant, and two bridge calls in one round run
+    # concurrently by construction (dispatch_all gathers them). Without a lock that is two real
+    # containers created for one turn, one of them immediately orphaned.
+    # Class-level, like the publication latch is module-level: two ContainerManager instances
+    # for one thread would otherwise each hold their own idea of the lock and neither would
+    # exclude the other. Pruned when the last waiter leaves — the count is taken BEFORE the
+    # await, so an entry can never be dropped out from under someone queued on it.
+    _sandbox_locks: Dict[str, asyncio.Lock] = {}
+    _sandbox_lock_waiters: Dict[str, int] = {}
+
+    @classmethod
+    @asynccontextmanager
+    async def _sandbox_lock(cls, thread_key: str) -> AsyncIterator[None]:
+        lock = cls._sandbox_locks.get(thread_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            cls._sandbox_locks[thread_key] = lock
+        cls._sandbox_lock_waiters[thread_key] = cls._sandbox_lock_waiters.get(thread_key, 0) + 1
+        try:
+            async with lock:
+                yield
+        finally:
+            remaining = cls._sandbox_lock_waiters.get(thread_key, 1) - 1
+            if remaining > 0:
+                cls._sandbox_lock_waiters[thread_key] = remaining
+            else:
+                cls._sandbox_lock_waiters.pop(thread_key, None)
+                cls._sandbox_locks.pop(thread_key, None)
+
+    async def _adopt_locked(self, thread_key: str, container_id: str) -> Optional[str]:
+        """The CAS write itself. Caller holds `_sandbox_lock(thread_key)`."""
+        try:
+            bound = await self.db.adopt_thread_container_async(thread_key, container_id)
+        except Exception as e:  # noqa: BLE001 — a lost binding costs continuity, never the turn
+            logger.warning(f"Could not adopt container {container_id} for {thread_key}: {e}")
+            return None
+        if bound == container_id:
+            logger.info(f"Adopted container {container_id} for thread {thread_key}")
+        else:
+            logger.info(
+                f"Not adopting {container_id} for {thread_key}: already bound to {bound}")
+        return bound
+
+    async def adopt(self, thread_key: str, container_id: str) -> Optional[str]:
+        """Bind a container the model is ALREADY running code in.
+
+        **No baseline listing.** `_snapshot_baseline` exists because a REUSED container arrives
+        holding files from earlier turns that are not this turn's output. An adopted one was
+        created for this turn and we have been in it since it was empty, so everything in it is
+        ours — a baseline call here would cost a round-trip to mark nothing, and on a slow
+        listing it could mark this turn's own chart as pre-existing and drop it.
+
+        Returns the container the thread is bound to afterwards, which is NOT necessarily ours:
+        the DB write is a compare-and-set that never overwrites a live binding (see
+        `database.adopt_thread_container`). The turn keeps using the id it observed regardless —
+        that is where its files are — so the return value is for the record, not for routing.
+        """
+        if not thread_key or not container_id or self.db is None:
+            return None
+        async with self._sandbox_lock(thread_key):
+            return await self._adopt_locked(thread_key, container_id)
+
+    async def bridge_container(self, thread_key: str, holder: Any) -> Optional[str]:
+        """An addressable container for a turn that started on `auto`, created on demand.
+
+        `mount_file` and `create_image_asset` need an id to push bytes into. On an auto turn
+        there is none until the model runs code, and these tools are precisely the ones that run
+        BEFORE it does. So the first one to ask pays for the create, fills the turn's shared
+        holder, and the tool loop pins the id into the next round's declaration.
+
+        The holder is re-checked INSIDE the lock: sibling calls in the same round get one
+        container between them, not one each.
+        """
+        if not thread_key or holder is None:
+            return None
+        async with self._sandbox_lock(thread_key):
+            existing = getattr(holder, "container_id", None)
+            if existing:
+                return cast(str, existing)
+            created = await self.create_explicit(thread_key)
+            if not isinstance(created, str):
+                logger.warning(f"No addressable container available for {thread_key}")
+                return None
+            if self.db is not None:
+                await self._adopt_locked(thread_key, created)
+            holder.container_id = created
+            return created
 
     async def invalidate(self, thread_key: str, container_id: Optional[str] = None) -> None:
         """Forget a container binding. Best-effort; never raises.

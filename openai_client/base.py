@@ -6,7 +6,7 @@ from typing import Any, Callable, Dict, List, Optional
 import aiohttp
 from openai import AsyncOpenAI
 
-from config import clamp_effort, config
+from config import FAST_SERVICE_TIER_MODEL, clamp_effort, config
 from logger import LoggerMixin, setup_logger
 from openai_client.container_errors import is_container_gone
 
@@ -126,6 +126,7 @@ def _build_request_params(
     layout: str = "legacy",
     legacy_kind: str = "plain",
     legacy_cache_params: bool = True,
+    service_tier_eligible: bool = False,
 ) -> Dict[str, Any]:
     """Assemble one Responses-API request.
 
@@ -137,6 +138,10 @@ def _build_request_params(
 
     ``layout="channel"`` is the one canonical shape (spec §3): instructions for every path,
     allowlisted input items, cache policy applied everywhere.
+
+    ``service_tier_eligible`` is the fast tier's opt-in. This builder also serves
+    reconsideration, background and research calls, so it cannot tell a user-facing turn from a
+    housekeeping one by itself — only a caller that flags itself may buy the 2x price.
     """
     model = model or config.gpt_model
     temperature = temperature if temperature is not None else config.default_temperature
@@ -199,6 +204,13 @@ def _build_request_params(
             else:
                 _request_log.debug(
                     f"prompt_cache_options dropped: unsupported on {model}")
+
+    # Fast tier: an eligible call site, `fast` in config, and the one model that honors it. A
+    # `standard` config sends NOTHING — the API's default is the literal "default" and
+    # "standard" is not a value it accepts, so omission is the only correct way to say it.
+    if (service_tier_eligible and config.openai_service_tier == "fast"
+            and model == FAST_SERVICE_TIER_MODEL):
+        params["service_tier"] = "fast"
     return params
 
 
@@ -421,6 +433,7 @@ class OpenAIClient(LoggerMixin):
         usage_sink: Optional[Dict[str, Any]] = None,
         attempt_sink: Optional[Any] = None,
         layout: str = "legacy",
+        service_tier_eligible: bool = False,
     ) -> str:
         return await responses_api.create_text_response(
             self,
@@ -438,6 +451,7 @@ class OpenAIClient(LoggerMixin):
             usage_sink=usage_sink,
             attempt_sink=attempt_sink,
             layout=layout,
+            service_tier_eligible=service_tier_eligible,
         )
 
     async def create_text_response_with_tools(
@@ -466,6 +480,7 @@ class OpenAIClient(LoggerMixin):
         artifacts_sink: Optional[List[Dict[str, Any]]] = None,
         container_gone_sink: Optional[List[str]] = None,
         layout: str = "legacy",
+        service_tier_eligible: bool = False,
     ) -> str:
         return await responses_api.create_text_response_with_tools(
             self,
@@ -489,6 +504,7 @@ class OpenAIClient(LoggerMixin):
             artifacts_sink=artifacts_sink,
             container_gone_sink=container_gone_sink,
             layout=layout,
+            service_tier_eligible=service_tier_eligible,
         )
 
     async def create_streaming_response(
@@ -509,6 +525,7 @@ class OpenAIClient(LoggerMixin):
         usage_sink: Optional[Dict[str, Any]] = None,
         attempt_sink: Optional[Any] = None,
         layout: str = "legacy",
+        service_tier_eligible: bool = False,
     ) -> str:
         return await responses_api.create_streaming_response(
             self,
@@ -528,6 +545,7 @@ class OpenAIClient(LoggerMixin):
             usage_sink=usage_sink,
             attempt_sink=attempt_sink,
             layout=layout,
+            service_tier_eligible=service_tier_eligible,
         )
 
     async def create_streaming_response_with_tools(
@@ -556,6 +574,7 @@ class OpenAIClient(LoggerMixin):
         artifacts_sink: Optional[List[Dict[str, Any]]] = None,
         container_gone_sink: Optional[List[str]] = None,
         layout: str = "legacy",
+        service_tier_eligible: bool = False,
     ) -> str:
         return await responses_api.create_streaming_response_with_tools(
             self,
@@ -581,6 +600,7 @@ class OpenAIClient(LoggerMixin):
             artifacts_sink=artifacts_sink,
             container_gone_sink=container_gone_sink,
             layout=layout,
+            service_tier_eligible=service_tier_eligible,
         )
 
     async def create_text_response_with_tool_loop(
@@ -592,7 +612,7 @@ class OpenAIClient(LoggerMixin):
         **params: Any,
     ) -> Dict[str, Any]:
         """Phase A: non-streaming response with local function-call execution.
-        Returns {"text", "tools_used", "local_tool_calls"}."""
+        Returns {"text", "segments", "tools_used", "local_tool_calls"}."""
         return await tool_loop_api.create_text_response_with_tool_loop(
             self,
             messages=messages,
@@ -613,7 +633,7 @@ class OpenAIClient(LoggerMixin):
         **params: Any,
     ) -> Dict[str, Any]:
         """Phase A: streaming response with local function-call execution.
-        Returns {"text", "tools_used", "local_tool_calls"}."""
+        Returns {"text", "segments", "tools_used", "local_tool_calls"}."""
         return await tool_loop_api.create_streaming_response_with_tool_loop(
             self,
             messages=messages,
@@ -870,6 +890,7 @@ class OpenAIClient(LoggerMixin):
         prompt_cache_options: Optional[Dict[str, Any]] = None,
         attempt_sink: Optional[Any] = None,
         layout: str = "legacy",
+        service_tier_eligible: bool = False,
     ) -> str:
         return await responses_api._create_text_response_with_timeout(
             self,
@@ -887,6 +908,7 @@ class OpenAIClient(LoggerMixin):
             prompt_cache_options=prompt_cache_options,
             attempt_sink=attempt_sink,
             layout=layout,
+            service_tier_eligible=service_tier_eligible,
         )
 
     async def _create_text_response_with_tools_with_timeout(
@@ -912,6 +934,7 @@ class OpenAIClient(LoggerMixin):
         artifacts_sink: Optional[List[Dict[str, Any]]] = None,
         container_gone_sink: Optional[List[str]] = None,
         layout: str = "legacy",
+        service_tier_eligible: bool = False,
     ) -> str:
         return await responses_api._create_text_response_with_tools_with_timeout(
             self,
@@ -936,6 +959,7 @@ class OpenAIClient(LoggerMixin):
             artifacts_sink=artifacts_sink,
             container_gone_sink=container_gone_sink,
             layout=layout,
+            service_tier_eligible=service_tier_eligible,
         )
 
 

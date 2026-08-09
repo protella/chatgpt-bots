@@ -140,11 +140,25 @@ class TestWakeDecisionShape:
 # ------------------------------------------------------------------- debounce + cohorts
 
 class _FakeClient:
-    """The classifier half of the world: records every cohort it is asked to judge."""
+    """The classifier half of the world: records every cohort it is asked to judge.
 
-    def __init__(self, wake=True):
+    `calls` counts calls STARTED and `completed` counts calls that ran to the end — two different
+    numbers since W5b, because a speculative call can be cancelled in flight. `delay` is what makes
+    that observable: a classifier that returns without ever awaiting cannot be interrupted, so a
+    zero-delay fake would report every cancelled call as completed and quietly pass a suite that
+    was measuring the wrong thing.
+
+    Keep `delay` SHORTER than the debounce in tests about the one-live-speculation cap. Longer, and
+    the sleeper's own wake-up cancels its call first — the ordinary superseded-abandon path, which
+    predates the cap — so the count comes out right for a reason that has nothing to do with what
+    the test claims to measure.
+    """
+
+    def __init__(self, wake=True, delay=0.0):
         self._wake = wake
+        self._delay = delay
         self.calls = 0
+        self.completed = 0
         self.cohorts = []          # one entry per call: the tuple of sources it saw
         self.steering = []
 
@@ -152,6 +166,9 @@ class _FakeClient:
         self.calls += 1
         self.cohorts.append(tuple(sources))
         self.steering.append(channel_steering_text)
+        if self._delay:
+            await asyncio.sleep(self._delay)
+        self.completed += 1
         return self._wake
 
     @property
@@ -163,19 +180,33 @@ def _texts(cohort):
     return [s.text for s in cohort]
 
 
+def _warm(engine, *, channel="C1", ts="0.5", thread_root=None, sender_id=None):
+    """Make a stream WARM, so the message under test still gets a debounce window to sit in.
+
+    W5c: a conversation with no arrival inside the last debounce window is judged immediately —
+    there is no burst to collect. Every test about what the window COLLECTS therefore starts from
+    an active stream, which is exactly one prior arrival."""
+    engine.note_arrival(channel, ts, thread_root, sender_id)
+
+
 class TestDebounceAndSupersession:
     @pytest.mark.asyncio
     async def test_rapid_fire_collapses_to_latest(self, monkeypatch):
         monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
-        fake = _FakeClient(wake=True)
+        fake = _FakeClient(wake=True, delay=0.02)
         engine = ParticipationEngine(fake)
+        _warm(engine)
         first = asyncio.create_task(engine.evaluate(channel_id="C1", ts="1.0", text="line one"))
         await asyncio.sleep(0.01)
         second = asyncio.create_task(engine.evaluate(channel_id="C1", ts="2.0", text="line two"))
         r1, r2 = await asyncio.gather(first, second)
         assert r1.decision is None and r1.decline_cause == "superseded"
         assert r2.decision.wake is True
-        assert fake.calls == 1       # ONE model call for the burst
+        # ONE model call COMPLETED for the burst, and one decision. The sleeper started a
+        # speculative call inside its own window; the survivor's enrollment cancelled it while it
+        # was still in flight, so it cost a request that was aborted rather than a whole judgment.
+        assert fake.completed == 1
+        assert fake.calls == 2               # started, and one of the two was cancelled early
         # ...and the superseded message is not lost: it is in the survivor's cohort.
         assert _texts(fake.last_cohort) == ["line one", "line two"]
 
@@ -292,8 +323,9 @@ class TestDebounceAndSupersession:
         # The rule is about the COHORT, not the survivor: someone who posts a file and then says
         # what it is has asked a question, and judging only the newest fragment would miss it.
         monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
-        fake = _FakeClient(wake=True)
+        fake = _FakeClient(wake=True, delay=0.02)
         engine = ParticipationEngine(fake)
+        _warm(engine, sender_id="U1")
         first = asyncio.create_task(engine.evaluate(
             channel_id="C1", ts="1.0", text="what do we think?", sender_id="U1"))
         await asyncio.sleep(0.01)
@@ -303,7 +335,8 @@ class TestDebounceAndSupersession:
         _, survivor = await asyncio.gather(first, second)
         assert survivor.decline_cause is None
         assert survivor.decision.wake is True
-        assert fake.calls == 1
+        assert fake.completed == 1   # the sleeper's speculation was cancelled, not completed
+        assert _texts(fake.last_cohort) == ["what do we think?", ""]
 
     def test_the_engine_has_no_pacing_rails(self):
         # F17: the hourly-cap hard rail is gone entirely, and the binary gate adds no replacement.
@@ -345,15 +378,21 @@ class TestCohortDelivery:
         (`_MAX_BURST_CARRY`). A cap here is a message the person actually sent that neither model
         ever sees, so there is no cap now and this asserts the whole burst arrives."""
         monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
-        fake = _FakeClient(wake=True)
+        fake = _FakeClient(wake=True, delay=0.02)
         engine = ParticipationEngine(fake)
+        _warm(engine, sender_id="U1")
         tasks = []
         for i in range(1, 6):
             tasks.append(asyncio.create_task(engine.evaluate(
                 channel_id="C1", ts=f"{i}.0", text=f"m{i}", sender_id="U1")))
             await asyncio.sleep(0.002)
         results = await asyncio.gather(*tasks)
-        assert fake.calls == 1
+        # ONE completed model call for the burst, judged on the whole of it. Each of the four
+        # sleepers did START a speculative call, and each was cancelled by the next message's
+        # enrollment within a couple of milliseconds — at most one speculation is ever live in a
+        # conversation, so the burst costs one judgment plus four aborted requests.
+        assert fake.completed == 1
+        assert fake.calls == 5
         assert _texts(fake.last_cohort) == ["m1", "m2", "m3", "m4", "m5"]
         # exactly one survivor, and its GateEvaluation carries the same bundle for the responder
         survivors = [r for r in results if r.decision is not None]
@@ -372,8 +411,9 @@ class TestCohortDelivery:
         two people talking at once in a thread is exactly the case where the second message alone
         reads as a non sequitur."""
         monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
-        fake = _FakeClient(wake=True)
+        fake = _FakeClient(wake=True, delay=0.02)
         engine = ParticipationEngine(fake)
+        _warm(engine, ts="10.4", thread_root="10.0", sender_id="U1")
         first = asyncio.create_task(engine.evaluate(
             channel_id="C1", ts="10.5", text="alice's words", sender_id="U1",
             sender_name="Alice", thread_root_ts="10.0"))
@@ -384,7 +424,7 @@ class TestCohortDelivery:
         r1, r2 = await asyncio.gather(first, second)
         assert r1.decision is None and r1.decline_cause == "superseded"
         assert r2.decision.wake is True
-        assert fake.calls == 1
+        assert fake.completed == 1   # Alice's speculation was cancelled the moment Bob enrolled
         assert _texts(fake.last_cohort) == ["alice's words", "bob's reply"]
         # Attribution is preserved per record, which is what makes the carry safe.
         assert [s.sender_name for s in fake.last_cohort] == ["Alice", "Bob"]
@@ -478,6 +518,7 @@ class TestCohortDelivery:
         monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
         fake = _FakeClient(wake=True)
         engine = ParticipationEngine(fake)
+        _warm(engine, sender_id="U1")
         first = asyncio.create_task(engine.evaluate(
             channel_id="C1", ts="1.0", text="the real question", sender_id="U1"))
         await asyncio.sleep(0.01)
@@ -486,7 +527,11 @@ class TestCohortDelivery:
         engine.note_arrival("C1", "2.0", None, "U1")
         ev = await first
         assert ev.decline_cause == "superseded"
-        assert fake.calls == 0
+        # W5b: a speculative call DID run inside the window and was discarded unused — nothing
+        # enrolled to cancel it, since the survivor has not started yet, and only an enrollment
+        # cancels. What the invariant is about is untouched: no decision came back, and the record
+        # is still there for that survivor to collect.
+        assert ev.decision is None and fake.calls == 1 and fake.completed == 1
         assert _texts(engine._drain_cohort("C1|top|U1", "2.0")) == ["the real question"]
 
     @pytest.mark.asyncio
@@ -599,6 +644,7 @@ class TestGateWiring:
         monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
         app, client, fake = _make_app(wake=True)
         engine = app.participation_engine
+        _warm(engine, sender_id="U1")
         first = asyncio.create_task(engine.evaluate(
             channel_id="C1", ts="9.0", text="earlier thought", sender_id="U1"))
         await asyncio.sleep(0.005)

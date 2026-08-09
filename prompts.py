@@ -413,9 +413,14 @@ THREAD_ACTIVITY_NO_REPLY_SUFFIX = (
 )
 
 
-# Volatile developer-suffix paragraph, added ONLY on turns where `set_reply_destination` is
-# exposed — a top-level message in a channel that allows both destinations. Everywhere else the
-# route has already decided and there is nothing to say.
+# Volatile developer-suffix paragraph, added ONLY on turns that still have a destination to
+# choose — a top-level message in a channel that allows both. Everywhere else the route has
+# already decided and there is nothing to say.
+#
+# W4: it teaches a MARKER, not a tool. Stating the choice by tool call cost a whole round before
+# the first word could be written; the marker rides the answer, so the destination is settled
+# inside the same call that produces it. The paragraph therefore keys off the turn alone and not
+# off any schema — there is no schema (message_processor/destination_tools.py).
 #
 # The default is REVERSED from the utility-model classifier this replaces: that one answered
 # "channel" whenever it was unsure (and on every error), so an ambiguous long answer landed in
@@ -426,10 +431,13 @@ THREAD_ACTIVITY_NO_REPLY_SUFFIX = (
 # channel. `thread` means the ORIGIN thread named in the coordinates block — the default
 # destination for this turn — and this choice is between two places, never a way to reach a third.
 DESTINATION_CONTRACT_SUFFIX = (
-    "[This message is at the top level of a channel where you may reply either way, so choose "
-    "before you write: call set_reply_destination exactly once, then answer. `thread` keeps the "
-    "reply under the trigger identified in the coordinates block — the origin thread, where your "
-    "reply lands by default — right for anything long, detailed, specialized, or mainly of "
+    "[This message is at the top level of a channel where you may reply either way, so say which "
+    "before you write: begin your reply with exactly [[reply:thread]] or [[reply:channel]] and "
+    "then write the answer straight after it. The marker is removed before anyone sees the "
+    "message — it is an instruction to us, never part of what you are saying — and it belongs "
+    "only on a reply that has words, so a turn that ends without any needs none. `thread` keeps "
+    "the reply under the trigger identified in the coordinates block — the origin thread, where "
+    "your reply lands by default — right for anything long, detailed, specialized, or mainly of "
     "interest to the person who asked. `channel` posts at the top level, where everyone reading "
     "along sees it without opening anything — right for a short answer the room genuinely "
     "benefits from. If it is a close call, choose thread: a thread costs one click to read, and "

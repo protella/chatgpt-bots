@@ -138,6 +138,30 @@ def resolve_participation_level(channel_settings: Optional[Dict[str, Any]]) -> s
 _MAX_SUPERSESSION_KEYS = 512
 
 
+def _freeze(value: Any) -> Any:
+    """A small payload as a comparable, immutable value — dicts and lists all the way down.
+
+    Used on `SourceMessage.edit`, the one field of a source that is a live mutable object rather
+    than a string. Sorted by the repr of the key so a mixed-key dict cannot raise here; the payload
+    is always small (an edit's before/after text and one flag)."""
+    if isinstance(value, dict):
+        return tuple(sorted(((k, _freeze(v)) for k, v in value.items()), key=lambda kv: repr(kv[0])))
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(v) for v in value)
+    if isinstance(value, (set, frozenset)):
+        return tuple(sorted((repr(v) for v in value)))
+    return value
+
+
+def _activity_lru_max() -> int:
+    """How many conversation streams keep an arrival marker (W5c). Read per call, not cached, so a
+    test or an operator can change the bound the same way every other config value changes."""
+    try:
+        return max(1, int(getattr(config, "participation_activity_lru_max", 1024)))
+    except (TypeError, ValueError):
+        return 1024
+
+
 # How an attachment is described to the gate: name plus KIND, and nothing else. Defined here,
 # beside the record that carries it, because two places need to agree — the Slack facade builds
 # these strings and the gate classifies on them, and a format invented at each end is how
@@ -204,6 +228,86 @@ def source_from_message(message: Any) -> SourceMessage:
         thread_root_ts=getattr(message, "thread_id", None),
         attachments=tuple(meta.get("participation_attachments") or ()),
     )
+
+
+@dataclass(frozen=True)
+class ArrivalMarker:
+    """When a conversation stream was last seen speaking — W5c's whole state.
+
+    `ts` is the Slack timestamp that was noted; `at` is the monotonic clock reading when it was
+    FIRST noted, and the clock is what the coldness test reads. A Slack ts would measure the gap
+    between two people's messages; `at` measures the gap between two ARRIVALS at this process,
+    which is what "was this stream busy a moment ago" actually asks.
+    """
+
+    ts: str
+    at: float
+
+
+@dataclass(frozen=True)
+class Arrival:
+    """`note_arrival`'s whole answer about ONE message: its own record, and what came before it.
+
+    Returned rather than looked up again later, and that is the point. The gate notes an arrival
+    twice — at gate entry in main.py, then again inside `evaluate` — with real work in between, so
+    by the second call the map may have moved on: another message in the same stream may have
+    arrived, or the LRU may have evicted the stream entirely. Either would make the second call
+    answer a different question from the first. The caller carries THIS record from the first call
+    to the second instead, so a message's coldness is decided by the state at the moment it
+    arrived, which is the only moment that describes it.
+    """
+
+    marker: ArrivalMarker
+    prior: Optional[ArrivalMarker]
+
+
+def _stream_was_cold(seen: Optional[Arrival], window: float) -> bool:
+    """Whether nothing arrived in this conversation within the last debounce window.
+
+    Judged on the arrival BEFORE this message. Nothing before it at all is the coldest case there
+    is. Otherwise the gap is measured between the two ARRIVALS — both times are in the record the
+    caller carries — against the window, the same `participation_debounce_seconds` that would be
+    waited, because a burst is defined as messages inside one such window and nothing else needs a
+    number.
+
+    Not "how long ago was the previous message", which is a different question with a different
+    answer: this is read after the caller's steering load, and clocking from now would let a slow
+    turn age a genuine burst into a cold stream — the exact thing carrying the record exists to
+    prevent.
+
+    Anything that is not an `Arrival` means somebody replaced `note_arrival` with a stub, and the
+    answer there is "not cold" — keep the wait, change nothing. A MagicMock answers every attribute
+    with another truthy mock, so a stub must not be able to talk this into a behaviour the caller
+    never asked for (the same lesson `_take_edit_context` learned the hard way).
+    """
+    if seen is None:
+        return True
+    if not isinstance(seen, Arrival) or not isinstance(seen.prior, (ArrivalMarker, type(None))):
+        return False
+    if seen.prior is None:
+        return True
+    return (seen.marker.at - seen.prior.at) > max(0.0, window)
+
+
+@dataclass
+class _Speculation:
+    """One in-flight speculative classifier call, and the two facts its owner cannot read off the
+    task itself.
+
+    `superseded` is set by a NEWER arrival's enrollment, which cancels this call because the burst
+    it judged has already been overtaken. The owner reads the flag rather than the task's state:
+    "was I cancelled by someone else" and "am I cancelled yet" are different questions, and a task
+    cancelled a microsecond ago still answers False to `cancelled()`. Awaiting it on that guess
+    would raise CancelledError out of a turn that is entitled to a decision.
+
+    `committed` is set by the owner just before it awaits the verdict, and closes the other side of
+    the same race: past its supersession check the owner is going to USE this call, so a message
+    arriving during the await must not cancel it out from under a decided turn.
+    """
+
+    task: "asyncio.Task[Tuple[Optional[bool], Optional[str], int]]"
+    superseded: bool = False
+    committed: bool = False
 
 
 @dataclass(frozen=True)
@@ -291,6 +395,28 @@ class ParticipationEngine:
         # the stale original — the edit's OWN re-evaluation, which carries edit context, is
         # exempt. conv key -> set of superseded ts. Bounded by _MAX_SUPERSESSION_KEYS.
         self._edit_superseded: "OrderedDict[str, set]" = OrderedDict()
+        # W5c: the ARRIVAL map — conversation key -> the newest `Arrival` seen in that stream. Its
+        # own structure, deliberately not folded into `_latest` or `_cohorts`: those two are
+        # cleared the moment a cohort drains or a source is withdrawn, and "this conversation was
+        # active seconds ago" has to outlive both — a drain is precisely when a stream is at its
+        # busiest.
+        #
+        # Bounded by an LRU (`participation_activity_lru_max`), which unlike the cohort map is safe
+        # here because this holds timestamps and never a message: an eviction can lose nothing
+        # anybody said. What it CAN cost, stated honestly: a stream evicted while it is still
+        # warm reads as cold to its next message, which is then judged immediately instead of
+        # waiting — that burst is answered as two turns rather than one, exactly as a genuinely
+        # cold start already is. It takes an eviction to reach that, and eviction only touches the
+        # least recently spoken-in stream once a thousand others have spoken since. A message
+        # already in flight is immune either way: its coldness was decided from the `Arrival` it
+        # carries (see `Arrival`), not from this map.
+        self._activity: "OrderedDict[str, Arrival]" = OrderedDict()
+        # W5b's cap: the ONE live speculative call a conversation is allowed, keyed the same way as
+        # everything else here. An entry lives from the moment its attempt starts speculating until
+        # that attempt uses or discards it; a newer arrival in the same stream cancels what it
+        # finds here (see `_supersede_stream_speculation`) before registering its own. Bounded by
+        # the fact that every entry has a live evaluation behind it that will remove its own.
+        self._speculations: Dict[str, _Speculation] = {}
 
     @staticmethod
     def _conv_key(channel_id: str, ts: str, thread_root: Optional[str],
@@ -307,19 +433,65 @@ class ParticipationEngine:
 
     def note_arrival(self, channel_id: str, ts: Optional[str],
                      thread_root: Optional[str] = None,
-                     sender_id: Optional[str] = None) -> None:
+                     sender_id: Optional[str] = None) -> Optional[Arrival]:
         """Register a message's ts as its conversation's newest — MONOTONICALLY (F5 fix b).
 
         Called at gate entry, BEFORE any await, so an older event delayed by memory/topic
         I/O can never overwrite a newer event's marker and win the debounce. Only a
         genuinely newer Slack ts advances the marker. F27: sender_id scopes the top-level
-        stream key so a monotonic advance is per-author."""
+        stream key so a monotonic advance is per-author.
+
+        RETURNS this arrival and the one before it (see `Arrival`), which is what W5c's adaptive
+        debounce judges coldness against. It has to be the PRIOR value: a reading taken after the
+        record was written would report the message's own arrival and call every stream warm.
+
+        THIS METHOD IS CALLED TWICE FOR EVERY MESSAGE — gate entry, then `evaluate` — and other
+        messages arrive in between. So the activity map is written in exactly ONE case: a ts
+        strictly NEWER than whatever that stream currently holds. Every other call is a pure read.
+        Not a move_to_end, not a re-time, not a reinsert:
+
+          * a repeat of the current ts returns the stored record untouched — re-timing it would
+            date the stream from the second look rather than the arrival, and even nudging LRU
+            recency would let a doubled call outrank a stream that actually spoke more recently;
+          * a ts that is not newer (our own second call after somebody overtook us, or an
+            out-of-order older event) must not overwrite a record that describes a LATER message;
+          * and if the stream was EVICTED between the two calls, a stale second call must not
+            reinsert itself — `_latest` still names the newer message, and inserting here would
+            both re-time a stream from an old message and evict some other stream to do it.
+
+        A call that cannot reconstruct what the stream looked like when its ts first arrived
+        answers conservatively — WARM, which keeps today's trailing wait. The direction matters: a
+        wrong "warm" costs one debounce, a wrong "cold" splits a burst. Callers that need the exact
+        answer carry the `Arrival` from their first call, which is what main.py does and what
+        `evaluate`'s `arrival` is for."""
         if not channel_id or not ts:
-            return
+            return None
         key = self._conv_key(channel_id, ts, thread_root, sender_id)
         current = self._latest.get(key)
         if current is None or _ts_key(ts) > _ts_key(current):
             self._latest[key] = ts
+
+        now = time.monotonic()
+        recorded = self._activity.get(key)
+        if recorded is not None:
+            if recorded.marker.ts == str(ts):
+                return recorded                     # same message, second call — same answer
+            if _ts_key(str(ts)) <= _ts_key(recorded.marker.ts):
+                return Arrival(marker=ArrivalMarker(ts=str(ts), at=now),
+                               prior=recorded.marker)
+        elif current is not None and _ts_key(str(ts)) < _ts_key(current):
+            # Evicted, and this call is a stale second look: the stream has a newer message than
+            # us. Answer warm — something newer than us exists in this stream right now, and the
+            # zero gap says so — but write nothing, so an old message cannot displace a live one.
+            return Arrival(marker=ArrivalMarker(ts=str(ts), at=now),
+                           prior=ArrivalMarker(ts=str(current), at=now))
+        arrival = Arrival(marker=ArrivalMarker(ts=str(ts), at=now),
+                          prior=recorded.marker if recorded is not None else None)
+        self._activity[key] = arrival
+        self._activity.move_to_end(key)
+        while len(self._activity) > _activity_lru_max():
+            self._activity.popitem(last=False)
+        return arrival
 
     def supersede(self, channel_id: str, ts: Optional[str],
                   thread_root: Optional[str] = None,
@@ -341,6 +513,15 @@ class ParticipationEngine:
         self._edit_superseded.move_to_end(key)
         while len(self._edit_superseded) > _MAX_SUPERSESSION_KEYS:
             self._edit_superseded.popitem(last=False)
+
+    def _is_edit_superseded(self, key: str, ts: str) -> bool:
+        """Whether an edit has marked `ts` — WITHOUT consuming the mark.
+
+        The speculative path (W5b) needs to know that this attempt is already doomed so it does not
+        spend a call on it, and consuming here would eat the mark the real check at window close is
+        waiting for, letting the stale original speak after all."""
+        bucket = self._edit_superseded.get(key)
+        return bool(bucket and str(ts) in bucket)
 
     def _consume_edit_supersession(self, key: str, ts: str) -> bool:
         """True (and clears the mark) iff `ts` was explicitly superseded by an edit for `key`.
@@ -397,6 +578,21 @@ class ParticipationEngine:
             self._cohorts.pop(key, None)
         taken.sort(key=lambda pair: pair[0])   # oldest first: the order they were said in
         return tuple(source for _, source in taken)
+
+    def _peek_cohort(self, key: str, own_ts: str) -> Tuple[SourceMessage, ...]:
+        """Exactly what `_drain_cohort` WOULD return right now, taking nothing.
+
+        W5b speculates on this tuple and then compares it, by value, against the real drain at
+        window close. Reading through the same rule (everything up to and including our own ts,
+        oldest first) is what makes that comparison meaningful: if the two differ, the cohort
+        genuinely changed under us, and the speculation is about a burst that no longer exists."""
+        bucket = self._cohorts.get(key)
+        if not bucket:
+            return ()
+        own_key = _ts_key(own_ts)
+        seen = [(_ts_key(pts), src) for pts, src in bucket.items() if _ts_key(pts) <= own_key]
+        seen.sort(key=lambda pair: pair[0])
+        return tuple(source for _, source in seen)
 
     def _take_cohort_files(self, key: str, sources: Sequence[SourceMessage]
                            ) -> Tuple[Tuple[str, Tuple[Dict[str, Any], ...]], ...]:
@@ -462,6 +658,112 @@ class ParticipationEngine:
         else:
             self._latest.pop(key, None)
 
+    # -------------------------------------------------------- classification helpers
+
+    @staticmethod
+    def _cohort_fingerprint(sources: Sequence[SourceMessage]) -> Tuple[Any, ...]:
+        """The cohort as an immutable VALUE, for the one comparison W5b turns on.
+
+        Comparing the records themselves compares object identity's poorer cousin: a SourceMessage
+        is frozen, but its `edit` payload is an ordinary dict that the speculative prompt has
+        already been rendered from. Mutate that dict mid-window and the two tuples still compare
+        equal, so a verdict about the old before/after text would be committed as a judgment of the
+        new one. Freezing the payload at speculation start makes the comparison a statement about
+        what the model was actually shown, which is what it has to be."""
+        return tuple((s.ts, s.text, s.sender_id, s.sender_name, s.sender_type, s.thread_root_ts,
+                      tuple(s.attachments), _freeze(s.edit)) for s in sources)
+
+    @staticmethod
+    def _is_captionless_image_cohort(sources: Sequence[SourceMessage]) -> bool:
+        """A cohort of nothing but wordless IMAGES — the one shape with nothing to judge.
+
+        ONE definition, read by the structural decline at window close and by W5b's eligibility
+        test at enrollment. Two copies would be two answers to "does this cohort get a classifier
+        call", and the speculative half would start spending calls on the path the real half
+        skips."""
+        attached = [d for s in sources for d in s.attachments]
+        return bool(attached and all(is_image_descriptor(d) for d in attached)
+                    and not any((s.text or "").strip() for s in sources))
+
+    async def _classify_cohort(self, sources: Tuple[SourceMessage, ...],
+                               channel_steering_text: Optional[str]
+                               ) -> Tuple[Optional[bool], Optional[str], int]:
+        """The model call, timed, with its failure captured rather than raised: (bit, failure
+        type name, ms). Shared by the speculative task and the ordinary post-debounce call so the
+        two cannot drift into asking the question differently or timing it differently.
+
+        Timed around the model call and NOTHING else. The gate's own wall time is dominated by the
+        debounce sleep, so reading it as classifier latency blames the provider for a delay we
+        chose. Measured on failure too — a timeout's duration is the story.
+
+        A cancellation is a BaseException and so passes straight through the fail-safe below: a
+        speculation somebody threw away is not a classifier failure and must not be recorded as
+        one."""
+        started = time.monotonic()
+        raw: Optional[bool] = None
+        detail: Optional[str] = None
+        try:
+            raw = await self.openai_client.classify_wake(
+                sources=sources, channel_steering_text=channel_steering_text)
+        except Exception as e:  # noqa: BLE001 — fail-safe is silence, never spam
+            detail = type(e).__name__
+        return raw, detail, int((time.monotonic() - started) * 1000)
+
+    def _supersede_stream_speculation(self, key: str, *, channel_id: str, ts: str) -> None:
+        """Cancel the speculation of whoever held this stream before us — at ENROLLMENT.
+
+        THE CAP: at most one live speculative call per conversation. The moment a newer message
+        enrolls, the older attempt is superseded by definition, and its speculation is a verdict
+        about a burst that has already been overtaken. Left alone it runs to completion and is
+        thrown away at the older attempt's own wake-up, so a five-message burst spent five calls to
+        use one. Cancelled here it is aborted within a message of starting.
+
+        Signal only: this cancels the API task and does not join it. The owner joins its own task
+        on the superseded path, which is where the accounting for it belongs — and cancels NOTHING
+        else. The older attempt's source stays enrolled for the survivor, its cohort is intact, and
+        `discard_source` remains the only path that withdraws a message.
+
+        A speculation whose owner has already committed to using it is left alone. That owner has
+        passed its own supersession check and is awaiting the verdict; cancelling underneath it
+        would turn a decided turn into a raised CancelledError.
+        """
+        live = self._speculations.get(key)
+        if live is None or live.committed:
+            return
+        live.superseded = True
+        live.task.cancel()
+        logger.debug("Wake gate: speculative classification superseded early by %s/%s",
+                     channel_id, ts)
+
+    def _forget_speculation(self, key: str, spec: "Optional[_Speculation]") -> None:
+        """Deregister OUR speculation, and only ours: a newer attempt may already have replaced the
+        entry, and popping that one would leave its task with nobody to cancel it."""
+        if spec is not None and self._speculations.get(key) is spec:
+            self._speculations.pop(key, None)
+
+    async def _abandon_speculation(self, key: str, spec: "Optional[_Speculation]", *, reason: str,
+                                   channel_id: str, ts: str, join: bool = True) -> None:
+        """Throw away a speculative verdict: cancel the API task and, normally, join it.
+
+        This cancels ONE task and touches no other state. The source stays enrolled, the cohort
+        stays intact, `_latest` is untouched — a superseded window still owes its words to the
+        survivor, and `discard_source` remains the only path that withdraws a message.
+
+        The result is dropped in silence beyond a debug line, and that is the point: a decision
+        row is minted from what `evaluate` returns, so a speculative call that nobody uses must
+        leave no verdict behind. One attempt, one decision.
+
+        `join=False` is for the one caller that cannot await — the debounce's own cancellation
+        handler, which is already unwinding and must re-raise promptly."""
+        if spec is None:
+            return
+        self._forget_speculation(key, spec)
+        spec.task.cancel()
+        logger.debug("Wake gate: speculative classification discarded (%s) for %s/%s",
+                     reason, channel_id, ts)
+        if join:
+            await asyncio.gather(spec.task, return_exceptions=True)
+
     # ------------------------------------------------------------- evaluate
 
     async def evaluate(self, *, channel_id: str, ts: str, text: str,
@@ -475,12 +777,20 @@ class ParticipationEngine:
                        thread_root_ts: Optional[str] = None,
                        edit_marker: Optional[str] = None,
                        carried_sources: Optional[List[SourceMessage]] = None,
+                       queue_drained: bool = False,
+                       arrival: Optional[Arrival] = None,
                        attempt_id: Optional[str] = None) -> GateEvaluation:
         """Debounce, coalesce, ask once, return one bit.
 
         `decision` is None when there is nothing to act on, and `decline_cause` says which kind of
         nothing — the CALLER owns the turn's single terminal event and cannot read that off a log
         line. `attempt_id` rides the diagnostics and changes no behaviour.
+
+        `arrival` is what `note_arrival` answered when the CALLER noted this message at gate entry,
+        and it is how the adaptive debounce stays a statement about this message: the caller does
+        real I/O between that call and this one, so re-deriving coldness here would read a stream
+        that has since moved on. Omit it and this call derives its own, which is correct for any
+        caller that has not already noted the arrival.
 
         The cohort: every source enrolled in this conversation up to and including this one goes to
         the classifier, oldest first, and comes back on the GateEvaluation so the responder answers
@@ -494,7 +804,15 @@ class ParticipationEngine:
         """
         key = self._conv_key(channel_id, ts, thread_root_ts, sender_id)
         # Monotonic; a stale caller can't clobber a newer marker.
-        self.note_arrival(channel_id, ts, thread_root_ts, sender_id)
+        #
+        # `arrival` is this message's own record from the caller's gate-entry call, and when it is
+        # present it — not this second call — decides coldness. Between the two calls the caller
+        # does real I/O, during which another message in the same stream can arrive or the LRU can
+        # evict the stream, and either would have this call answer a question about a different
+        # moment than the one this message arrived in. The note itself still happens, because
+        # `_latest` and the activity record are what a LATER message will read.
+        noted = self.note_arrival(channel_id, ts, thread_root_ts, sender_id)
+        seen = arrival if arrival is not None else noted
 
         # The edit context belongs to THIS attempt or to nobody: it is keyed by the edit's own
         # marker, so the original attempt (which carries no marker) cannot pop the edit's context
@@ -521,8 +839,68 @@ class ParticipationEngine:
             if carried.ts and carried.ts != source.ts:
                 self._enroll_source(key, carried)
 
-        wait = max(0.0, float(getattr(config, "participation_debounce_seconds", 3.0)))
+        # Enrollment is the moment the stream changes hands. If we are its newest message, whoever
+        # was speculating here is superseded — by definition, and now rather than at their own
+        # wake-up — so their call is aborted while it is still cheap. An out-of-order older arrival
+        # is not the survivor and cancels nothing.
+        if self._latest.get(key) == ts:
+            self._supersede_stream_speculation(key, channel_id=channel_id, ts=ts)
+
+        debounce = max(0.0, float(getattr(config, "participation_debounce_seconds", 3.0)))
+        # A Phase-Q drain redispatch has already been debounced, by the drain: it lingered with the
+        # lock held so stragglers could join, then took the whole queue at once. Waiting the
+        # debounce again would coalesce nothing — the batch is closed — and every message in it has
+        # been waiting since before the previous turn ended. Only the sleep is skipped; supersession,
+        # the cohort drain, classification and telemetry all run exactly as they do for any turn.
+        #
+        # W5c, the other way to earn a zero wait: the stream was COLD. The debounce exists to
+        # collect a burst, and a burst is — by the debounce's own definition — messages within one
+        # window of each other. If nothing arrived in this conversation within the last window,
+        # there is no burst to collect and the wait buys nothing but three seconds of the person
+        # watching a channel where nothing happens. No new constant governs this: the window IS
+        # `participation_debounce_seconds`, so one tuned value still describes both halves of the
+        # same behaviour. A stream that IS warm keeps today's trailing wait exactly.
+        cold = _stream_was_cold(seen, debounce)
+        wait = 0.0 if (queue_drained or cold) else debounce
+
+        # W5b: the leading-edge speculative call. The debounce is dead time we already spend, so
+        # the classifier can run INSIDE it and have its verdict in hand when the window closes.
+        #
+        # Two rules keep it honest. It starts only when the cohort AS IT STANDS RIGHT NOW would
+        # earn a classifier call anyway — no path that skips the model today may gain an API call
+        # because we guessed early — and its verdict is used only if the cohort at window close is
+        # the same one it judged. Everything else discards it. And it exists only when there is a
+        # window to hide in: `wait` of zero (a queue drain, or a cold stream above) starts nothing,
+        # which is what makes "one attempt, one decision" structural rather than a promise — the
+        # immediate path and the speculative path can never both be live for one evaluation.
+        speculative: Optional[_Speculation] = None
+        speculated_on: Tuple[Any, ...] = ()
         if wait:
+            cohort_now = self._peek_cohort(key, ts)
+            eligible = (
+                bool(cohort_now)
+                # Already superseded before we even slept — today's code asks nobody.
+                and self._latest.get(key) == ts
+                # A wordless pile of pictures is a structural decline, not a judgment.
+                and not self._is_captionless_image_cohort(cohort_now)
+                # An edit has already cancelled this attempt; PEEKED, never consumed, so the real
+                # check at window close still finds its mark.
+                and not (edit_context is None and self._is_edit_superseded(key, ts))
+            )
+            if eligible:
+                # The fingerprint is taken HERE, before the task can run, so it records the cohort
+                # the model is about to be shown rather than whatever that cohort has become by
+                # the time the window closes.
+                speculated_on = self._cohort_fingerprint(cohort_now)
+                speculative = _Speculation(task=asyncio.create_task(
+                    self._classify_cohort(cohort_now, channel_steering_text)))
+                # Registered so the NEXT message in this stream can find it and cancel it. Ours
+                # replaces whatever was here; we cancelled that one at enrollment.
+                self._speculations[key] = speculative
+
+            # The window itself. Started AFTER the speculation so the call is already in flight for
+            # the whole of it — that is the entire latency win, and reversing these two lines would
+            # give it back.
             try:
                 await asyncio.sleep(wait)
             except asyncio.CancelledError:
@@ -532,12 +910,22 @@ class ParticipationEngine:
                 # entry stays forever, and worse, gets swept into some later survivor's cohort as
                 # a message from the distant past. Nothing else is owed here: the sources were
                 # never judged, and re-raising leaves the caller's cancellation intact.
+                #
+                # The speculative task is this turn's own child, so it goes with the turn — but
+                # WITHOUT a join: we are already unwinding and the caller's cancellation must not
+                # wait on an HTTP round trip. Cancelling it withdraws nothing from the cohort.
+                await self._abandon_speculation(key, speculative, reason="evaluation cancelled",
+                                                channel_id=channel_id, ts=ts, join=False)
                 self.discard_source(channel_id, ts, thread_root_ts, sender_id)
                 raise
 
         if self._latest.get(key) != ts:
             # Superseded. Our record STAYS enrolled for the survivor, so nothing this person said
-            # is lost — it arrives at both models as part of the survivor's cohort.
+            # is lost — it arrives at both models as part of the survivor's cohort. The speculative
+            # call is the ONLY thing cancelled here: the survivor answers for this message, and it
+            # needs the enrollment we are leaving behind.
+            await self._abandon_speculation(key, speculative, reason="superseded",
+                                            channel_id=channel_id, ts=ts)
             participation_telemetry.gate_declined(
                 channel_id, ts, cause="superseded", attempt_id=attempt_id,
                 survivor_ts=self._latest.get(key))
@@ -549,6 +937,12 @@ class ParticipationEngine:
         # context-free original consumes the mark; the edit's own attempt carries a marker and is
         # exempt, which is now structural rather than a coincidence of pop ordering.
         if edit_context is None and self._consume_edit_supersession(key, ts):
+            # The accepted cost of W5b, named where it happens: this attempt was eligible when the
+            # window opened and the edit arrived during it, so a speculative call has already been
+            # spent on a cohort nobody will hear about. Rare, one utility call, and it buys the
+            # common case a whole debounce window.
+            await self._abandon_speculation(key, speculative, reason="edit superseded",
+                                            channel_id=channel_id, ts=ts)
             participation_telemetry.gate_declined(channel_id, ts, cause="edit_superseded",
                                                   attempt_id=attempt_id)
             return GateEvaluation(decline_cause="edit_superseded")
@@ -575,27 +969,39 @@ class ParticipationEngine:
         # it, and often should — so treating "no caption" as "nothing to do" for those would skip
         # both models on exactly the material this bot is best at. A picture with no caption is the
         # narrow case where there is genuinely nothing being asked.
-        attached = [d for s in sources for d in s.attachments]
-        if (attached and all(is_image_descriptor(d) for d in attached)
-                and not any((s.text or "").strip() for s in sources)):
+        if self._is_captionless_image_cohort(sources):
+            await self._abandon_speculation(key, speculative, reason="image-only cohort",
+                                            channel_id=channel_id, ts=ts)
             participation_telemetry.gate_declined(
                 channel_id, ts, cause="image_only", attempt_id=attempt_id,
                 source_count=len(sources))
             return GateEvaluation(decline_cause="image_only", sources=sources,
                                   source_files=source_files)
 
-        # Timed around the model call and NOTHING else. The gate's own wall time is dominated by
-        # the debounce sleep, so reading it as classifier latency blames the provider for a delay
-        # we chose. Measured on failure too — a timeout's duration is the story.
-        classifier_started = time.monotonic()
-        detail: Optional[str] = None
-        raw: Optional[bool] = None
-        try:
-            raw = await self.openai_client.classify_wake(
-                sources=sources, channel_steering_text=channel_steering_text)
-        except Exception as e:  # noqa: BLE001 — fail-safe is silence, never spam
-            detail = type(e).__name__
-        classifier_ms = int((time.monotonic() - classifier_started) * 1000)
+        # THE decision call — exactly one per evaluation, from one of two places.
+        #
+        # The speculative verdict counts only if the cohort that closed the window fingerprints
+        # identically to the one it judged — a deep value taken at speculation start, so a mutable
+        # edit payload cannot be changed underneath a verdict that was rendered from the old one.
+        # Sources joining, an edit replacing a source's text in place, or a supersession consumed
+        # mid-window all make it a verdict about a different burst. When it does not match it is
+        # cancelled and thrown away — no row, no reuse — and the ordinary call runs exactly as it
+        # does today, on the cohort that actually exists.
+        if (speculative is not None and not speculative.superseded
+                and speculated_on == self._cohort_fingerprint(sources)):
+            # Claimed before the await: past the supersession check this verdict is the turn's, so
+            # a message landing during the round trip must leave it alone rather than cancel a
+            # decision out from under us. `superseded` is the other half — a newer arrival already
+            # cancelled this call, so there is nothing to wait for and the fallback below runs a
+            # normal one. Neither path can produce two decisions.
+            speculative.committed = True
+            self._forget_speculation(key, speculative)
+            raw, detail, classifier_ms = await speculative.task
+        else:
+            await self._abandon_speculation(key, speculative, reason="cohort changed under speculation",
+                                            channel_id=channel_id, ts=ts)
+            raw, detail, classifier_ms = await self._classify_cohort(
+                sources, channel_steering_text)
 
         if raw is None:
             # No bit. NOT a decision, and deliberately not dressed as one: the rich gate

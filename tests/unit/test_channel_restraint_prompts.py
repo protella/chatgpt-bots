@@ -27,6 +27,8 @@ import pytest
 import prompts
 from config import config
 
+from message_processor.destination_tools import destination_marker
+from message_processor.turn_runtime import SELECTABLE_DESTINATIONS
 from message_processor.utilities import (SURFACE_CHANNEL,
                                         local_tools_guidance_for,
                                         reach_tools_for)
@@ -233,9 +235,20 @@ def test_silence_ends_words_not_work_in_both_paragraphs():
 
 
 def test_both_paragraphs_are_one_bracketed_block():
-    for s in BOTH + (DESTINATION_CONTRACT_SUFFIX,):
+    for s in BOTH:
         assert s.startswith("[") and s.endswith("]")
         assert "[" not in s[1:] and "]" not in s[:-1]     # nothing can close the frame early
+
+
+def test_the_destination_paragraph_is_one_block_around_two_markers():
+    """Same frame, one licensed exception: W4's markers are literally brackets, so the paragraph
+    that teaches them cannot be bracket-free. Nothing ELSE may add one — with the two markers
+    removed, the old no-inner-bracket rule still holds exactly."""
+    s = DESTINATION_CONTRACT_SUFFIX
+    assert s.startswith("[") and s.endswith("]")
+    for destination in SELECTABLE_DESTINATIONS:
+        s = s.replace(destination_marker(destination), "MARKER")
+    assert "[" not in s[1:] and "]" not in s[:-1]
 
 
 def test_the_two_paragraphs_are_not_the_same_text():
@@ -259,10 +272,19 @@ def test_the_destination_contract_names_the_origin_thread():
     assert "the origin thread, where your reply lands by default" in s
 
 
-def test_the_destination_contract_keeps_its_thread_default_and_single_call():
+def test_the_destination_contract_keeps_its_thread_default_and_asks_for_one_marker():
+    """W4 changed HOW the choice is stated — a marker in the first tokens instead of a tool call
+    that cost a whole round — and nothing else about the contract. The rubric is the same."""
     s = DESTINATION_CONTRACT_SUFFIX
-    assert "call set_reply_destination exactly once" in s
+    assert "begin your reply with exactly" in s
+    assert "set_reply_destination" not in s, "the tool is retired on the surface this rides"
     assert "If it is a close call, choose thread" in s
+
+
+def test_the_destination_contract_excuses_a_turn_with_no_words():
+    """A marker belongs to a reply. A turn that ends in silence or a reaction has nothing to
+    place, and the paragraph has to say so or the model will invent words to carry one."""
+    assert "a turn that ends without any needs none" in DESTINATION_CONTRACT_SUFFIX
 
 
 def test_the_destination_contract_cannot_be_read_as_reaching_a_third_thread():

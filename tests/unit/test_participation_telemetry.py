@@ -19,6 +19,7 @@ import asyncio
 import contextlib
 import json
 import logging
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1294,6 +1295,39 @@ def test_a_turn_outcome_reports_what_the_turn_accumulated(sink):
                                    "first_ts": "50.0", "state": "committed",
                                    "chars": 11, "kind": "reply"}]
     assert "text" not in row["destinations"][0]   # the ledger records a length, never the reply
+
+
+def test_a_turn_outcome_carries_the_destination_contract_miss(sink):
+    """W4's battery metric, and it has to ride HERE. The `visible_action` copy belongs to the
+    gate population, and the ungated channel turns — most of the selectable ones — never emit a
+    terminal at all, so a miss rate read from that alone would be blind to exactly the traffic
+    the marker was built for."""
+    turn = _turn(turn_id="s:11")
+    turn.destination_selected = False
+    turn.settle_default_destination()          # words arrived, no marker ever did
+    assert turn.destination_contract_miss is True
+
+    pt.emit_turn_outcome(turn, channel_id="C1", trigger_ts="10.0", kind="reply")
+
+    assert sink("turn_outcome")[0]["destination_contract_miss"] is True
+
+
+def test_a_turn_that_placed_its_own_reply_writes_no_miss(sink):
+    """Written ONLY when true, the same convention the terminal copy follows: a column that is
+    false on nearly every row costs bytes on every line to say nothing."""
+    message = SimpleNamespace(thread_id="10.0")
+    turn = _turn(turn_id="s:12")
+    turn.destination_selected = False
+    turn.destination_source = "default"
+    turn.select_destination("channel", message=message)
+
+    pt.emit_turn_outcome(turn, channel_id="C1", trigger_ts="10.0", kind="reply")
+
+    row = sink("turn_outcome")[0]
+    assert "destination_contract_miss" not in row
+    # …and neither does a turn that never had the choice in the first place.
+    pt.emit_turn_outcome(_turn(turn_id="s:13"), channel_id="C1", trigger_ts="11.0", kind="reply")
+    assert "destination_contract_miss" not in sink("turn_outcome")[1]
 
 
 def test_a_turn_outcome_is_emitted_exactly_once(sink):

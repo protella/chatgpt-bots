@@ -51,7 +51,10 @@ def _processor(container="cntr_job1"):
     processor.db.find_thread_images_async = AsyncMock(return_value=[])
     processor.db.get_thread_documents_async = AsyncMock(return_value=[])
     processor.container_manager = MagicMock()
-    processor.container_manager.get_or_create = AsyncMock(return_value=container)
+    # W3: a build resolves through create_explicit — `auto` gives it neither a mount target nor
+    # a readable listing. get_or_create is left as a bare MagicMock deliberately: awaiting it
+    # would raise, so a regression back to it fails loudly here.
+    processor.container_manager.create_explicit = AsyncMock(return_value=container)
     processor.container_manager.invalidate = AsyncMock()
     processor.openai_client = MagicMock()
     return processor
@@ -72,7 +75,7 @@ def _card(plan=("Research the thing", "Build the deck")):
 @pytest.mark.unit
 class TestBuildPhase:
     async def test_uses_its_own_container_not_the_threads(self, monkeypatch):
-        # The whole point. A chat turn calling get_or_create on the SHARED container would
+        # The whole point. A build resolving the SHARED thread container would
         # baseline the job's half-written deck as already-published, and the publisher would
         # then skip it — the deck would vanish, silently, the more the user chatted.
         processor = _processor()
@@ -95,7 +98,8 @@ class TestBuildPhase:
 
         # Job-scoped ledger, keyed off the job id — never the bare thread key.
         assert build["ledger_key"] == "C1:1.0#job:abc123"
-        processor.container_manager.get_or_create.assert_awaited_once_with("C1:1.0#job:abc123")
+        processor.container_manager.create_explicit.assert_awaited_once_with(
+            "C1:1.0#job:abc123")
 
     async def test_build_tools_exclude_the_slack_posting_image_tools(self, monkeypatch):
         # generate_image is DETACHED and posts straight to Slack: inside a build it would land

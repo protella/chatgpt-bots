@@ -1248,7 +1248,12 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
     # still land under the real thread_key, so tomorrow's "revise that deck" can find the file.
     ledger_key = f"{thread_key}#job:{job_id}"
     manager = getattr(processor, "container_manager", None)
-    container = await manager.get_or_create(ledger_key) if manager is not None else AUTO_CONTAINER
+    # W3: `create_explicit`, never `get_or_create` — a chat turn is happy to start on `auto` and
+    # adopt whatever it lands in, but a build has files to mount in and a listing to read back
+    # out, and neither works without an addressable id. This is the caller that genuinely needs
+    # the blocking create.
+    container = (await manager.create_explicit(ledger_key) if manager is not None
+                 else AUTO_CONTAINER)
     if not isinstance(container, str):
         # An `auto` container has no addressable id, so nothing can be mounted into it and its
         # listing cannot be read back. A build phase without those is not a degraded build —

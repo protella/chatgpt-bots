@@ -1650,6 +1650,14 @@ class MessageProcessor(ThreadManagementMixin,
         if trigger.metadata is None:
             trigger.metadata = {}
         trigger.metadata["queued_batch_size"] = len(batch)
+        # This redispatch IS a coalescing window that already closed: the linger above held the lock
+        # while stragglers piled in, and the pop took every one of them. Waiting the participation
+        # debounce again on the far side coalesces nothing and delays a batch that has been waiting
+        # since before the previous turn ended, so the gate skips its sleep for this turn. Explicit
+        # rather than inferred from `carried_gate_sources`, which is stamped only for a batch of
+        # more than one and would leave the single-message drain paying the full debounce for
+        # nothing. Stamped here, where the trigger's metadata is guaranteed to exist.
+        trigger.metadata["queue_drained"] = True
         # T2-10: hand the trigger turn the earlier messages' image parts and attachment failures.
         # process_message folds the images into this turn's multipart content (respecting the
         # per-turn cap) and routes the failures through the failed-files notice.
