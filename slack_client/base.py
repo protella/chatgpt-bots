@@ -35,19 +35,19 @@ from message_processor.people_tools import register_people_tools
 from message_processor.research_tools import register_research_tools
 
 
-# The ignore[misc] on the class statement, narrowed to what is actually left: two mixin methods
-# insert SLACK-ONLY parameters into the MIDDLE of BaseClient's signature, so the positional
-# order diverges — SlackUtilitiesMixin.download_file puts `allow_html` before `max_bytes`, and
-# SlackMessagingMixin.update_message puts `lease`/`surface` before `receipts`. Those extensions
-# belong to the concrete client, not the ABC, and every caller passes them by keyword; moving
-# them would be a runtime change to the seam. mypy reports the mismatch HERE because the mixins
-# do not inherit BaseClient (they inherit `_Host`), so the class statement is the only place the
-# two definitions meet.
+# The ignore[misc] on the class statement, narrowed to what is actually left: SlackMessagingMixin
+# .update_message inserts SLACK-ONLY `lease`/`surface` parameters into the MIDDLE of BaseClient's
+# signature, before `receipts`, so the positional order diverges. That extension belongs to the
+# concrete client, not the ABC, and every caller passes it by keyword; moving it would be a
+# runtime change to the seam. mypy reports the mismatch HERE because the mixins do not inherit
+# BaseClient (they inherit `_Host`), so the class statement is the only place the two definitions
+# meet.
 #
-# This ignore IS removable, and ordering is verifiably the whole reason: making `allow_html` and
-# `lease`/`surface` keyword-only AFTER the parameters they currently precede clears both errors
-# and mypy goes green with the ignore deleted. Not done here — it is a signature change to two
-# live seams, which this typing round is not chartered to make.
+# This ignore IS removable, and ordering is verifiably the whole reason: making `lease`/`surface`
+# keyword-only AFTER the parameters they currently precede clears the error and mypy goes green
+# with the ignore deleted. Not done here — it is a signature change to a live seam.
+# (`download_file`'s `allow_html` used to diverge the same way; BaseClient now declares it in the
+# same position, so that half is gone.)
 class SlackBot(SlackMessageEventsMixin,  # type: ignore[misc]
                SlackSettingsHandlersMixin,
                SlackRegistrationMixin,
@@ -281,9 +281,11 @@ class SlackBot(SlackMessageEventsMixin,  # type: ignore[misc]
                                          receipt_class=receipt_class)
 
     async def download_file_async(self, file_url: str, file_id: Optional[str] = None,
+                                  allow_html: bool = False,
                                   max_bytes: Optional[int] = None) -> Optional[bytes]:
         """Download a file/image from the platform (async version), aborting past max_bytes when set"""
-        return await self.download_file(file_url, file_id, max_bytes=max_bytes)
+        return await self.download_file(file_url, file_id, allow_html=allow_html,
+                                        max_bytes=max_bytes)
     
 
 

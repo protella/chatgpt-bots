@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from base_client import BaseClient, Message
+from canvas_content import CANVAS_MIMETYPE
 from config import config, pipeline_status
 from message_markers import (
     ends_with_continuation,
@@ -1459,7 +1460,11 @@ class ThreadManagementMixin(_Host):
                                         # or a row that retention SLIMMED (summary nulled). Both
                                         # re-derive here; they differ only in how the result is
                                         # persisted (update the slimmed row vs. insert a new one).
-                                        document_data = await client.download_file(att_url, attachment.get("id"))
+                                        # A canvas body IS html — opt out of the login-page
+                                        # guard or the rebuild sees a deleted file.
+                                        document_data = await client.download_file(
+                                            att_url, attachment.get("id"),
+                                            allow_html=(mimetype == CANVAS_MIMETYPE))
                                         if document_data and self.document_handler:
                                             extracted_content = await self.document_handler.safe_extract_content_async(
                                                 document_data, mimetype, filename,

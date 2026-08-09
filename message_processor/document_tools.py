@@ -18,6 +18,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, cast
 
+from canvas_content import CANVAS_MIMETYPE
 from config import config
 from document_handler import DocumentHandler
 from tool_registry import ToolContext, ToolRegistry
@@ -245,7 +246,11 @@ async def execute_read_document(ctx: ToolContext, args: Dict[str, Any]) -> Dict[
         if turn is not None:
             await turn.claim_work(ctx.client, getattr(ctx, "message", None))
         try:
-            data = await ctx.client.download_file(url_private, doc_file_id)
+            # A canvas body IS html, so it has to opt out of the login-page guard that would
+            # otherwise reject it; parse_canvas makes that check itself.
+            data = await ctx.client.download_file(
+                url_private, doc_file_id,
+                allow_html=(doc.get("mime_type") == CANVAS_MIMETYPE))
         except Exception as e:
             return {"ok": False, "error": f"download_failed: {e}"}
         if not data:

@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import ambient_fetch
+from canvas_content import CANVAS_MIMETYPE
 from config import clamp_effort, config
 from logger import setup_logger
 
@@ -750,8 +751,11 @@ class AmbientArtifactService:
             # Streamed cap: the ambient ceiling is enforced DURING download (stop at limit+1),
             # not after buffering a whole body — a missing/dishonest declared size can't blow
             # memory. Returns None when the cap is hit (treated as too_large by the caller).
+            # A canvas body IS html: without the opt-out the downloader rejects it as a
+            # sign-in page and the file reads as deleted. parse_canvas makes that call itself.
             return await client.download_file(
-                job.url, job.ref, max_bytes=int(self.config.ambient_file_max_bytes))
+                job.url, job.ref, allow_html=(job.mimetype == CANVAS_MIMETYPE),
+                max_bytes=int(self.config.ambient_file_max_bytes))
         except Exception as e:  # noqa: BLE001
             logger.debug(f"ambient download failed for {job.ref}: {e}")
             return None

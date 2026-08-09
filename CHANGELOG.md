@@ -142,6 +142,29 @@ From then on the database backs itself up nightly (7-day retention) as part of t
 cleanup, which it never did before. The three `pre-v3-*` backups are **exempt from that
 retention** — they're your rollback path, so nothing deletes them but you.
 
+### 🛑 Added - Background work can be cancelled mid-run
+
+New `cancel_background_job` tool: the bot can stop its own background work when it's no longer
+wanted — a deep-research/build job or an in-flight image generation — by id, with a reason that
+lands on the job's status card ("❌ cancelled — …"). Guards make it honest: a job already
+posting its results refuses the cancel, racing cancels can't overwrite each other's reason, and
+cancelling mid-build releases the job's code-interpreter container. The bot is prompted to use
+it when a requester says stop or another participant is delivering the same thing.
+
+### 📄 Fixed - Slack canvases are readable documents
+
+A canvas shared into a channel was reported as "deleted/unavailable" even though it opened fine
+in Slack: Slack serves canvas content as HTML, and every document path treated an HTML body as
+a login page. Canvases are now a first-class document type — converted to markdown on arrival,
+via `read_document`, in cold thread rebuilds, and in ambient file memory — and a real sign-in
+page still fails honestly instead of leaking as content. Canvas `/docs/…` links are also no
+longer probed as images (the same bug family as the `/archives/` permalink fix).
+
+### 🌀 Fixed - A cancelled job's card stops its spinner
+
+A status card finalized as failed or cancelled kept its in-progress step animating forever;
+terminal cards now render that step with a static ⏹.
+
 ### 🗣️ Changed - A failed attachment is mentioned in the reply, not a warning card
 
 When some files in a message can't be read (unsupported type, too large, download failure), the

@@ -22,6 +22,7 @@ import os
 from typing import Any, Dict, List, Optional
 from urllib.parse import unquote, urlparse
 
+from canvas_content import CANVAS_MIMETYPE
 from database import UNATTENDED_SUMMARY_TEMPLATE
 from logger import setup_logger
 
@@ -141,6 +142,10 @@ async def build_catalog(db, thread_key: str) -> List[Dict[str, Any]]:
         # A row with neither ref predates on-demand access — its bytes are unreachable, so
         # offering it would only produce a mount that fails.
         if row_id is None or (not url and not slack_id):
+            continue
+        # A canvas's bytes are HTML, which is not a useful build input — the model reads a
+        # canvas through history or read_document instead.
+        if row.get("mime_type") == CANVAS_MIMETYPE:
             continue
         entries.append({
             "file_id": document_file_id(row_id),

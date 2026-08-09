@@ -209,6 +209,20 @@ class TestImageURLHandler:
                 "<https://example.slack.com/archives/C0000000000/p1234567890123456>")
         assert handler.extract_image_urls(text) == []
 
+    def test_canvas_link_is_not_an_image_candidate(self, handler):
+        """A /docs/ link is a canvas, not a file to download — same bogus "Couldn't Download
+        File" card as a permalink, because Slack hands back HTML."""
+        text = ("the spec lives in "
+                "<https://example.slack.com/docs/T0000000000/F0000000000>")
+        assert handler.extract_image_urls(text) == []
+
+    def test_a_real_image_under_docs_still_extracts(self, handler):
+        """The /docs/ skip is a blanket path rule, but extension-matched URLs are collected
+        before it — so a genuine image whose path happens to start /docs/ survives."""
+        text = "<https://example.slack.com/docs/example.png>"
+        assert handler.extract_image_urls(text) == [
+            "https://example.slack.com/docs/example.png"]
+
     def test_markdown_closing_paren_is_not_part_of_the_url(self, handler):
         """[label](url) syntax must not leave the trailing paren glued to the capture."""
         text = "([thread](https://imgur.com/abc123))"
