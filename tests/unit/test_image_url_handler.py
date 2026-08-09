@@ -201,6 +201,20 @@ class TestImageURLHandler:
         urls = handler.extract_image_urls(text)
         assert len(urls) == 0
 
+    def test_message_permalink_is_not_an_image_candidate(self, handler):
+        """A Slack /archives/ permalink references a conversation, not a file — it must never
+        enter the download path (live-caught: a peer bot linked a deleted thread and the bot
+        posted a bogus "Couldn't Download File" card)."""
+        text = ("see the earlier round in "
+                "<https://example.slack.com/archives/C0000000000/p1234567890123456>")
+        assert handler.extract_image_urls(text) == []
+
+    def test_markdown_closing_paren_is_not_part_of_the_url(self, handler):
+        """[label](url) syntax must not leave the trailing paren glued to the capture."""
+        text = "([thread](https://imgur.com/abc123))"
+        urls = handler.extract_image_urls(text)
+        assert urls == ["https://imgur.com/abc123"]
+
     @pytest.mark.asyncio
     async def test_validate_image_url_accepts_wellformed(self, handler):
         """validate is now a no-network shape check for EVERY host — a well-formed URL passes,
