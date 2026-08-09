@@ -61,7 +61,10 @@ _RESEARCH_JOB_INSTRUCTION = (
     "foresee, drop one that turned out to be unnecessary. It is a plan, not a contract. Four "
     "steps max, under 80 characters each. Update as you go — a card that catches up at the end "
     "is not a status card.\n\n"
-    "Cross-check multiple independent sources before stating a conclusion. Produce a clear, "
+    "Cross-check multiple independent sources before stating a conclusion. A technical or "
+    "factual claim earns its place in the report only when a source you actually opened THIS "
+    "run supports it; a claim carried over from the conversation gets verified, not repeated. "
+    "Produce a clear, "
     "well-structured findings report that leads with the direct answer, supports each key "
     "claim with a source and a link, notes where sources disagree, and states honestly what "
     "remains uncertain or could not be verified. End with a short list of the sources/links "
@@ -69,14 +72,16 @@ _RESEARCH_JOB_INSTRUCTION = (
 )
 
 # Appended to the research instruction when the job also has to BUILD something. The research
-# phase runs first and knows nothing about the sandbox — but what it writes down is the ONLY
-# thing the build phase gets to work from, so it has to capture the raw numbers, not just
+# phase runs first and knows nothing about the sandbox — but what it writes down is the only
+# RESEARCHED material the build phase gets (it reads the conversation and can mount the thread's
+# files, but it cannot search), so it has to capture the raw numbers, not just
 # prose about them. A build phase asked for a chart with no figures in front of it will invent
 # them, which is the exact failure the code-interpreter path exists to prevent.
 _RESEARCH_FOR_BUILD_ADDENDUM = (
     "\n\nAFTER the research, a second phase will BUILD these deliverables from your report:\n"
     "{deliverables}\n\n"
-    "Your report is the ONLY input that phase receives — it cannot search, and it must not "
+    "Your report is the ONLY researched material that phase receives — it can read this "
+    "conversation and mount this thread's files, but it cannot search, and it must not "
     "invent. So write down the concrete material it will need: exact figures, dates, names and "
     "categories, laid out as plain markdown tables wherever something will be charted or "
     "tabulated. Anything you leave out simply will not make it into the file.\n\n"
@@ -100,10 +105,18 @@ _BUILD_JOB_INSTRUCTION = (
     "- Charts and tables must be computed from the figures in the findings above. Never make a "
     "number up to fill a slide, and never let an image model draw a chart — it will invent "
     "plausible-looking data.\n"
+    "- You have NO web access here — do not claim otherwise, and never put a factual or "
+    "technical claim into a deliverable that your source material (the findings, the "
+    "conversation, a mounted file) does not establish. If the material does not cover it, leave "
+    "it out or mark it unverified: a plausible guess reads as fact once it is in a document.\n"
     "- Need an illustration, a cover image, a diagram? Call create_image_asset — it puts the "
     "image INTO the sandbox for you to embed. Do not call it for charts.\n"
     "- Need a file the user shared, or one you produced earlier in this thread? Call mount_file "
     "to bring its real bytes into the sandbox.\n"
+    "- Revising or correcting a file this thread already produced? That file is the starting "
+    "point: mount_file it, change ONLY what was flagged, leave everything else exactly as it "
+    "was, and check each change against the source material before you save. Rebuilding from "
+    "scratch silently loses everything that was already right.\n"
     "- Embed every chart and image as an IN-MEMORY buffer (io.BytesIO), never as a saved file, "
     "or the user gets your loose ingredients posted next to the deliverable.\n"
     "- Save ONLY the finished deliverables — nothing else. Then RE-OPEN each one and verify it "

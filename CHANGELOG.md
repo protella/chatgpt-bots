@@ -142,6 +142,22 @@ From then on the database backs itself up nightly (7-day retention) as part of t
 cleanup, which it never did before. The three `pre-v3-*` backups are **exempt from that
 retention** — they're your rollback path, so nothing deletes them but you.
 
+### 📝 Changed - Corrections to a built file edit it, not rewrite it
+
+When a background build is asked to fix a document it already produced, it now starts from the
+prior file and changes only what was flagged — instead of rebuilding from scratch and silently
+losing what was already right. Jobs are also held to their sources: a claim the material doesn't
+establish gets left out or marked unverified, never asserted. And rejected work now stays open —
+the bot starts the corrected attempt or says concretely what it will fix, rather than just
+withdrawing the file.
+
+### 👀 Changed - The working ack is for work, and closings get answered
+
+A plain web search no longer flashes the 👀 "working on it" reaction — its citations already
+show the bot looked things up; the ack is reserved for genuinely slow work like the sandbox and
+background jobs. And when someone closes an exchange with a message aimed at the bot, it now
+acknowledges it (a reaction is enough) instead of reading "nothing to add" as "add nothing".
+
 ### ⚡ Changed - Replies start seconds sooner, everywhere
 
 Three dead waits were cut out of every turn. The code sandbox is no longer created up front
