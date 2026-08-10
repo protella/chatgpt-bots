@@ -1125,6 +1125,13 @@ async def create_streaming_response_with_tools(
                             # surfaces artifacts, since we tell the model never to write the
                             # `sandbox:` links that would produce a citation.
                             _note_container(artifacts_sink, item)
+                            # The code the sandbox actually ran, for the observer. Consumers
+                            # log it at DEBUG only — it is job content, not telemetry.
+                            await _emit_tool_event({
+                                "kind": "code_interpreter",
+                                "code": getattr(item, "code", None),
+                                "container_id": getattr(item, "container_id", None),
+                            })
                     continue
                 elif event_type in ["response.done", "response.completed",
                                      "response.incomplete", "response.failed"]:

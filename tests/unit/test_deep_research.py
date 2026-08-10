@@ -888,7 +888,11 @@ def test_build_instruction_edits_the_prior_file_and_invents_nothing():
     asked to CORRECT (losing everything right about the old one), and filling gaps with plausible
     claims it has no source for — it cannot search from in here."""
     assert "Revising or correcting a file this thread already produced" in rt._BUILD_JOB_INSTRUCTION
-    assert "mount_file it, change ONLY what was flagged" in rt._BUILD_JOB_INSTRUCTION
+    # Two branches now, because a revision job may arrive with the prior content already inlined
+    # (the revision master) or with nothing but the file itself to go and mount.
+    assert "THAT is your working master — edit it, don't rebuild" in rt._BUILD_JOB_INSTRUCTION
+    assert "Otherwise mount_file the file and read it back first" in rt._BUILD_JOB_INSTRUCTION
+    assert "Either way change ONLY what was flagged" in rt._BUILD_JOB_INSTRUCTION
     # Editing the prior file is only half of it: the untouched parts must stay untouched, and
     # each touched one must be checked — a partial fix reads as a finished correction.
     assert "leave everything else exactly as it was" in rt._BUILD_JOB_INSTRUCTION
@@ -1748,6 +1752,7 @@ async def test_a_job_dispatched_without_a_plan_is_rejected_not_started(monkeypat
     res = await rt.execute_start_background_job(
         ctx, {"task": "t", "plan": ["Do the thing"]})
     assert res.get("ok") is True
+    proc.scheduled[0].close()  # don't leave the captured coro un-awaited
 
 
 def test_a_todo_is_truncated_before_it_is_deduped():

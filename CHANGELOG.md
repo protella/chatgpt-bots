@@ -142,6 +142,22 @@ From then on the database backs itself up nightly (7-day retention) as part of t
 cleanup, which it never did before. The three `pre-v3-*` backups are **exempt from that
 retention** — they're your rollback path, so nothing deletes them but you.
 
+### 🧭 Added - A running background job can take mid-run updates
+
+Follow-ups that change a running job's task ("drop that section", "add X") now reach the job
+between its working rounds via a new `update_background_job` tool, appear on its status card
+("N update(s) passed along"), and prompt it to revise its todo list; updates that arrive after
+the last working round are surfaced in the delivery reply as not-applied (with a follow-up
+offer), and the bot is prompted to only claim what the tool actually accepted.
+
+### 📝 Changed - Revision jobs now start from the file they're revising
+
+When a background job declares it is correcting a file already in the thread, it is handed that
+file's current content (fetched from Slack and extracted in memory at build start; no revision
+master or extracted content is ever stored) with orders to make point edits, whenever the file
+can be fetched and inlined; with DEBUG diagnostics enabled, the sandbox code a job runs is
+logged locally so revision misbehavior is diagnosable from `logs/`.
+
 ### 🛑 Added - Background work can be cancelled mid-run
 
 New `cancel_background_job` tool: the bot can stop its own background work when it's no longer

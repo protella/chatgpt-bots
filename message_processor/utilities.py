@@ -894,10 +894,15 @@ class MessageUtilitiesMixin(_Host):
                                     extracted_content, mimetype, file_name,
                                     image_inputs, image_count, max_images)
 
-                            # Warm the read_document extraction LRU (in-memory only)
+                            # Warm the read_document extraction LRU (in-memory only) — but only
+                            # with text that IS the document. A degraded extraction (a DOCX
+                            # fallback, a lossy decode, an un-OCR'd scan) cached here would be
+                            # served to a later read_document as a clean hit, warning stripped.
                             if file_id:
-                                from message_processor.document_tools import _extraction_cache
-                                _extraction_cache.put(file_id, extracted_content["content"])
+                                from message_processor.document_tools import (
+                                    _extraction_cache, extraction_is_clean)
+                                if extraction_is_clean(extracted_content):
+                                    _extraction_cache.put(file_id, extracted_content["content"])
 
                             entry = {
                                 "filename": file_name,
@@ -1089,10 +1094,16 @@ class MessageUtilitiesMixin(_Host):
                                     # them the breadcrumb advertises read_document access the
                                     # tool can't honor (no cached content, no ledger row), and
                                     # the persisted summary that survives the turn is missing.
-                                    # Warm the read_document extraction LRU (in-memory only)
+                                    # Warm the read_document extraction LRU (in-memory only),
+                                    # clean extractions only — the scanned-PDF branch just
+                                    # above sets a `warning`, and caching that would serve the
+                                    # un-OCR'd text to a later read as though it were the page.
                                     if file_id:
-                                        from message_processor.document_tools import _extraction_cache
-                                        _extraction_cache.put(file_id, extracted_content["content"])
+                                        from message_processor.document_tools import (
+                                            _extraction_cache, extraction_is_clean)
+                                        if extraction_is_clean(extracted_content):
+                                            _extraction_cache.put(
+                                                file_id, extracted_content["content"])
 
                                     entry = {
                                         "filename": file_name,
@@ -1790,7 +1801,12 @@ class MessageUtilitiesMixin(_Host):
                 "Treat questions or comments about that work as follow-ups — do NOT call "
                 "start_background_job for it again. Start another job only if the user has "
                 "explicitly asked for separate, additional work. Work that is no longer "
-                "wanted can be stopped with cancel_background_job(job_id, reason).]"
+                "wanted can be stopped with cancel_background_job(job_id, reason). A "
+                "correction or a change of scope for work that should CONTINUE goes to "
+                "update_background_job(job_id, note) — the job runs on a snapshot and cannot "
+                "see this message otherwise, so agreeing to fold something in without that "
+                "call changes nothing. Say the update was passed along, and claim it was "
+                "applied only once the job's own output shows it.]"
             )
         except Exception as e:
             self.log_debug(f"research in-flight note build failed: {e}")

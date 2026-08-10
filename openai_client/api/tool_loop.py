@@ -16,7 +16,7 @@ tools run, and only the final round's text reaches the user.
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Iterable, List, Optional, cast
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, cast
 
 from config import config
 from logger import setup_logger
@@ -166,6 +166,51 @@ def _replay_round_items(sink: List[Dict[str, Any]], input_items: List[Dict[str, 
             content.extend(reservation.get("parts") or [])
         if content:
             input_items.append({"role": "user", "content": content})
+
+
+_PreRoundCallback = Callable[[], Awaitable[List[Dict[str, Any]]]]
+
+
+async def _inject_pre_round_items(self, callback: Optional[_PreRoundCallback],
+                                  input_items: List[Dict[str, Any]]) -> None:
+    """Give the caller one chance per round to append items to the running input.
+
+    ONCE PER WHILE-ITERATION, not once per HTTP attempt. A container-recovery retry
+    (`responses.py`) re-sends the very list this appended to, so injecting any deeper would put
+    the same items in front of the model twice; from up here a retry simply carries what is
+    already there. Free rounds and the forced-final `tool_choice="none"` round are rounds too —
+    the last one is a job's final chance to hear a correction before it writes its answer.
+
+    Placement is the whole contract: the previous round's `_replay_round_items` has already run,
+    so items land AFTER complete function_call/function_call_output pairs and never between a
+    reasoning item and the call it belongs to.
+
+    The callback is AWAITED, so it must be an async callable — awaiting is what makes an
+    `async def` with no awaits in its body legal, which is the shape a caller needs to pop a
+    queue and return with nothing able to interleave. A plain `def` handed in here is refused
+    loudly rather than half-applied: awaiting its list raises, and the round goes out unsteered
+    with a warning instead of the returned coroutine being read as a malformed item list.
+
+    `except Exception`, deliberately not `BaseException`: a cancelled job must still cancel, so
+    CancelledError propagates. A return that is not a list of item dicts is dropped WHOLE rather
+    than filtered — half an injection is a worse round than an unsteered one — and the round
+    goes out regardless.
+    """
+    if callback is None:
+        return
+    try:
+        items: Any = await callback()
+    except Exception as e:  # noqa: BLE001 — a caller's bookkeeping never fails a round
+        self.log_warning(f"Pre-round input callback failed: {e}")
+        return
+    if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
+        self.log_warning(
+            f"Pre-round input callback returned {type(items).__name__}, not a list of item "
+            "dicts — skipping injection this round")
+        return
+    if items:
+        input_items.extend(items)
+        self.log_info(f"Injected {len(items)} pre-round input item(s)")
 
 
 def _observed_container(tool_context: Any, artifacts_sink: Any) -> Optional[str]:
@@ -752,6 +797,7 @@ async def create_streaming_response_with_tool_loop(
     tool_choice: Optional[str] = None,
     free_tools: Optional[Iterable[str]] = None,
     aggregate_segments: bool = False,
+    pre_round_input_callback: Optional[_PreRoundCallback] = None,
     **params: Any,
 ) -> Dict[str, Any]:
     """Streaming response with local tool execution.
@@ -783,6 +829,13 @@ async def create_streaming_response_with_tool_loop(
     mean "unbounded": a model looping on update_todos alone is a runaway too, just a cheaper one.
     A MIXED round (bookkeeping + real work) is fully productive — only the free calls in it ride
     free, so the round is charged normally.
+
+    ``pre_round_input_callback`` is an ASYNC callable awaited once per round, immediately before
+    the request; the list of input items it returns is appended to the running input. Generic,
+    but scoped: a background job is the intended caller, folding in the mid-run notes that
+    arrived while the previous round was working. See ``_inject_pre_round_items`` for the
+    guarantees it is holding to — once per ROUND and not per HTTP attempt, after the round's
+    replayed tool pairs, and never able to fail the round.
     """
     rounds_cap = int(max_tool_rounds) if max_tool_rounds is not None else config.max_tool_rounds
     calls_cap = (int(max_tool_calls) if max_tool_calls is not None
@@ -846,6 +899,10 @@ async def create_streaming_response_with_tool_loop(
         # W3, request side: picks up a container a BRIDGE tool created during the previous
         # round's dispatch, which lands in the holder after the response-side check has run.
         tools = await _adopt_and_pin(tool_context, params.get("artifacts_sink"), tools)
+        # Last seam before the request goes out: everything the previous round produced is
+        # already on the input, so a caller can add to it here (a job's mid-run steering notes)
+        # and know the items sit after complete tool pairs.
+        await _inject_pre_round_items(self, pre_round_input_callback, input_items)
         sink: List[Dict[str, Any]] = []
         text = await responses_api.create_streaming_response_with_tools(
             self,

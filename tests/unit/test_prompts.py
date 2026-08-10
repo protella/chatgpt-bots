@@ -188,11 +188,27 @@ class TestPrompts:
         eight more minutes, then delivered the doc. The tool now exists; the guidance has to
         say that agreeing is not stopping, or the model keeps agreeing and nothing happens."""
         from prompts import LOCAL_TOOLS_GUIDANCE
-        assert "- cancel_background_job:" in LOCAL_TOOLS_GUIDANCE
-        assert "no longer wanted" in LOCAL_TOOLS_GUIDANCE
-        assert "still drops a deliverable nobody wants" in LOCAL_TOOLS_GUIDANCE
+        assert "cancel_background_job" in LOCAL_TOOLS_GUIDANCE
+        assert "agreeing to a change in words changes nothing" in LOCAL_TOOLS_GUIDANCE
+        assert "posts whatever it built" in LOCAL_TOOLS_GUIDANCE
         # ...without turning every follow-up question into a cancel.
-        assert "a follow-up, not a withdrawal" in LOCAL_TOOLS_GUIDANCE
+        assert "A refinement is not a withdrawal" in LOCAL_TOOLS_GUIDANCE
+
+    def test_guidance_separates_steering_a_job_from_killing_it(self):
+        """The same incident, other half: five corrections arrived for a job that was WANTED,
+        and the only tool that existed would have thrown the work away. Cancel and update have
+        to be told apart by what is being asked, or the model reaches for the brake when it
+        needs the steering wheel — and, worse, replies to a correction without sending it."""
+        from prompts import LOCAL_TOOLS_GUIDANCE
+        assert "update_background_job(job_id, note)" in LOCAL_TOOLS_GUIDANCE
+        # Abandon vs. modify, named as the thing that picks between them.
+        assert "ABANDONING the deliverable entirely" in LOCAL_TOOLS_GUIDANCE
+        assert "MODIFYING work that should still continue" in LOCAL_TOOLS_GUIDANCE
+        assert "never leave a correction unsent because you replied to it" in \
+            LOCAL_TOOLS_GUIDANCE
+        # The honesty rule: accepted is not applied, and a later cancel wins.
+        assert '"passed along", not applied' in LOCAL_TOOLS_GUIDANCE
+        assert "a later cancel supersedes it" in LOCAL_TOOLS_GUIDANCE
 
     @pytest.mark.critical
     def test_critical_prompts_structure(self):

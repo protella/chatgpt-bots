@@ -14,6 +14,14 @@ from token_counter import TokenCounter
 # Shared stateless estimator for incremental context-size tracking
 _ESTIMATOR = TokenCounter()
 
+# Mid-run steering (update_background_job). A LIFETIME cap, counted on the entry and never
+# decremented: capping the pending backlog instead would let a job absorb hundreds of notes
+# across successive drains, which is the runaway this number exists to stop.
+_MAX_JOB_NOTES = 10
+# One note, capped. Long enough for a real correction with its reasoning, short enough that ten
+# of them cannot crowd out the job's own context.
+_JOB_NOTE_CHARS = 1500
+
 
 @dataclass
 class ThreadState:
@@ -715,6 +723,107 @@ class AsyncThreadStateManager(LoggerMixin):
         (nobody asked; `cancel_research_jobs` sets no reason)."""
         entry = (self._active_research.get(thread_key) or {}).get(job_id)
         return (entry or {}).get("cancel_reason")
+
+    # --- mid-run steering: notes queued for a running job (update_background_job) ---
+
+    def steerable_in_flight(self, thread_key: str) -> List[Dict[str, Any]]:
+        """What this thread's steering tool can reach — background JOBS only, as id + gist.
+
+        Deliberately not `cancellable_in_flight`: that one also lists image generations, which
+        are seconds long and have no tool loop to inject a note into. Offering one back as a
+        candidate would invite the model to steer something unsteerable, and the retry would
+        fail for a reason the roster itself had implied was fine."""
+        return [{"job_id": j.get("job_id"), "task_summary": j.get("task_summary"),
+                 "kind": "job"}
+                for j in self.research_jobs_in_flight(thread_key)]
+
+    def queue_job_note(self, thread_key: str, job_id: Optional[str],
+                       note: Any) -> Dict[str, Any]:
+        """Hand a running job a mid-run correction. Returns the tool result the model reads.
+
+        Entirely synchronous, for the same reason `request_background_cancel` is: a round's tool
+        calls dispatch under `asyncio.gather`, so any await between reading the entry and
+        appending the note lets a sibling call interleave — two notes could each see nine
+        accepted and both be admitted past the cap, and a cancel could land between the gate
+        check and the append, leaving a note queued on a job that is already stopping.
+
+        The refusal ladder is ORDERED, and the order is the honest one: every answer above a
+        given rung has already been ruled out by the time that rung speaks. `delivery_in_progress`
+        outranks `job_finishing` precisely because `job_finishing` tells the model it can still
+        cancel — true while the job is winding down, a lie once delivery has begun."""
+        text = " ".join(note.split()) if isinstance(note, str) else ""
+        if not text:
+            return {"ok": False, "error": "empty_note"}
+
+        research = self._active_research.get(thread_key) or {}
+        if not research:
+            return {"ok": False, "error": "no_job_running"}
+
+        if job_id is not None and not isinstance(job_id, str):
+            # A non-string id names nothing — same answer as an id that doesn't exist, so the
+            # model gets the roster back and can pick from it.
+            return {"ok": False, "error": "job_not_found",
+                    "in_flight": self.steerable_in_flight(thread_key)}
+        resolved = (job_id or "").strip() or None
+        if resolved is None:
+            # Omitted, explicit null and blank are the same intent — "I didn't name one" — which
+            # is only unambiguous with exactly one job running.
+            if len(research) > 1:
+                return {"ok": False, "error": "job_id_required",
+                        "in_flight": self.steerable_in_flight(thread_key)}
+            resolved = next(iter(research))
+        entry = research.get(resolved)
+        if entry is None:
+            return {"ok": False, "error": "job_not_found",
+                    "in_flight": self.steerable_in_flight(thread_key)}
+
+        if entry.get("cancel_reason"):
+            return {"ok": False, "error": "already_cancelling"}
+        task = entry.get("task")
+        if task is None or task.done() or task.cancelling():
+            # `task is None` is the job that died before its coroutine body ever started;
+            # `cancelling()` is shutdown's reason-less cancel, which sets no cancel_reason and
+            # so would otherwise read as a perfectly healthy job.
+            return {"ok": False, "error": "job_already_finished"}
+        if entry.get("delivery_started"):
+            return {"ok": False, "error": "delivery_in_progress",
+                    "hint": "the job is already posting its results; too late to change it"}
+        if entry.get("steering_closed"):
+            return {"ok": False, "error": "job_finishing",
+                    "hint": "the job's working rounds are over; the output can no longer change "
+                            "— you can still cancel until it starts posting"}
+        if int(entry.get("notes_accepted") or 0) >= _MAX_JOB_NOTES:
+            return {"ok": False, "error": "queue_full"}
+
+        if len(text) > _JOB_NOTE_CHARS:
+            text = text[:_JOB_NOTE_CHARS - 1] + "…"
+        entry.setdefault("notes", []).append(text)
+        entry["notes_accepted"] = int(entry.get("notes_accepted") or 0) + 1
+        return {"ok": True, "job_id": resolved, "queued": len(entry["notes"])}
+
+    def drain_job_notes(self, thread_key: str, job_id: str) -> List[str]:
+        """Take everything queued for this job, arrival order, leaving the queue empty.
+
+        Sync, and the caller must not await between this returning and the notes reaching the
+        round's input — a note popped and then dropped is one the tool already said `ok` to."""
+        entry = (self._active_research.get(thread_key) or {}).get(job_id)
+        if entry is None:
+            return []
+        notes = cast(List[str], entry.get("notes") or [])
+        entry["notes"] = []
+        return list(notes)
+
+    def close_job_steering(self, thread_key: str, job_id: str) -> None:
+        """The job's working rounds are over — nothing accepted from here can change its output.
+
+        Separate from `delivery_started` because the two moments are genuinely different: the
+        last model round ends minutes before the first post goes out, and cancelling stays
+        honest across that gap while steering does not. Sync, and called with NO await between
+        the last stream returning and this, or a note accepted in the gap is one no round will
+        ever read."""
+        entry = (self._active_research.get(thread_key) or {}).get(job_id)
+        if entry is not None:
+            entry["steering_closed"] = True
 
     async def cancel_research_jobs(self, timeout: float = 5.0):
         """Cancel and await all registered research tasks (shutdown). Bounded so a wedged

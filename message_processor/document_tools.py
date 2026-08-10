@@ -16,7 +16,7 @@ Executors never raise: every failure is an ``{"ok": False, ...}`` result.
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Awaitable, Callable, Dict, List, Optional, cast
 
 from canvas_content import CANVAS_MIMETYPE
 from config import config
@@ -183,6 +183,139 @@ def _query_slices(text: str, query: str) -> List[Dict[str, Any]]:
     return matches
 
 
+def extraction_warning(extracted: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Why this extractor result is not the document — or ``None`` when it is.
+
+    Three distinct ways the extractor hands back truthy text that is not the file's text, and
+    they do NOT share a signal:
+
+    ``error`` — a failure it recovered from. ``warning`` — a lower-fidelity fallback path (the
+    DOCX xml-parsing and pandoc routes, a lossy character decode). Both are explicit.
+
+    The third is not, and it is the dangerous one: a SCANNED PDF whose text was never recovered.
+    ``parse_pdf_structured`` marks the scan with ``is_image_based``/``requires_ocr``, and when
+    OCR is off, unavailable, or fruitless it substitutes an explanatory note — "[Note: This PDF
+    appears to be a scanned document…]" — as the content, with no error and no warning attached.
+    Read literally that is a truthy, clean-looking extraction whose entire content is a status
+    message about itself. Cached, it becomes the document as far as every later read is
+    concerned; handed to a revision master, the build faithfully "revises" a status message
+    into the deliverable and drops the real document.
+
+    ``ocr_text_used`` is the ONLY field that means the content string carries text recovered
+    from the scan. ``ocr_processed`` deliberately does not qualify: it marks that page IMAGES
+    were sent to a vision model, while the content string it accompanies was REPLACED by a
+    one-line note about that having happened.
+
+    Returning the reason rather than a bool so callers can surface something truthy — for a
+    scan placeholder there is no upstream message to forward, and a `None` "warning" would sail
+    straight through the master's rejection check.
+    """
+    if not extracted:
+        return "no extraction result"
+    error = extracted.get("error")
+    if error:
+        return str(error)
+    warning = extracted.get("warning")
+    if warning:
+        return str(warning)
+    if ((extracted.get("requires_ocr") or extracted.get("is_image_based"))
+            and not extracted.get("ocr_text_used")):
+        return ("scanned document: OCR did not recover the text, so this content is an "
+                "explanatory note rather than the document")
+    return None
+
+
+def extraction_is_clean(extracted: Optional[Dict[str, Any]]) -> bool:
+    """Is this extractor result safe to CACHE and to hand a revision master?
+
+    One definition, because the invariant has to hold everywhere the LRU is written — the
+    reader, the master path, and the two ingestion warmers in `utilities.py`.
+    """
+    return extraction_warning(extracted) is None
+
+
+async def load_document_text(client: Any, doc: Dict[str, Any], *,
+                             bypass_cache: bool = False,
+                             on_miss: Optional[Callable[[], Awaitable[None]]] = None,
+                             ) -> Dict[str, Any]:
+    """Fetch + extract ONE document row's full text, in memory, for whoever asks.
+
+    Hoisted out of ``execute_read_document`` so a second caller — the background job's
+    revision master (``research_tools._load_revision_master``) — gets the identical
+    download/extract path rather than a parallel copy of it that drifts.
+
+    Two things the two callers genuinely disagree about, and nothing else:
+
+    ``bypass_cache`` — the reader wants the LRU (iterating on one document is the common
+    case). A master must never read it: the cache is not purged when a file is deleted in
+    Slack, so a cached entry could resurrect content the user removed, and a revision master
+    has to be as fresh as Slack is anyway.
+
+    ``on_miss`` — the reader stakes its 👀 only when it is about to do real work (F38), which
+    is exactly a cache miss. Awaited after the source-ref check and before the download, so a
+    row that can never be fetched does not claim anything.
+
+    Returns ``{"content": str, "cached": bool}`` — plus a truthy ``"warning"`` whenever the
+    text came back DEGRADED, in any of the three senses ``extraction_warning`` recognises: an
+    extractor ``error`` it recovered from, an extractor ``warning`` from a lower-fidelity
+    fallback, or a scanned PDF whose text was never recovered (marked only by
+    ``requires_ocr``/``is_image_based`` with no ``ocr_text_used``, and carrying an explanatory
+    note as its content). Otherwise ``{"error": code}`` with ``code`` one of ``no_source_ref``,
+    ``download_failed``, ``file_deleted``, ``extraction_failed`` — the last two carrying a
+    ``detail``.
+
+    Degraded content is NEVER cached: caching it would let a later read serve a placeholder,
+    a partial extraction, or a note about a scan as a clean hit with the signal stripped off.
+    """
+    doc_file_id = doc.get("file_id")
+    url_private = doc.get("url_private")
+    if not url_private and not doc_file_id:
+        # Before the cache and before on_miss: a row with no way to fetch it claims nothing.
+        return {"error": "no_source_ref"}
+
+    cache_key = cast(str, doc_file_id or url_private)  # one of the two is present (checked above)
+    if not bypass_cache:
+        cached = _extraction_cache.get(cache_key)
+        if cached is not None:
+            return {"content": cached, "cached": True}
+
+    if on_miss is not None:
+        await on_miss()
+    try:
+        # A canvas body IS html, so it has to opt out of the login-page guard that would
+        # otherwise reject it; parse_canvas makes that check itself.
+        data = await client.download_file(
+            url_private, doc_file_id,
+            allow_html=(doc.get("mime_type") == CANVAS_MIMETYPE))
+    except Exception as e:  # noqa: BLE001 — every failure is a result, never a raise
+        return {"error": "download_failed", "detail": str(e)}
+    if not data:
+        # Deleted-in-Slack is indistinguishable from never-there — by design,
+        # deletion removes the content from the bot's reach.
+        return {"error": "file_deleted"}
+
+    extracted = await _document_handler.safe_extract_content_async(
+        data, doc.get("mime_type") or "application/octet-stream",
+        doc.get("filename") or "document",
+        # Text slices only: page images are useless in a tool result, but OCR TEXT
+        # rescues image-only/scanned PDFs that yield nothing from local extraction.
+        ocr_images=False, ocr_text=True)
+    text = (extracted or {}).get("content")
+    if not text:
+        return {"error": "extraction_failed",
+                "detail": (extracted or {}).get("error", "no content extracted")}
+    result: Dict[str, Any] = {"content": text, "cached": False}
+    degraded = extraction_warning(extracted)
+    if degraded is None:
+        _extraction_cache.put(cache_key, text)
+    else:
+        # Every flavour of degradation surfaced under ONE name, always truthy, so callers have
+        # one thing to check: the reader ignores it (partial text beats no text), a master
+        # rejects on it.
+        result["warning"] = degraded
+    return result
+
+
 async def execute_read_document(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     """Download from Slack CDN (memory only) -> extract (BytesIO) -> return the slice."""
     file_id = (args.get("file_id") or "").strip() or None
@@ -231,44 +364,28 @@ async def execute_read_document(ctx: ToolContext, args: Dict[str, Any]) -> Dict[
                 "hint": "Pass a filename from known_documents, an attachment note, or fetched "
                         "history — any file shared in this channel is reachable, no summary needed."}
 
-    doc_file_id = doc.get("file_id")
-    url_private = doc.get("url_private")
-    if not url_private and not doc_file_id:
-        return {"ok": False, "error": "document_has_no_source_ref",
-                "hint": "This document predates on-demand access; only its summary is available."}
-
-    cache_key = cast(str, doc_file_id or url_private)  # one of the two is present (checked above)
-    text = _extraction_cache.get(cache_key)
-    if text is None:
+    async def _claim_work() -> None:
         # F38: a cache MISS means a real download plus extraction (OCR on a scanned PDF is
         # genuinely slow) — stake the 👀. A cache hit returns instantly and claims nothing.
         turn = getattr(ctx, "turn", None)
         if turn is not None:
             await turn.claim_work(ctx.client, getattr(ctx, "message", None))
-        try:
-            # A canvas body IS html, so it has to opt out of the login-page guard that would
-            # otherwise reject it; parse_canvas makes that check itself.
-            data = await ctx.client.download_file(
-                url_private, doc_file_id,
-                allow_html=(doc.get("mime_type") == CANVAS_MIMETYPE))
-        except Exception as e:
-            return {"ok": False, "error": f"download_failed: {e}"}
-        if not data:
-            # Deleted-in-Slack is indistinguishable from never-there — by design,
-            # deletion removes the content from the bot's reach.
-            return {"ok": False, "error": "file_deleted",
-                    "hint": "The file is no longer available in Slack; only its summary remains."}
-        extracted = await _document_handler.safe_extract_content_async(
-            data, doc.get("mime_type") or "application/octet-stream",
-            doc.get("filename") or "document",
-            # Text slices only: page images are useless in a tool result, but OCR TEXT
-            # rescues image-only/scanned PDFs that yield nothing from local extraction.
-            ocr_images=False, ocr_text=True)
-        text = (extracted or {}).get("content")
-        if not text:
-            return {"ok": False, "error": "extraction_failed",
-                    "detail": (extracted or {}).get("error", "no content extracted")}
-        _extraction_cache.put(cache_key, text)
+
+    loaded = await load_document_text(ctx.client, doc, on_miss=_claim_work)
+    error = loaded.get("error")
+    if error == "no_source_ref":
+        return {"ok": False, "error": "document_has_no_source_ref",
+                "hint": "This document predates on-demand access; only its summary is available."}
+    if error == "download_failed":
+        return {"ok": False, "error": f"download_failed: {loaded.get('detail')}"}
+    if error == "file_deleted":
+        return {"ok": False, "error": "file_deleted",
+                "hint": "The file is no longer available in Slack; only its summary remains."}
+    if error:
+        return {"ok": False, "error": "extraction_failed", "detail": loaded.get("detail")}
+    # Truthy content is success and an accompanying extractor warning is ignored — the reader
+    # would rather hand back partial text than nothing. Only a MASTER is stricter than this.
+    text = cast(str, loaded.get("content"))
 
     total = len(text)
     base = {"ok": True, "filename": doc.get("filename"), "total_chars": total}
