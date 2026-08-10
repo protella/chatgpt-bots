@@ -191,12 +191,21 @@ class TestBotConfig:
             config.validate()
     
     def test_validate_missing_openai_key(self, mock_env, monkeypatch):
-        """Test validation fails when OPENAI_KEY is missing"""
+        """Test validation fails when neither OPENAI_API_KEY nor legacy OPENAI_KEY is set"""
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("OPENAI_KEY", raising=False)
         config = BotConfig()
-        
-        with pytest.raises(ValueError, match="OPENAI_KEY is required"):
+
+        with pytest.raises(ValueError, match="OPENAI_API_KEY is required"):
             config.validate()
+
+    def test_standard_key_name_wins_over_legacy(self, mock_env, monkeypatch):
+        """OPENAI_API_KEY (standard) is preferred; OPENAI_KEY still works alone."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-standard")
+        monkeypatch.setenv("OPENAI_KEY", "sk-legacy")
+        assert BotConfig().openai_api_key == "sk-standard"
+        monkeypatch.delenv("OPENAI_API_KEY")
+        assert BotConfig().openai_api_key == "sk-legacy"
 
     def test_boot_rejects_an_invalid_global_default(self, mock_env, monkeypatch):
         """T104 (respec §6.2). GPT_MODEL, GPT_IMAGE_MODEL and DEFAULT_VERBOSITY must each be a

@@ -46,6 +46,9 @@ def mock_env(monkeypatch):
         'TESTING': 'true',
         'SLACK_BOT_TOKEN': 'xoxb-test-token',
         'SLACK_APP_TOKEN': 'xapp-test-token',
+        # Both the canonical and the legacy name, so an ambient OPENAI_API_KEY on the host
+        # can never leak past the fixture into a config assertion.
+        'OPENAI_API_KEY': 'sk-test-key',
         'OPENAI_KEY': 'sk-test-key',
         # GPT_MODEL and DEFAULT_VERBOSITY must be REAL values: config.validate() refuses to boot
         # on either one outside its allowlist, because the channel capability resolver falls back

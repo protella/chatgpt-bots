@@ -699,15 +699,17 @@ async def test_thread_participation_handles_api_error(tag_only):
 
 
 def test_default_config_is_safe(monkeypatch):
-    # OUT OF THE BOX: the bot must not auto-listen, and the default channel mode is
-    # tag_only. Build a fresh config with the env keys absent — the module singleton
-    # may reflect a real .env (e.g. the dev box enables listening for live testing).
+    # OUT OF THE BOX: the master switch is OFF — an upgraded .env without the key must not
+    # start listening. Once listening IS enabled, channels default to full participation
+    # ("auto_respond" → level "on"): the teammate behavior is v3's headline, and the ⚙️ modal
+    # and feedback memory are the dial-down paths (owner decision, 2026-08-10). Build a fresh
+    # config with the env keys absent — the module singleton may reflect a real .env.
     monkeypatch.delenv("ENABLE_CHANNEL_LISTENING", raising=False)
     monkeypatch.delenv("CHANNEL_RESPONSE_MODE", raising=False)
     from config import BotConfig
     fresh = BotConfig()
     assert fresh.enable_channel_listening is False
-    assert fresh.channel_response_mode == "tag_only"
+    assert fresh.channel_response_mode == "auto_respond"
 
 
 def test_bot_with_real_user_id_lands_in_roster():

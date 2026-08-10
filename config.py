@@ -260,7 +260,10 @@ class BotConfig:
     slack_app_token: str = field(default_factory=lambda: os.getenv("SLACK_APP_TOKEN", ""))
     
     # OpenAI credentials
-    openai_api_key: str = field(default_factory=lambda: os.getenv("OPENAI_KEY", ""))
+    # Standard name first; OPENAI_KEY is the legacy pre-v3 name, still accepted so existing
+    # deployments keep working without editing their .env.
+    openai_api_key: str = field(
+        default_factory=lambda: os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY") or "")
     
     # Model configuration
     gpt_model: str = field(default_factory=lambda: os.getenv("GPT_MODEL", "gpt-5.6-sol"))
@@ -600,11 +603,13 @@ class BotConfig:
     # DMs, exactly as before — restarting the bot changes nothing. Flip on to let the bot see
     # and (per channel_response_mode) respond to non-mention public/private channel messages.
     enable_channel_listening: bool = field(default_factory=lambda: os.getenv("ENABLE_CHANNEL_LISTENING", "false").lower() == "true")
-    # Default response mode for channels (Phase 7 adds per-channel overrides):
-    #   "tag_only"     - respond only when clearly addressed (name / reply in our thread); no LLM. DEFAULT.
-    #   "auto_respond" - a lightweight classifier decides respond/react/ignore per message.
+    # Default response mode for channels with no explicitly saved level (per-channel settings win):
+    #   "auto_respond" - the wake-up check decides respond/react/ignore per message. DEFAULT —
+    #                    the teammate behavior is v3's headline; feedback memory and the ⚙️
+    #                    modal are the dial-down paths.
+    #   "tag_only"     - respond only when clearly addressed (name / reply in our thread); no LLM.
     #   "off"          - never respond in channels.
-    channel_response_mode: str = field(default_factory=lambda: os.getenv("CHANNEL_RESPONSE_MODE", "tag_only").strip().lower())
+    channel_response_mode: str = field(default_factory=lambda: os.getenv("CHANNEL_RESPONSE_MODE", "auto_respond").strip().lower())
     # Default for channels with no explicit setting: may the bot answer a top-level
     # message at channel level? This is an ALLOWANCE, not a decision: where both destinations
     # are legal the MODEL chooses per reply (set_reply_destination). A channel's saved setting
@@ -614,8 +619,9 @@ class BotConfig:
     # "ChatGPT, can you…" wakes it. Keep in sync with the bot's display name(s).
     # Env: BOT_NAME_ALIASES (comma-separated) — SET THIS per environment (e.g. "ChatGPT-Dev" in dev).
     bot_name_aliases: list = field(default_factory=lambda: _env_list("BOT_NAME_ALIASES", ["ChatGPT"]))
-    # 👍/👎 feedback buttons under DM/assistant responses (Phase H; channels use reactions)
-    enable_feedback_buttons: bool = field(default_factory=lambda: os.getenv("ENABLE_FEEDBACK_BUTTONS", "true").lower() == "true")
+    # 👍/👎 feedback buttons under DM/assistant responses (channels use reactions). Default OFF —
+    # thumbs *reactions* on bot messages are still recorded passively either way.
+    enable_feedback_buttons: bool = field(default_factory=lambda: os.getenv("ENABLE_FEEDBACK_BUTTONS", "false").lower() == "true")
     # --- Per-thread actor tail (slack_client/actor_tail.py) ---
     # Who spoke in a thread, never what they said — the content ring is gone; the channel stream
     # is the room. What survives is STRUCTURAL: it is how `thread_has_other_bot` knows a second
@@ -1159,7 +1165,7 @@ class BotConfig:
         if not self.slack_app_token:
             raise ValueError("SLACK_APP_TOKEN is required")
         if not self.openai_api_key:
-            raise ValueError("OPENAI_KEY is required")
+            raise ValueError("OPENAI_API_KEY is required (the legacy name OPENAI_KEY also works)")
         if self.gpt_model not in SUPPORTED_CHAT_MODELS:
             raise ValueError(
                 f"GPT_MODEL {self.gpt_model!r} is not a supported model; "

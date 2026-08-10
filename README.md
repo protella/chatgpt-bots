@@ -17,59 +17,55 @@ summaries instead of being silently truncated.
 
 **Core**
 
-- **Conversation** - the thread's available history rebuilt from Slack every turn (bounded by
-  workspace retention; long threads compact into summaries); multi-user aware, with every
-  message timestamped in the sender's timezone
-- **Images** - generation and editing from natural language (`gpt-image-2`); generation runs in
-  the background so the thread keeps moving, and the bot reviews its own output
-- **Vision** - analyzes and compares uploaded images, at full resolution
-- **Documents** - uploads become a short summary; the bot re-reads the original from Slack when
-  asked for specifics. Native PDF reading, OCR for scanned PDFs, ~100 text/code file types,
-  and Slack canvases. Raw file content is not persisted by the bot - it stores derived
-  summaries, structural metadata, and Slack file references only (OCR shells out to
-  poppler/tesseract, which may use temporary files)
-- **Code interpreter** - writes and runs Python in a per-thread sandbox and uploads the results
-  (`.png`, `.xlsx`, `.docx`, `.pptx`, `.csv`, `.pdf`). Charts are computed from real data,
-  never drawn by an image model
-- **Web search** - available at every reasoning level
-- **Deep research** - long questions detach into a background job with a live status card and
-  deliver a sourced report (or a built file) minutes later; the thread stays usable meanwhile
-- **Slack search** - in DMs, workspace search through Slack's own permission-scoped index; in
-  channels, a keyword scan of that channel's history and thread replies
-- **On-demand context** - older history, permalinks to earlier messages, channel info, pins,
-  reactions, and people lookups, all fetched live
-- **Canvases** - creates the channel canvas (the pinned tab), and reads/edits/lists canvases
-  in place
+- **Conversation** - talk to it in DMs, threads, or channels. It follows the whole
+  conversation, keeps track of who said what, and knows what "last night" or "an hour ago"
+  means
+- **Images** - ask for a picture, or an edit to one, in plain language; it works in the
+  background while the conversation keeps moving
+- **Vision** - drop in a screenshot or photo and ask about it
+- **Documents** - upload a PDF, spreadsheet, Word doc, or code file and ask questions about
+  it. Scanned PDFs and Slack canvases included; file contents are read on demand and never
+  stored
+- **Code interpreter** - "chart this spreadsheet" runs real Python on your real data and
+  hands the chart (or spreadsheet, deck, PDF) back into the thread - numbers are computed,
+  never invented by an image model
+- **Web search** - current information, with cited sources
+- **Deep research** - a big question becomes a background job with a live progress card; a
+  sourced report or a built deliverable arrives minutes later while you keep chatting
+- **Slack search** - "what did we decide about X?" - it searches your workspace (in DMs) or
+  the current channel (in channels) and answers with links to the messages
+- **On-demand context** - it can pull up older history, link you to the message where
+  something was decided, and look up people, pins, and channel info
+- **Canvases** - it can create and edit the channel canvas, so living documents get updated
+  in place instead of reposted
 
-**Channel teammate (`ENABLE_CHANNEL_LISTENING`)** - even when enabled, each channel starts at
-mentions-only; someone in the channel sets it to "on" via the ⚙️ button before the bot
-participates uninvited there.
+**Channel teammate (`ENABLE_CHANNEL_LISTENING`)** - invite it to a channel and it behaves
+like a teammate, on by default:
 
-- Decides on its own whether to reply, react, or stay out of a conversation; silence is the
-  default, and messages aimed at other people get nothing
-- Reactions that fit the moment, including your workspace's custom emoji
-- Per-channel controls for anyone via the ⚙️ Configure button: participation level
-  (on / mentions-only / off), a standing channel policy in plain text, reply placement, and
-  the channel's model/effort/verbosity
-- Per-channel memory of durable facts, managed by the bot and editable by hand
-- Ambient memory (`ENABLE_AMBIENT_MEMORY`) - links, images, and files shared in the channel
-  are summarized in the background so later questions about them have context
-- A one-time introduction when the bot is added to a channel (`ENABLE_CHANNEL_JOIN_INTRO`)
-- A rotating JSONL decision log (`logs/participation.jsonl`, when
-  `ENABLE_PARTICIPATION_TELEMETRY=true`) recording every spoke/declined decision and why
+- Answers when it can genuinely help, reacts when an emoji says it better (your workspace's
+  custom emoji included), and stays out of conversations that aren't for it
+- Takes feedback: tell it "be quieter in here" and that becomes the channel's standing rule
+- Remembers each channel's durable facts - decisions, conventions, preferences - and you can
+  review and edit them
+- Quietly takes notes on links, files, and images shared in the channel, so "what did that
+  chart say?" works days later (`ENABLE_AMBIENT_MEMORY`)
+- Introduces itself once when added to a channel (`ENABLE_CHANNEL_JOIN_INTRO`)
+- Anyone can tune it per channel - participation level (on / mentions-only / off), standing
+  rules, reply placement, model - via the ⚙️ button under any of its replies
+- For operators: every spoke/declined decision is logged with its reason
+  (`logs/participation.jsonl`, `ENABLE_PARTICIPATION_TELEMETRY`)
 
 **User experience**
 
 - Settings modal (`/chatgpt-settings`): model, reasoning effort, verbosity, image defaults,
   custom instructions - per user, per channel, and per thread
-- 👍/👎 feedback buttons in DMs; thumbs reactions on any bot message count as the same signal
-- Live status bubble with customizable "working…" messages and ticking checklists on image jobs
+- Live status bubble with customizable "working…" messages and ticking checklists on image
+  jobs
+- Optional 👍/👎 feedback buttons in DMs (`ENABLE_FEEDBACK_BUTTONS`, off by default); thumbs
+  reactions on any bot message are always recorded as the same signal
 
 ## Known limitations
 
-- **Channel search can't reach every thread reply.** Slack has no per-channel index of replies,
-  so a recent reply under a thread whose root is older than the scanned span is only found if
-  it was also posted to the channel.
 - **Context is bounded by Slack.** The bot rebuilds what Slack retains and returns - workspace
   retention policies and plan limits apply.
 - **Sandbox containers idle out after ~20 minutes** (an OpenAI API limit); a revived thread
@@ -151,16 +147,18 @@ per-thread settings from any message's ⋯ menu.
 
 ## Configuration
 
-Required in `.env`: `OPENAI_KEY` (note the name - not `OPENAI_API_KEY`), `SLACK_BOT_TOKEN`,
-`SLACK_APP_TOKEN`. Everything else has a working default, and
+Required in `.env`: `OPENAI_API_KEY`, `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN` (the legacy name
+`OPENAI_KEY` still works). Everything else has a working default, and
 [.env.example](.env.example) documents every knob inline, grouped by audience.
 
 > **⚠️ Know what the supplied config turns on.** Copied as-is, `.env.example` enables the
-> channel teammate (`ENABLE_CHANNEL_LISTENING=true`) and Slack-native streaming
-> (`SLACK_NATIVE_STREAMING=true`) - both of which the *code* defaults to off - plus ambient
+> full channel teammate (`ENABLE_CHANNEL_LISTENING=true` with channels defaulting to "on" -
+> the master switch is off only when the key is absent), Slack-native streaming, ambient
 > memory, the channel join intro, deep research (minutes of model time per job), the code
 > interpreter, image tools, and MCP access for new users (`MCP_ENABLED_DEFAULT=true`).
-> For a conservative mentions-and-DMs-only deployment, set:
+> Any channel can be dialed down from the ⚙️ button (or by telling the bot), and
+> `CHANNEL_RESPONSE_MODE=tag_only` makes mentions-only the global default instead. For a
+> conservative mentions-and-DMs-only deployment, set:
 >
 > ```
 > ENABLE_CHANNEL_LISTENING=false
@@ -169,9 +167,6 @@ Required in `.env`: `OPENAI_KEY` (note the name - not `OPENAI_API_KEY`), `SLACK_
 > ENABLE_CHANNEL_JOIN_INTRO=false
 > ENABLE_DEEP_RESEARCH=false
 > ```
->
-> Even with channel listening on, each channel starts at mentions-only until a member turns
-> it "on" via the ⚙️ button.
 
 Also worth a decision on day one: `BOT_NAME_ALIASES` (names the bot answers to without an
 `@` - set per environment so a dev bot doesn't answer to the prod bot's name),
@@ -223,6 +218,13 @@ For production, run it under a process supervisor (`systemd`, `pm2`) that starts
 repo directory with the virtualenv active and restarts on failure - a fatal startup error
 exits non-zero on purpose.
 
+A container works well too, and nothing about the bot resists it: it makes only outbound
+connections (Socket Mode), so no ports are exposed and no reverse proxy is needed. Build the
+image with the optional system packages (`poppler-utils`, `tesseract-ocr`, `pandoc`), mount
+`data/` and `logs/` as volumes so the database and its backups outlive the container, and
+pass the environment via `--env-file .env`. Keep `data/` on a real local volume - SQLite in
+WAL mode should not live on a network filesystem.
+
 ## MCP (Model Context Protocol)
 
 > **Beta.** There is no approval UI, so `require_approval` is always forced to `"never"`
@@ -272,8 +274,8 @@ conversation history moved out of the database into Slack. The short version:
    silently loses workspace search and the agent surface.
 6. Start the bot and watch the migration log lines.
 
-The exact keys, manifest deltas, and log lines are in the
-[CHANGELOG's Upgrade Instructions](CHANGELOG.md) - follow them in order.
+The exact keys, manifest deltas, and log lines are in [UPGRADING.md](UPGRADING.md) - follow
+it in order.
 
 ## Development
 
