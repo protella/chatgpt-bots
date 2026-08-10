@@ -506,8 +506,8 @@ async def test_cancelling_the_one_running_job_ends_its_card(monkeypatch):
     # Whitespace-normalized on the way in, and the card says who stopped it and why.
     assert _card_body(client.card_updates[-1]) == \
         "❌ cancelled — the user asked me to stand down"
-    # A cancelled job delivers nothing: no findings, no failure note.
-    assert client.sent == []
+    # A cancelled job delivers nothing beyond the dispatch ack: no findings, no failure note.
+    assert [t for (_c, _t, t, _u) in client.sent] == [rt._JOB_ACK_TEXT]
     assert tm.research_in_flight_count("C1:100.0") == 0
 
 

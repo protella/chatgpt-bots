@@ -1017,6 +1017,15 @@ def _research_label(processor, label_source: str) -> Optional[str]:
 # CONSTANT notification fallback across every chat.update — Slack badges "(edited)" only when
 # the top-level `text` changes, so keeping it fixed lets blocks-only updates stay unbadged.
 _CARD_FALLBACK_TEXT = "Deep research in progress…"
+# The job's one line of voice (owner decision 2026-08-10, revised same day). The dispatching
+# turn's ack reply is suppressed (F30.1) — the job's chrome is the whole acknowledgment — yet
+# the card renders no words of its own, so a dispatch read as a card materializing with no reply
+# at all. A STANDALONE message posted just before the card, NOT a line on it: the card
+# chat.updates in place, so anything written on it is gone the moment the job goes terminal — a
+# fast job would flash the ack for seconds and nobody would ever see it. Deliberately generic
+# across every job mode (research, build, or whatever comes next), and promise-free: what gets
+# delivered is decided at the callback, not here.
+_JOB_ACK_TEXT = "On it — working on this in the background."
 # FOUR lines, total, and never a "+N more". A status card is a glance, not a log: the moment it
 # needs an expander it has stopped being one. _MAX_TODOS caps the list at four in the schema;
 # this is the render-side backstop (the list PLUS a phase/verdict tail can still reach five), and
@@ -2364,6 +2373,16 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
             f"ending: " + " | ".join(_gist(n, 80) for n in notes))
 
     try:
+        # The one line of voice the user gets for the whole dispatch (the turn's ack reply is
+        # suppressed) — a REGULAR message ahead of the card, in the bot's own identity, so it
+        # survives the card's in-place updates. Best-effort like every piece of job chrome: a
+        # failed ack must never kill the job, and CancelledError still propagates.
+        try:
+            await client.send_message(channel_id, thread_root, _JOB_ACK_TEXT,
+                                      receipts=receipts, receipt_class="background_job")
+        except Exception as e:  # noqa: BLE001 — chrome, not the job
+            processor.log_debug(f"Background job {job_id}: ack post failed: {e}")
+
         # The card post has to survive a cancel that lands mid-flight. `_finalize` returns early
         # while `ts` is None, so a cancel arriving after Slack accepted the post but before the
         # ts came back would leave `finalize_cancelled` a silent no-op — a card spinning forever

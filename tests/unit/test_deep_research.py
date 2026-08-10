@@ -288,14 +288,16 @@ async def test_happy_path_posts_findings_with_trailer(monkeypatch):
         processor=proc, client=client, channel_id="C1", thread_root="100.0",
         thread_key="C1:100.0", job_id="j1", task="the task",
         snapshot=[{"role": "user", "content": "q"}], system_prompt="DEV", model="gpt-5.6-sol")
-    assert len(client.sent) == 1
-    _, thread, text, username = client.sent[0]
+    assert len(client.sent) == 2                     # the dispatch ack, then the findings
+    assert client.sent[0][2] == rt._JOB_ACK_TEXT
+    _, thread, text, username = client.sent[1]
     assert thread == "100.0"
     assert "The answer is 42." in text
     assert "_deep research ·" in text and "effort" in text  # trailer
     assert "tools: web_search" in text  # visible tool attribution in the trailer
     assert username is None
-    assert client.sent_classes == ["background_job"]  # §4: findings ride as background_job
+    # §4: findings AND the ack ride as background_job
+    assert client.sent_classes == ["background_job", "background_job"]
 
 
 @pytest.mark.asyncio
@@ -309,8 +311,8 @@ async def test_error_path_posts_failure_note(monkeypatch):
         processor=proc, client=client, channel_id="C1", thread_root="100.0",
         thread_key="C1:100.0", job_id="j1", task="the task",
         snapshot=[], system_prompt=None, model="gpt-5.6-sol")
-    assert len(client.sent) == 1
-    assert "hit a wall" in client.sent[0][2]
+    assert len(client.sent) == 2                     # the dispatch ack, then the note
+    assert "hit a wall" in client.sent[1][2]
 
 
 @pytest.mark.asyncio
@@ -325,8 +327,8 @@ async def test_timeout_path_posts_failure_note(monkeypatch):
         processor=proc, client=client, channel_id="C1", thread_root="100.0",
         thread_key="C1:100.0", job_id="j1", task="the task",
         snapshot=[], system_prompt=None, model="gpt-5.6-sol")
-    assert len(client.sent) == 1
-    assert "time limit" in client.sent[0][2]
+    assert len(client.sent) == 2                     # the dispatch ack, then the note
+    assert "time limit" in client.sent[1][2]
 
 
 @pytest.mark.asyncio
@@ -587,8 +589,9 @@ async def test_card_posted_on_job_start_with_label(monkeypatch):
     # Final card update reads "Reported findings below." and lands BEFORE the report post.
     assert client.card_updates
     assert "Reported findings below." in _card_body(client.card_updates[-1])
-    # Findings posted under the SAME label.
-    assert client.sent and client.sent[0][3] and client.sent[0][3].startswith("Sol [research:")
+    # Findings posted under the SAME label (the dispatch ack before them stays unlabeled).
+    assert client.sent and client.sent[-1][3] and client.sent[-1][3].startswith("Sol [research:")
+    assert client.sent[0][3] is None
     # Fallback text stays constant across every card update (no "(edited)" badge).
     assert all(u[2] == rt._CARD_FALLBACK_TEXT for u in client.card_updates)
 
@@ -627,7 +630,7 @@ async def test_card_failure_does_not_break_findings(monkeypatch):
         processor=proc, client=client, channel_id="C1", thread_root="100.0",
         thread_key="C1:100.0", job_id="j1", task="t", snapshot=[],
         system_prompt="DEV", model="gpt-5.6-sol")
-    assert len(client.sent) == 1 and "body" in client.sent[0][2]  # findings still posted
+    assert len(client.sent) == 2 and "body" in client.sent[1][2]  # findings still posted
 
 
 @pytest.mark.asyncio
@@ -646,7 +649,7 @@ async def test_card_label_failure_falls_back_unlabeled_and_remembers(monkeypatch
     assert len(client.card_posts) == 1 and client.card_posts[0][4] is None
     assert getattr(proc, rt._RESEARCH_LABEL_DISABLED_ATTR) is True
     # Findings also skip the label (plain post).
-    assert client.sent and client.sent[0][3] is None
+    assert client.sent and client.sent[-1][3] is None
 
 
 # --------------------------------------------- card rendering + throttle (isolated)
@@ -939,8 +942,8 @@ async def test_job_wires_todo_rewrites_to_card(monkeypatch):
     assert rt._FREE_JOB_TOOLS in stub.calls[0]["free_tools"]
     assert stub.calls[0]["registry"].has_tools({})
     # Trailer attributes research sources only — card bookkeeping excluded.
-    assert "tools: web_search" in client.sent[0][2]
-    assert "update_todos" not in client.sent[0][2]
+    assert "tools: web_search" in client.sent[-1][2]
+    assert "update_todos" not in client.sent[-1][2]
 
 
 @pytest.mark.asyncio
@@ -1016,7 +1019,7 @@ async def test_short_label_hint_survives_untruncated_on_card_and_findings(monkey
     expected = "ChatGPT [research: fast-casual 2026 outlook]"
     assert len(expected) <= 50
     assert client.card_posts[0][4] == expected      # untruncated, bracket intact
-    assert client.sent[0][3] == expected            # findings byline identical
+    assert client.sent[-1][3] == expected           # findings byline identical
     # No hint → falls back to the (gisted) task text, still bracket-safe.
     label = rt._research_label(proc, "fast-casual 2026 outlook")
     assert label == expected
@@ -1105,6 +1108,33 @@ def test_a_finished_job_shows_what_got_done_and_a_failed_one_shows_where_it_stop
     assert any("two" in ln for ln in lines)            # the step it died on SURVIVES
     assert lines[-1].startswith("❌ ") or "hit a wall" in lines[-1]
     assert len(lines) <= rt._CARD_MAX_LINES
+
+
+@pytest.mark.asyncio
+async def test_the_ack_is_a_standalone_message_ahead_of_the_card_and_never_on_it(monkeypatch):
+    """The dispatch turn's ack reply is suppressed, so this one plain message is the only words
+    the user gets — posted BEFORE the card so it reads as "message, then card", and never
+    written onto the card itself: the card chat.updates in place, so a line on it would vanish
+    the moment the job went terminal (a fast job would flash it for seconds)."""
+    monkeypatch.setattr(config, "enable_deep_research", True)
+    monkeypatch.setattr(config, "enable_research_label", True)
+    openai = SimpleNamespace(create_streaming_response_with_tool_loop=_StreamStub(
+        text="# Findings\nbody"))
+    client = _CardClient()
+    await rt._run_background_job(
+        processor=_FakeProcessor(openai_client=openai, tm=AsyncThreadStateManager()),
+        client=client, channel_id="C1", thread_root="100.0", thread_key="C1:100.0",
+        task="dig into the thing", job_id="j1", snapshot=[], system_prompt=None,
+        model="gpt-5.6-sol")
+
+    acks = [s for s in client.sent if s[2] == rt._JOB_ACK_TEXT]
+    assert len(acks) == 1                                   # posted exactly once, plain text
+    assert client.sent.index(acks[0]) == 0                  # ahead of everything the job posts
+    assert acks[0][3] is None                               # the bot's own voice, no byline
+    assert client.sent_classes[0] == "background_job"
+    assert client.card_posts, "the card still posts right after the ack"
+    for chrome in client.card_posts + client.card_updates:
+        assert rt._JOB_ACK_TEXT not in _card_body(chrome)
 
 
 # ----------------------------------------------------- F37: the job hands off to the model
@@ -1208,8 +1238,9 @@ async def test_the_report_is_not_posted_as_text_when_a_file_carries_it(monkeypat
         deliverables=[{"type": "pdf", "description": "the report", "filename": "report.pdf"}])
 
     bodies = [t for (_c, _t, t, _u) in client.sent]
-    assert len(bodies) == 1, f"expected ONE message, got {len(bodies)}"
-    assert bodies[0].startswith("Here's the PDF")
+    assert bodies[0] == rt._JOB_ACK_TEXT
+    assert len(bodies) == 2, f"expected the ack + ONE message, got {len(bodies)}"
+    assert bodies[1].startswith("Here's the PDF")
     # The report — tables and all — never reached the thread as text.
     assert not any("| Date | Model |" in b for b in bodies)
     assert not any("# Findings" in b for b in bodies)
@@ -1391,7 +1422,7 @@ async def test_build_mode_skips_the_research_phase(monkeypatch):
     assert len(stub.calls) == 1
     assert stub.calls[0] is stub.delivery_kwargs
     assert seen["ids"] == ["art_1"]
-    assert [t for (_c, _t, t, _u) in client.sent] == ["Charted it."]
+    assert [t for (_c, _t, t, _u) in client.sent] == [rt._JOB_ACK_TEXT, "Charted it."]
 
 
 @pytest.mark.asyncio
@@ -1564,7 +1595,7 @@ async def test_a_successful_delivery_does_not_also_dump_the_report(monkeypatch):
         deliverables=[{"type": "pdf", "description": "d", "filename": "report.pdf"}])
 
     bodies = [t for (_c, _t, t, _u) in client.sent]
-    assert bodies == ["Here's the PDF."]
+    assert bodies == [rt._JOB_ACK_TEXT, "Here's the PDF."]
     assert _card_body(client.card_updates[-1]).startswith("✅")
 
 
@@ -1676,7 +1707,7 @@ async def test_two_deliver_calls_in_one_round_do_not_overwrite_each_other(monkey
     assert results[0]["ok"] is True
     assert results[1]["ok"] is False and results[1]["error"] == "already_delivered"
     bodies = [t for (_c, _t, t, _u) in client.sent]
-    assert bodies[0] == "FIRST"                      # the first decision stands
+    assert bodies[1] == "FIRST"                      # the first decision stands (after the ack)
     assert not any("SECOND" in b for b in bodies)
 
 

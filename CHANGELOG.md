@@ -142,6 +142,14 @@ From then on the database backs itself up nightly (7-day retention) as part of t
 cleanup, which it never did before. The three `pre-v3-*` backups are **exempt from that
 retention** — they're your rollback path, so nothing deletes them but you.
 
+### 💬 Added - Background jobs say "On it" before the card
+
+Dispatching a background job used to post the status card with no words at all — the model's
+ack reply is deliberately suppressed, so the card just materialized. The job now posts one
+short plain message first ("On it — working on this in the background."), the same line for
+every job type. It's a regular message, not part of the card, so it stays in the thread after
+the job finishes.
+
 ### 🧭 Added - A running background job can take mid-run updates
 
 Follow-ups that change a running job's task ("drop that section", "add X") now reach the job
