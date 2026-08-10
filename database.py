@@ -662,7 +662,7 @@ class DatabaseManager(LoggerMixin):
         # NOTE (Phase S): there is deliberately NO messages table. Slack is the only
         # transcript — context is always rebuilt from conversations.replies. The DB keeps
         # only what Slack doesn't have: config, memory, derived artifacts (images/documents),
-        # and thread_summaries (compaction state). See Docs/CHANNEL_TEAMMATE_REDESIGN_PLAN.md §5b.
+        # and thread_summaries (compaction state) — the v3 mirror-drop migration removed the rest.
 
         # Thread summaries table — rolling compaction store for long threads.
         # summary_text covers everything at or before boundary_ts; refs_json preserves

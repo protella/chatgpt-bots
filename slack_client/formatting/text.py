@@ -162,7 +162,9 @@ class SlackFormattingMixin(_Host):
     # Error copy authored by the message processor: optional emoji (unicode or
     # :name:) followed by a **Bold Title** on the first line. Raw exception
     # strings never look like this.
-    _AUTHORED_ERROR_RE = re.compile(r"^(?::[\w+-]+:|[^\w*`\n])*\*{1,2}[^\n*]+\*{1,2}")
+    # The prefix group is atomic ((?>…)): ':' and '+' match both alternation branches, so a
+    # non-matching ':+:+:…' prefix would otherwise backtrack exponentially (CodeQL py/redos).
+    _AUTHORED_ERROR_RE = re.compile(r"^(?>(?::[\w+-]+:|[^\w*`\n])*)\*{1,2}[^\n*]+\*{1,2}")
 
     # The only error text a raw/technical failure may show the user. The actual
     # exception belongs in the logs (callers log it before reaching here).

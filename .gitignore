@@ -187,7 +187,8 @@ mcp_config*.bak
 slack_app_manifest.yml
 
 # Company-branded loading messages stay local (like .env) — the generic set is the committed default
-status_messages/loading_messages.acmedata.txt
+status_messages/loading_messages.*.txt
+!status_messages/loading_messages.generic.txt
 
 # Working specs co-authored by Claude + codex (never published: internal IDs, live plans)
 Docs/specs/
@@ -199,3 +200,6 @@ Docs/internal/
 
 # Playwright MCP browser-session artifacts
 .playwright-mcp/
+
+# Prod deployment checklist — internal implementation notes, never published
+Docs/V3_PROD_DEPLOYMENT_CHECKLIST.md

@@ -1,7 +1,6 @@
 """GPT-5.6 upgrade — effort clamp, per-model modal ladders, request-param shapes.
 
-Live-verified facts these tests encode (probed against the real API 2026-07-09,
-see Docs/GPT_5_6_UPGRADE_PLAN.md "Verification results"):
+Live-verified facts these tests encode (probed against the real API 2026-07-09):
 - `max` returns 200 on ALL three 5.6 tiers -> offered everywhere on 5.6
 - `minimal` 400s on every 5.6 model -> must never reach the API
 - effort=none allows temperature/top_p on 5.6 (same hybrid shape as 5.5)

@@ -287,12 +287,12 @@ class TestStatusPlainText:
 
     def test_unknown_and_custom_shortcodes_are_stripped(self):
         from slack_client.messaging import _status_plain_text
-        # Workspace custom emoji have no Unicode form — strip, don't show ":acmedata:" literally.
-        assert _status_plain_text(":acmedata: digging in…") == "digging in…"
+        # Workspace custom emoji have no Unicode form — strip, don't show ":acmecorp:" literally.
+        assert _status_plain_text(":acmecorp: digging in…") == "digging in…"
 
     def test_all_shortcode_string_falls_back(self):
         from slack_client.messaging import _status_plain_text
-        assert _status_plain_text(":acmedata:") == "working on it…"
+        assert _status_plain_text(":acmecorp:") == "working on it…"
         assert _status_plain_text("") == "working on it…"
 
     @pytest.mark.asyncio
@@ -313,7 +313,7 @@ class TestStatusPlainText:
         from config import config
         monkeypatch.setattr(config, "enable_assistant_status", True)
         monkeypatch.setattr(config, "status_loading_messages_inline", True)
-        monkeypatch.setattr(config, "status_loading_messages", [":mag: one…", ":acmedata: two…"])
+        monkeypatch.setattr(config, "status_loading_messages", [":mag: one…", ":acmecorp: two…"])
         host = _MsgClient(SimpleNamespace(assistant_threads_setStatus=AsyncMock()))
         await host.set_assistant_status("D1", "1.0")
         kwargs = host.app.client.assistant_threads_setStatus.await_args.kwargs

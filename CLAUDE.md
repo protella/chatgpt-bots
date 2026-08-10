@@ -59,7 +59,7 @@ thread.
 
 ### Persistence (`data/slack.db`, WAL mode)
 **Slack is the only transcript — conversation history is NEVER written to the DB** (the `messages`
-mirror was removed in v3; see `Docs/CHANNEL_TEAMMATE_REDESIGN_PLAN.md` §5b). The DB holds only what
+mirror was removed in v3 by the mirror-drop migration). The DB holds only what
 Slack doesn't: config (users/threads/channel_settings), channel memory, derived artifacts (image
 analyses/prompts, document extractions), and thread compaction summaries. Backups to
 `data/backups/`, 7-day retention.

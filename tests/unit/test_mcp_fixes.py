@@ -3,6 +3,8 @@ accumulation, discovery-cache wiring, approval warning, health probe."""
 import asyncio
 import json
 import re
+
+import pytest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -247,15 +249,20 @@ def test_health_probe_noop_without_servers():
 
 # ---------- live config sanity ----------
 
-def test_live_config_parses_with_interpolated_key(monkeypatch):
-    """The real mcp_config.json must load with ACMEDATA_MCP_KEY set (as .env provides)."""
-    monkeypatch.setenv("ACMEDATA_MCP_KEY", "test-key-value")
+def test_live_config_parses_with_interpolated_keys(monkeypatch):
+    """The real mcp_config.json (when present) must load with its ${VAR} keys resolved from env."""
+    try:
+        raw = open("mcp_config.json").read()
+    except FileNotFoundError:
+        pytest.skip("no local mcp_config.json on this clone")
+    for var in sorted(set(re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", raw))):
+        monkeypatch.setenv(var, "test-key-value")
     from config import config as bot_config
     monkeypatch.setattr(bot_config, "mcp_config_path", "mcp_config.json")
     mgr = MCPManager(db=None)
     mgr.initialize()
-    assert "acmedata-production-ai" in mgr.servers
-    assert mgr.servers["acmedata-production-ai"]["headers"]["X-API-Key"] == "test-key-value"
+    enabled = {name for name, server in json.loads(raw)["mcpServers"].items()
+               if server.get("enabled", True)}
+    assert set(mgr.servers) == enabled
     # no literal secrets remain in the config file
-    raw = open("mcp_config.json").read()
     assert not re.search(r'"X-API-Key":\s*"[^$]', raw)

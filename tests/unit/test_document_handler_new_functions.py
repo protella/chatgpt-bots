@@ -325,12 +325,12 @@ class TestSlackFileURLExtraction:
         
         processor = MessageProcessor()
         
-        text = "Check this file: <https://acmedata.slack.com/files/U01AF99F3JR/F09BQ7Y1VDE/document.pdf>"
+        text = "Check this file: <https://acmecorp.slack.com/files/U01AF99F3JR/F09BQ7Y1VDE/document.pdf>"
         
         urls = processor._extract_slack_file_urls(text)
         
         assert len(urls) == 1
-        assert 'acmedata.slack.com/files' in urls[0]
+        assert 'acmecorp.slack.com/files' in urls[0]
     
     def test_extract_slack_file_urls_generic(self):
         """Test extraction of generic Slack file URLs"""

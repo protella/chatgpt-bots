@@ -1,8 +1,8 @@
 # Single-Stream Channel Context — Implementation Spec
 
-Status: **PLANNED, codex signed off — awaiting owner "go". No implementation has begun.**
-Planning: 6 codex rounds (session `019fabf3-ef7a-7631-89e4-28a6dd0cc0ca`), 2026-07-28/29, informed
-by direct interrogation of a live Claude Tag instance and its public docs. Codex sign-off: round 6.
+Status: **IMPLEMENTED** (August 2026) — kept because code and tests cite it as the reference
+for the single-stream channel context and the participation-ledger telemetry contract
+(v8–v10). Section numbers (§4/§5/§10/§11) are load-bearing; don't renumber.
 
 ## 0. Goal
 
