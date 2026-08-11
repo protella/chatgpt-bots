@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### 🔧 Changed
+
+- **The progress line on an image no longer sits frozen while you wait.** It re-words itself
+  every so often, and once a render runs long it says so plainly instead of repeating the
+  same line.
+
 ## [3.0.3] - 2026-08-11
 
 ### 🩹 Fixed

@@ -579,6 +579,16 @@ async def execute_generate_image(ctx, args: Dict[str, Any]) -> Dict[str, Any]:
                                  done_text="Generated image")
         except Exception as e:  # noqa: BLE001 — a status hiccup must not block the generation
             logger.debug(f"checklist start failed: {e}")
+        else:
+            # A render runs for minutes; one frozen line reads like a hang. Re-word it from
+            # the same pool, and say so honestly once it overruns.
+            checklist.start_rotation(
+                lambda: pipeline_status("generating_image", "Generating image…"),
+                interval=config.image_status_rotate_seconds,
+                escalate_after=config.image_status_long_wait_seconds,
+                escalate_provider=lambda: pipeline_status(
+                    "image_taking_longer", "Still working on it. Taking longer than expected…"),
+            )
 
         # RECHECKED HERE, immediately before the launch. The check at the top of this executor
         # was two awaits ago — the work claim and the checklist post — and a turn that gave up
@@ -962,106 +972,127 @@ async def execute_edit_image(ctx, args: Dict[str, Any]) -> Dict[str, Any]:
                              done_text="Edited image")
     except Exception as e:  # noqa: BLE001
         logger.debug(f"checklist start failed: {e}")
-
-    if _revoked(turn):
-        await processor._abort_checklist(checklist, client, ctx.channel_id, ctx.thread_ts)
-        return _err("turn_cancelled",
-                    "This turn was cut short before the edit ran, so nothing was posted.")
-    try:
-        async with _semaphore():
-            # RECHECKED INSIDE the semaphore, for the same reason as create_image_asset: the
-            # wait for it is unbounded, and a turn that gave up while we queued must not have
-            # paid for an edit.
-            if _revoked(turn):
-                await processor._abort_checklist(checklist, client, ctx.channel_id, ctx.thread_ts)
-                return _err("turn_cancelled",
-                            "This turn was cut short before the edit ran, so nothing was posted.")
-            # LAUNCH BOUNDARY for edit_image: the image API request. The Slack post is downstream
-            # of it, so a duplicate that relaunched here would pay twice AND post twice. No await
-            # between this and the request.
-            try:
-                _mark_launched(ctx)
-            except LaunchNotRecorded as e:
-                logger.error(f"edit_image: launch not recorded for {thread_key}: {e}")
-                await processor._abort_checklist(checklist, client, ctx.channel_id, ctx.thread_ts)
-                return _err("launch_not_recorded", _LAUNCH_FAILED_MESSAGE)
-            image_data = await processor.openai_client.edit_image(
-                input_images=b64_images,
-                input_mimetypes=input_mimetypes,
-                prompt=prompt,
-                model=settings["model"],
-                image_description=description,
-                input_fidelity=settings["input_fidelity"],
-                quality=settings["quality"],
-                background=settings["background"],
-                output_format=settings["format"],
-                output_compression=settings["compression"],
-                enhance_prompt=True,
-                conversation_history=None,
-            )
-    except Exception as e:  # noqa: BLE001
-        await processor._abort_checklist(checklist, client, ctx.channel_id, ctx.thread_ts)
-        if _moderation_blocked(e):
-            return _err("moderation_blocked", _MODERATION_MESSAGE)
-        logger.error(f"edit_image failed for {thread_key}: {e}", exc_info=True)
-        return _err("edit_failed", "The image could not be edited.")
-
-    from message_processor.image_delivery import publish_image
-
-    async def _publish_and_signal():
-        """THE upload effect path, leased end to end: Slack accepting the upload, the
-        pending-share record that makes the resulting message ours, and this turn's own note
-        that it visibly delivered something. Split them and a cancellation in between leaves our
-        picture in the channel with nothing claiming it — permanently outside the stream we
-        rebuild from — or a delivered picture whose turn settles as a silence and retracts the 👀
-        it had every right to keep.
-        """
-        posted = await publish_image(
-            processor=processor, client=client, channel_id=ctx.channel_id,
-            thread_id=ctx.thread_ts, thread_key=thread_key, image_data=image_data,
-            checklist=checklist, generation_id=None, prompt=image_data.prompt,
-            db=ctx.db, thread_manager=processor.thread_manager,
-            message_ts=ctx.trigger_ts, image_type="edited", provenance_tool="edit_image",
-            receipts=getattr(turn, "receipt_ledger", None) if turn is not None else None,
+    else:
+        checklist.start_rotation(
+            lambda: pipeline_status("editing_image", "Editing image…"),
+            interval=config.image_status_rotate_seconds,
+            escalate_after=config.image_status_long_wait_seconds,
+            escalate_provider=lambda: pipeline_status(
+                "image_taking_longer", "Still working on it. Taking longer than expected…"),
         )
-        if posted and turn is not None:
-            turn.visible_action_committed = True
-        return posted
 
+    # Rotation outlives every return below, and unlike a message edit it keeps writing to
+    # the composer status. A cancellation here is routine (the turn finalizer cancels
+    # overdue tool flights) and would otherwise leave a rotator rewording forever, past the
+    # turn's own status clear. cancel_rotation is idempotent, so the paths that already
+    # ended it pay nothing.
     try:
-        file_url = await _run_effect(turn, "edit_image.publish", _publish_and_signal)
-    except EffectRevoked:
-        await processor._abort_checklist(checklist, client, ctx.channel_id, ctx.thread_ts)
-        return _err("turn_cancelled",
-                    "This turn was cut short, so the edited image was not posted.")
-    if not file_url:
-        return _err("post_failed", "The edited image was created but could not be posted.")
+        if _revoked(turn):
+            await processor._abort_checklist(checklist, client, ctx.channel_id, ctx.thread_ts)
+            return _err("turn_cancelled",
+                        "This turn was cut short before the edit ran, so nothing was posted.")
+        try:
+            async with _semaphore():
+                # RECHECKED INSIDE the semaphore, for the same reason as create_image_asset: the
+                # wait for it is unbounded, and a turn that gave up while we queued must not have
+                # paid for an edit.
+                if _revoked(turn):
+                    await processor._abort_checklist(checklist, client, ctx.channel_id, ctx.thread_ts)
+                    return _err("turn_cancelled",
+                                "This turn was cut short before the edit ran, so nothing was posted.")
+                # LAUNCH BOUNDARY for edit_image: the image API request. The Slack post is downstream
+                # of it, so a duplicate that relaunched here would pay twice AND post twice. No await
+                # between this and the request.
+                try:
+                    _mark_launched(ctx)
+                except LaunchNotRecorded as e:
+                    logger.error(f"edit_image: launch not recorded for {thread_key}: {e}")
+                    await processor._abort_checklist(checklist, client, ctx.channel_id, ctx.thread_ts)
+                    return _err("launch_not_recorded", _LAUNCH_FAILED_MESSAGE)
+                image_data = await processor.openai_client.edit_image(
+                    input_images=b64_images,
+                    input_mimetypes=input_mimetypes,
+                    prompt=prompt,
+                    model=settings["model"],
+                    image_description=description,
+                    input_fidelity=settings["input_fidelity"],
+                    quality=settings["quality"],
+                    background=settings["background"],
+                    output_format=settings["format"],
+                    output_compression=settings["compression"],
+                    enhance_prompt=True,
+                    conversation_history=None,
+                )
+        except Exception as e:  # noqa: BLE001
+            await processor._abort_checklist(checklist, client, ctx.channel_id, ctx.thread_ts)
+            if _moderation_blocked(e):
+                return _err("moderation_blocked", _MODERATION_MESSAGE)
+            logger.error(f"edit_image failed for {thread_key}: {e}", exc_info=True)
+            return _err("edit_failed", "The image could not be edited.")
 
-    processor.thread_manager.mark_needs_refresh(thread_key)
-    logger.info(f"Edited image posted for {thread_key} from {[e['image_id'] for e in resolved]}")
+        from message_processor.image_delivery import publish_image
 
-    # Show the model what it just made. It used to get only this text and never the picture, so
-    # it was writing "here's the edit" about something it had not seen — and could not tell the
-    # user the edit had gone wrong, or act on "make the text bigger" from any actual knowledge.
-    from message_processor.image_view import stage_produced_image
-    shown = stage_produced_image(ctx, image_data, label="Your edited image")
+        async def _publish_and_signal():
+            """THE upload effect path, leased end to end: Slack accepting the upload, the
+            pending-share record that makes the resulting message ours, and this turn's own note
+            that it visibly delivered something. Split them and a cancellation in between leaves our
+            picture in the channel with nothing claiming it — permanently outside the stream we
+            rebuild from — or a delivered picture whose turn settles as a silence and retracts the 👀
+            it had every right to keep.
+            """
+            posted = await publish_image(
+                processor=processor, client=client, channel_id=ctx.channel_id,
+                thread_id=ctx.thread_ts, thread_key=thread_key, image_data=image_data,
+                checklist=checklist, generation_id=None, prompt=image_data.prompt,
+                db=ctx.db, thread_manager=processor.thread_manager,
+                message_ts=ctx.trigger_ts, image_type="edited", provenance_tool="edit_image",
+                receipts=getattr(turn, "receipt_ledger", None) if turn is not None else None,
+            )
+            if posted and turn is not None:
+                turn.visible_action_committed = True
+            return posted
 
-    result = {
-        "ok": True,
-        "status": "posted",
-        "message": (
-            "The edited image has been posted to the thread, and it is attached below so you can "
-            "see it. Look at it: if it matches what was asked, acknowledge in one short line "
-            "without narrating the picture (everyone can see it). If the edit clearly did NOT do "
-            "what was asked, say so plainly rather than presenting it as a success."
-            if shown else
-            "The edited image has been posted to the thread. Acknowledge briefly; do not "
-            "describe it."),
-        "sources": [e["image_id"] for e in resolved],
-    }
-    if rejected:
-        result["ignored_overrides"] = rejected
-    return result
+        try:
+            file_url = await _run_effect(turn, "edit_image.publish", _publish_and_signal)
+        except EffectRevoked:
+            await processor._abort_checklist(checklist, client, ctx.channel_id, ctx.thread_ts)
+            return _err("turn_cancelled",
+                        "This turn was cut short, so the edited image was not posted.")
+        if not file_url:
+            return _err("post_failed", "The edited image was created but could not be posted.")
+
+        processor.thread_manager.mark_needs_refresh(thread_key)
+        logger.info(f"Edited image posted for {thread_key} from {[e['image_id'] for e in resolved]}")
+
+        # Show the model what it just made. It used to get only this text and never the picture, so
+        # it was writing "here's the edit" about something it had not seen — and could not tell the
+        # user the edit had gone wrong, or act on "make the text bigger" from any actual knowledge.
+        from message_processor.image_view import stage_produced_image
+        shown = stage_produced_image(ctx, image_data, label="Your edited image")
+
+        result = {
+            "ok": True,
+            "status": "posted",
+            "message": (
+                "The edited image has been posted to the thread, and it is attached below so you can "
+                "see it. Look at it: if it matches what was asked, acknowledge in one short line "
+                "without narrating the picture (everyone can see it). If the edit clearly did NOT do "
+                "what was asked, say so plainly rather than presenting it as a success."
+                if shown else
+                "The edited image has been posted to the thread. Acknowledge briefly; do not "
+                "describe it."),
+            "sources": [e["image_id"] for e in resolved],
+        }
+        if rejected:
+            result["ignored_overrides"] = rejected
+        return result
+    finally:
+        # abort(), not cancel_rotation(): a rotation tick may already have queued a deferred
+        # flush, and only the locked terminal shutdown stops that flush from re-setting the
+        # composer status after the turn clears it. Terminal-idempotent, so the happy path
+        # (complete() already ran inside publish_image) and the _abort_checklist paths are
+        # unaffected.
+        await checklist.abort()
 
 
 async def _download_edit_source(client, url: str) -> Tuple[Optional[str], Optional[str]]:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from config import config
 from message_markers import CHECKLIST_STATUS_MARKER
@@ -11,6 +11,11 @@ logger = logging.getLogger(__name__)
 
 _DONE_MARK = "✓"
 _FAIL_MARK = "✗"
+
+# Belt-and-braces: no leak path may rotate forever. Longer than any legitimate render.
+_ROTATION_MAX_SECONDS = 1800.0
+# A deleted message fails every edit, so an orphaned rotator dies within ~3 ticks.
+_ROTATION_MAX_EDIT_FAILURES = 3
 
 
 def _strip_ellipsis(text: str) -> str:
@@ -70,6 +75,10 @@ class ProgressChecklist:
         self._last_edit_time = float("-inf")
         self._pending_flush: Optional[asyncio.Task] = None
         self._delete_task: Optional[asyncio.Task] = None
+        self._rotation_task: Optional[asyncio.Task] = None
+        # Consecutive rejected message edits. A surface that has gone away (deleted message)
+        # rejects every write, which is how an orphaned rotator learns to stop.
+        self._edit_failures = 0
 
     @property
     def message_id(self) -> Optional[str]:
@@ -86,6 +95,10 @@ class ProgressChecklist:
 
     async def step(self, active_text: str, done_text: Optional[str] = None) -> None:
         """Complete the current active step and start a new one."""
+        # A rotator belongs to the step that started it: the next step declares its own
+        # wording (e.g. "Uploading…"), and a rotator still running from the previous stage
+        # would immediately overwrite it with that stage's variants.
+        self.cancel_rotation()
         async with self._lock:
             if self._terminal:
                 logger.debug("checklist terminal; step(%r) ignored", active_text)
@@ -100,6 +113,7 @@ class ProgressChecklist:
     async def complete(self, final_text: Optional[str] = None,
                        delete_after: Optional[float] = None) -> None:
         """Mark every step done (sticky). Optionally delete the message after a delay."""
+        self.cancel_rotation()
         async with self._lock:
             if self._terminal:
                 logger.debug("checklist already terminal; complete() ignored")
@@ -118,6 +132,7 @@ class ProgressChecklist:
 
     async def fail(self, note: str) -> None:
         """Mark the active step failed (sticky); completed steps stay visible."""
+        self.cancel_rotation()
         async with self._lock:
             if self._terminal:
                 logger.debug("checklist already terminal; fail() ignored")
@@ -128,6 +143,91 @@ class ProgressChecklist:
             self._active = None
             self._failed_note = note
             await self._terminal_flush()
+
+    async def abort(self) -> None:
+        """Shut the checklist down without rendering anything (the surface is being removed).
+
+        Terminal like complete/fail, but silent: no edit, no status write, no network call
+        of any kind. Cancelling the rotation task alone is not enough — a tick that already
+        ran may have left a deferred flush queued, and that flush would edit a message that
+        is about to be deleted and re-set the composer status after its clear.
+        """
+        self.cancel_rotation()
+        async with self._lock:
+            self._terminal = True
+            self._cancel_pending_flush()
+
+    # --- rotation ---
+
+    def start_rotation(self, provider: Callable[[], str], interval: float,
+                       escalate_after: Optional[float] = None,
+                       escalate_provider: Optional[Callable[[], str]] = None) -> None:
+        """Re-word the active step periodically from ``provider``.
+
+        A single long step (a minutes-long image render) otherwise shows one frozen line.
+        Rotation edits go through the normal flush path, so the message text and the
+        mirrored composer status always carry the SAME wording — never a mismatched pair.
+        Past ``escalate_after`` seconds the wording comes from ``escalate_provider``
+        instead (honest "this is taking longer than expected"). A no-op when rotation is
+        disabled (``interval <= 0``), already running, or the checklist is terminal.
+        """
+        if interval <= 0 or self._rotation_task is not None or self._terminal:
+            return
+        self._rotation_task = asyncio.create_task(
+            self._rotate(provider, interval, escalate_after, escalate_provider))
+
+    def cancel_rotation(self) -> None:
+        """Stop re-wording the active step. Sync and idempotent (safe before any start)."""
+        task = self._rotation_task
+        self._rotation_task = None
+        if task is not None:
+            task.cancel()
+
+    async def _rotate(self, provider: Callable[[], str], interval: float,
+                      escalate_after: Optional[float],
+                      escalate_provider: Optional[Callable[[], str]]) -> None:
+        """The rotation loop. Never raises: a status hiccup must not touch the pipeline."""
+        started = self._now()
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                if self._now() - started > _ROTATION_MAX_SECONDS:
+                    return
+                async with self._lock:
+                    if self._terminal or self._active is None:
+                        return
+                    if self._edit_failures >= _ROTATION_MAX_EDIT_FAILURES:
+                        # Nothing is accepting these writes any more — the surface is gone
+                        # and no terminal call is coming (an orphaned rotator).
+                        logger.debug("checklist rotation stopped: surface not accepting edits")
+                        return
+                    source = provider
+                    if (escalate_after is not None and escalate_provider is not None
+                            and self._now() - started > escalate_after):
+                        source = escalate_provider
+                    text = self._next_rotation_text(source)
+                    if text is None:
+                        continue
+                    # Only the active label rotates; the done-label stays what the caller
+                    # declared, so the finished line still reads "Generated image".
+                    self._active = text
+                    await self._flush_or_schedule()
+        except asyncio.CancelledError:
+            return
+        except Exception:  # noqa: BLE001 — a progress surface must never break the job
+            logger.debug("checklist rotation stopped", exc_info=True)
+
+    def _next_rotation_text(self, source: Callable[[], str]) -> Optional[str]:
+        """One different wording from ``source``, or None to skip this tick.
+
+        The pools are drawn from at random, so a repeat is expected; one re-draw is
+        enough to avoid a no-op edit without spinning on a single-variant pool.
+        """
+        for _ in range(2):
+            text = source()
+            if text and text != self._active:
+                return text
+        return None
 
     # --- internal ---
 
@@ -201,7 +301,10 @@ class ProgressChecklist:
                 ok = await self._client.update_message(
                     self._channel_id, self._message_id, self._message_body())
                 if ok is False:
+                    self._edit_failures += 1
                     logger.debug("checklist edit failed; keeping state for next flush")
+                else:
+                    self._edit_failures = 0
             await self._mirror_active_status()
         elif self._surface == "assistant_status":
             if self._active and hasattr(self._client, "set_assistant_status"):

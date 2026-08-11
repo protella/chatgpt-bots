@@ -449,6 +449,16 @@ def _stub_checklist(monkeypatch):
         async def step(self, text, done_text=None):
             self.steps.append(text)
 
+        def start_rotation(self, provider, interval, escalate_after=None,
+                           escalate_provider=None):
+            self.rotation = (interval, escalate_after)
+
+        def cancel_rotation(self):
+            self.rotation = None
+
+        async def abort(self):
+            self.cancel_rotation()
+
     monkeypatch.setattr("message_processor.progress.ProgressChecklist", _Checklist)
 
 
@@ -1163,6 +1173,16 @@ async def test_revoking_during_the_checklist_post_stops_the_detached_job():
 
         async def step(self, text, done_text=None):
             turn.revoke_effects("the turn was cancelled while the card went up")
+
+        def start_rotation(self, provider, interval, escalate_after=None,
+                           escalate_provider=None):
+            pass
+
+        def cancel_rotation(self):
+            pass
+
+        async def abort(self):
+            pass
 
     with patch("message_processor.progress.ProgressChecklist", _RevokingChecklist):
         out = await it.execute_generate_image(ctx, {"prompt": "a red cat"})

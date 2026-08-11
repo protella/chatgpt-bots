@@ -137,6 +137,11 @@ class ImageJobMixin(_Host):
         completed ✓ nor a failed ✗ checklist should linger)."""
         if checklist is None:
             return
+        # Shut the checklist down BEFORE the message goes: the rotator must not edit a
+        # surface that is about to be deleted, and a flush it already queued must not fire
+        # afterwards and re-set the composer status we are about to clear.
+        if hasattr(checklist, "abort"):
+            await checklist.abort()
         try:
             if checklist.surface == "assistant_status":
                 if hasattr(client, "clear_assistant_status"):

@@ -530,6 +530,13 @@ class BotConfig:
     # Stage-keyed pipeline status variants ([stage] sections, one variant per line).
     pipeline_messages_file: str = field(default_factory=lambda: os.getenv(
         "PIPELINE_MESSAGES_FILE", "status_messages/pipeline_messages.txt"))
+    # How often an image progress checklist re-words its active step from the same stage
+    # pool — an image render is minutes long, and one frozen line reads like a hang.
+    # 0 disables rotation (the step text is picked once and kept).
+    image_status_rotate_seconds: float = field(default_factory=lambda: float(os.getenv("IMAGE_STATUS_ROTATE_SECONDS", "25")))
+    # Past this many seconds the wording switches to the honest [image_taking_longer] pool
+    # instead of the stage pool: still working, just slower than usual.
+    image_status_long_wait_seconds: float = field(default_factory=lambda: float(os.getenv("IMAGE_STATUS_LONG_WAIT_SECONDS", "90")))
 
     def get_loading_messages(self) -> list:
         """Resolve the loading-message pool: inline env wins, then the file, then defaults."""

@@ -6,6 +6,7 @@ the only surface) in place. All edits serialize on an internal lock; non-termina
 edits inside the min-edit interval coalesce; terminal states are sticky.
 """
 import asyncio
+from itertools import cycle
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -271,6 +272,128 @@ async def test_false_returning_update_message_keeps_state():
     assert client.update_message.await_count == 2
     # State still carries the completed step for a later retry.
     assert c._done == ["Enhanced prompt"]
+
+
+# ---------------- rotating status text ----------------
+
+@pytest.mark.asyncio
+async def test_rotation_rewords_active_step_and_keeps_done_text():
+    client = _client()
+    c = ProgressChecklist(client, "C1", "T1", message_id="m1", min_edit_interval=0)
+    await c.step("Generating image…", done_text="Generated image")
+    assert _last_text(client) == f"{LOADER} Generating image…"
+
+    c.start_rotation(lambda: "Mixing the colors…", interval=0.01)
+    await asyncio.sleep(0.05)
+    assert _last_text(client) == f"{LOADER} Mixing the colors…"
+
+    # The done-label is the one the caller declared, not the rotated wording.
+    await c.complete()
+    assert _last_text(client) == "✓ Generated image"
+
+
+@pytest.mark.asyncio
+async def test_rotation_escalates_to_long_wait_wording():
+    client = _client()
+    c = ProgressChecklist(client, "C1", "T1", message_id="m1", min_edit_interval=0)
+    await c.step("Generating image…", done_text="Generated image")
+
+    c.start_rotation(lambda: "Mixing the colors…", interval=0.01,
+                     escalate_after=0.05,
+                     escalate_provider=lambda: "Taking longer than expected…")
+    await asyncio.sleep(0.15)
+    assert _last_text(client) == f"{LOADER} Taking longer than expected…"
+    c.cancel_rotation()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["complete", "fail"])
+async def test_terminal_stops_rotation(terminal):
+    client = _client()
+    c = ProgressChecklist(client, "C1", "T1", message_id="m1", min_edit_interval=0)
+    await c.step("Generating image…", done_text="Generated image")
+    c.start_rotation(lambda: "Mixing the colors…", interval=0.01)
+
+    if terminal == "complete":
+        await c.complete()
+    else:
+        await c.fail("Image generation failed")
+    assert c._rotation_task is None
+
+    settled = client.update_message.await_count
+    await asyncio.sleep(0.05)
+    assert client.update_message.await_count == settled
+
+
+@pytest.mark.asyncio
+async def test_zero_interval_disables_rotation():
+    client = _client()
+    c = ProgressChecklist(client, "C1", "T1", message_id="m1", min_edit_interval=0)
+    await c.step("Generating image…", done_text="Generated image")
+
+    c.start_rotation(lambda: "Mixing the colors…", interval=0)
+    assert c._rotation_task is None
+    settled = client.update_message.await_count
+    await asyncio.sleep(0.05)
+    assert client.update_message.await_count == settled
+    assert _last_text(client) == f"{LOADER} Generating image…"
+
+
+@pytest.mark.asyncio
+async def test_cancel_rotation_is_idempotent_before_and_after_start():
+    client = _client()
+    c = ProgressChecklist(client, "C1", "T1", message_id="m1", min_edit_interval=0)
+    c.cancel_rotation()          # before any start
+    c.cancel_rotation()
+
+    await c.step("Generating image…", done_text="Generated image")
+    c.start_rotation(lambda: "Mixing the colors…", interval=0.01)
+    c.cancel_rotation()
+    c.cancel_rotation()          # second cancel is a no-op
+    assert c._rotation_task is None
+
+    settled = client.update_message.await_count
+    await asyncio.sleep(0.05)
+    assert client.update_message.await_count == settled
+
+
+@pytest.mark.asyncio
+async def test_abort_silences_a_flush_the_rotation_already_queued():
+    # Abort runs when the surface is about to be deleted. Cancelling the rotation task alone
+    # is not enough: a tick inside the min-edit interval leaves a DEFERRED flush queued, and
+    # that flush would edit the deleted message and re-set the status after its clear.
+    client = _client(send_thinking_indicator=AsyncMock(return_value=None))
+    c = ProgressChecklist(client, "C1", "T1", min_edit_interval=0.2, prefer_message=True)
+    await c.step("Generating image…", done_text="Generated image")
+
+    c.start_rotation(lambda: "Mixing the colors…", interval=0.05)
+    await asyncio.sleep(0.1)     # a tick fired and scheduled the deferred flush
+    assert c._pending_flush is not None
+
+    await c.abort()
+    edits, statuses = client.update_message.await_count, client.set_assistant_status.await_count
+
+    await asyncio.sleep(0.3)     # well past when that flush would have landed
+    assert client.update_message.await_count == edits
+    assert client.set_assistant_status.await_count == statuses
+
+
+@pytest.mark.asyncio
+async def test_rotation_gives_up_after_repeated_failed_edits():
+    # An orphaned rotator (its job cancelled before any terminal call) would otherwise reword
+    # forever. A deleted message rejects every edit, which is the signal to stop.
+    client = _client(update_message=AsyncMock(return_value=False))
+    c = ProgressChecklist(client, "C1", "T1", message_id="m1", min_edit_interval=0)
+    await c.step("Generating image…", done_text="Generated image")
+
+    swing = cycle(["Mixing the colors…", "Rendering the pixels…"])
+    c.start_rotation(lambda: next(swing), interval=0.01)
+    await asyncio.sleep(0.15)
+
+    assert c._rotation_task is not None and c._rotation_task.done()
+    settled = client.update_message.await_count
+    await asyncio.sleep(0.05)
+    assert client.update_message.await_count == settled
 
 
 # ---------------- terminal idempotency ----------------

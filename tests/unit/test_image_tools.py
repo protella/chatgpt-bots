@@ -52,14 +52,32 @@ def _stub_checklist(monkeypatch):
     """Both synchronous tools post a progress checklist. It is imported inside the executor,
     so patching the module attribute swaps it everywhere; its own behavior is covered in
     test_background_image_gen.py."""
+    made: list = []
+
     class _Checklist:
         def __init__(self, *a, **k):
             self.steps = []
+            self.rotation_started = False
+            self.rotation_cancels = 0
+            made.append(self)
 
         async def step(self, text, done_text=None):
             self.steps.append(text)
 
+        def start_rotation(self, provider, interval, escalate_after=None,
+                           escalate_provider=None):
+            self.rotation_started = True
+
+        def cancel_rotation(self):
+            self.rotation_cancels += 1
+
+        async def abort(self):
+            self.cancel_rotation()
+
     monkeypatch.setattr("message_processor.progress.ProgressChecklist", _Checklist)
+    # The checklists the executors built, in construction order — a test that cares about
+    # rotation lifecycle asks for this fixture by name.
+    return made
 
 
 @pytest.fixture(autouse=True)
@@ -401,6 +419,24 @@ async def test_edit_happy_path_posts_the_result(monkeypatch):
     publish.assert_awaited_once()
     # A fresh image landed in the thread → the next turn must rebuild from Slack.
     assert proc.thread_manager.consume_needs_refresh("C1:100.0") is True
+
+
+@pytest.mark.asyncio
+async def test_edit_cancellation_stops_the_status_rotation(_stub_checklist):
+    # The turn finalizer cancels overdue tool flights, and CancelledError is not an Exception:
+    # without the executor's finally, the rotator would outlive the turn and keep rewording the
+    # composer status after the turn cleared it.
+    oc = _openai(edit=AsyncMock(side_effect=asyncio.CancelledError()))
+    proc = _FakeProcessor(openai_client=oc)
+
+    with pytest.raises(asyncio.CancelledError):
+        await it.execute_edit_image(
+            _ctx(proc, catalog=CATALOG),
+            {"source_image_ids": ["img_7"], "prompt": "make it blue"})
+
+    checklist = _stub_checklist[-1]
+    assert checklist.rotation_started is True
+    assert checklist.rotation_cancels >= 1
 
 
 @pytest.mark.asyncio
