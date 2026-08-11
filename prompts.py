@@ -673,7 +673,9 @@ RECONSIDERATION_INSTRUCTION = (
     "draft or revise it to account for what arrived — `post` delivers after one more staleness "
     "check against anything even newer. If the conversation is moving too fast for that check to "
     "ever pass and the reply genuinely still belongs, `force_post` delivers without it. If the "
-    "room no longer needs the reply, `skip` and it is never posted."
+    "room no longer needs the reply, `skip` and it is never posted. When the substance of your "
+    "reply has already reached the room through what arrived, a near-duplicate helps no one: "
+    "prefer `skip`, and revise only when you have something the newer messages did not deliver."
 )
 
 
