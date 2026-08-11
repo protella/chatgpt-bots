@@ -3528,7 +3528,11 @@ class TextHandlerMixin(_Host):
             # answer, and this covers the turn that produced text without ever streaming a chunk
             # — which still has to land somewhere, and lands in the default thread.
             _bind_destination()
-            show_attribution = not final_post_only
+            # The NARROW property, not the widened local above it: `final_post_only` also
+            # carries `silence_capable` so a gate-woken turn buffers its whole answer, but
+            # chrome suppression is only ever about a top-level channel reply. Reading the
+            # local here cost every gate-woken reply its attribution footer (live 2026-08-11).
+            show_attribution = not (turn is not None and turn.final_post_only)
 
             # Add unified tools note at the END if any tools were used
             # This works for both paginated and non-paginated responses.
@@ -3630,7 +3634,10 @@ class TextHandlerMixin(_Host):
                     # "gpt-5.6-sol" post). Same placement rule as the native stopStream finalize
                     # above: threaded replies only, never a top-level place-in-channel reply.
                     direct_footer_blocks = None
-                    if not final_post_only and hasattr(client, "attachable_footer_blocks"):
+                    # Same narrow read as show_attribution above: buffering (the widened
+                    # local) must not suppress chrome on a gate-woken threaded reply.
+                    if (not (turn is not None and turn.final_post_only)
+                            and hasattr(client, "attachable_footer_blocks")):
                         try:
                             direct_footer_blocks = client.attachable_footer_blocks(
                                 message.channel_id, thread_config.get("model"))

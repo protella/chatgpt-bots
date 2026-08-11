@@ -644,6 +644,49 @@ async def test_direct_final_post_top_level_suppresses_footer(monkeypatch):
     assert resp.metadata.get("footer_attached") is not True
 
 
+# =============================================== 2c. the "_Tools Used:_" attribution footer
+
+class _ToolEventOpenAI(FakeOpenAI):
+    """Streams a reply after firing ONE hosted-tool event, exactly as the API layer does.
+
+    `response.mcp_call.in_progress` carries no server_label (the SDK event model has only
+    item_id/output_index/sequence_number), so the live callback sees the GENERIC "mcp" id.
+    """
+
+    def __init__(self, chunks, tool_type="mcp", status="calling"):
+        super().__init__(chunks)
+        self.tool_type, self.status = tool_type, status
+
+    async def create_streaming_response(self, messages=None, stream_callback=None,
+                                        tool_callback=None, **kw):
+        if tool_callback is not None:
+            await tool_callback(self.tool_type, self.status)
+        return await self._run(stream_callback, **kw)
+
+
+@pytest.mark.asyncio
+async def test_a_gate_woken_reply_still_says_which_tools_it_used(monkeypatch):
+    """A gate-woken channel turn is silence_capable, so it buffers and posts once — but it is
+    still a THREADED reply, and a threaded reply that consulted an external source has to say so.
+
+    Seen live on prod: an MCP-backed answer landed with no attribution line at all, while the
+    same code path put one under every addressed turn.
+    """
+    monkeypatch.setattr(config, "enable_no_reply_tool", True, raising=False)
+    slack = FakeSlack(native=True)
+    processor = _processor(_ToolEventOpenAI(["Chicken sandwich LTOs are up 9% QoQ."]))
+    msg, ts = _message(silence_capable=True), _thread_state()
+    turn = _thread_turn(msg)
+    assert turn.silence_capable and not turn.final_post_only   # the shape under test
+
+    resp = await _run(processor, slack, msg, ts, turn)
+
+    delivered = "".join(slack.live.values())
+    assert "_Tools Used: MCP_" in delivered, (
+        f"the reply reached the thread with no attribution footer: {delivered!r}")
+    assert "_Tools Used: MCP_" in (resp.content or "")
+
+
 # ============================================================ 3. the placement rule
 
 def test_final_post_only_is_exactly_a_channel_destination(monkeypatch):
