@@ -185,6 +185,7 @@ mcp_config*.bak
 
 # Slack app manifest (environment-specific; use slack_app_manifest.example.yml as template)
 slack_app_manifest.yml
+slack_app_manifest.v3.yml
 
 # Company-branded loading messages stay local (like .env) — the generic set is the committed default
 status_messages/loading_messages.*.txt

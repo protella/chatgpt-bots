@@ -2588,9 +2588,12 @@ async def _run_research_phase(*, processor, client, channel_id: str, thread_root
     )
     # The report never passed through the chat turn's text cleanup — which is why web_search's
     # citation markers used to reach the user raw, rendering as
-    # "…one-million-token context. cite:ship:turn12search1:walking:".
-    text = strip_citation_markers(
-        strip_sandbox_links((result.get("text") or "").strip())).strip()
+    # "…one-million-token context. cite:ship:turn12search1:walking:". The destination marker
+    # is the same story: the researcher writes under the thread's system prompt, which teaches
+    # [[reply:...]], and a job has no destination to choose — strip it here so every consumer
+    # of the report (post_report, the rescue dump, the DB) sees clean text. Seen live 2026-08-10.
+    text = parse_destination_marker(strip_citation_markers(
+        strip_sandbox_links((result.get("text") or "").strip())))[1].strip()
     return text, (result.get("tools_used") or [])
 
 

@@ -1625,6 +1625,30 @@ async def test_a_destination_marker_in_the_delivery_reply_never_reaches_slack(mo
 
 
 @pytest.mark.asyncio
+async def test_a_destination_marker_in_the_report_never_reaches_slack(monkeypatch):
+    """Same leak, other surface: the RESEARCHER writes under the thread's system prompt too, so
+    the report itself can open with [[reply:...]] — and post_report ships that text verbatim.
+    Stripped at report extraction, so the posted report, the rescue dump, and the DB all see
+    clean text. Seen live on prod 2026-08-10."""
+    monkeypatch.setattr(config, "enable_deep_research", True)
+    monkeypatch.setattr(config, "enable_research_label", False)
+    stub = _PlanStub(text="[[reply:thread]]" + REPORT,
+                     plan={"reply": "Rundown below.", "publish": [], "post_report": True})
+    client = _CardClient()
+    proc = _FakeProcessor(openai_client=SimpleNamespace(
+        create_streaming_response_with_tool_loop=stub), tm=AsyncThreadStateManager())
+
+    await rt._run_background_job(
+        processor=proc, client=client, channel_id="C1", thread_root="100.0",
+        thread_key="C1:100.0", job_id="j1", task="t", mode="research",
+        snapshot=[], system_prompt="DEV", model="gpt-5.6-sol", deliverables=[])
+
+    bodies = [t for (_c, _t, t, _u) in client.sent]
+    assert any(REPORT.strip() in t for t in bodies), "the report was not posted"
+    assert not any("[[reply:" in t for t in bodies)
+
+
+@pytest.mark.asyncio
 async def test_a_published_chart_does_not_count_as_the_findings(monkeypatch):
     """Codex find. The model asks for BOTH the report and a supplementary chart. The report post
     fails; the chart uploads fine. A naive "something published, so we're covered" check skips
