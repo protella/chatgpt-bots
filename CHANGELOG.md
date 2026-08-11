@@ -2,9 +2,9 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [3.0.0] - 2026-08-10
 
-> Shipping as **v3.0.0** — a major release. The headlines: a new model lineup
+> **v3.0.0** is a major release. The headlines: a new model lineup
 > (GPT-5.6 Sol/Terra/Luna), an opt-in **channel teammate** mode,
 > **deep research and document builds that run in the background**, a code sandbox that
 > computes real charts from real data, and conversation history moved out of the
