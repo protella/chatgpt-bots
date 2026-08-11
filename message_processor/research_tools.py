@@ -43,6 +43,7 @@ from canvas_content import CANVAS_MIMETYPE
 from config import clamp_effort, config
 from message_processor import document_tools, outbound_receipts
 from message_processor.artifacts import strip_citation_markers, strip_sandbox_links
+from message_processor.destination_tools import parse_destination_marker
 from tool_registry import ToolContext, ToolRegistry
 
 # Process-lifetime flag: set once a labelled findings post fails (likely a missing
@@ -2635,7 +2636,10 @@ async def _plan_delivery(processor, *, job_id: str, task: str, report: str, stag
             return {"ok": False, "error": "already_delivered",
                     "message": "You already called deliver. Your first call stands."}
         plan["_delivered"] = True
-        plan["reply"] = (args.get("reply") or "").strip()
+        # The thread's system prompt teaches the [[reply:...]] destination marker, and this
+        # model call carries that prompt — but delivery has no destination to choose (the job's
+        # thread is fixed), so a marker here is stripped, never posted. Seen live 2026-08-10.
+        plan["reply"] = parse_destination_marker((args.get("reply") or "").strip())[1].strip()
         plan["publish"] = [str(a).strip() for a in (args.get("publish") or []) if a]
         plan["post_report"] = bool(args.get("post_report"))
         return {"ok": True}
