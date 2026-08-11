@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.0.3] - 2026-08-11
+
+### 🩹 Fixed
+
+- **Replies the bot volunteers in a channel now credit their sources.** A regression had
+  suppressed the "Tools Used" footer and the settings chrome on any reply the bot chose to
+  make without being addressed; both now attach, including the MCP server name when company
+  data was used.
+- **Fewer duplicate answers after a correction.** When you correct a request mid-flight, the
+  review step now prefers acknowledging the original quietly over posting a second copy of
+  the same answer.
+
 ## [3.0.2] - 2026-08-10
 
 ### 🩹 Fixed
