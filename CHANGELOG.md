@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.0.1] - 2026-08-10
+
+### 🩹 Fixed
+
+- **A background job's posted text no longer leaks the internal `[[reply:thread]]` placement
+  marker.** Both delivery surfaces — the job's reply message and a report posted as text —
+  now strip it before anything reaches Slack.
+
 ## [3.0.0] - 2026-08-10
 
 > **v3.0.0** is a major release. The headlines: a new model lineup
