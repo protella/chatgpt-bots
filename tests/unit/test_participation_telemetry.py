@@ -2030,9 +2030,10 @@ def test_at_most_one_reconsider_outcome_per_turn(tmp_path):
 
 
 def test_a_dm_stale_send_with_a_turn_id_and_no_turn_start_is_tolerated(tmp_path):
-    """The ruled tolerance: DM turns take leases and emit stale_send rows carrying a turn_id,
-    but DMs are outside the channel-turn population, so there is no turn_start to join — and
-    that must never read as a violation."""
+    """The ruled tolerance: DM turns take leases and emit stale_send rows carrying a turn_id.
+    A DM turn writes its own start/outcome pair now, but it is counted apart from the channel
+    population — and a file holding the suppression row WITHOUT that pair (a rotated head, a
+    ledger written before the pair existed) must never read as a violation."""
     rows = [
         _v10("session_start", at=1.0, build="abc"),
         _suppression(turn_id="dm-turn", at=2.0),

@@ -26,10 +26,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import message_processor.dm_reconsideration as dm_reconsideration
 import message_processor.reconsideration as reconsideration
 from base_client import Message, Response
 from config import config
 from message_processor import participation_telemetry
+from message_processor.dm_reconsideration import (DMSnapshotItem, DMSurfaceSnapshot,
+                                                  pin_dm_turn_context)
 from message_processor.channel_request import to_input_items
 from message_processor.reconsideration import (RECONSIDER_FUSE_PASSES,
                                                build_reconsideration_request, draft_fence,
@@ -43,11 +46,33 @@ from message_processor.turn_runtime import TurnRuntime
 from openai_client.api.responses import (ReconsiderationDecision,
                                          ReconsiderationDecisionError)
 from prompts import RECONSIDERATION_INSTRUCTION
-from tests.unit.channel_turn_harness import build_stream, normalized, pin_channel_turn
+from tests.unit.channel_turn_harness import (build_stream, normalized, pin_channel_turn,
+                                             thread_config)
 
 CH = "C1"
+DM = "D9"
 TRIGGER_TS = "10.0"
 NEWER_TS = "11.0"
+
+
+def dm_item(ts: str, text: str, *, sender: str = "U1", sender_type: str = "human",
+            root: Optional[str] = None, channel: str = DM) -> DMSnapshotItem:
+    """One rebuilt DM message, in the shape the real snapshot produces."""
+    role = "assistant" if sender_type == "self" else "user"
+    content = text if role == "assistant" else f"[Dana Whitfield ts={ts}] {text}"
+    return DMSnapshotItem(
+        metadata={"ts": ts, "channel_id": channel, "sender_id": sender,
+                  "sender_type": sender_type, "thread_root_ts": root or ts},
+        role=role, content=content)
+
+
+def dm_surface_snapshot(*, include_suppressor: bool = True) -> DMSurfaceSnapshot:
+    """The rebuilt DM surface: the original question, and (by default) the SAME person's newer
+    top-level question that suppressed the draft — a different thread root entirely."""
+    items = [dm_item(TRIGGER_TS, "the question")]
+    if include_suppressor:
+        items.append(dm_item(NEWER_TS, "actually, different question"))
+    return DMSurfaceSnapshot(message_items=tuple(items))
 
 
 # =============================================================================== fakes
@@ -732,7 +757,10 @@ async def test_a_suppression_after_the_runner_ended_is_rethrown_unmarked(events,
 
 
 @pytest.mark.asyncio
-async def test_dm_and_leaseless_suppressions_rethrow_untouched(events, monkeypatch):
+async def test_suppressions_with_no_reviewable_surface_rethrow_untouched(events, monkeypatch):
+    """Fail closed, in the three shapes that have nothing to review with: no lease, no turn,
+    and a turn sent to the DM surface without the DM context its handler pins (ruling 6 — a
+    DM WITH that context reconsiders, and has its own tests below)."""
     rig = _Rig(monkeypatch, script=[])
     rig.race()
     exc = rig.suppress()
@@ -1143,16 +1171,53 @@ class SiteOpenAI:
     branch converts the chrome surface)."""
 
     def __init__(self, final_text: str, chunks: Optional[List[str]] = None,
-                 decisions: Optional[List[Any]] = None):
+                 decisions: Optional[List[Any]] = None,
+                 fail_with: Optional[BaseException] = None,
+                 background_job: bool = False, terminal_action: Optional[str] = None):
         self.final_text = final_text
         self.chunks = list(chunks or [])
+        self.fail_with = fail_with
+        self.background_job = background_job
+        self.terminal_action = terminal_action
         self.create_reconsideration_decision = FakeDecider(list(decisions or []))
 
+    async def create_streaming_response_with_tool_loop(
+            self, messages=None, tools=None, registry=None, tool_context=None,
+            stream_callback=None, tool_callback=None, hidden_suppression_sink=None, **kw):
+        """The loop's shape, over the same streamed chunks — and the two signals whose ENDINGS
+        deliver nothing while the round still returns text."""
+        text = await self.create_streaming_response(
+            messages=messages, stream_callback=stream_callback, tool_callback=tool_callback,
+            hidden_suppression_sink=hidden_suppression_sink)
+        if self.background_job and tool_context is not None:
+            tool_context.background_job_started = True
+        return {"text": text, "segments": [text] if text else [], "tools_used": [],
+                "local_tool_calls": [], "terminal_action": self.terminal_action,
+                "silence_reason": "nothing_to_add" if self.terminal_action else None}
+
     async def create_streaming_response(self, messages=None, stream_callback=None,
-                                        tool_callback=None, **kw):
+                                        tool_callback=None, hidden_suppression_sink=None,
+                                        **kw):
+        """Mirrors `responses.py`'s hidden-buffer contract — through the REAL `_hidden_for`
+        predicate, so this double cannot quietly hide something the API layer would not."""
+        from openai_client.api.responses import _hidden_for
+
+        hidden = hidden_suppression_sink[0] if hidden_suppression_sink else None
         for chunk in self.chunks:
-            await stream_callback(chunk)
-        await stream_callback(None)
+            if hidden is not None:
+                continue                       # hidden-buffer mode: nothing reaches the sink
+            try:
+                await stream_callback(chunk)
+            except Exception as error:
+                hidden = _hidden_for(hidden_suppression_sink, error)
+                if hidden is None:
+                    raise
+        if self.fail_with is not None:
+            if hidden is not None:
+                raise hidden from self.fail_with    # ruling 5
+            raise self.fail_with
+        if hidden is None:
+            await stream_callback(None)
         return self.final_text
 
 
@@ -1201,11 +1266,26 @@ class SiteRig:
 
     def __init__(self, monkeypatch, *, decisions: List[Any], final_text: str,
                  slack: Optional[SiteSlack] = None, chunks: Optional[List[str]] = None,
-                 receipts: bool = False):
+                 receipts: bool = False, fail_with: Optional[BaseException] = None,
+                 background_job: bool = False, terminal_action: Optional[str] = None):
         monkeypatch.setattr(config, "enable_no_reply_tool", False, raising=False)
         self.slack = slack if slack is not None else SiteSlack()
-        self.openai = SiteOpenAI(final_text, chunks=chunks, decisions=decisions)
+        self.openai = SiteOpenAI(final_text, chunks=chunks, decisions=decisions,
+                                 fail_with=fail_with, background_job=background_job,
+                                 terminal_action=terminal_action)
         self.processor = _site_processor(self.openai)
+        self.tool_loop = bool(background_job or terminal_action)
+        if self.tool_loop:
+            # The tool-loop branch is the only one that can report these endings, and it is
+            # taken only with a registry AND a non-empty tools array.
+            self.processor._build_tools_array = MagicMock(
+                return_value=[{"type": "function", "name": "start_background_job"}])
+            self.processor._build_tool_context = MagicMock(
+                return_value=SimpleNamespace(background_job_started=False,
+                                             sandbox_image_assets=[], mounted_files=[],
+                                             current_input=None, system_prompt=None,
+                                             model=None))
+            self.processor._persist_destination_provenance = MagicMock()
         self.message = _msg()
         self.marks = ConversationWatermarks()
         self.lease = self.marks.begin_turn(self.message)
@@ -1218,7 +1298,8 @@ class SiteRig:
         from tests.unit.channel_turn_harness import thread_config
         self.cfg = thread_config()
         self.turn.capability_profile = self.cfg
-        prepared: Tuple[Any, ...] = (None, {}, False, "", None)
+        prepared: Tuple[Any, ...] = ((SimpleNamespace(), {}, False, "", None) if self.tool_loop
+                                     else (None, {}, False, "", None))
         self.ctx = pin_channel_turn(self.turn, trigger_ts=TRIGGER_TS,
                                     origin_thread_ts=TRIGGER_TS, config=self.cfg,
                                     prepared=prepared)
@@ -1234,6 +1315,269 @@ class SiteRig:
         return await self.processor._handle_streaming_text_response(
             "hi", _site_thread_state(), self.slack, self.message, thinking_id, None,
             turn=self.turn)
+
+
+class _NativeSession:
+    """`NativeStreamSession`, in the one respect that matters here: `start()` AUTHORIZES before
+    it calls Slack, because chat.startStream MINTS the reply message."""
+
+    def __init__(self, calls: List[Any]):
+        self._calls = calls
+        self.ts: Optional[str] = None
+        self.active = False
+        self._sent = ""
+
+    async def start(self, initial_text: str = "", lease=None) -> bool:
+        if lease is not None:
+            lease.authorize("native_start")     # raises when the room has moved on
+        self._calls.append(("start", initial_text))
+        self.ts = "native-1"
+        self.active = True
+        self._sent = initial_text
+        return True
+
+    async def update(self, text: str) -> bool:
+        self._calls.append(("update", text))
+        self._sent = text
+        return True
+
+    async def finish(self, final_text: Optional[str] = None, blocks=None) -> bool:
+        self._calls.append(("finish", final_text))
+        self.active = False
+        return True
+
+
+class NativeSiteSlack(SiteSlack):
+    """The same transport, with native streaming ON — the surface an ADDRESSED turn uses, and
+    the one whose refusal used to kill the turn outright."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.native_calls: List[Any] = []
+
+    def supports_native_streaming(self) -> bool:
+        return True
+
+    def begin_native_stream(self, channel, thread_ts, user_id=None):
+        return _NativeSession(self.native_calls)
+
+
+# --------------------------------------------------- the refused native stream (ruling 2-5)
+#
+# An addressed turn streams live, so the guard's only shot is chat.startStream — and a refusal
+# there used to abort the whole attempt: the model's finished answer thrown away, the room told
+# nothing, no review of any kind. It now runs to completion behind a closed curtain and hands
+# the finished draft to the same runner the buffered path uses.
+
+
+@pytest.mark.asyncio
+async def test_a_refused_native_start_completes_hidden_and_posts_the_reviewed_draft(
+        events, monkeypatch):
+    slack = NativeSiteSlack()
+    rig = SiteRig(monkeypatch, decisions=[_decision("post", None)], final_text="the answer",
+                  chunks=["the ", "answer"], slack=slack)
+    resp = await rig.run()
+
+    # NOTHING was streamed: the session was refused at start, and no append or stop followed.
+    assert slack.native_calls == []
+    assert slack.updates == []
+    # The whole answer went out once, as an ordinary post, after the review.
+    assert [p["text"] for p in slack.posts] == ["the answer"]
+    assert rig.turn.reconsider.outcome == "posted_asis"
+    assert resp.metadata["posted"] is True
+    assert resp.metadata["native_stream"] is False, "a refused stream is not a stream"
+    assert rig.lease.state == COMMITTED
+    # The draft the model reviewed is the COMPLETE answer, not the two chunks that raced it.
+    assert "the answer" in rig.openai.create_reconsideration_decision.calls[0][
+        "input_items"][-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_the_hidden_draft_carries_the_original_refusal_not_a_second_one(
+        events, monkeypatch):
+    """Ruling 3. The lease is SUPPRESSED by the time the draft is finished, so re-attempting
+    the send would raise a NEW exception with the same evidence — and rearm, which is bound to
+    the exception this lease last raised, would still pass. The turn would then be reviewing a
+    refusal that was manufactured minutes after the fact. The object handed to the runner is
+    the one `chat.startStream` refused."""
+    slack = NativeSiteSlack()
+    rig = SiteRig(monkeypatch, decisions=[_decision("post", None)], final_text="the answer",
+                  chunks=["the answer"], slack=slack)
+    seen: List[Any] = []
+    original = reconsideration.reconsider_stale_draft
+
+    async def _spy(**kwargs):
+        seen.append(kwargs["suppressed"])
+        return await original(**kwargs)
+
+    monkeypatch.setattr(reconsideration, "reconsider_stale_draft", _spy)
+    await rig.run()
+
+    assert len(seen) == 1
+    assert seen[0].surface == "native_start", "the refusal that actually happened"
+    # Exactly ONE authorization refusal reached the lease before the review — the send closure
+    # is only entered after the rearm, and it succeeds.
+    assert [a["surface"] for a in slack.authorizations] == ["final_post"]
+    assert slack.authorizations[0]["state"] == PENDING
+
+
+@pytest.mark.asyncio
+async def test_a_generation_failure_after_the_hidden_refusal_posts_nothing_at_all(
+        events, monkeypatch):
+    """Ruling 5, at the site: the API layer reports the stored suppression, so the handler's
+    outer boundary rethrows it — no non-streaming retry, no interruption notice, no
+    reconsideration over a partial draft."""
+    slack = NativeSiteSlack()
+    rig = SiteRig(monkeypatch, decisions=[_decision("post", None)], final_text="the answer",
+                  chunks=["the ans"], slack=slack,
+                  fail_with=RuntimeError("the stream died mid-answer"))
+    with pytest.raises(StaleSendSuppressed) as raised:
+        await rig.run()
+
+    assert raised.value.surface == "native_start"
+    assert slack.posts == [] and slack.updates == [] and slack.notices == []
+    assert rig.openai.create_reconsideration_decision.calls == []
+    assert rig.turn.reconsider is None
+
+
+@pytest.mark.asyncio
+async def test_a_hidden_turn_that_drafts_nothing_leaves_the_refusal_standing(
+        events, monkeypatch):
+    """No draft, nothing to review. The turn is accounted for exactly as it was before
+    hidden-buffer mode existed, rather than reviewing an empty answer."""
+    slack = NativeSiteSlack()
+    rig = SiteRig(monkeypatch, decisions=[_decision("post", None)], final_text="",
+                  chunks=["  "], slack=slack)
+    with pytest.raises(StaleSendSuppressed) as raised:
+        await rig.run()
+    assert raised.value.surface == "native_start"
+    assert slack.posts == [] and rig.openai.create_reconsideration_decision.calls == []
+    assert rig.turn.reconsider is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["background_job", "no_reply", "reaction_only"])
+async def test_a_hidden_turn_whose_ending_delivers_nothing_leaves_the_refusal_standing(
+        ending, events, monkeypatch):
+    """The test is the ENDING, not the length of the text. `start_background_job` returns with
+    an ack the status card replaces — non-empty text that is never posted — so a length-based
+    guard let that turn walk out of the background branch with the suppression swallowed: no
+    row, no review, no terminal handling."""
+    slack = NativeSiteSlack()
+    # The background-job ack is REAL TEXT that is never posted — the case a length check misses.
+    text = "On it — I'll post the build when it's done." if ending == "background_job" else ""
+    rig = SiteRig(monkeypatch, decisions=[_decision("post", None)], final_text=text,
+                  chunks=["On it"], slack=slack,
+                  background_job=(ending == "background_job"),
+                  terminal_action=("no_reply" if ending == "no_reply" else None))
+
+    with pytest.raises(StaleSendSuppressed) as raised:
+        await rig.run()
+
+    assert raised.value.surface == "native_start"
+    assert slack.posts == [] and slack.updates == [] and slack.notices == []
+    assert rig.openai.create_reconsideration_decision.calls == []
+    assert rig.turn.reconsider is None
+
+
+@pytest.mark.asyncio
+async def test_a_hidden_skip_leaves_the_room_untouched(events, monkeypatch):
+    slack = NativeSiteSlack()
+    rig = SiteRig(monkeypatch, decisions=[_decision("skip", None)], final_text="the answer",
+                  chunks=["the answer"], slack=slack)
+    with pytest.raises(StaleSendSuppressed):
+        await rig.run()
+    assert slack.posts == [] and slack.native_calls == []
+    assert rig.turn.reconsider.outcome == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_a_hidden_revision_replaces_the_canonical_text_before_the_send(
+        events, monkeypatch):
+    slack = NativeSiteSlack()
+    rig = SiteRig(monkeypatch, decisions=[_decision("post", "rewritten for the room")],
+                  final_text="the answer", chunks=["the answer"], slack=slack)
+    resp = await rig.run()
+    assert [p["text"] for p in slack.posts] == ["rewritten for the room"]
+    assert resp.content == "rewritten for the room"
+    assert rig.turn.reconsider.outcome == "posted_revised"
+    committed = rig.turn.committed_destinations
+    assert len(committed) == 1 and committed[0].text == "rewritten for the room"
+
+
+@pytest.mark.asyncio
+async def test_a_hidden_delivery_that_never_lands_is_not_rescued(events, monkeypatch):
+    """r5-1 holds on this path too: the runner owns the failed delivery, so the site must not
+    hand the answer back to main.py to post — that would post the very draft the guard
+    refused."""
+    slack = NativeSiteSlack(refuse_post=True)
+    rig = SiteRig(monkeypatch, decisions=[_decision("post", None)], final_text="the answer",
+                  chunks=["the answer"], slack=slack)
+    resp = await rig.run()
+    assert slack.posts == []
+    assert resp.metadata["streamed"] is True, "no `final_post_failed` rescue"
+    assert resp.metadata["posted"] is False
+    assert rig.turn.reconsider.error == "delivery_failed"
+
+
+@pytest.mark.asyncio
+async def test_n_turns_racing_one_scope_each_end_reviewed_or_delivered(events, monkeypatch):
+    """The incident's shape: several asks land within milliseconds and each turn's draft is
+    refused by the next arrival. Every turn must end EXAMINED — posted, or dropped by a
+    decision that is written down. None may end in silence nobody chose."""
+    marks = ConversationWatermarks()
+    turns = []
+    for index in range(3):
+        message = _msg(ts=f"{10 + index}.0", sender="U1")
+        lease = marks.begin_turn(message)
+        turn = TurnRuntime.for_message(message, channel_post_allowed=False)
+        turn.send_lease = lease
+        turn.guard_mode = "buffered"
+        pin_channel_turn(turn, trigger_ts=message.metadata["ts"], origin_thread_ts=None,
+                         channel_id=CH)
+        turns.append((message, lease, turn))
+
+    newest = "13.0"
+    marks.begin_turn(_msg(ts=newest, sender="U1"))     # the last ask supersedes all three
+
+    async def _snapshot(**kwargs):
+        return SimpleNamespace(stream=build_stream(
+            [normalized(f"{10 + i}.0", f"ask {i}", sender_id="U1") for i in range(3)]
+            + [normalized(newest, "the newest ask", sender_id="U1")],
+            channel_id=CH, team_id="T1"))
+
+    monkeypatch.setattr(reconsideration, "build_reconsideration_snapshot", _snapshot)
+
+    outcomes: List[str] = []
+    posted: List[str] = []
+    for index, (message, lease, turn) in enumerate(turns):
+        decider = FakeDecider([_decision("post", None) if index else _decision("skip", None)])
+        processor = _processor(decider)
+
+        async def _deliver(text: str, _lease=lease) -> Optional[str]:
+            _lease.authorize("final_post")
+            posted.append(text)
+            _lease.commit()
+            return "99.9"
+
+        try:
+            lease.authorize("final_post")
+        except StaleSendSuppressed as exc:
+            try:
+                await intercept_stale_send(
+                    processor=processor, client=SimpleNamespace(bot_user_id="UBOT"),
+                    message=message, turn=turn, lease=lease, suppressed=exc,
+                    draft=f"draft {index}", deliver=_deliver)
+            except StaleSendSuppressed:
+                pass
+        outcomes.append(turn.reconsider.outcome)
+
+    assert outcomes == ["skipped", "posted_asis", "posted_asis"]
+    assert posted == ["draft 1", "draft 2"]
+    # NEVER SILENT: every turn has a reviewed outcome, and the ledger has a row for each.
+    assert all(turn.reconsider is not None for _m, _l, turn in turns)
+    assert len(_named(events, "reconsider_outcome")) == 3
+    assert len(_named(events, "stale_send")) == 3
 
 
 # ------------------------------------------------------------------ the buffered final post
@@ -1808,7 +2152,9 @@ class MainRig:
                  metadata: Optional[Dict[str, Any]] = None, channel: str = CH,
                  deliver_result: str = "accept",
                  destination: Optional[str] = None,
-                 footer_blocks: Optional[List[Dict[str, Any]]] = None):
+                 footer_blocks: Optional[List[Dict[str, Any]]] = None,
+                 dm: bool = False, pin_context: bool = True,
+                 dm_snapshot: Optional[Any] = None):
         self.bot = _main_bot()
         self.message = _main_message(channel)
         self.decider = FakeDecider(decisions)
@@ -1826,8 +2172,21 @@ class MainRig:
 
         async def _process(message, client, thinking_id=None, turn=None):
             rig.turn = turn
-            pin_channel_turn(turn, trigger_ts=TRIGGER_TS, origin_thread_ts=TRIGGER_TS,
-                             channel_id=channel)
+            if dm:
+                if pin_context:
+                    pin_dm_turn_context(turn, message,
+                                        thread_config=dict(thread_config()),
+                                        instructions="DM-SYSTEM-PROMPT",
+                                        prompt_cache_key=f"{channel}:{TRIGGER_TS}")
+                # THE DM RACE: the same person's next question, TOP-LEVEL and therefore under a
+                # different thread root — which is why rebuilding only the original thread
+                # could never see it (ruling 6).
+                rig.bot.watermarks.begin_turn(_msg(ts=NEWER_TS, thread=NEWER_TS, sender="U1",
+                                                   channel=channel))
+                return rig.response
+            if pin_context:
+                pin_channel_turn(turn, trigger_ts=TRIGGER_TS, origin_thread_ts=TRIGGER_TS,
+                                 channel_id=channel)
             if destination is not None:
                 # F39: a reply headed for the channel top level, whose reply target is None.
                 turn.reply_destination = destination
@@ -1866,6 +2225,15 @@ class MainRig:
             return SimpleNamespace(stream=_fresh_stream())
 
         monkeypatch.setattr(reconsideration, "build_reconsideration_snapshot", _snapshot)
+
+        self.dm_snapshot_calls: List[Dict[str, Any]] = []
+
+        async def _dm_snapshot_seam(**kwargs):
+            self.dm_snapshot_calls.append(kwargs)
+            return dm_snapshot if dm_snapshot is not None else dm_surface_snapshot()
+
+        monkeypatch.setattr(dm_reconsideration, "build_dm_reconsideration_snapshot",
+                            _dm_snapshot_seam)
 
     async def run(self):
         await self.bot.handle_message(self.message, self.client)
@@ -2084,13 +2452,309 @@ async def test_main_once_gate_suppression_gets_exactly_one_terminal_row(events, 
 
 
 @pytest.mark.asyncio
-async def test_main_dm_suppression_drops_as_today_with_no_runner(events, monkeypatch):
-    rig = MainRig(monkeypatch, decisions=[_decision("post", None)], channel="D123")
+async def test_main_dm_without_a_pinned_context_drops_as_today(events, monkeypatch):
+    """FAIL CLOSED. A DM turn whose handler never pinned its request evidence cannot be
+    re-asked — reconstructing the question is not reconsideration — so the suppression stands
+    and the terminal catch owns the row, exactly as before ruling 6."""
+    rig = MainRig(monkeypatch, decisions=[_decision("post", None)], channel=DM, dm=True,
+                  pin_context=False)
     await rig.run()
     assert rig.sent == []                            # suppressed, nothing posted
     assert rig.decider.calls == []                   # the runner never ran
     assert rig.turn.reconsider is None
     assert len(_named(events, "stale_send")) == 1    # the terminal catch's row
+
+
+# ====================================================================== DMs reconsider (r6)
+#
+# A DM's stale draft used to die in silence: `intercept_stale_send` rethrew for anything that
+# was not a channel turn. It now takes the SAME runner, over a fresh snapshot of the DM
+# SURFACE — which spans thread roots, because the message that suppressed the draft is usually
+# the person's next TOP-LEVEL DM.
+
+
+@pytest.mark.asyncio
+async def test_a_dm_draft_is_reconsidered_over_its_own_surface_and_posts(events, monkeypatch):
+    rig = MainRig(monkeypatch, decisions=[_decision("post", None)], channel=DM, dm=True)
+    await rig.run()
+
+    assert [s["text"] for s in rig.sent] == ["the answer"]
+    assert rig.turn.reconsider.outcome == "posted_asis"
+    # The snapshot was asked for the DM SURFACE, rooted at the turn's own thread.
+    assert rig.dm_snapshot_calls and rig.dm_snapshot_calls[0]["channel_id"] == DM
+    assert rig.dm_snapshot_calls[0]["origin_root_ts"] == TRIGGER_TS
+    # The request re-asks under the turn's OWN pinned instructions — nothing invented here.
+    call = rig.decider.calls[0]
+    assert call["instructions"] == "DM-SYSTEM-PROMPT"
+    assert call["prompt_cache_key"] == f"{DM}:{TRIGGER_TS}"
+    # …and the rebuilt room, plus exactly one appended developer item quoting the draft.
+    assert call["input_items"][-1]["role"] == "developer"
+    assert "the answer" in call["input_items"][-1]["content"]
+    assert any(NEWER_TS in item["content"] for item in call["input_items"][:-1])
+    # Telemetry reaches DM turns now (ruling 8): a pass, an outcome, and the suppression row.
+    assert len(_named(events, "reconsider_start")) == 1
+    assert _named(events, "reconsider_start")[0]["channel_id"] == DM
+    assert len(_named(events, "reconsider_outcome")) == 1
+    assert len(_named(events, "stale_send")) == 1
+    # …and the turn those rows belong to CLOSES. Every one of them is keyed by turn_id, so a DM
+    # turn writing them and no terminal would break exactly-one-terminal accounting outright.
+    starts, outcomes = _named(events, "turn_start"), _named(events, "turn_outcome")
+    assert len(starts) == 1 and starts[0]["surface"] == "dm"
+    assert len(outcomes) == 1 and outcomes[0]["turn_id"] == rig.turn.turn_id
+    assert outcomes[0]["reconsider"] == {"outcome": "posted_asis", "passes": 1, "forced": False}
+    assert all(row["turn_id"] == rig.turn.turn_id
+               for row in _named(events, "reconsider_start")
+               + _named(events, "reconsider_outcome") + _named(events, "stale_send"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision,text,outcome,delivered", [
+    ("post", "rewritten for the DM", "posted_revised", "rewritten for the DM"),
+    ("force_post", None, "posted_asis", "the answer"),
+])
+async def test_dm_revised_and_forced_endings(decision, text, outcome, delivered, events,
+                                             monkeypatch):
+    rig = MainRig(monkeypatch, decisions=[_decision(decision, text)], channel=DM, dm=True)
+    await rig.run()
+    assert [s["text"] for s in rig.sent] == [delivered]
+    assert rig.turn.reconsider.outcome == outcome
+    assert rig.turn.reconsider.forced is (decision == "force_post")
+
+
+@pytest.mark.asyncio
+async def test_a_dm_skip_posts_nothing_and_records_the_review(events, monkeypatch):
+    """The point of the whole exercise: silence is still a legal ending — but a REVIEWED one,
+    written down, rather than a draft nobody ever looked at."""
+    rig = MainRig(monkeypatch, decisions=[_decision("skip", None)], channel=DM, dm=True)
+    await rig.run()
+    assert rig.sent == []
+    assert rig.turn.reconsider.outcome == "skipped"
+    assert _named(events, "reconsider_outcome")[0]["outcome"] == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_a_dm_snapshot_missing_the_suppressor_fails_closed(events, monkeypatch):
+    """The suppressing message must be IN the rebuilt surface or the review cannot claim to
+    have covered it — the same §4a rule the channel surface obeys."""
+    rig = MainRig(monkeypatch, decisions=[_decision("post", None)], channel=DM, dm=True,
+                  dm_snapshot=dm_surface_snapshot(include_suppressor=False))
+    await rig.run()
+    assert rig.sent == []
+    assert rig.turn.reconsider.outcome == "error_dropped"
+    assert rig.turn.reconsider.error == "context_rebuild"
+    assert rig.decider.calls == []                    # never asked; nothing to ask over
+
+
+@pytest.mark.asyncio
+async def test_a_dm_model_failure_gives_up_with_the_subtype(events, monkeypatch):
+    rig = MainRig(monkeypatch, decisions=[ReconsiderationDecisionError("empty")], channel=DM,
+                  dm=True)
+    await rig.run()
+    assert rig.sent == []
+    assert rig.turn.reconsider.outcome == "error_dropped"
+    assert rig.turn.reconsider.error == "model_failure"
+
+
+@pytest.mark.asyncio
+async def test_a_dm_delivery_that_never_lands_is_the_runners_and_posts_nothing_else(
+        events, monkeypatch):
+    rig = MainRig(monkeypatch, decisions=[_decision("post", None)], channel=DM, dm=True,
+                  deliver_result="none")
+    await rig.run()
+    assert rig.sent == []
+    assert rig.turn.reconsider.outcome == "error_dropped"
+    assert rig.turn.reconsider.error == "delivery_failed"
+
+
+def test_the_dm_surface_snapshot_spans_thread_roots():
+    """The reviewed-through extraction reads the DM snapshot with the SAME code that reads a
+    channel stream — and it is the cross-root top-level message, not anything in the original
+    thread, that covers the suppressing scope and lets the rearm through."""
+    marks = ConversationWatermarks()
+    message = _msg(ts=TRIGGER_TS, channel=DM, thread=TRIGGER_TS, sender="U1")
+    lease = marks.begin_turn(message)
+    marks.begin_turn(_msg(ts=NEWER_TS, channel=DM, thread=NEWER_TS, sender="U1"))
+    with pytest.raises(StaleSendSuppressed) as caught:
+        lease.authorize("final_post")
+    exc = caught.value
+    assert exc.scope == ("top", DM, "U1"), "a new top-level DM, under its own root"
+
+    snapshot = dm_surface_snapshot()
+    assert suppressing_ts_present(snapshot, exc.observed_latest_ts)
+    reviewed = reviewed_through_map(lease, snapshot)
+    assert reviewed[("top", DM, "U1")] == NEWER_TS
+    lease.rearm_after_reconsideration(reviewed, exc)   # the whole point: it goes through
+    assert lease.state == PENDING
+
+    # …and a snapshot of the original thread alone can never verify it.
+    thread_only = DMSurfaceSnapshot(message_items=(dm_item(TRIGGER_TS, "the question"),))
+    assert not suppressing_ts_present(thread_only, exc.observed_latest_ts)
+
+
+def test_a_bot_reply_in_the_dm_snapshot_never_advances_a_baseline():
+    """Our own words are not evidence that the room was reviewed — the same rule the channel
+    extraction holds to, and the reason a DM full of our replies still fails closed."""
+    marks = ConversationWatermarks()
+    lease = marks.begin_turn(_msg(ts=TRIGGER_TS, channel=DM, thread=TRIGGER_TS, sender="U1"))
+    marks.begin_turn(_msg(ts=NEWER_TS, channel=DM, thread=NEWER_TS, sender="U1"))
+    with pytest.raises(StaleSendSuppressed) as caught:
+        lease.authorize("final_post")
+
+    ours = DMSurfaceSnapshot(message_items=(
+        dm_item(TRIGGER_TS, "the question"),
+        dm_item(NEWER_TS, "our own reply", sender="UBOT", sender_type="self")))
+    reviewed = reviewed_through_map(lease, ours)
+    assert reviewed[("top", DM, "U1")] == TRIGGER_TS
+    with pytest.raises(ValueError):
+        lease.rearm_after_reconsideration(reviewed, caught.value)
+
+
+@pytest.mark.asyncio
+async def test_a_trailing_cursor_on_the_history_page_is_normal_not_a_failure():
+    """A long-lived DM ALWAYS hands back a next_cursor with its newest page. Draining it would
+    read the conversation back to its first message; capping the pager at one page instead
+    turned the cursor into a fetch error, and the runner dropped the draft over it. Exactly one
+    page is read, and the cursor is simply not followed."""
+    from message_processor.dm_reconsideration import build_dm_reconsideration_snapshot
+
+    pages: List[Dict[str, Any]] = []
+
+    async def _history(**kwargs):
+        pages.append(kwargs)
+        return {"ok": True,
+                "messages": [{"ts": NEWER_TS, "user": "U1", "text": "actually, different"}],
+                "has_more": True,
+                "response_metadata": {"next_cursor": "dXNlcjpVMDYxTkZUVDI="}}
+
+    async def _replies(**kwargs):
+        return {"ok": True, "messages": [{"ts": TRIGGER_TS, "user": "U1", "text": "the question"}]}
+
+    client = SimpleNamespace(
+        app=SimpleNamespace(client=SimpleNamespace(conversations_history=_history,
+                                                   conversations_replies=_replies)),
+        classify_sender=lambda msg: "human", bot_user_id_for=lambda bot_id: None)
+
+    snapshot = await build_dm_reconsideration_snapshot(
+        client=client, channel_id=DM, origin_root_ts=TRIGGER_TS,
+        requester_name="Dana Whitfield")
+
+    assert len(pages) == 1, "one page, and the cursor is not followed"
+    assert "cursor" not in pages[0]
+    assert {item.metadata["ts"] for item in snapshot.message_items} == {NEWER_TS}
+
+
+@pytest.mark.asyncio
+async def test_a_user_addressed_dm_is_resolved_to_its_conversation_before_reading():
+    """Outbound posting takes a bare user id; conversations.history does not — it answers
+    channel_not_found, which would surface as context_rebuild and drop the draft. The read is
+    done against the resolved D… id while the ITEMS keep the original id, because that is what
+    the lease's scopes are keyed by."""
+    import message_processor.dm_reconsideration as dm_mod
+    from message_processor.dm_reconsideration import build_dm_reconsideration_snapshot
+
+    dm_mod._IM_CHANNEL_IDS.clear()
+    opened: List[Dict[str, Any]] = []
+    read_channels: List[str] = []
+
+    async def _open(**kwargs):
+        opened.append(kwargs)
+        return {"ok": True, "channel": {"id": "D77"}}
+
+    async def _history(**kwargs):
+        read_channels.append(kwargs["channel"])
+        return {"ok": True,
+                "messages": [{"ts": NEWER_TS, "user": "W1", "text": "the newer question"}]}
+
+    async def _replies(**kwargs):
+        read_channels.append(kwargs["channel"])
+        return {"ok": True, "messages": []}
+
+    client = SimpleNamespace(
+        app=SimpleNamespace(client=SimpleNamespace(conversations_history=_history,
+                                                   conversations_replies=_replies,
+                                                   conversations_open=_open)),
+        classify_sender=lambda msg: "human", bot_user_id_for=lambda bot_id: None)
+
+    snapshot = await build_dm_reconsideration_snapshot(
+        client=client, channel_id="W1", origin_root_ts=TRIGGER_TS,
+        requester_name="Dana Whitfield")
+
+    assert opened == [{"users": "W1"}]
+    assert read_channels == ["D77", "D77"]
+    assert snapshot.message_items[0].metadata["channel_id"] == "W1", (
+        "scope identity comes from the message, not from where we read")
+
+    # Resolved once per process: a second snapshot opens nothing.
+    await build_dm_reconsideration_snapshot(client=client, channel_id="W1",
+                                            origin_root_ts=None)
+    assert opened == [{"users": "W1"}]
+    dm_mod._IM_CHANNEL_IDS.clear()
+
+
+@pytest.mark.asyncio
+async def test_an_unresolvable_dm_conversation_fails_closed():
+    """No resolver, no read. The runner classifies it as context_rebuild and the suppression
+    stands — never a guess at which conversation to read."""
+    import message_processor.dm_reconsideration as dm_mod
+    from message_processor.dm_reconsideration import build_dm_reconsideration_snapshot
+
+    dm_mod._IM_CHANNEL_IDS.clear()
+
+    async def _history(**kwargs):
+        raise AssertionError("must not read before the conversation is resolved")
+
+    client = SimpleNamespace(
+        app=SimpleNamespace(client=SimpleNamespace(conversations_history=_history)),
+        classify_sender=lambda msg: "human", bot_user_id_for=lambda bot_id: None)
+
+    with pytest.raises(RuntimeError):
+        await build_dm_reconsideration_snapshot(client=client, channel_id="U1",
+                                                origin_root_ts=None)
+
+
+@pytest.mark.asyncio
+async def test_the_dm_snapshot_reads_top_level_and_the_origin_thread_and_writes_nothing():
+    """The real builder, against a fake web client: one history walk for the timeline across
+    roots, one replies walk for the origin thread, merged oldest-first."""
+    from message_processor.dm_reconsideration import build_dm_reconsideration_snapshot
+
+    history_calls: List[Dict[str, Any]] = []
+    reply_calls: List[Dict[str, Any]] = []
+
+    async def _history(**kwargs):
+        history_calls.append(kwargs)
+        return {"ok": True, "messages": [
+            {"ts": NEWER_TS, "user": "U1", "text": "actually, different question"},
+            {"ts": TRIGGER_TS, "user": "U1", "text": "the question"},
+        ]}
+
+    async def _replies(**kwargs):
+        reply_calls.append(kwargs)
+        return {"ok": True, "messages": [
+            {"ts": TRIGGER_TS, "user": "U1", "text": "the question"},
+            {"ts": "10.5", "bot_id": "B1", "text": "a partial answer",
+             "thread_ts": TRIGGER_TS},
+        ]}
+
+    client = SimpleNamespace(
+        app=SimpleNamespace(client=SimpleNamespace(conversations_history=_history,
+                                                   conversations_replies=_replies)),
+        classify_sender=lambda msg: "self" if msg.get("bot_id") else "human",
+        bot_user_id_for=lambda bot_id: None)
+
+    snapshot = await build_dm_reconsideration_snapshot(
+        client=client, channel_id=DM, origin_root_ts=TRIGGER_TS,
+        requester_name="Dana Whitfield")
+
+    assert reply_calls and reply_calls[0]["ts"] == TRIGGER_TS
+    assert {item.metadata["ts"] for item in snapshot.message_items} == {TRIGGER_TS, NEWER_TS}
+    items = snapshot.input_items()
+    assert [i["role"] for i in items] == ["user", "assistant", "user"]   # oldest first
+    assert items[0]["content"].startswith(f"[Dana Whitfield ts={TRIGGER_TS}]")
+    assert items[1]["content"] == "a partial answer"                    # ours rides as itself
+    assert NEWER_TS in items[2]["content"]
+    # The one message that appears in BOTH walks is one item, not two.
+    assert len(items) == 3
 
 
 # =============================================================================== telemetry

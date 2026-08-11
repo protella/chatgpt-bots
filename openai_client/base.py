@@ -526,6 +526,7 @@ class OpenAIClient(LoggerMixin):
         attempt_sink: Optional[Any] = None,
         layout: str = "legacy",
         service_tier_eligible: bool = False,
+        hidden_suppression_sink: Optional[List[BaseException]] = None,
     ) -> str:
         return await responses_api.create_streaming_response(
             self,
@@ -546,6 +547,7 @@ class OpenAIClient(LoggerMixin):
             attempt_sink=attempt_sink,
             layout=layout,
             service_tier_eligible=service_tier_eligible,
+            hidden_suppression_sink=hidden_suppression_sink,
         )
 
     async def create_streaming_response_with_tools(
@@ -575,6 +577,7 @@ class OpenAIClient(LoggerMixin):
         container_gone_sink: Optional[List[str]] = None,
         layout: str = "legacy",
         service_tier_eligible: bool = False,
+        hidden_suppression_sink: Optional[List[BaseException]] = None,
     ) -> str:
         return await responses_api.create_streaming_response_with_tools(
             self,
@@ -601,6 +604,7 @@ class OpenAIClient(LoggerMixin):
             container_gone_sink=container_gone_sink,
             layout=layout,
             service_tier_eligible=service_tier_eligible,
+            hidden_suppression_sink=hidden_suppression_sink,
         )
 
     async def create_text_response_with_tool_loop(

@@ -2168,16 +2168,24 @@ class TestTurnLedgerWiring:
         assert len(outcomes) == 1 and outcomes[0]["kind"] == "error_unhandled"
 
     @pytest.mark.asyncio
-    async def test_a_dm_turn_is_outside_the_turn_population(self, bot, sink):
-        """Same discriminator receipts use. A DM has no channel stream and no receipt, so a row
-        describing one would carry an H and a stream flag that mean nothing."""
+    async def test_a_dm_turn_is_counted_apart_but_still_closes_its_row(self, bot, sink):
+        """DM turns joined the population when their stale drafts started being reconsidered
+        (STALE_SUPPRESSION_RECONSIDERATION ruling 8): a DM now writes stale_send,
+        reconsider_start, reconsider_outcome and model_response rows, all keyed by turn_id, and a
+        population row with no terminal breaks exactly-one-terminal accounting. So a DM gets the
+        pair — under `surface="dm"`, which is what keeps the two populations countable apart —
+        and no stream evidence, because it still has no stream."""
         message = self._message(channel_id="D999")
         bot.processor.process_message = AsyncMock(return_value=Mock(
             type="text", content="pong", metadata={"streamed": False}))
 
         await bot.handle_message(message, self._client())
 
-        assert sink("turn_start") == [] and sink("turn_outcome") == []
+        starts, outcomes = sink("turn_start"), sink("turn_outcome")
+        assert len(starts) == 1 and starts[0]["surface"] == "dm"
+        assert len(outcomes) == 1 and outcomes[0]["turn_id"] == starts[0]["turn_id"]
+        assert outcomes[0]["stream_build_present"] is False
+        assert "H" not in outcomes[0]
 
     @pytest.mark.asyncio
     async def test_a_gate_that_never_woke_leaves_no_turn_row(self, bot, sink):

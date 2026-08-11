@@ -172,17 +172,18 @@ MANDATORY: Dict[str, Tuple[Tuple[str, str], ...]] = {
 #       stream_over_budget, history_fetch_failed, origin_fetch_failed), attempt_id only on a
 #       GATED turn.
 #   model_response.model/token counts — a call that raised before the response has none.
-#   reconsider_start.attempt_id/model_attempt_seq — ungated channel turns mint no attempt, and
-#       a failed attempt-sink open omits the seq (telemetry never blocks the model call).
+#   reconsider_start.attempt_id/model_attempt_seq — ungated turns (channel or DM) mint no
+#       attempt, and a failed attempt-sink open omits the seq (telemetry never blocks the model
+#       call). DM turns emit these events too — see `_check_reconsiderations`.
 #   reconsider_outcome.attempt_id — as above; `forced` rides only on posted outcomes and
 #       `error` only on `error_dropped` — their PRESENCE elsewhere is the violation, absence
 #       is the normal encoding.
 #   stale_send.turn_id — NOT a legal absence: v9 rows REQUIRE it (MANDATORY above), because the
 #       pass-count invariant reads the per-turn suppression count. Older rows stay exempt for
-#       free — _grade_version skips anything below v9. DM rows carrying a turn_id with no
-#       channel turn_start to join are still TOLERATED by ruling at the JOIN level (DMs are
-#       outside the turn population, as today); it is the missing FIELD that fails, not the
-#       missing join.
+#       free — _grade_version skips anything below v9. A row carrying a turn_id with no
+#       turn_start to join is TOLERATED at the JOIN level (a DM ledger written before DM turns
+#       joined the population has exactly that shape); it is the missing FIELD that fails, not
+#       the missing join.
 #   turn_outcome.reconsider — present only when a reconsideration ran; nested keys follow the
 #       reconsider_outcome rules (forced posted-only, error error_dropped-only, no nulls).
 #   turn_outcome.edits[].announcement_ts — ALWAYS present, in BOTH states: announcement-first
@@ -1003,15 +1004,58 @@ def _check_stream_render_joins(joins: Joins, report: Report, *, fragments: set) 
                         f"stream_render(s) exist (first at {_first_at(row, renders[0])})")
 
 
-def _check_model_attempts(joins: Joins, report: Report) -> None:
+def _is_dm_row(row: Row) -> bool:
+    """A DM's rows, by the only discriminator a ledger line carries: its channel id.
+
+    "D…" is the conversation itself; "U…" and "W…" are the RECIPIENT ids a DM is sometimes
+    addressed by (a Slack user id is "U…" on a normal workspace and "W…" on Enterprise Grid, and
+    outbound DMs post to either), so all three read as DM. Nothing else on a row distinguishes
+    the surface — `turn_start.surface` says it outright, but only that one event carries it."""
+    channel_id = row.obj.get("channel_id")
+    return isinstance(channel_id, str) and channel_id[:1] in ("D", "U", "W")
+
+
+def _dm_head_is_present(row: Row, fragments: set) -> bool:
+    """Can a DM's sequence be graded with no `turn_start` to prove its head is in the input?
+
+    Yes — UNLESS we are reading a rotated fragment of its session, in which case pass 1 (or
+    attempt 1) may be sitting in `participation.jsonl.1` and a sequence that legitimately starts
+    at 3 would be failed as a gap. This is the same exemption a channel turn gets; a DM just
+    reaches it by a different route, because the row that would otherwise prove the head is
+    present is the one it may not have.
+    """
+    return row.session not in fragments
+
+
+def _turn_is_dm(joins: "Joins", turn_id: str) -> bool:
+    """Is this TURN a DM's? Asked of the turn rather than of one row, because the event that
+    needs the answer — `model_response` — carries no `channel_id` at all. Any joined row that
+    does carry one answers for the whole turn; they all name the same conversation."""
+    for index in (joins.turn_starts, joins.turn_outcomes, joins.reconsider_starts,
+                  joins.reconsider_outcomes, joins.stale_sends):
+        for row in index.get(turn_id, ()):
+            if row.obj.get("channel_id") is not None:
+                return _is_dm_row(row)
+    return False
+
+
+def _check_model_attempts(joins: Joins, report: Report, *, fragments: set) -> None:
     """`attempt_seq` starts at 1 and is contiguous per turn_id — the sequence is what makes "this
     turn cost four API calls" true rather than a lower bound.
 
     Only checked for turns whose `turn_start` we can see: a rotated file can cut a turn's head
     off, and a sequence that legitimately starts at 3 must not be graded as a gap.
+
+    A DM's rows are graded WITHOUT that head, because a ledger written before DM turns joined
+    the turn population has no `turn_start` to join them to and the one attempt sequence a DM
+    ever produces would go permanently unchecked. The ROTATION exemption still applies to them
+    (`_dm_head_is_present`) — it is the missing turn_start that DMs are excused from, never the
+    missing head.
     """
     for turn_id, responses in sorted(joins.model_responses.items()):
-        if turn_id not in joins.turn_starts:
+        if turn_id not in joins.turn_starts and not (
+                _turn_is_dm(joins, turn_id)
+                and _dm_head_is_present(responses[0], fragments)):
             report.warn("model_response_orphan_turn", responses[0],
                         f"turn_id={turn_id} has no turn_start (sequence not graded)")
             continue
@@ -1028,7 +1072,7 @@ def _check_model_attempts(joins: Joins, report: Report) -> None:
                         f"{expected}")
 
 
-def _check_reconsiderations(joins: Joins, report: Report) -> None:
+def _check_reconsiderations(joins: Joins, report: Report, *, fragments: set) -> None:
     """The v9 join invariants, all on turn_id: pass numbers contiguous from 1; a turn's
     `reconsider_start` count never exceeds its `stale_send` count (every pass exists because a
     suppression event preceded it, and each suppression event writes exactly one row); at most
@@ -1041,17 +1085,23 @@ def _check_reconsiderations(joins: Joins, report: Report) -> None:
 
     DELIBERATELY NOT HERE: no cross-join of posted outcomes to `turn_outcome` kind or to F7 —
     F7 provenance is DB state with no ledger source, and the posted-outcome ⇒ ordinary-reply
-    correspondence is unit/integration-mandated instead. And DM `stale_send` rows that carry a
-    `turn_id` with no channel `turn_start` to join are TOLERATED by ruling: DMs are outside the
-    turn population, as today, so an unjoined suppression row is a DM's, not a defect.
+    correspondence is unit/integration-mandated instead. And a `stale_send` row that carries a
+    `turn_id` with no `turn_start` to join is TOLERATED: a DM ledger written before DM turns
+    joined the population has exactly that shape, and it is not a defect.
 
-    Contiguity, the pass-count comparison and the `passes` equality are graded only for turns
-    whose `turn_start` is in the input: a rotated file can cut a turn's head off, and a sequence
-    that legitimately starts at 3 — or whose early suppression rows are in
-    `participation.jsonl.1` — must not be graded as a gap.
+    DM RECONSIDERATIONS ARE GRADED (STALE_SUPPRESSION_RECONSIDERATION ruling 8). A DM's draft
+    goes through the same runner, so its passes obey the same arithmetic, and a DM row set may
+    have no `turn_start` beside it — declining to grade those would leave the DM population
+    unchecked. They are recognized by channel id (`_is_dm_row`) and graded in place.
+
+    ROTATION IS STILL EXEMPT, on both surfaces. A file whose `session_start` is missing is a
+    fragment: its early passes may be in `participation.jsonl.1`, so a sequence legitimately
+    starting at 3 is not graded as a gap. What DMs are excused from is the missing `turn_start`,
+    never the missing head.
     """
     for turn_id, starts in sorted(joins.reconsider_starts.items()):
-        if turn_id not in joins.turn_starts:
+        if turn_id not in joins.turn_starts and not (
+                _is_dm_row(starts[0]) and _dm_head_is_present(starts[0], fragments)):
             report.warn("reconsider_start_orphan_turn", starts[0],
                         f"turn_id={turn_id} has no turn_start (passes not graded)")
             continue
@@ -1077,7 +1127,8 @@ def _check_reconsiderations(joins: Joins, report: Report) -> None:
                         f"turn_id={turn_id} has {len(outcomes)} reconsider_outcome rows "
                         f"(first at {_first_at(outcomes[-1], outcomes[0])}) — at most one "
                         f"runner invocation per turn")
-        if turn_id not in joins.turn_starts:
+        if turn_id not in joins.turn_starts and not (
+                _is_dm_row(outcomes[0]) and _dm_head_is_present(outcomes[0], fragments)):
             report.warn("reconsider_outcome_orphan_turn", outcomes[0],
                         f"turn_id={turn_id} has no turn_start")
             continue
@@ -1185,10 +1236,17 @@ def check_paths(paths: List[str]) -> Report:
     report.counts["turn_start"] = len(joins.turn_starts)
     report.counts["visible_action"] = len(joins.terminal_rows)
     report.counts["turn_outcome"] = sum(len(v) for v in joins.turn_outcomes.values())
+    # THREE populations now, and the DM one is counted apart for the same reason the gate and
+    # turn denominators are: DM turns joined the turn population when their drafts started being
+    # reconsidered, and a talk rate that pools a channel's turns with a DM's describes neither.
+    report.counts["turn_start_dm"] = sum(
+        1 for rows in joins.turn_starts.values() if _is_dm_row(rows[0]))
+    report.counts["turn_outcome_dm"] = sum(
+        1 for rows in joins.turn_outcomes.values() for row in rows if _is_dm_row(row))
     _check_turn_pairing(joins, report, tail_session=tail, fragments=fragments)
     _check_stream_render_joins(joins, report, fragments=fragments)
-    _check_model_attempts(joins, report)
-    _check_reconsiderations(joins, report)
+    _check_model_attempts(joins, report, fragments=fragments)
+    _check_reconsiderations(joins, report, fragments=fragments)
     _check_terminal_invariant(joins, report, graded, fragments=fragments)
 
     report.violations.sort(key=lambda f: (report.file_order(f.file), f.line, f.name))
@@ -1230,8 +1288,12 @@ def human_report(report: Report, out) -> None:
     print("  denominators (DO NOT divide one into the other):", file=out)
     print(f"      gate_start   {counts['gate_start']:>6}  gate attempts  "
           f"(visible_action: {counts['visible_action']})", file=out)
-    print(f"      turn_start   {counts['turn_start']:>6}  channel turns  "
-          f"(turn_outcome: {counts['turn_outcome']})", file=out)
+    channel_starts = counts["turn_start"] - counts["turn_start_dm"]
+    channel_outcomes = counts["turn_outcome"] - counts["turn_outcome_dm"]
+    print(f"      turn_start   {channel_starts:>6}  channel turns  "
+          f"(turn_outcome: {channel_outcomes})", file=out)
+    print(f"      turn_start   {counts['turn_start_dm']:>6}  DM turns       "
+          f"(turn_outcome: {counts['turn_outcome_dm']})", file=out)
     if events:
         print("  events   : " + ", ".join(f"{name}={events[name]}"
                                           for name in sorted(events)), file=out)
@@ -1263,8 +1325,11 @@ def json_report(report: Report) -> Dict[str, Any]:
         "events": dict(sorted(report.events.items())),
         "denominators": {"gate_start": report.counts["gate_start"],
                          "visible_action": report.counts["visible_action"],
-                         "turn_start": report.counts["turn_start"],
-                         "turn_outcome": report.counts["turn_outcome"]},
+                         "turn_start": report.counts["turn_start"] - report.counts["turn_start_dm"],
+                         "turn_outcome": (report.counts["turn_outcome"]
+                                          - report.counts["turn_outcome_dm"]),
+                         "turn_start_dm": report.counts["turn_start_dm"],
+                         "turn_outcome_dm": report.counts["turn_outcome_dm"]},
         "sessions": {"seen": list(report.sessions_seen),
                      "closed": sorted(report.sessions_closed),
                      "opened": sorted(report.sessions_opened)},

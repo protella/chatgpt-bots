@@ -34,10 +34,13 @@ reach the gate, so any rate over this population has "messages that entered the 
 denominator and nothing wider. The `gate_declined(cause=engine_off)` event covers only the OTHER
 engine-off path, the one inside the gate itself.
 
-The CHANNEL-TURN population is keyed by `turn_id` and covers `turn_start`, `turn_outcome`,
-`stream_render`, `model_response` and `outbound_receipt`. EVERY channel
-turn is in it, gated or not — a mention and a continuation write turn rows while writing no gate
-rows at all — so its denominator is `turn_start` and is strictly wider than `gate_start`.
+The TURN population is keyed by `turn_id` and covers `turn_start`, `turn_outcome`,
+`stream_render`, `model_response` and `outbound_receipt`. EVERY turn is in it, gated or not — a
+mention and a continuation write turn rows while writing no gate rows at all — so its
+denominator is `turn_start` and is strictly wider than `gate_start`. DM turns joined it on
+2026-08-10 (spec §10, CV9 amendment) because their stale drafts are reconsidered and those rows
+are keyed by `turn_id`; they carry `surface="dm"`, no stream evidence, and are COUNTED APART
+from channel turns — a rate that pools the surfaces describes neither.
 
 EVENTS.
   session_start   the sink opened. A health marker and a restart boundary, NOT an attempt: it
@@ -73,16 +76,19 @@ EVENTS.
                   answered on its behalf. See the linkage rule below.
   reaction        one attempt at one emoji: operation (add/remove) x result (added /
                   already_present / refused / failed / removed / remove_failed).
-  turn_start      a CHANNEL turn opened (v8). Keyed by `turn_id`, not `attempt_id`: every channel
-                  turn writes one, including the mentions and continuations no gate judged. It is
-                  the denominator of the TURN population, which is not the gate population — the
-                  two must never be divided into each other.
+  turn_start      a turn opened (v8). Keyed by `turn_id`, not `attempt_id`: every turn writes
+                  one, including the mentions and continuations no gate judged, and (since the
+                  CV9 amendment) DM turns under `surface="dm"`. It is the denominator of the
+                  TURN population, which is not the gate population and is counted per surface —
+                  none of the three must ever be divided into each other.
   turn_outcome    what that turn ended up doing, exactly once per turn_start, assembled in the
                   outer finally from the turn's own accumulated state. NOT a terminal event in the
-                  `visible_action` sense; it describes a turn, not a gate attempt.
+                  `visible_action` sense; it describes a turn, not a gate attempt. On a DM it
+                  carries `stream_build_present: false` and no `H` — a DM has no stream, and the
+                  row says so rather than implying one.
   stream_render   one channel stream BUILD: the pinned window, the hashes that identify it, and
                   what it cost in bytes. Joins to its turn by `turn_id`.
-  model_response  one Responses API attempt on a channel turn, success or failure.
+  model_response  one Responses API attempt on a turn, success or failure.
   outbound_receipt one receipt state transition (spec §5), from the transition's own result rather
                   than from what the caller intended.
   visible_action  THE SOLE TERMINAL EVENT. Exactly one per attempt in a HEALTHY EMITTED LEDGER,
@@ -847,9 +853,10 @@ def stale_send(channel_id: Optional[str], trigger_ts: Optional[str], *,
     gate population. Any rate computed against `gate_start` has to exclude them, for the same
     reason the ledger excludes those turns everywhere else.
 
-    `turn_id` (v9) joins the row to the CHANNEL-TURN population, so a turn's suppression rows
-    can be counted beside its `reconsider_start`s. DM suppressions carry one too, with no
-    channel `turn_start` to join — the checker tolerates those rows by name.
+    `turn_id` (v9) joins the row to the turn population, so a turn's suppression rows can be
+    counted beside its `reconsider_start`s. DM turns are members too (see `reconsider_start`);
+    a ledger written before they were has DM suppression rows with no `turn_start` to join, and
+    the checker tolerates exactly those.
 
     The terminal event says what the room saw; this says why, and with what evidence: the ts
     this turn had accounted for, the newer one that overtook it, which scope noticed, which
@@ -866,6 +873,14 @@ def reconsider_start(channel_id: Optional[str], trigger_ts: Optional[str], *,
                      model_attempt_seq: Optional[int] = None) -> None:
     """One reconsideration pass opened (v9). Emitted via the structured-decision wrapper's
     `on_attempt_open` callback, after `ModelAttemptSink.open()` and before the request.
+
+    DM TURNS EMIT THESE TOO (STALE_SUPPRESSION_RECONSIDERATION ruling 8). A DM's stale draft is
+    reviewed over its own surface snapshot through the same runner, so its passes are real
+    passes and are written down as such — which is also why a DM turn now writes its own
+    `turn_start`/`turn_outcome` pair (spec §10, CV9 amendment): these rows are keyed by
+    `turn_id`, and a population row with no terminal breaks exactly-one-terminal accounting.
+    DMs remain outside the GATE population (they mint no attempt) and are counted apart from
+    channel turns, never pooled with them.
 
     `turn_id` is the primary turn-population join — mandatory in the grammar. `pass_number`
     lands on the wire as the literal key `pass`, counting from 1 and contiguous per turn.
@@ -887,7 +902,8 @@ def reconsider_outcome(channel_id: Optional[str], trigger_ts: Optional[str], *,
                        attempt_id: Optional[str] = None, forced: Optional[bool] = None,
                        error: Optional[str] = None) -> None:
     """How one reconsideration runner invocation ended (v9). At most one per invocation;
-    exactly one on every non-cancelled path.
+    exactly one on every non-cancelled path — on DM turns as well as channel turns
+    (STALE_SUPPRESSION_RECONSIDERATION ruling 8; see `reconsider_start`).
 
     `passes` is the number of `reconsider_start` events THIS invocation emitted — a fuse drop
     records 5, a failure or cancellation records the passes started by then. `forced` rides
@@ -1051,12 +1067,16 @@ def turn_start(channel_id: Optional[str], trigger_ts: Optional[str], *, turn_id:
                origin_thread_ts: Optional[str] = None, surface: Optional[str] = None,
                gated: bool = False, attempt_id: Optional[str] = None,
                wake_source: Optional[str] = None) -> None:
-    """A channel turn opened. THE DENOMINATOR OF THE TURN POPULATION.
+    """A turn opened. THE DENOMINATOR OF THE TURN POPULATION.
 
-    Emitted for every channel turn, gated or not, which is exactly what makes it a different
-    denominator from `gate_start`: a mention and a thread continuation are turns with no attempt,
-    and a ledger that could only count judged messages could never say what share of the bot's
-    channel output the gate is responsible for. `gated` is that split, on the row.
+    Emitted for every turn, gated or not, which is exactly what makes it a different denominator
+    from `gate_start`: a mention and a thread continuation are turns with no attempt, and a
+    ledger that could only count judged messages could never say what share of the bot's output
+    the gate is responsible for. `gated` is that split, on the row.
+
+    `surface` is the other split, and it is load-bearing rather than descriptive: DM turns are
+    members (spec §10, CV9 amendment) and are counted apart from channel ones, so a consumer
+    that wants the channel denominator filters on it rather than assuming.
     """
     _soft_check(surface, TURN_SURFACES, "turn surface")
     record("turn_start", channel_id=channel_id, trigger_ts=trigger_ts, turn_id=turn_id,
@@ -1073,7 +1093,7 @@ def turn_outcome(channel_id: Optional[str], trigger_ts: Optional[str], *,
                  reconsider: Optional[Dict[str, Any]] = None,
                  edits: Optional[List[Dict[str, Any]]] = None,
                  destination_contract_miss: Optional[bool] = None) -> None:
-    """What one channel turn ended up doing. Exactly one per `turn_start`.
+    """What one turn ended up doing. Exactly one per `turn_start`.
 
     `destinations` is the OBSERVED set — every surface Slack accepted, whether or not it reached
     its final text — because that is what the room saw, with ONE ruled exception: the zero-chunk
@@ -1204,13 +1224,15 @@ def model_response(*, turn_id: Optional[str], attempt_seq: Optional[int],
                    status: Optional[str] = None, cached_input_tokens: Optional[int] = None,
                    input_tokens: Optional[int] = None, output_tokens: Optional[int] = None,
                    detail: Any = None) -> None:
-    """One Responses API attempt on a channel turn — the call, not the turn.
+    """One Responses API attempt on a turn — the call, not the turn.
 
     Written on failure as well as success, because the question this answers is "how many calls
     did this turn cost and why", and an attempt that raised is exactly the expensive kind. Each
-    tool-loop round is its own attempt: the loop issues one API call per round. A channel turn's
+    tool-loop round is its own attempt: the loop issues one API call per round. A turn's
     reconsideration passes are attempts of the SAME turn with `fork_reason` =
-    `stale_reconsideration` (v9), so their tokens and failures land here beside the responder's.
+    `stale_reconsideration` (v9), so their tokens and failures land here beside the responder's —
+    on a DM that reconsideration attempt is usually the turn's ONLY row here, since the DM
+    responder path carries no attempt sink.
 
     `cached_input_tokens` is the provider's own `input_tokens_details.cached_tokens`, which is the
     only evidence that the pinned-prefix cache key is doing anything at all.

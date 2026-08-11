@@ -498,6 +498,11 @@ class TurnRuntime:
     # steering snapshot, the origin slice, this turn's raw attachment parts, the cohort
     # fallbacks). Set once by base.py; read by both text.py paths.
     channel_turn_context: Any = field(default=None, repr=False)
+    # The DM twin, and deliberately much smaller: a `DMTurnContext` holding only what a DM turn
+    # cannot re-derive after the fact — the instructions and sampling settings its request was
+    # built with, and the trigger it answered. Stale reconsideration is its one reader (a DM
+    # rebuilds its own surface snapshot, but it must not INVENT the request it re-asks with).
+    dm_turn_context: Any = field(default=None, repr=False)
     # This turn's resolved channel tool exposure and catalogs, so the request the admission
     # estimate measured and the request that gets sent are built from the same evidence — and so
     # the canvas API call behind the catalog happens once per turn rather than once per attempt.

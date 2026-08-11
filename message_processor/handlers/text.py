@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, cast
 
 from base_client import BaseClient, Message, Response
 from config import config, pipeline_status
 from message_processor import participation_telemetry
 from message_processor._host import _Host
+from message_processor.dm_reconsideration import pin_dm_turn_context
 from message_processor.reconsideration import intercept_stale_send
 from message_processor.routing_facts import POSTURE_THREAD
 from message_processor.stale_send_guard import StaleSendSuppressed
@@ -1307,6 +1308,11 @@ class TextHandlerMixin(_Host):
             # carries the per-turn _silence_capable_turn flag so no_response_needed is exposed only
             # where it should be; the timeout-retry path already nulled the registry there.
             cache_key = thread_key
+            # Ruling 6: the same pin as the streaming twin — a DM suppression here reaches the
+            # reconsideration runner through main.py, and the runner must re-ask under THIS
+            # turn's instructions and settings.
+            pin_dm_turn_context(turn, message, thread_config=thread_config,
+                                instructions=system_prompt, prompt_cache_key=cache_key)
 
         # Update status before generating
         failed_mcp_display = ", ".join(sorted(self._as_mcp_exclusion_set(failed_mcp_server)))
@@ -2037,13 +2043,18 @@ class TextHandlerMixin(_Host):
                 "role": "developer",
                 "content": suffix,
             }]
+            cache_key = thread_key
+            # Ruling 6: a DM's draft is reconsidered over a fresh DM-surface snapshot, and the
+            # request it re-asks under must be THIS turn's — pinned here, where the turn's own
+            # instructions and settings exist, rather than reconstructed afterwards.
+            pin_dm_turn_context(turn, message, thread_config=thread_config,
+                                instructions=system_prompt, prompt_cache_key=cache_key)
             ci_container = await self._resolve_ci_container(request_config, thread_key)
             await self._prepare_sandbox_tools(request_config, thread_key, ci_container, client)
             tools = self._build_tools_array(request_config, model,
                                             exclude_mcp_server=exclude_mcp_server,
                                             registry=registry, ci_container=ci_container,
                                             surface=surface)
-            cache_key = thread_key
 
         # Post an initial message to get the message ID for streaming updates.
         # Seed with a random pick from the loading pool (same variance as the
@@ -2244,7 +2255,10 @@ class TextHandlerMixin(_Host):
                 # next round streams (finalize is far too late). The wrapper skips the None
                 # completion signal on a function-call round (responses.py), so this is the
                 # only boundary at which the preamble can be committed before the wait.
-                if status == "started" and tool_type in _PRE_TOOL_FLUSH_TOOLS:
+                # …but a HIDDEN stream has no surface to push a preamble to, and saying it
+                # pushed one would be the only trace of this turn anyone could find.
+                if (status == "started" and tool_type in _PRE_TOOL_FLUSH_TOOLS
+                        and not native_coord.hidden):
                     had_preamble = buffer.has_pending_update()
                     await _flush_native_pending(force=True)
                     if had_preamble:
@@ -2463,6 +2477,15 @@ class TextHandlerMixin(_Host):
         # Any start/append failure flips the coordinator inert and the legacy
         # update_message_streaming edit loop below takes over seamlessly.
         native_coord = None
+        # HIDDEN-BUFFER MODE (STALE_SUPPRESSION_RECONSIDERATION ruling 2). The stale guard
+        # refuses chat.startStream on the FIRST delta of an addressed turn, and that refusal
+        # used to abort the attempt — the model's work thrown away and the room told nothing.
+        # Registering the refusal here instead tells the API layer to run the generation (and
+        # its whole tool loop) to completion with no visible surface; the finished draft then
+        # goes to the same reconsideration runner the buffered path uses. ONE list per turn,
+        # holding the ORIGINAL exception object, because everything downstream — rearm, force,
+        # the telemetry marker — is identity-bound to it.
+        hidden_stale: List[BaseException] = []
 
         def _bind_destination() -> None:
             """Fix this turn's reply target, once. Idempotent.
@@ -2530,6 +2553,11 @@ class TextHandlerMixin(_Host):
             """
             nonlocal visible_content_delivered, first_delivered_ts, current_message_id, current_part
             if native_coord is None or native_coord.failed or not native_coord.started:
+                return
+            if native_coord.hidden:
+                # The stream was refused before Slack was called. Nothing may be appended, and
+                # this must not be read as an inert sink either — the legacy fallback the
+                # failure branch below arms would post the answer the guard refused.
                 return
             if force:
                 if not buffer.has_pending_update():
@@ -2720,7 +2748,17 @@ class TextHandlerMixin(_Host):
                                 "Could not clear the existing surface — native streaming stood "
                                 "down rather than leave a second message behind")
                     if not stand_down:
-                        if await native_coord.start(lease=_send_lease()):
+                        try:
+                            native_started = await native_coord.start(lease=_send_lease())
+                        except StaleSendSuppressed as stale:
+                            # Ruling 2/3: complete-then-reconsider. Register the ORIGINAL
+                            # refusal — the API layer buffers the rest of the generation with
+                            # nothing visible, and the finished draft reaches the runner
+                            # carrying this exact exception, never a second one manufactured
+                            # by re-attempting a send the lease already refuses.
+                            hidden_stale.append(stale)
+                            raise
+                        if native_started:
                             # `native_coord.part_ts` is now this attempt's ledger of owned
                             # messages (one per part) — the error path reconciles it, so an MCP
                             # retry inherits the stream instead of minting a second one.
@@ -3214,6 +3252,10 @@ class TextHandlerMixin(_Host):
                     mcp_results_sink=mcp_results,
                     artifacts_sink=artifacts,
                     container_gone_sink=containers_gone,
+                    # Ruling 2: ONE sink for the whole loop — a refusal hidden in round 1
+                    # keeps every later round silent, and a failure in any of them reports
+                    # the suppression rather than itself.
+                    hidden_suppression_sink=hidden_stale,
                     # W2: the user-facing responder call — the only one that may buy
                     # the fast tier (see the non-streaming twin).
                     service_tier_eligible=True
@@ -3259,6 +3301,7 @@ class TextHandlerMixin(_Host):
                     mcp_results_sink=mcp_results,
                     artifacts_sink=artifacts,
                     container_gone_sink=containers_gone,
+                    hidden_suppression_sink=hidden_stale,
                     service_tier_eligible=True
                 )
             else:
@@ -3277,6 +3320,7 @@ class TextHandlerMixin(_Host):
                     layout=request_layout,
                     usage_sink=usage_info,
                     attempt_sink=attempt_sink,
+                    hidden_suppression_sink=hidden_stale,
                     service_tier_eligible=True
                 )
 
@@ -3311,6 +3355,26 @@ class TextHandlerMixin(_Host):
             response_text = consume_destination_marker(response_text, turn=turn, message=message,
                                                        segments=response_segments)
             response_text = strip_provenance_echo(strip_citation_markers(strip_sandbox_links(response_text)))
+
+            # Hidden-buffer mode ends in a REVIEW of a draft, so it needs a draft that is
+            # actually going to be delivered. Every ending below that deliberately delivers
+            # NOTHING leaves none — and the test is the ENDING, not the length of the text.
+            # `start_background_job` is the case that proves it: it returns with an ack the card
+            # replaces, so `response_text` is non-empty while nothing is ever posted. A
+            # length-based check would have let that turn walk out of the background branch with
+            # the suppression swallowed — no row, no review, no terminal handling. Rethrown here
+            # instead, the turn is accounted for exactly as it was before this mode existed: one
+            # `stale_send` row from main.py's terminal catch, and a terminal kind that reports
+            # whatever else the turn did leave in the room (a reaction, a job card, a
+            # cross-thread post). `visible_content_delivered` is False by construction here —
+            # a hidden turn has appended nothing — so these read the same as the branches do.
+            if hidden_stale and (terminal_action == "no_reply"
+                                 or background_job_started
+                                 or self._is_reaction_only(response_text, local_tool_calls)
+                                 or not (response_text or "").strip()):
+                self.log_info(
+                    "Hidden stale turn has no draft to deliver — the refusal stands")
+                raise hidden_stale[0]
 
             # Record the API's authoritative context size on the thread
             thread_state.record_usage(usage_info.get("input_tokens", 0),
@@ -3510,7 +3574,8 @@ class TextHandlerMixin(_Host):
             # F52/F8: True once the settings footer has ridden a delivered message on the
             # direct final-post path (which has no native stream to attach to).
             direct_footer_attached = False
-            if native_coord is not None and native_coord.started and not native_coord.failed:
+            if (native_coord is not None and native_coord.started
+                    and not native_coord.failed and not native_coord.hidden):
                 suffix = tools_note
                 # Settings chrome ("⚙️ <model>") rides the LAST part of the response
                 # itself (stopStream accepts blocks) instead of a separate trailing
@@ -3614,13 +3679,29 @@ class TextHandlerMixin(_Host):
                     # most has to cover. A silence-capable turn buffers its whole answer here
                     # precisely so this single check spans the entire model call; without the
                     # lease that promise was empty and a superseded answer still posted.
+                    # Hidden-buffer mode: the refusal already happened, at the native start,
+                    # and the generation ran on behind it. The draft goes to the runner
+                    # carrying THAT original exception — re-attempting the send first would
+                    # only manufacture a second refusal from the same suppressed lease.
+                    hidden_suppression = hidden_stale[0] if hidden_stale else None
                     try:
-                        posted_ts = await _direct_final_post(response_text)
+                        if hidden_suppression is not None:
+                            posted_ts = await intercept_stale_send(
+                                processor=self, client=client, message=message, turn=turn,
+                                lease=_send_lease(),
+                                suppressed=cast(StaleSendSuppressed, hidden_suppression),
+                                draft=response_text, deliver=_direct_final_post,
+                                channel_turn=channel_turn)
+                            if posted_ts is None:
+                                reconsider_owned_failure = True
+                        else:
+                            posted_ts = await _direct_final_post(response_text)
                     except StaleSendSuppressed as stale:
                         # A COMPLETE buffered draft refused at its first visible surface — the
                         # reconsideration case (STALE_RECONSIDERATION §3). The runner decides;
-                        # this site keeps delivering through the closure above. Channel turns
-                        # only; a DM suppression rethrows untouched.
+                        # this site keeps delivering through the closure above.
+                        if hidden_suppression is not None:
+                            raise      # the runner already ran and rethrew: that is the ending
                         posted_ts = await intercept_stale_send(
                             processor=self, client=client, message=message, turn=turn,
                             lease=_send_lease(), suppressed=stale, draft=response_text,
@@ -3963,8 +4044,11 @@ class TextHandlerMixin(_Host):
                          f"final length: {buffer_stats['text_length']} chars")
             
             stream_meta = {"streamed": True, "message_id": message_id,
+                           # A refused stream is not a stream: `hidden` never minted a message,
+                           # and this turn's words (if any) went out as a plain reconsidered post.
                            "native_stream": bool(native_coord is not None and native_coord.started
-                                                 and not native_coord.failed),
+                                                 and not native_coord.failed
+                                                 and not native_coord.hidden),
                            # Chrome rode the final stopStream OR the direct final-post — tells
                            # main.py's separate footer post to stand down (falls back when neither
                            # attached: finalize failed, split reply, or top-level placement).

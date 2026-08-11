@@ -35,6 +35,28 @@ def _is_suppression(error: BaseException) -> bool:
     return isinstance(error, _SUPPRESSED_CLASS)
 
 
+def _hidden_for(sink: Optional[List[BaseException]],
+                error: BaseException) -> Optional[BaseException]:
+    """Hidden-buffer mode, and ONLY for a suppression the CALLER registered.
+
+    STALE_SUPPRESSION_RECONSIDERATION ruling 2: a refused native stream must not abort the
+    attempt. The generation (and its tool loop) runs to completion with no visible surface, and
+    the finished draft goes to reconsideration. The caller registers the refusal in `sink` at
+    the moment it happens — so the exception returned here is the ORIGINAL object (ruling 3),
+    never a copy and never a second refusal manufactured later.
+
+    An unregistered suppression answers None and keeps today's behavior exactly: the attempt
+    ends. That is the fail-closed default — a delivery path this feature has not been designed
+    for must never be quietly turned into a buffered one.
+    """
+    if not sink:
+        return None
+    for stored in sink:
+        if stored is error:
+            return stored
+    return None
+
+
 def _build(**kwargs) -> Dict[str, Any]:
     """The one request assembler, imported function-locally: openai_client.base imports THIS
     module, so a module-level import back into it is a cycle."""
@@ -634,10 +656,11 @@ async def create_streaming_response(
     attempt_sink: Optional[Any] = None,
     layout: str = "legacy",
     service_tier_eligible: bool = False,
+    hidden_suppression_sink: Optional[List[BaseException]] = None,
 ) -> str:
     """
     Create a streaming text response using the Responses API
-    
+
     Args:
         messages: List of message dictionaries
         stream_callback: Function to call with text chunks as they arrive
@@ -650,7 +673,12 @@ async def create_streaming_response(
         verbosity: For GPT-5 models (low, medium, high)
         store: Whether to store the response (default False for stateless)
         tool_callback: Optional callback for tool events (event_type, status)
-    
+        hidden_suppression_sink: the caller's list of stale-send refusals it has already
+            decided to buffer through (see `_hidden_for`). A callback suppression found in
+            it switches this call to hidden-buffer mode — the stream runs to completion, the
+            callback is never invoked again, and a later generation failure re-raises the
+            STORED suppression instead of itself.
+
     Returns:
         Complete generated text response
     """
@@ -679,6 +707,10 @@ async def create_streaming_response(
 
     attempts: List[Any] = []
     usage_captured: Dict[str, Any] = {}
+    # A refusal an EARLIER round of this turn already hid (the tool loop passes one sink through
+    # every round): this call starts hidden and never opens a surface of its own.
+    hidden: Optional[BaseException] = (hidden_suppression_sink[0]
+                                       if hidden_suppression_sink else None)
     try:
         # Determine operation type based on reasoning effort and context
         # All text operations use the same timeout regardless of reasoning level
@@ -742,15 +774,23 @@ async def create_streaming_response(
                             text_chunk = _segment_separator(complete_text) + text_chunk
                         text_item_index = item_index
                         complete_text += text_chunk
-                        try:
-                            result = stream_callback(text_chunk)
-                            # If the callback returns a coroutine, await it
-                            if hasattr(result, '__await__'):
-                                await result
-                        except Exception as callback_error:
-                            if _is_suppression(callback_error):
-                                raise   # the room moved on: end the attempt, not an error
-                            self.log_warning(f"Stream callback error: {callback_error}")
+                        if hidden is None:
+                            try:
+                                result = stream_callback(text_chunk)
+                                # If the callback returns a coroutine, await it
+                                if hasattr(result, '__await__'):
+                                    await result
+                            except Exception as callback_error:
+                                hidden = _hidden_for(hidden_suppression_sink, callback_error)
+                                if hidden is not None:
+                                    self.log_info(
+                                        "Stale refusal at the first surface — buffering the "
+                                        "rest of this generation with nothing visible")
+                                elif _is_suppression(callback_error):
+                                    raise   # the room moved on: end the attempt, not an error
+                                else:
+                                    self.log_warning(
+                                        f"Stream callback error: {callback_error}")
                     continue
                 elif event_type == "response.output_item.done":
                     # Extract MCP server_label from completed items for attribution
@@ -792,15 +832,21 @@ async def create_streaming_response(
                         self.log_info("Stream completed")
                     # Always signal completion so the callback flushes any buffered text — a
                     # failed/incomplete stream that skips this leaves the buffer stuck forever.
-                    try:
-                        result = stream_callback(None)  # type: ignore[arg-type]  # None = the terminal flush signal
-                        # If the callback returns a coroutine, await it
-                        if hasattr(result, '__await__'):
-                            await result
-                    except Exception as callback_error:
-                        if _is_suppression(callback_error):
-                            raise   # the room moved on: nothing flushes, nothing posts
-                        self.log_warning(f"Stream completion callback error: {callback_error}")
+                    # Skipped in hidden-buffer mode: there is no surface to flush INTO, and the
+                    # whole answer is returned below for reconsideration to deliver.
+                    if hidden is None:
+                        try:
+                            result = stream_callback(None)  # type: ignore[arg-type]  # None = the terminal flush signal
+                            # If the callback returns a coroutine, await it
+                            if hasattr(result, '__await__'):
+                                await result
+                        except Exception as callback_error:
+                            hidden = _hidden_for(hidden_suppression_sink, callback_error)
+                            if hidden is None and _is_suppression(callback_error):
+                                raise   # the room moved on: nothing flushes, nothing posts
+                            if hidden is None:
+                                self.log_warning(
+                                    f"Stream completion callback error: {callback_error}")
                     break
                 elif event_type and ("call" in event_type or "tool" in event_type):
                     # Handle specific tool events
@@ -877,6 +923,15 @@ async def create_streaming_response(
             # before Slack was called. One line, carrying the evidence, and the attempt ends here.
             self.log_warning(f"Streaming attempt ended without posting — {e}")
             raise
+        if hidden is not None:
+            # Ruling 5, fail closed: the generation failed AFTER the refusal, so there is no
+            # complete draft to reconsider — and a partial one must never be offered. The
+            # turn's outcome is the STORED suppression, which forecloses the retry, the
+            # interruption notice and every other rescue the failure would otherwise trigger.
+            self.log_warning(
+                f"Streaming failed after a hidden stale refusal — reporting the suppression "
+                f"rather than the failure ({e})")
+            raise hidden from e
         self.log_error(f"Error creating streaming response: {e}", exc_info=True)
         raise
     finally:
@@ -909,6 +964,7 @@ async def create_streaming_response_with_tools(
     container_gone_sink: Optional[List[str]] = None,
     layout: str = "legacy",
     service_tier_eligible: bool = False,
+    hidden_suppression_sink: Optional[List[BaseException]] = None,
 ) -> str:
     """
     Create streaming text response with tools (e.g., web search)
@@ -932,6 +988,10 @@ async def create_streaming_response_with_tools(
             and the completion flush (stream_callback(None)) is skipped so the loop
             can run another round.
         tool_choice: Optional tool_choice override (e.g. "none" when the loop caps out)
+        hidden_suppression_sink: the caller's registered stale-send refusals (see
+            `_hidden_for`). ONE sink is threaded through every round of a tool loop, so a
+            refusal hidden in round 1 keeps rounds 2..N silent too — and a generation failure
+            in any of them re-raises the stored suppression instead of itself (ruling 5).
 
     Returns:
         Complete generated text response
@@ -966,6 +1026,9 @@ async def create_streaming_response_with_tools(
 
     attempts: List[Any] = []
     usage_captured: Dict[str, Any] = {}
+    # Already hidden when an earlier round of this turn's tool loop was refused a surface.
+    hidden: Optional[BaseException] = (hidden_suppression_sink[0]
+                                       if hidden_suppression_sink else None)
     try:
         # Determine operation type based on reasoning effort and context
         # Determine operation type - all text operations use same timeout regardless of reasoning/tools
@@ -1054,15 +1117,23 @@ async def create_streaming_response_with_tools(
                             text_chunk = _segment_separator(complete_text) + text_chunk
                         text_item_index = item_index
                         complete_text += text_chunk
-                        try:
-                            result = stream_callback(text_chunk)
-                            # If the callback returns a coroutine, await it
-                            if hasattr(result, '__await__'):
-                                await result
-                        except Exception as callback_error:
-                            if _is_suppression(callback_error):
-                                raise   # the room moved on: end the attempt, not an error
-                            self.log_warning(f"Stream callback error: {callback_error}")
+                        if hidden is None:
+                            try:
+                                result = stream_callback(text_chunk)
+                                # If the callback returns a coroutine, await it
+                                if hasattr(result, '__await__'):
+                                    await result
+                            except Exception as callback_error:
+                                hidden = _hidden_for(hidden_suppression_sink, callback_error)
+                                if hidden is not None:
+                                    self.log_info(
+                                        "Stale refusal at the first surface — buffering the "
+                                        "rest of this generation with nothing visible")
+                                elif _is_suppression(callback_error):
+                                    raise   # the room moved on: end the attempt, not an error
+                                else:
+                                    self.log_warning(
+                                        f"Stream callback error: {callback_error}")
                     continue
                 elif event_type == "response.output_item.done":
                     # Extract MCP server_label from completed items for attribution
@@ -1159,16 +1230,20 @@ async def create_streaming_response_with_tools(
                         break
                     # Signal the callback that streaming is complete with None so it flushes
                     # any buffered text — a failed/incomplete stream that skips this leaves the
-                    # buffer stuck forever.
-                    try:
-                        result = stream_callback(None)  # type: ignore[arg-type]  # None = the terminal flush signal
-                        # If the callback returns a coroutine, await it
-                        if hasattr(result, '__await__'):
-                            await result
-                    except Exception as callback_error:
-                        if _is_suppression(callback_error):
-                            raise   # the room moved on: nothing flushes, nothing posts
-                        self.log_warning(f"Stream completion callback error: {callback_error}")
+                    # buffer stuck forever. Hidden-buffer mode has no surface to flush into.
+                    if hidden is None:
+                        try:
+                            result = stream_callback(None)  # type: ignore[arg-type]  # None = the terminal flush signal
+                            # If the callback returns a coroutine, await it
+                            if hasattr(result, '__await__'):
+                                await result
+                        except Exception as callback_error:
+                            hidden = _hidden_for(hidden_suppression_sink, callback_error)
+                            if hidden is None and _is_suppression(callback_error):
+                                raise   # the room moved on: nothing flushes, nothing posts
+                            if hidden is None:
+                                self.log_warning(
+                                    f"Stream completion callback error: {callback_error}")
                     break
                 elif event_type and ("call" in event_type or "tool" in event_type):
                     # Handle specific tool events
@@ -1242,6 +1317,8 @@ async def create_streaming_response_with_tools(
     except asyncio.TimeoutError as e:
         # Log timeout as warning without stack trace
         self.log_warning(f"Streaming response with tools timed out: {e}")
+        if hidden is not None:
+            raise hidden from e     # ruling 5: the refusal is the outcome, not the timeout
         raise
     except Exception as e:
         if _is_suppression(e):
@@ -1249,6 +1326,14 @@ async def create_streaming_response_with_tools(
             # A stack trace here would file a turn where nothing went wrong as a failure.
             self.log_warning(f"Streaming attempt ended without posting — {e}")
             raise
+        if hidden is not None:
+            # Ruling 5, fail closed: a generation that failed after the hidden refusal has no
+            # complete draft, and a partial one is never reconsidered. Re-raising the STORED
+            # suppression forecloses the non-streaming retry and the interruption notice.
+            self.log_warning(
+                f"Streaming with tools failed after a hidden stale refusal — reporting the "
+                f"suppression rather than the failure ({e})")
+            raise hidden from e
         # Check if this is an MCP connection error (expected failure, handled gracefully)
         error_msg = str(e)
         is_mcp_error = "mcp server" in error_msg.lower() and ("404" in error_msg or "424" in error_msg)

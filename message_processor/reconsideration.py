@@ -19,8 +19,16 @@ because a turn whose delivery visibly (or possibly) half-happened must never be 
 "suppressed, room saw nothing" — it re-raises the newest suppression (marked, §5) so the site's
 except path and main.py's terminal handling run exactly once, unmodified.
 
+THE SURFACES. The loop below is surface-agnostic (STALE_SUPPRESSION_RECONSIDERATION ruling 6):
+a small adapter answers "which model", "what does the room look like now" and "what request
+re-asks the question", and the channel and the DM each answer it their own way — the channel
+with its pure stream snapshot and the canonical assembler, the DM with a pure DM-SURFACE
+snapshot (`dm_reconsideration.py`) that spans thread roots, because the message that suppressed
+a DM draft usually arrived as a new top-level DM under a different root. Everything else — the
+decision, the rearm, the fuse, the telemetry — is shared, and neither surface can drift from it.
+
 THE LOOP (§4e — owner ruling: model judgment, no policy cap). Pass N rebuilds a pure snapshot of
-the channel, assembles the ENTIRE normal channel request over it in no-tools mode, appends ONE
+the surface, assembles the ENTIRE normal request over it in no-tools mode, appends ONE
 developer item quoting the current draft, and asks for a structured {decision, text}. A `post`
 re-arms the guard through per-scope reviewed-through timestamps COMPUTED BY THIS MODULE from the
 serialized snapshot — never supplied by the model — and delivers; a fresh suppression from that
@@ -38,6 +46,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from config import config
@@ -196,6 +205,96 @@ def reviewed_through_map(lease: TurnSendLease, stream: Any) -> Dict[Scope, str]:
     return reviewed
 
 
+# --------------------------------------------------------------------- surface adapters
+
+
+@dataclass
+class PreparedDecision:
+    """One pass's request, whatever surface built it: what to send, and what it costs."""
+
+    instructions: str
+    api_items: List[Dict[str, Any]]
+    estimate: Any
+    params: Dict[str, Any] = field(default_factory=dict)
+
+
+class ChannelReconsiderSurface:
+    """The channel half of the adapter: the pure channel snapshot and the canonical assembler,
+    exactly as §4c/§4d fix them. Nothing here is new — it is the runner's original body, moved
+    behind the same three questions the DM surface answers (STALE_SUPPRESSION_RECONSIDERATION
+    ruling 6), so the decision loop below no longer knows which surface it is serving."""
+
+    label = "channel"
+
+    def __init__(self, *, processor: Any, client: Any, message: Any, turn: Any, ctx: Any):
+        self._processor = processor
+        self._client = client
+        self._message = message
+        self._turn = turn
+        self.ctx = ctx
+        self.model: Any = None
+        self._profile_hash = ""
+        self._schema_version = ""
+
+    def prepare(self) -> None:
+        self.model = select_reconsideration_model(self._turn, self.ctx.thread_config)
+        profile = reconsideration_profile(self.ctx.thread_config, model=self.model)
+        self._profile_hash = capability_profile_hash(profile)
+        self._schema_version = tool_schema_version(None, profile)
+
+    async def rebuild(self) -> Any:
+        snapshot = await build_reconsideration_snapshot(
+            client=self._client, db=getattr(self._processor, "db", None),
+            team_id=self.ctx.team_id, channel_id=self.ctx.channel_id,
+            trigger_ts=self.ctx.trigger_ts, origin_root_ts=self.ctx.origin_thread_ts,
+            capability_profile_hash=self._profile_hash,
+            tool_schema_version=self._schema_version,
+            reach_tools=(),
+            drain_timeout=getattr(config, "index_drain_timeout_seconds", None))
+        return snapshot.stream
+
+    def build_request(self, stream: Any, *, pass_number: int,
+                      draft: str) -> PreparedDecision:
+        fresh_ctx = fresh_turn_context(self.ctx, stream)
+        request, api_items, estimate = build_reconsideration_request(
+            processor=self._processor, client=self._client, ctx=fresh_ctx, model=self.model,
+            pass_number=pass_number, draft=draft,
+            reply_destination=(getattr(self._turn, "reply_destination", None)
+                               if getattr(self._turn, "destination_selected", False)
+                               else None))
+        cfg = self.ctx.thread_config
+        return PreparedDecision(
+            instructions=request.instructions, api_items=api_items, estimate=estimate,
+            params={"reasoning_effort": cfg.get("reasoning_effort"),
+                    "verbosity": cfg.get("verbosity"),
+                    "max_output_tokens": cfg.get("max_tokens"),
+                    "temperature": cfg.get("temperature"),
+                    "prompt_cache_key": request.prompt_cache_key})
+
+
+def surface_for(*, processor: Any, client: Any, message: Any, turn: Any,
+                channel_turn: bool) -> Optional[Any]:
+    """Which surface's fresh context this turn reconsiders over — or None, meaning it cannot
+    reconsider at all and the suppression stands (fail closed).
+
+    A channel turn needs its pinned `ChannelTurnContext`; a DM needs the `DMTurnContext` its
+    handler pinned when it built the request. A turn carrying neither is one whose request we
+    would have to INVENT to re-ask it, and inventing the question is not reconsideration."""
+    if channel_turn:
+        ctx = getattr(turn, "channel_turn_context", None)
+        if ctx is None:
+            return None
+        return ChannelReconsiderSurface(processor=processor, client=client, message=message,
+                                        turn=turn, ctx=ctx)
+    dm_ctx = getattr(turn, "dm_turn_context", None)
+    if dm_ctx is None or not getattr(dm_ctx, "channel_id", None):
+        return None
+    from message_processor.dm_reconsideration import DMReconsiderSurface
+
+    return DMReconsiderSurface(processor=processor, client=client, message=message, turn=turn,
+                               ctx=dm_ctx)
+
+
 # --------------------------------------------------------------------- interception
 
 
@@ -204,24 +303,32 @@ async def intercept_stale_send(*, processor: Any, client: Any, message: Any, tur
                                suppressed: StaleSendSuppressed, draft: str,
                                deliver: Callable[[str], Awaitable[Optional[str]]],
                                channel_turn: bool = True) -> Optional[str]:
-    """The site wrapper (§4b). Channel turns only; DM suppressions rethrow untouched, exactly as
-    today. A suppression observed while `turn.reconsider` is already set — the once-per-turn
-    gate — is rethrown immediately, UNMARKED, so main.py's terminal catch emits its `stale_send`
-    row exactly once: no second runner, no second outcome, no lost row."""
-    if not channel_turn or turn is None or lease is None:
+    """The site wrapper (§4b). `channel_turn` no longer decides WHETHER a draft is reviewed —
+    only which surface provides the fresh context (STALE_SUPPRESSION_RECONSIDERATION ruling 6):
+    a DM's draft is reviewed over a pure DM-surface snapshot, through this same runner.
+
+    A turn with no lease, no runtime, or no pinned context for its surface still rethrows —
+    fail closed. So does a suppression observed while `turn.reconsider` is already set (the
+    once-per-turn gate), rethrown immediately and UNMARKED so main.py's terminal catch emits
+    its `stale_send` row exactly once: no second runner, no second outcome, no lost row."""
+    if turn is None or lease is None:
         raise suppressed
     if getattr(turn, "reconsider", None) is not None:
         raise suppressed
+    surface = surface_for(processor=processor, client=client, message=message, turn=turn,
+                          channel_turn=channel_turn)
+    if surface is None:
+        raise suppressed
     return await reconsider_stale_draft(
         processor=processor, client=client, message=message, turn=turn, lease=lease,
-        suppressed=suppressed, draft=draft, deliver=deliver)
+        suppressed=suppressed, draft=draft, deliver=deliver, surface=surface)
 
 
 async def reconsider_stale_draft(*, processor: Any, client: Any, message: Any, turn: Any,
                                  lease: TurnSendLease, suppressed: StaleSendSuppressed,
                                  draft: str,
-                                 deliver: Callable[[str], Awaitable[Optional[str]]]
-                                 ) -> Optional[str]:
+                                 deliver: Callable[[str], Awaitable[Optional[str]]],
+                                 surface: Optional[Any] = None) -> Optional[str]:
     """The runner (§4b–§4f). Decide-only: it never posts (delivery is the site's closure) and
     owns no cleanup (rethrow endings hand the turn back to today's stale terminal path).
 
@@ -232,6 +339,9 @@ async def reconsider_stale_draft(*, processor: Any, client: Any, message: Any, t
     room saw nothing"; the site's own failed-delivery accounting owns the state (§4b r5-1,
     §4f review r8). Every other non-posted ending emits its outcome, marks the newest
     suppression `telemetry_recorded`, and re-raises it.
+
+    `surface` provides the fresh context and the request over it (channel or DM). Omitted, it
+    defaults to this turn's channel surface — the shape every existing caller passes.
     """
     channel_id = getattr(message, "channel_id", None)
     trigger_ts = (getattr(message, "metadata", None) or {}).get("ts")
@@ -270,7 +380,10 @@ async def reconsider_stale_draft(*, processor: Any, client: Any, message: Any, t
         _finish("error_dropped", error=error)
         return current
 
-    ctx = getattr(turn, "channel_turn_context", None)
+    if surface is None:
+        surface = ChannelReconsiderSurface(
+            processor=processor, client=client, message=message, turn=turn,
+            ctx=getattr(turn, "channel_turn_context", None))
     try:
         while True:
             _emit_suppression(current)
@@ -288,13 +401,10 @@ async def reconsider_stale_draft(*, processor: Any, client: Any, message: Any, t
             # failure — `request_build`, never `context_rebuild`: it must not masquerade as a
             # Slack-history failure (§4f review r8). ------------------------------------------
             try:
-                if ctx is None:
-                    raise RuntimeError("channel turn reached reconsideration with no pinned "
-                                       "context")
-                model = select_reconsideration_model(turn, ctx.thread_config)
-                profile = reconsideration_profile(ctx.thread_config, model=model)
-                profile_hash = capability_profile_hash(profile)
-                schema_version = tool_schema_version(None, profile)
+                if getattr(surface, "ctx", None) is None:
+                    raise RuntimeError(f"{getattr(surface, 'label', 'unknown')} turn reached "
+                                       "reconsideration with no pinned context")
+                surface.prepare()
             except asyncio.CancelledError:
                 raise
             except Exception as selection_error:  # noqa: BLE001 — §4f: never post unexamined
@@ -305,14 +415,7 @@ async def reconsider_stale_draft(*, processor: Any, client: Any, message: Any, t
             # ---- the pure snapshot (§4c). `context_rebuild` is EXACTLY the Slack-history
             # failures: snapshot build, deadline miss, missing suppressing ts. ----------------
             try:
-                snapshot = await build_reconsideration_snapshot(
-                    client=client, db=getattr(processor, "db", None), team_id=ctx.team_id,
-                    channel_id=ctx.channel_id, trigger_ts=ctx.trigger_ts,
-                    origin_root_ts=ctx.origin_thread_ts,
-                    capability_profile_hash=profile_hash,
-                    tool_schema_version=schema_version,
-                    reach_tools=(),
-                    drain_timeout=getattr(config, "index_drain_timeout_seconds", None))
+                fresh_stream = await surface.rebuild()
             except asyncio.CancelledError:
                 raise
             except Exception as rebuild_error:  # noqa: BLE001 — §4f: never post unexamined
@@ -326,15 +429,11 @@ async def reconsider_stale_draft(*, processor: Any, client: Any, message: Any, t
             # through assembly AND estimate consumption), so a poisoned estimate object whose
             # properties raise is classified rather than escaping unclassified. ----------------
             try:
-                fresh_ctx = fresh_turn_context(ctx, snapshot.stream)
-                present = suppressing_ts_present(snapshot.stream, current.observed_latest_ts)
-                reviewed = reviewed_through_map(lease, snapshot.stream)
-                request, api_items, estimate = build_reconsideration_request(
-                    processor=processor, client=client, ctx=fresh_ctx, model=model,
-                    pass_number=pass_number, draft=current_draft,
-                    reply_destination=(getattr(turn, "reply_destination", None)
-                                       if getattr(turn, "destination_selected", False)
-                                       else None))
+                present = suppressing_ts_present(fresh_stream, current.observed_latest_ts)
+                reviewed = reviewed_through_map(lease, fresh_stream)
+                prepared = surface.build_request(fresh_stream, pass_number=pass_number,
+                                                 draft=current_draft)
+                estimate = prepared.estimate
                 fits = bool(estimate.fits)
                 overflow_note = ("" if fits else
                                  f"~{estimate.total_tokens:,} of {estimate.limit_tokens:,}")
@@ -372,16 +471,12 @@ async def reconsider_stale_draft(*, processor: Any, client: Any, message: Any, t
 
             try:
                 decision = await processor.openai_client.create_reconsideration_decision(
-                    input_items=api_items,
-                    instructions=request.instructions,
-                    model=model,
-                    reasoning_effort=ctx.thread_config.get("reasoning_effort"),
-                    verbosity=ctx.thread_config.get("verbosity"),
-                    max_output_tokens=ctx.thread_config.get("max_tokens"),
-                    temperature=ctx.thread_config.get("temperature"),
-                    prompt_cache_key=request.prompt_cache_key,
+                    input_items=prepared.api_items,
+                    instructions=prepared.instructions,
+                    model=surface.model,
                     attempt_sink=sink,
-                    on_attempt_open=_on_attempt_open)
+                    on_attempt_open=_on_attempt_open,
+                    **prepared.params)
             except asyncio.CancelledError:
                 raise
             except Exception as model_error:  # noqa: BLE001 — timeout/refusal/schema alike
@@ -460,4 +555,5 @@ async def reconsider_stale_draft(*, processor: Any, client: Any, message: Any, t
 
 __all__ = ["RECONSIDER_FUSE_PASSES", "intercept_stale_send", "reconsider_stale_draft",
            "build_reconsideration_request", "reconsideration_item", "draft_fence",
-           "reviewed_through_map", "suppressing_ts_present", "select_reconsideration_model"]
+           "reviewed_through_map", "suppressing_ts_present", "select_reconsideration_model",
+           "ChannelReconsiderSurface", "PreparedDecision", "surface_for"]

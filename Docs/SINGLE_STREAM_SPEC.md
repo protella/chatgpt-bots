@@ -296,7 +296,8 @@ calibration in memory.
 
 `CONTRACT_VERSION` 8 → 9 (`participation_telemetry.py`; checker
 `tools/participation_ledger_check.py`). Channel-turn population only — DMs stay excluded, and
-`GATE_CONTRACT` does not move. **Null encoding:** unavailable optional fields are OMITTED,
+`GATE_CONTRACT` does not move. (**Superseded on 2026-08-10** for the population clause only: see
+the CV9 amendment below, where DM turns become members with their own denominator.) **Null encoding:** unavailable optional fields are OMITTED,
 matching the emitter's drop-None behavior; no JSON nulls anywhere in the grammar, and the
 checker treats an absent optional field as "unavailable".
 
@@ -369,6 +370,29 @@ OMITTED, never null.
   joins a COMMITTED `correction_announcement` destination in that turn's `destinations` — the
   disclosure is a real post the room saw, so an unjoined ts means one of the two records is
   wrong about what was delivered.
+
+### CV9 amendment — DM turns join the turn population (2026-08-10)
+
+Ruling 8 of `Docs/specs/STALE_SUPPRESSION_RECONSIDERATION.md` extended `reconsider_start` /
+`reconsider_outcome` to DM turns. That made the CV9 line above — "channel-turn population only"
+— untrue in a way that broke accounting rather than merely wording: a DM turn writes
+`stale_send`, `reconsider_start`, `reconsider_outcome` and `model_response` rows, all keyed by
+`turn_id`, and a turn-population row with no terminal breaks the one property the population
+exists for. So:
+
+- **DM turns are population members.** `turn_start` / `turn_outcome` are emitted for EVERY turn
+  with a runtime, not only channel ones (`main.py:_turn_telemetry_scope`), with
+  `turn_start.surface` = `dm` — a value `TURN_SURFACES` has always declared. A DM row carries
+  `stream_build_present: false` and no `H`: a DM has no stream, and says so.
+- **Two denominators, never divided into each other**, exactly as the gate and turn populations
+  already are: the checker counts and reports `turn_start` / `turn_outcome` (channel) beside
+  `turn_start_dm` / `turn_outcome_dm`, and the JSON report carries all four. A talk rate that
+  pools the surfaces describes neither.
+- **Grading.** DM sequences (`reconsider_*`, `model_response`) are graded WITHOUT a `turn_start`
+  to join — older ledgers have none — but the rotated-fragment exemption still applies to them:
+  what a DM is excused from is the missing `turn_start`, never a missing head.
+- `CONTRACT_VERSION` does NOT move: no event gained, lost or changed a field. Only the
+  population widened, and the counts say so on their face.
 
 ## 11. Config & pinned rules
 

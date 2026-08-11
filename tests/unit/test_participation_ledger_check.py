@@ -355,7 +355,8 @@ def test_a_turn_outcome_is_never_counted_as_a_terminal(tmp_path):
     code, payload = check(write_ledger(tmp_path, rows))
     assert code == 0, payload["violations"]
     assert payload["denominators"] == {"gate_start": 1, "visible_action": 0,
-                                       "turn_start": 1, "turn_outcome": 1}
+                                       "turn_start": 1, "turn_outcome": 1,
+                                       "turn_start_dm": 0, "turn_outcome_dm": 0}
     assert "gate_start_without_terminal" in warning_names(payload)
     assert "turn_event_in_terminal_population" not in names(payload)
 
@@ -654,3 +655,136 @@ def test_every_violation_carries_a_name_a_place_and_a_detail(tmp_path):
 def test_the_cli_never_writes_to_stderr_on_a_ledger_it_understands(tmp_path, flag):
     result = run_checker(write_ledger(tmp_path, healthy_rows()), extra=(flag,))
     assert result.stderr == ""
+
+
+# ---------------------------------------------------------- DM reconsiderations (ruling 8)
+#
+# A DM's stale draft goes through the same reconsideration runner as a channel's, so its passes
+# obey the same arithmetic — and a DM will NEVER have a `turn_start` to join. Declining to grade
+# unjoined rows would mean the DM population is never checked at all.
+
+
+def dm_reconsideration_rows(session=SESSION, *, passes=1):
+    """One DM turn whose draft was suppressed, reviewed in `passes` passes, and posted."""
+    turn_id = f"t-dm-{session}"
+    rows = [envelope("session_start", session=session, build="deadbee")]
+    for index in range(passes):
+        rows.append(envelope("stale_send", session=session, channel_id="D9", trigger_ts="1.0",
+                             turn_id=turn_id, last_seen_ts="1.0", observed_latest_ts="2.0",
+                             scope="top", surface="final_post", guard_mode="start_only"))
+        rows.append(envelope("reconsider_start", session=session, channel_id="D9",
+                             trigger_ts="1.0", turn_id=turn_id, scope=["top", "D9", "U1"],
+                             observed_latest_ts="2.0", model_attempt_seq=index + 1,
+                             **{"pass": index + 1}))
+    rows.append(envelope("reconsider_outcome", session=session, channel_id="D9",
+                         trigger_ts="1.0", turn_id=turn_id, outcome="posted_asis",
+                         passes=passes, forced=False))
+    rows.append(envelope("session_end", session=session))
+    return rows
+
+
+def test_a_dm_reconsideration_is_graded_rather_than_reported_as_an_orphan(tmp_path):
+    code, payload = check(write_ledger(tmp_path, dm_reconsideration_rows(passes=2)))
+    assert (code, names(payload)) == (0, set())
+    assert "reconsider_start_orphan_turn" not in warning_names(payload)
+    assert "reconsider_outcome_orphan_turn" not in warning_names(payload)
+
+
+def test_a_dm_reconsideration_with_miscounted_passes_fails_by_name(tmp_path):
+    rows = dm_reconsideration_rows(passes=2)
+    rows[row_index(rows, "reconsider_outcome")]["passes"] = 5
+    code, payload = check(write_ledger(tmp_path, rows))
+    assert code == 1
+    assert "reconsider_outcome_passes_mismatch" in names(payload)
+
+
+def test_a_channel_reconsideration_with_no_turn_start_is_still_only_a_warning(tmp_path):
+    """The rotated-file exemption is unchanged for CHANNEL turns: a sequence whose head is in
+    `participation.jsonl.1` must not be graded as a gap."""
+    rows = dm_reconsideration_rows()
+    for row in rows:
+        if row.get("channel_id") == "D9":
+            row["channel_id"] = "C1"
+    code, payload = check(write_ledger(tmp_path, rows))
+    assert code == 0
+    assert "reconsider_start_orphan_turn" in warning_names(payload)
+
+
+def test_a_dm_reconsideration_attempt_sequence_is_graded_without_a_turn_start(tmp_path):
+    """`model_response` carries no channel_id, so the DM classification has to come from the
+    turn's other rows. An older ledger (written before DM turns joined the population) has the
+    reconsider rows and no turn_start — and its one attempt sequence must still be graded."""
+    rows = dm_reconsideration_rows()
+    turn_id = rows[row_index(rows, "reconsider_outcome")]["turn_id"]
+    rows.insert(-1, envelope("model_response", turn_id=turn_id, attempt_seq=2, status="ok",
+                             model="gpt-5.6-sol", fork_reason="stale_reconsideration"))
+    code, payload = check(write_ledger(tmp_path, rows))
+    assert code == 1
+    assert "model_response_attempt_seq_not_contiguous" in names(payload)
+    assert "model_response_orphan_turn" not in warning_names(payload)
+
+
+def test_an_enterprise_grid_user_addressed_dm_reads_as_a_dm(tmp_path):
+    """A Slack user id is "W…" on Enterprise Grid, and an outbound DM can be addressed by it.
+    Missing that prefix put those turns back in the orphan bucket."""
+    rows = dm_reconsideration_rows()
+    for row in rows:
+        if row.get("channel_id") == "D9":
+            row["channel_id"] = "W123"
+    code, payload = check(write_ledger(tmp_path, rows))
+    assert (code, names(payload)) == (0, set())
+    assert "reconsider_start_orphan_turn" not in warning_names(payload)
+
+
+def test_dm_turns_are_counted_apart_from_channel_turns(tmp_path):
+    """Two populations, two denominators, never divided into each other — the rule the gate and
+    turn counts already follow, extended to the surface that just joined."""
+    rows = healthy_rows() + [
+        envelope("turn_start", channel_id="D9", trigger_ts="1.0", turn_id="t-dm",
+                 surface="dm", gated=False),
+        envelope("turn_outcome", channel_id="D9", trigger_ts="1.0", turn_id="t-dm",
+                 kind="reply", chars=4, stream_build_present=False, destinations=[], edits=[]),
+    ]
+    code, payload = check(write_ledger(tmp_path, rows))
+    assert (code, names(payload)) == (0, set())
+    assert payload["denominators"]["turn_start"] == 1        # channel only
+    assert payload["denominators"]["turn_start_dm"] == 1
+    assert payload["denominators"]["turn_outcome_dm"] == 1
+
+
+def dm_fragment_rows(rows):
+    """The same rows read as a ROTATED FRAGMENT: the session_start is in participation.jsonl.1,
+    so the head of every sequence may be too."""
+    return [row for row in rows if row["event"] != "session_start"]
+
+
+def test_a_rotated_dm_fragment_is_not_graded_as_a_gap(tmp_path):
+    """A fragment can cut a DM's first pass and first attempt off the top of the file. Grading
+    what is left would fail a healthy turn for starting at 3 — the exact exemption channel turns
+    already had, and the one DMs were missing."""
+    rows = dm_reconsideration_rows(passes=2)
+    turn_id = rows[row_index(rows, "reconsider_outcome")]["turn_id"]
+    # Drop pass 1 and its suppression, and record the outcome over the passes that survived —
+    # i.e. exactly what a rotated head looks like from here.
+    rows = [row for row in rows
+            if not (row["event"] in ("reconsider_start", "stale_send")
+                    and row.get("pass", 1) == 1)]
+    rows.insert(-1, envelope("model_response", turn_id=turn_id, attempt_seq=2, status="ok",
+                             model="gpt-5.6-sol", fork_reason="stale_reconsideration"))
+    code, payload = check(write_ledger(tmp_path, dm_fragment_rows(rows)))
+
+    assert (code, names(payload)) == (0, set()), payload["violations"]
+    assert {"reconsider_start_orphan_turn", "model_response_orphan_turn"} <= warning_names(
+        payload)
+
+
+def test_a_complete_dm_session_is_still_graded(tmp_path):
+    """The mutation of the test above: with the session_start present nothing is exempt, and the
+    same truncated sequence fails."""
+    rows = dm_reconsideration_rows(passes=2)
+    rows = [row for row in rows
+            if not (row["event"] in ("reconsider_start", "stale_send")
+                    and row.get("pass", 1) == 1)]
+    code, payload = check(write_ledger(tmp_path, rows))
+    assert code == 1
+    assert "reconsider_pass_not_contiguous" in names(payload)

@@ -1432,6 +1432,148 @@ async def test_an_ordinary_callback_error_is_still_swallowed(with_tools):
     assert any("callback error" in line for line in host.logged["warning"])
 
 
+# ------------------------------------------------- rider F: hidden-buffer mode (ruling 2/3/5)
+#
+# A refusal at the FIRST surface used to end the attempt, which threw away work the model had
+# already been paid for and left the room with nothing to reconsider. When the caller REGISTERS
+# the refusal, the generation instead runs to completion behind a closed curtain: no further
+# callback, no surface, and the finished text comes back for review.
+
+
+def _refusal(surface: str = "native_start") -> StaleSendSuppressed:
+    return StaleSendSuppressed(scope=("thread", "C1", "10.0"), last_seen_ts="10.0",
+                               observed_latest_ts="11.0", surface=surface)
+
+
+def _two_delta_events():
+    """Two deltas and a clean terminal — finite, real strings (pitfall #6)."""
+    return [SimpleNamespace(type="response.output_text.delta", delta="first "),
+            SimpleNamespace(type="response.output_text.delta", delta="second"),
+            SimpleNamespace(type="response.completed",
+                            response=SimpleNamespace(usage=SimpleNamespace(
+                                input_tokens=1, output_tokens=1)))]
+
+
+def _streaming_call(with_tools: bool):
+    from openai_client.api import responses as R
+
+    call = (R.create_streaming_response_with_tools if with_tools
+            else R.create_streaming_response)
+    return call, ({"tools": [{"type": "web_search"}]} if with_tools else {})
+
+
+@pytest.mark.parametrize("with_tools", [False, True])
+@pytest.mark.asyncio
+async def test_a_registered_refusal_buffers_the_rest_of_the_generation(with_tools):
+    """The whole answer is generated and returned, and NOTHING reaches the callback after the
+    refusal — not another delta, not even the terminal flush that would publish the buffer."""
+    host = _stream_host()
+
+    async def _iter(response, op):
+        for event in _two_delta_events():
+            yield event
+
+    host._safe_stream_iteration = _iter
+    refusal = _refusal()
+    sink: list = []
+    seen: list = []
+
+    def _cb(chunk):
+        seen.append(chunk)
+        if len(seen) == 1:
+            sink.append(refusal)      # the site registers it, then lets it fly
+            raise refusal
+
+    call, kwargs = _streaming_call(with_tools)
+    text = await call(host, messages=[{"role": "user", "content": "hi"}],
+                      stream_callback=_cb, model="gpt-5.6-sol",
+                      hidden_suppression_sink=sink, **kwargs)
+
+    assert text == "first second", "the generation completed behind the curtain"
+    assert seen == ["first "], "no visible surface after the refusal, flush included"
+    assert sink == [refusal] and sink[0] is refusal, "the ORIGINAL object, never a copy"
+    assert host.logged["error"] == []
+
+
+@pytest.mark.parametrize("with_tools", [False, True])
+@pytest.mark.asyncio
+async def test_an_unregistered_refusal_still_ends_the_attempt(with_tools):
+    """The mutation: hiding is opt-in PER EXCEPTION. A suppression from a delivery path this
+    turn never registered — the legacy seed post, say — keeps today's abort even though a sink
+    is right there."""
+    host = _stream_host()
+
+    async def _iter(response, op):
+        for event in _two_delta_events():
+            yield event
+
+    host._safe_stream_iteration = _iter
+    sink: list = []                                   # armed, but nothing registered in it
+
+    def _cb(chunk):
+        raise _refusal("legacy_seed")
+
+    call, kwargs = _streaming_call(with_tools)
+    with pytest.raises(StaleSendSuppressed) as raised:
+        await call(host, messages=[{"role": "user", "content": "hi"}],
+                   stream_callback=_cb, model="gpt-5.6-sol",
+                   hidden_suppression_sink=sink, **kwargs)
+    assert raised.value.surface == "legacy_seed"
+
+
+@pytest.mark.parametrize("with_tools", [False, True])
+@pytest.mark.asyncio
+async def test_a_generation_failure_after_a_hidden_refusal_reports_the_suppression(with_tools):
+    """Ruling 5, fail closed. There is no complete draft to reconsider and a partial one is
+    never offered — so the turn's outcome is the STORED suppression, which is also what stops
+    the caller retrying, apologizing, or posting the half-answer."""
+    host = _stream_host()
+    refusal = _refusal()
+    sink: list = []
+
+    async def _iter(response, op):
+        yield SimpleNamespace(type="response.output_text.delta", delta="first ")
+        raise RuntimeError("the stream died mid-answer")
+
+    host._safe_stream_iteration = _iter
+
+    def _cb(chunk):
+        sink.append(refusal)
+        raise refusal
+
+    call, kwargs = _streaming_call(with_tools)
+    with pytest.raises(StaleSendSuppressed) as raised:
+        await call(host, messages=[{"role": "user", "content": "hi"}],
+                   stream_callback=_cb, model="gpt-5.6-sol",
+                   hidden_suppression_sink=sink, **kwargs)
+
+    assert raised.value is refusal, "the original refusal, not a new one"
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert host.logged["error"] == [], "nothing went wrong that the room needs told about"
+
+
+@pytest.mark.asyncio
+async def test_a_later_tool_round_starts_hidden_from_the_shared_sink():
+    """The tool loop hands ONE sink to every round. Round 2 must not open a surface just
+    because IT was never refused — the refusal belongs to the turn, not to the round."""
+    host = _stream_host()
+
+    async def _iter(response, op):
+        for event in _two_delta_events():
+            yield event
+
+    host._safe_stream_iteration = _iter
+    sink: list = [_refusal()]        # round 1 already hid
+    seen: list = []
+
+    call, kwargs = _streaming_call(True)
+    text = await call(host, messages=[{"role": "user", "content": "hi"}],
+                      stream_callback=lambda chunk: seen.append(chunk),
+                      model="gpt-5.6-sol", hidden_suppression_sink=sink, **kwargs)
+
+    assert text == "first second" and seen == []
+
+
 # ================================== reconsideration (§4a): rearm and force reopen a refusal
 #
 # A suppression is no longer always terminal: the reconsideration runner may REARM the lease

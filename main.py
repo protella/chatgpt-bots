@@ -29,6 +29,7 @@ import token_counter
 from base_client import BaseClient, Message
 from slack_client import admission_watermark
 from slack_client.event_handlers import registration
+from slack_client.utilities import is_dm_conversation
 
 # The dev-only epoch fence. THE IMPORT ITSELF IS GATED ON THE FLAG, so "without
 # DEV_EPOCH_FENCE_ENABLE nothing happens" is literally true rather than nearly true: with the flag
@@ -1182,8 +1183,10 @@ class ChatBotV2:
                             # was writing. Raises StaleSendSuppressed — and a COMPLETE drafted
                             # reply refused at its first surface is exactly the reconsideration
                             # case (STALE_RECONSIDERATION §3), so the suppression is handed to
-                            # the runner instead of straight to the terminal catch. Channel
-                            # turns only; DM suppressions rethrow untouched. The runner either
+                            # the runner instead of straight to the terminal catch. DMs go too
+                            # now, over their own surface snapshot
+                            # (STALE_SUPPRESSION_RECONSIDERATION ruling 6); `channel_turn` says
+                            # WHICH surface, not whether. The runner either
                             # returns a delivered ts (bookkeeping below proceeds normally),
                             # returns None on its accounted delivery_failed and
                             # delivery_exception endings, or rethrows the suppression to the
@@ -1206,9 +1209,11 @@ class ChatBotV2:
                                     message=message, turn=turn, lease=lease,
                                     suppressed=stale, draft=response.content or "",
                                     deliver=_reconsidered_reply_send,
-                                    channel_turn=bool(
-                                        message.channel_id
-                                        and not str(message.channel_id).startswith("D")))
+                                    # THE discriminator the handlers use (`_turn_surface`), not
+                                    # a second copy of it: a "D…" test misses the DM whose
+                                    # channel id is the recipient's "U…" id, and the two halves
+                                    # of one turn must not disagree about which surface it is on.
+                                    channel_turn=not is_dm_conversation(message.channel_id))
                             # Honest accounting: the ACTUAL send result decides `posted` (a
                             # failed send must not burn the hourly unprompted quota).
                             if isinstance(response.metadata, dict):
@@ -1646,14 +1651,26 @@ class ChatBotV2:
             lease.close()
 
     @staticmethod
-    def _turn_telemetry_scope(message: Message, turn) -> bool:
-        """Do this turn's rows belong in the CV8 turn population? Channel turns only.
+    def _turn_population_surface(message: Message) -> str:
+        """`channel` or `dm` — the same discriminator receipts use, never a prefix test."""
+        return ("channel" if outbound_receipts.receipts_apply(
+            getattr(message, "channel_id", None)) else "dm")
 
-        The same discriminator receipts use, not a prefix test: the turn population is the one
-        answering from a channel stream, and a DM has neither a stream nor a receipt to describe.
+    @staticmethod
+    def _turn_telemetry_scope(message: Message, turn) -> bool:
+        """Do this turn's rows belong in the turn population? EVERY turn with a runtime does.
+
+        This used to be channel-only, on the reasoning that a DM has neither a stream nor a
+        receipt to describe. That stopped being tenable when DM drafts started being
+        reconsidered (STALE_SUPPRESSION_RECONSIDERATION ruling 8): a DM turn now writes
+        `stale_send`, `reconsider_start`, `reconsider_outcome` and `model_response` rows, all
+        keyed by `turn_id` — turn-population rows by construction — and a population row with
+        NO terminal breaks the one property that makes any of this readable, exactly-one
+        terminal per turn. So DM turns carry their own `turn_start`/`turn_outcome` pair, under
+        `surface="dm"` (a value the grammar has always declared), and the two surfaces are
+        counted SEPARATELY: a rate that pools them describes neither.
         """
-        return turn is not None and outbound_receipts.receipts_apply(
-            getattr(message, "channel_id", None))
+        return turn is not None
 
     def _emit_turn_start(self, message: Message, turn, *, gate_required: bool) -> None:
         """The turn population's denominator. Written before anything can be posted."""
@@ -1664,7 +1681,7 @@ class ChatBotV2:
             message.channel_id, meta.get("ts"),
             turn_id=getattr(turn, "turn_id", None),
             origin_thread_ts=message.thread_id,
-            surface="channel",
+            surface=self._turn_population_surface(message),
             gated=bool(gate_required),
             attempt_id=participation_telemetry.attempt_id_for(message),
             wake_source=meta.get("wake_source"))

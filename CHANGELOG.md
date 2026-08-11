@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.0.2] - 2026-08-10
+
+### 🩹 Fixed
+
+- **A suppressed answer is now reviewed instead of silently dropped, on every surface.**
+  When a newer message from the same person arrives while the bot is still composing an
+  earlier answer, the earlier draft used to be discarded outright on the native-streaming
+  path and in DMs. Now the generation finishes silently, and a review step decides whether
+  to post it (independent questions each get their answer), rework it, or drop it (a
+  correction supersedes the original ask). Applies to channels and DMs alike.
+- **Ledger completeness for DMs**: DM turns now record the same start/outcome bookkeeping
+  as channel turns (with their own denominator in the health checker), so no suppression
+  can end without a terminal row.
+
 ## [3.0.1] - 2026-08-10
 
 ### 🩹 Fixed

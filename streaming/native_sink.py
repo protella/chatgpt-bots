@@ -78,10 +78,22 @@ class NativeStreamCoordinator:
         self.failed = False
         self.finished = False
         self.part_ts: list = []  # ts of every native message created (finished + current)
+        # HIDDEN-BUFFER MODE. The stale-send guard refused `start()`, so chat.startStream was
+        # never called and this coordinator owns no message at all. It is deliberately NOT
+        # `failed`: `failed` means "Slack let us down, fall back to the legacy edit loop", and
+        # that fallback would post the very answer the guard refused. Every write path below
+        # checks `hidden` first and does nothing, so the generation runs to completion with no
+        # visible surface and the finished draft goes to reconsideration instead.
+        self.suppression: Optional[Exception] = None
+
+    @property
+    def hidden(self) -> bool:
+        """Was the first surface refused before Slack was ever called?"""
+        return self.suppression is not None
 
     @property
     def active(self) -> bool:
-        return (not self.failed and not self.finished
+        return (not self.failed and not self.finished and not self.hidden
                 and self.session is not None and self.session.active)
 
     @property
@@ -104,10 +116,14 @@ class NativeStreamCoordinator:
         try:
             self.session = self._client.begin_native_stream(self.channel, self.thread_ts, user_id=self.user_id)
             ok = await self.session.start(lease=lease)
-        except StaleSendSuppressed:
+        except StaleSendSuppressed as suppressed:
             # Not a sink failure: the conversation moved on and the stream was deliberately
             # never opened. Swallowed here it would look like Slack refusing us, and the caller
             # would quietly fall back to the legacy edit loop and post the stale answer anyway.
+            # Remembered rather than merely re-raised: this exact object is the one the
+            # reconsideration machinery is identity-bound to, and `hidden` is what keeps every
+            # later write path (tool flush, finalize, abandon) from touching Slack.
+            self.suppression = suppressed
             raise
         except Exception as e:  # noqa: BLE001 - best-effort sink, never fatal
             self._log(f"native coordinator start error: {e}")
@@ -132,6 +148,10 @@ class NativeStreamCoordinator:
 
     async def update(self, raw_text: str) -> Tuple[bool, Optional[str]]:
         """Append the tail of the current part's cumulative raw text; roll on overflow."""
+        if self.hidden:
+            # Nothing to append to and nothing to fail: report "not written" WITHOUT flipping
+            # `failed`, which is the flag that hands the turn to the legacy edit loop.
+            return False, None
         if not self.active:
             self.failed = True
             return False, None
@@ -191,6 +211,11 @@ class NativeStreamCoordinator:
 
         Returns False if anything failed — the caller should fall back to the legacy
         final-correction edit on ``current_ts`` (and post any chrome separately)."""
+        if self.hidden:
+            # The refused stream has no message to finalize. Returning False here does NOT mean
+            # "fall back and post it anyway": the caller's hidden branch owns this turn's
+            # delivery, through reconsideration.
+            return False
         if self.session is None or self.finished:
             return False
         try:
@@ -218,6 +243,10 @@ class NativeStreamCoordinator:
 
         Returns False if the stop call failed (the caller should treat the stream message
         as possibly-lingering and fall back to an explicit delete)."""
+        if self.hidden:
+            # No stream was ever opened, so there is nothing to stop and nothing lingering.
+            self.finished = True
+            return True
         ok = True
         if self.session is not None and self.session.active:
             try:
