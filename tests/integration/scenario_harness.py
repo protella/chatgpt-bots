@@ -37,7 +37,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from unittest.mock import AsyncMock, MagicMock
 
 from base_client import Message
@@ -419,7 +419,8 @@ def _real_search_slack(sink, hits: Sequence[Dict[str, Any]]):
 
 def recording_registry(sink: List[Dict[str, Any]],
                        transport: Optional[FakeTransport] = None,
-                       search_hits: Optional[Sequence[Dict[str, Any]]] = None) -> ToolRegistry:
+                       search_hits: Optional[Sequence[Dict[str, Any]]] = None,
+                       canned_results: Optional[Mapping[str, Dict[str, Any]]] = None) -> ToolRegistry:
     """The production channel tool surface with its effects redirected into `sink`.
 
     Schemas, gates and registration order come from `SlackBot._build_tool_registry` — the model
@@ -442,7 +443,7 @@ def recording_registry(sink: List[Dict[str, Any]],
         elif name == "search_slack" and search_hits is not None:
             executor = _real_search_slack(sink, search_hits)
         else:
-            executor = _recorder(sink, name)
+            executor = _recorder(sink, name, canned_results)
         out._tools[name] = dict(tool, executor=executor)
     return out
 
@@ -456,9 +457,14 @@ def _passthrough(sink, name, executor):
     return run
 
 
-def _recorder(sink, name):
+def _recorder(sink, name, canned=None):
     async def run(ctx, args):
-        result = dict(_RECORDED_RESULTS.get(name, {"ok": True}))
+        # A per-scenario canned answer outranks the shared default: some rows exist to test
+        # what the model does with a SPECIFIC tool answer (an "already pinned" note), and the
+        # shared map cannot say that without saying it for every row at once. Membership, not
+        # truthiness — an explicitly canned {} is still the row's answer.
+        result = dict(canned[name] if canned is not None and name in canned
+                      else _RECORDED_RESULTS.get(name, {"ok": True}))
         sink.append({"name": name, "arguments": args, "result": result})
         return result
 
@@ -618,6 +624,7 @@ async def run_responder_trial(openai_client: Any, *, room: Room, trigger: Say,
                               code_interpreter: bool = False,
                               wake_source: Optional[str] = "channel_activity",
                               search_hits: Optional[Sequence[Dict[str, Any]]] = None,
+                              canned_results: Optional[Mapping[str, Dict[str, Any]]] = None,
                               model: Optional[str] = None) -> TrialResult:
     """One responder turn, graded on what it did.
 
@@ -627,7 +634,8 @@ async def run_responder_trial(openai_client: Any, *, room: Room, trigger: Say,
     """
     sink: List[Dict[str, Any]] = []
     transport = FakeTransport()
-    registry = recording_registry(sink, transport, search_hits=search_hits)
+    registry = recording_registry(sink, transport, search_hits=search_hits,
+                                  canned_results=canned_results)
     client = platform_client(registry)
     host = processor_host()
 

@@ -152,6 +152,10 @@ class SlackBot(SlackMessageEventsMixin,  # type: ignore[misc]
         registry.register(self.get_edit_own_message_tool_schema(),
                           self.execute_edit_own_message,
                           enabled=lambda _cfg: False)
+        # PIN_MESSAGE: pin/unpin a message by ts ON REQUEST, both surfaces. Budgeted; no flag.
+        # Request-only policy lives in the schema; Slack's message_not_found confines targets
+        # to the current conversation.
+        registry.register(self.get_pin_message_tool_schema(), self.execute_pin_message)
         # F2: on the DM surface no_response_needed is exposed only on turns whose ROUTE allows
         # silence (the `silence_capable` routing fact), via the per-request
         # _silence_capable_turn flag the text handler sets in a COPIED config. On the channel

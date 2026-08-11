@@ -87,7 +87,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import pytest
 
@@ -373,6 +373,17 @@ nothing. Nothing else in the table moved.
 |                        | unaddressed                                                  |                  |      |
 | org-ownership-question | "Who owns the Grellivak relationship? I'm thinking it's      | silence          | hard |
 |                        | Tessa?" — the room holds no evidence                         |                  |      |
+
+====================== NEW IN THE SPENT-REQUEST ROUND — OWNER REVIEW ======================
+
+One live finding, 2026-08-10: a request that queued behind an in-flight turn was answered
+by that turn, redispatched anyway (by design), and answered a second time — "It's already
+pinned." Nothing else in the table moved.
+
+| id                        | setup                                                       | expected outcome         | bar     |
+|---------------------------|-------------------------------------------------------------|--------------------------|---------|
+| answered-ask-already-done | pin request whose work is already done; the tool result says | silence or reaction_only | hard    |
+|                           | "already pinned"; the prior answer is not in the stream     |                          |         |
 
 ========================= NEW IN THE CROSS-THREAD AGENCY WAVE — OWNER REVIEW =========================
 
@@ -1179,6 +1190,23 @@ ORG_OWNERSHIP = _room([
         "Who owns the Grellivak relationship? I'm thinking it's Tessa?"),
 ])
 
+# The 2026-08-10 double-answer, replayed at its true seam. The trigger is the ask (the room's
+# newest message — the fulfillment is deliberately NOT in the stream, matching the live ledger:
+# the redispatched turn's H was its own trigger ts, so the bot's earlier answer was invisible
+# and it learned "already pinned" only from its own tool call). The canned result IS the
+# discovery; the graded contract is what the words do after it.
+ANSWERED_ASK = _room([
+    Say("1780060000.000100", "Sam Sutton",
+        "Rollback steps: scale down the canary, restore the previous image tag, "
+        "re-run the smoke suite."),
+    Say("1780060010.000100", "Sam Sutton",
+        "worth keeping visible imo",
+        thread="1780060000.000100"),
+    Say("1780060020.000100", "Jamie Jensen",
+        "ChatGPT pin that rollback-steps message above",
+        thread="1780060000.000100"),
+])
+
 
 @dataclass(frozen=True)
 class ResponderScenario:
@@ -1207,6 +1235,14 @@ class ResponderScenario:
     # the subject. Present ⇒ `search_slack` runs its PRODUCTION executor over these hits instead
     # of the empty recorder, so derivation, provenance checks and §2g enrollment actually happen.
     search_hits: Optional[Tuple[Dict[str, Any], ...]] = None
+    # Per-row canned tool answers: the recorder returns the named dict verbatim instead of its
+    # generic success. For rows whose subject is what the model does WITH a specific tool
+    # answer (an "already pinned" note), not whether it calls the tool.
+    canned_results: Optional[Mapping[str, Dict[str, Any]]] = None
+    # The wake route the coordinates block names ("woke on: ..."). The default matches the
+    # harness default; a row that replays a bare-name incident must say name_mention, because
+    # that word is in the prompt the model reads.
+    wake_source: str = "channel_activity"
     # WHAT THE WORDS HAVE TO CARRY, for a row whose contract is a useful answer rather than the
     # fact that it spoke. The outcome label cannot see this: `channel_reply` is returned by "I'm
     # not sure" and by a sentence about something else, and both would pass a row whose whole
@@ -1531,6 +1567,22 @@ RESPONDER_SCENARIOS: Tuple[ResponderScenario, ...] = (
         "have. No evidence in the room, no org knowledge held: silence. A reaction is not an "
         "answer to a question either. "
         "Pre-change (committed prompts): 3/3 silence; observed: silence, silence, silence."),
+
+    # ------------------------------------ the spent-request round: answered is answered
+    ResponderScenario(
+        "answered-ask-already-done", ANSWERED_ASK, "1780060020.000100",
+        (SILENCE, REACTION_ONLY), HARD,
+        "The 2026-08-10 double-answer, replayed at its true seam: a pin request redispatched "
+        "after the work was already done, with the fulfillment invisible in the stream (H "
+        "excludes the bot's own later answer) — the turn discovers it only when its own tool "
+        "returns 'already pinned', and the failure is announcing that ('It's already "
+        "pinned.') instead of closing quietly. Spent is spent: silence or a reaction. "
+        "Pre-change (committed prompts): 0/3; observed: in_thread_reply, in_thread_reply, "
+        "in_thread_reply (pin_message called).",
+        canned_results={"pin_message": {"ok": True, "action": "pin",
+                                        "ts": "1780060000.000100",
+                                        "note": "already pinned"}},
+        wake_source="name_mention"),
 )
 
 
@@ -2301,7 +2353,8 @@ async def test_tier2_responder_corpus():
         (scenario, lambda s=scenario: run_responder_trial(
             client, room=s.room, trigger=s.trigger, steering=s.steering,
             silence_capable=s.silence_capable, addressed=s.addressed,
-            search_hits=s.search_hits))
+            search_hits=s.search_hits, canned_results=s.canned_results,
+            wake_source=s.wake_source))
         for scenario in scenarios for _ in range(TRIALS)
     ]
     results = await gather_trials([f for _, f in factories])

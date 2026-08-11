@@ -11,6 +11,7 @@ from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Mapping,
                     Optional, Tuple, cast)
 from uuid import uuid4
 
+import aiohttp
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_sdk.errors import SlackApiError
 
@@ -39,6 +40,7 @@ from slack_client.event_handlers.feedback import (
 )
 from slack_client._host import _Host
 from slack_client.formatting.blocks import extract_supplementary_text
+from slack_client.normalizer import TimestampError, parse_ts
 from slack_client.utilities import is_user_shaped_id, strip_citations
 
 import re as _re
@@ -2542,6 +2544,147 @@ class SlackMessagingMixin(_Host):
             _record("failed", target_ts=ts,
                     detail=(result.get("error") if isinstance(result, dict) else None))
         return result
+
+    # --- pin_message local tool (PIN §2/§3/§4) ---
+
+    def get_pin_message_tool_schema(self) -> dict:
+        """PIN §3: the one static schema, both surfaces, no channel_id property — the
+        conversation comes from the ToolContext, and Slack's own `message_not_found` is what
+        confines a target to it. The request-only policy lives in this description; enforcement
+        is social, exactly as it is for the other participant-facing writes."""
+        return {
+            "type": "function",
+            "name": "pin_message",
+            "description": (
+                "Pin a message to this conversation's pinned items, or unpin one — only when "
+                "someone here asks you to. The target must be a message in THIS conversation. "
+                "Slack shows who pinned what, and a pin is a shared surface: never pin on your "
+                "own initiative, and never pin to make a point. Never call this just to "
+                "check or refresh a pin — if nothing needs to change, make no call."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["pin", "unpin"],
+                               "description": "pin adds the message to the pinned items; unpin removes it."},
+                    "ts": {"type": "string",
+                           "description": ("Timestamp (ts) of the target message in THIS "
+                                           "conversation, exactly as an id you can see this "
+                                           "turn: from the turn coordinates, a message header "
+                                           "in the stream, or a tool result about this "
+                                           "conversation. Never guess or derive one. A thread "
+                                           "reply's ts pins that reply itself.")},
+                },
+                "required": ["action", "ts"],
+            },
+        }
+
+    async def execute_pin_message(self, ctx: Any, args: Any) -> dict:
+        """Shim: result observability + never-raise. One log line per unsuccessful call —
+        except workspace_unavailable, whose single line is the epoch helper's own warning."""
+        try:
+            result = await self._execute_pin_message(ctx, args)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — the tool contract is a dict, never a raise
+            self.log_error(f"pin_message failed: {e}")
+            return {"ok": False, "error": "pin_failed"}
+        if isinstance(result, dict) and not result.get("ok") \
+                and result.get("error") != "workspace_unavailable":
+            self.log_info(f"pin_message refused: {result.get('error')}")
+        return result
+
+    async def _execute_pin_message(self, ctx: Any, args: Any) -> dict:
+        """PIN §4: pin or unpin ONE message of this conversation, on request.
+
+        §4.8 — NO `run_effect` lease, an explicit architectural exception: `run_effect` guards
+        IRREVERSIBLE effects, and pin/unpin is reversible and idempotent. The §4.4 keyed lock
+        covers ordering, and the worst case of a duplicate dispatch is `already_pinned`.
+
+        Every model-supplied value is TYPE-CHECKED before any coercion and no Slack call may
+        precede a refusal, so a malformed argument can never reach the workspace."""
+        channel_id = getattr(ctx, "channel_id", None)
+        if not channel_id:
+            return {"ok": False, "error": "no_channel_context"}
+        action = args.get("action")
+        if not isinstance(action, str):
+            return {"ok": False, "error": "invalid_action"}
+        action = action.strip().lower()
+        if action not in ("pin", "unpin"):
+            return {"ok": False, "error": "invalid_action"}
+        raw_ts = args.get("ts")
+        if not isinstance(raw_ts, str):
+            return {"ok": False, "error": "invalid_ts"}
+        ts = raw_ts.strip()
+        try:
+            parse_ts(ts)
+        except TimestampError:
+            return {"ok": False, "error": "invalid_ts"}
+        # §4.4: the module-level edit lock, reused AS-IS and keyed the same way, so two turns
+        # aiming at one message serialize. Last-writer-wins across turns is accepted.
+        lock_key = (getattr(self, "self_team_id", None), channel_id, ts)
+        lock = _edit_transaction_lock(*lock_key)
+        try:
+            async with lock:
+                # Epoch check INSIDE the lock, at the mutation point: a turn parked behind
+                # this lock must not spend an authorization that went stale while it waited.
+                if _epoch_refused(self, channel_id,
+                                  "pins_add" if action == "pin" else "pins_remove"):
+                    # The helper already warned; the wrapper stays quiet about this one.
+                    return {"ok": False, "error": "workspace_unavailable"}
+                try:
+                    if action == "pin":
+                        await self.app.client.pins_add(channel=channel_id, timestamp=ts)
+                    else:
+                        await self.app.client.pins_remove(channel=channel_id, timestamp=ts)
+                    return {"ok": True, "action": action, "ts": ts}
+                except SlackApiError as e:
+                    # Never str(e): the API error name is the whole classification.
+                    resp = getattr(e, "response", None)
+                    err = (resp.get("error")
+                           if resp is not None and callable(getattr(resp, "get", None))
+                           else None)
+                    if err == "already_pinned":
+                        return {"ok": True, "action": "pin", "ts": ts, "note": "already pinned"}
+                    if err in ("no_pin", "not_pinned"):
+                        return {"ok": True, "action": "unpin", "ts": ts,
+                                "note": "was not pinned"}
+                    if isinstance(err, str) and err and err not in ("fatal_error",
+                                                                    "internal_error"):
+                        return {"ok": False, "error": err}
+                    # AMBIGUOUS (§4.6): the mutation may have landed → reconcile below.
+                except (asyncio.TimeoutError, aiohttp.ClientError):
+                    pass  # AMBIGUOUS for the same reason: no answer is not a failed write.
+                # §4.7: EXACTLY ONE read, no retry and no second mutation. Whatever this cannot
+                # settle is `outcome_unknown` — a guess here is how a pin gets double-applied.
+                try:
+                    resp = await self.app.client.pins_list(channel=channel_id)
+                except Exception:  # noqa: BLE001 — an unreadable state is outcome_unknown
+                    return {"ok": False, "error": "outcome_unknown"}
+                # The SDK hands back an AsyncSlackResponse, not a dict.
+                body = resp.data if isinstance(getattr(resp, "data", None), dict) else (
+                    resp if isinstance(resp, dict) else None)
+                if (body is None or body.get("ok") is not True
+                        or not isinstance(body.get("items"), list)):
+                    return {"ok": False, "error": "outcome_unknown"}
+                # A malformed ITEM is skipped, not fatal — one junk entry must not turn a
+                # readable answer into an unknown one.
+                present = any(
+                    isinstance(item, dict)
+                    and isinstance(item.get("message"), dict)
+                    and item["message"].get("ts") == ts
+                    for item in body["items"])
+                if action == "pin":
+                    if present:
+                        return {"ok": True, "action": "pin", "ts": ts,
+                                "note": "confirmed pinned after an ambiguous response"}
+                    return {"ok": False, "error": "pin_failed"}
+                if present:
+                    return {"ok": False, "error": "unpin_failed"}
+                return {"ok": True, "action": "unpin", "ts": ts,
+                        "note": "confirmed removed after an ambiguous response"}
+        finally:
+            _prune_edit_transaction_lock(lock_key, lock)
 
     # Reaction-guard eviction tuning. Entries touched within the recency window are PINNED
     # (never evicted) — this covers both the committed slots of an ACTIVE turn (so a burst

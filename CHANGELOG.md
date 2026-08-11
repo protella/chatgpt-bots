@@ -99,6 +99,10 @@ any member can set a channel to mentions-only or off via the ⚙️ button.
 - **No message in a burst is dropped**: rapid-fire messages are judged and answered as one
   conversation, each thread debounced on its own, and a queued @-mention can't be discarded
   by a verdict on surrounding chatter.
+- **A fulfilled request is spent.** When what was asked for is already visibly done — the
+  room shows it, or the bot's own tool reports it already so — being the addressee doesn't
+  earn a second answer or an announcement that it was already done; a reaction, or nothing,
+  closes it. (This is how two rapid asks for the same thing get one answer, not two.)
 - Internal context that sharpens these calls: a wake note saying why it woke
   (`ENABLE_WAKE_ENVELOPE`), the thread's recent back-and-forth
   (`PARTICIPATION_THREAD_TAIL`), thread markers on messages that carry discussions, who's
@@ -136,6 +140,11 @@ any member can set a channel to mentions-only or off via the ⚙️ button.
   misleading people; the default correction is still a new message. Every edit posts an
   announcement in the edited message's thread first — a silent edit is structurally
   impossible — and only its own finalized replies from this turn are editable.
+- **It can pin and unpin messages — only when asked.** Someone asks for it by message,
+  it happens, and the reply says what happened; "already pinned" and "nothing pinned to
+  remove" are honest answers, not errors. It never pins on its own initiative and never
+  calls the tool just to check a pin. If Slack's answer is ambiguous mid-flight, the bot
+  reads the pin list back before claiming success.
 - **A finished answer survives being raced.** If new messages land between composing and
   posting, the bot re-reads and decides: post as written, revise, or drop because the room
   no longer needs it. An overtaken half-composed reply is dropped before it reaches Slack;

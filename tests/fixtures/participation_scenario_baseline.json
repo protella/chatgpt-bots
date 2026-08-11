@@ -267,6 +267,20 @@
         "passes": 3,
         "trials": 3
       },
+      "answered-ask-already-done": {
+        "bar": "hard",
+        "expected": [
+          "silence",
+          "reaction_only"
+        ],
+        "outcomes": [
+          "silence",
+          "reaction_only",
+          "silence"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
       "banter-aimed-at-self": {
         "bar": "hard",
         "expected": [

@@ -348,6 +348,23 @@ def test_letting_the_exchange_end_names_no_scenario():
     assert "lands fine with a reaction or with nothing" in _LET_THE_EXCHANGE_END
 
 
+def test_a_fulfilled_request_is_spent():
+    """A live 2026-08-10 turn re-answered a pin request whose work was already done, announcing
+    "It's already pinned." — it learned the fulfillment from its own tool result, so the room
+    could not teach it. Being the addressee keeps earning an answer only while an answer is left
+    to give. The rule rides the shared constant because that turn was a thread reply."""
+    from prompts import _LET_THE_EXCHANGE_END
+
+    for fragment in ("turns out to be already delivered",
+                     "your own tool comes back telling you it is already so",
+                     "the request is spent",
+                     "closes a spent request"):
+        assert fragment in _LET_THE_EXCHANGE_END, f"the spent-request rule lost {fragment!r}"
+    # And it reaches the thread path as well as the channel one — the incident was a thread turn.
+    for s in BOTH:
+        assert "the request is spent" in s
+
+
 # ------------------------------------------------------------ the cross-thread conduct paragraph
 
 CONDUCT = CHANNEL_CROSS_THREAD_CONDUCT_SUFFIX
