@@ -292,6 +292,88 @@ def test_web_search_never_claims_work():
     assert not _claims_work("web_search", "started")
 
 
+def test_one_search_stays_silent_and_a_second_claims():
+    """Amended 2026-08-11: one search is a fact-check, two is a hunt worth an eye."""
+    turn = TurnRuntime()
+    assert not turn.note_search_event("web_search", "started")
+    assert turn.note_search_event("web_search", "started")
+    # Idempotent claim, so every later search may fire; the gate must not stop saying yes —
+    # claim_work is the guard against a second eye, not a flag here.
+    assert turn.note_search_event("web_search", "started")
+
+
+def test_only_a_started_search_counts_toward_the_second():
+    """Phases of a call already in flight are not new searches, and neither is another tool."""
+    turn = TurnRuntime()
+    for tool_type, status in [
+        ("web_search", "searching"),
+        ("web_search", "completed"),
+        ("file_search", "started"),
+        ("code_interpreter", "started"),
+    ]:
+        assert not turn.note_search_event(tool_type, status)
+    # None of that counted, so a real first search is still the first one.
+    assert not turn.note_search_event("web_search", "started")
+    assert turn.note_search_event("web_search", "started")
+
+
+async def _replay_search_gate(turn, host, msg, events):
+    """One handler invocation's worth of tool events, run through the REAL gate the streaming
+    tool_callback uses. Returns the reaction count after each event."""
+    added_after = []
+    for tool_type, status in events:
+        if turn.note_search_event(tool_type, status):
+            await turn.claim_work(host, msg)
+        added_after.append(len(host.added))
+    return added_after
+
+
+@pytest.mark.asyncio
+async def test_a_turn_that_searches_twice_claims_once(monkeypatch):
+    """A hunting turn's event stream: silent through the first search, the eye lands on the
+    second, and a third search adds nothing."""
+    monkeypatch.setattr(config, "enable_reactions", True)
+    monkeypatch.setattr(config, "enable_ack_reaction", True, raising=False)
+    monkeypatch.setattr(config, "ack_reaction_emoji", "eyes", raising=False)
+    host = _Host()
+    turn = TurnRuntime(silence_capable=True, progress_enabled=False)
+
+    added_after = await _replay_search_gate(turn, host, _msg(), [
+        ("web_search", "started"),
+        ("web_search", "searching"),
+        ("web_search", "completed"),
+        ("web_search", "started"),
+        ("web_search", "completed"),
+        ("web_search", "started"),
+    ])
+
+    assert added_after == [0, 0, 0, 1, 1, 1]
+    assert turn.ack_lease is not None
+
+
+@pytest.mark.asyncio
+async def test_searches_accumulate_across_a_handler_re_entry(monkeypatch):
+    """An MCP failover re-enters the text handler with a fresh closure. The count lives on the
+    TURN, which the retry is handed, so one search either side of the failover is still a hunt."""
+    monkeypatch.setattr(config, "enable_reactions", True)
+    monkeypatch.setattr(config, "enable_ack_reaction", True, raising=False)
+    monkeypatch.setattr(config, "ack_reaction_emoji", "eyes", raising=False)
+    host = _Host()
+    turn = TurnRuntime(silence_capable=True, progress_enabled=False)
+    msg = _msg()
+
+    # First invocation: one search, then the MCP failure that ends this attempt.
+    first = await _replay_search_gate(turn, host, msg, [
+        ("web_search", "started"), ("web_search", "completed")])
+    assert first == [0, 0]
+
+    # The retry — same TurnRuntime, new closure — searches once more.
+    second = await _replay_search_gate(turn, host, msg, [("web_search", "started")])
+
+    assert second == [1]
+    assert turn.ack_lease is not None
+
+
 @pytest.mark.asyncio
 async def test_a_turn_that_searches_and_runs_code_still_acks(monkeypatch):
     """The exclusion is web_search alone: the sandbox in the same turn still stakes the claim,

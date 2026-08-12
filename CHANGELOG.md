@@ -4,11 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-08-12
+
+### ✨ Added
+
+- **Share an image link and the bot can now post the picture itself.** A new import tool
+  fetches a direct image URL (PNG, JPEG, GIF, WebP), posts it into the conversation, and the
+  imported image can be viewed or edited on later turns like any other. Pages and documents
+  are declined honestly.
+- **Imported images are checked before they're posted.** The bot looks at the fetched pixels
+  and confirms they actually show what was asked for; a wrong image (the link said White
+  House, the pixels said supermarket aisle) is refused with a one-line description of what
+  the picture really shows, and the bot tries a better source instead of posting it.
+
 ### 🔧 Changed
 
 - **The progress line on an image no longer sits frozen while you wait.** It re-words itself
   every so often, and once a render runs long it says so plainly instead of repeating the
   same line.
+- **The bot notices when a channel is joking about it specifically.** Banter unmistakably
+  about the bot now wakes it for a possible reaction or comeback; talk about AI or other
+  bots in general still leaves it asleep.
+- **Canvas requests show they're being worked on.** Creating, editing, or deleting a canvas
+  now stakes the 👀 acknowledgment on your message as soon as the work starts, instead of
+  running silently until the reply.
+- **Long web hunts show they're being worked on too.** One quick web search stays quiet, but
+  the moment a reply turns into a real multi-search hunt the 👀 acknowledgment appears,
+  instead of the bot looking dead for a minute.
+
+### 🩹 Fixed
+
+- **One reply can no longer fire more tool calls than its budget allows.** Both tool loops
+  now enforce the per-turn cap before dispatch, so a single model response can't shotgun a
+  burst of paid fetches past the limit.
 
 ## [3.0.3] - 2026-08-11
 

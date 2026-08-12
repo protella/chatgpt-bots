@@ -464,6 +464,35 @@ _OVER_BUDGET_RESULT = {
 }
 
 
+def _over_budget_overrides(calls: List[Dict[str, Any]], free_names: set,
+                           remaining_allowance: int) -> Dict[int, Any]:
+    """Refuse the PRODUCTIVE calls in this round that exceed the turn's REMAINING call
+    allowance — BEFORE they are dispatched. Returns result_overrides for _run_tool_round.
+
+    Same shape, and the same reason, as ``_free_call_overrides``: a round's calls dispatch in
+    PARALLEL, so charging them afterwards stops only the NEXT round — by which time a single
+    response carrying a dozen `import_web_image` calls has already run a dozen fetches, vision
+    calls and Slack uploads against a budget of three. The cap has to bind before dispatch.
+
+    Order is the round's own call order: the first N run, the excess is refused. Refused, not
+    dropped — a function_call left without a matching function_call_output earns a 400 on the
+    next request, so the excess gets ``_OVER_BUDGET_RESULT`` fed back instead.
+
+    Free (bookkeeping) calls are invisible to this: they have their own allowance and must never
+    be displaced by, or displace, productive work. ``_charge`` bills only what actually RAN, so
+    the calls suppressed here cost nothing — they did nothing."""
+    allowed = max(0, int(remaining_allowance))
+    overrides: Dict[int, Any] = {}
+    taken = 0
+    for c in calls:
+        if c.get("name") in free_names:
+            continue
+        taken += 1
+        if taken > allowed:
+            overrides[id(c)] = _OVER_BUDGET_RESULT
+    return overrides
+
+
 async def _handle_no_reply_terminal(
     self,
     registry: ToolRegistry,
@@ -754,8 +783,15 @@ async def create_text_response_with_tool_loop(
                     f"{_NO_REPLY_TOOL} called after a prior attempt already exposed text — "
                     "rejecting; model must complete the reply")
                 terminal_result = _INVALID_NO_REPLY_RESULT
-            suppressed = _free_call_overrides(calls, free_names,
-                                              free_calls_cap - free_calls)
+            # Rejecting the terminal does not exempt the round from the turn's budget: the
+            # siblings are ordinary productive work and dispatch in parallel like any other
+            # round's. The terminal itself reserves a slot here exactly as it does on the
+            # honored path, and `_terminal_overrides` still wins for that call below.
+            suppressed = {
+                **_free_call_overrides(calls, free_names, free_calls_cap - free_calls),
+                **_over_budget_overrides(calls, free_names,
+                                         config.max_tool_calls_per_turn - total_calls),
+            }
             _charge(calls, suppressed)
             await _run_tool_round(
                 self, registry, tool_context, sink, input_items, local_tool_calls,
@@ -770,6 +806,14 @@ async def create_text_response_with_tool_loop(
             continue
 
         suppressed = _free_call_overrides(calls, free_names, free_calls_cap - free_calls)
+        over_budget = _over_budget_overrides(calls, free_names,
+                                             config.max_tool_calls_per_turn - total_calls)
+        if over_budget:
+            self.log_warning(
+                f"Suppressed {len(over_budget)} productive call(s) past this turn's remaining "
+                f"budget ({config.max_tool_calls_per_turn - total_calls}) — not dispatched; the "
+                "round runs what the allowance covers and the rest are answered over_budget")
+        suppressed = {**suppressed, **over_budget}
         _charge(calls, suppressed)
         await _run_tool_round(self, registry, tool_context, sink, input_items, local_tool_calls,
                               result_overrides=suppressed or None)
@@ -848,6 +892,9 @@ async def create_streaming_response_with_tool_loop(
     def _suppress_excess_free(calls: List[Dict[str, Any]]) -> Dict[int, Any]:
         return _free_call_overrides(calls, free_names,
                                     free_calls_cap - budget["free_calls"])
+
+    def _suppress_over_budget(calls: List[Dict[str, Any]]) -> Dict[int, Any]:
+        return _over_budget_overrides(calls, free_names, calls_cap - budget["calls"])
 
     def _charge(calls: List[Dict[str, Any]], suppressed: Dict[int, Any]) -> None:
         """Bill a round. A round of PURE bookkeeping costs no round and no productive call;
@@ -990,7 +1037,11 @@ async def create_streaming_response_with_tool_loop(
                     f"{_NO_REPLY_TOOL} called after visible text already streamed — rejecting; "
                     "model must complete the reply")
                 terminal_result = _INVALID_NO_REPLY_RESULT
-            suppressed = _suppress_excess_free(calls)
+            # Rejecting the terminal does not exempt the round from the turn's budget: the
+            # siblings are ordinary productive work and dispatch in parallel like any other
+            # round's. The terminal itself reserves a slot here exactly as it does on the
+            # honored path, and `_terminal_overrides` still wins for that call below.
+            suppressed = {**_suppress_excess_free(calls), **_suppress_over_budget(calls)}
             _charge(calls, suppressed)
             _replay_committed_text(input_items, text)
             await _run_tool_round(
@@ -1012,6 +1063,13 @@ async def create_streaming_response_with_tool_loop(
             self.log_warning(
                 f"Suppressed {len(suppressed)} excess bookkeeping call(s) in one round — "
                 "not dispatched; the model is told to make a single call")
+        over_budget = _suppress_over_budget(calls)
+        if over_budget:
+            self.log_warning(
+                f"Suppressed {len(over_budget)} productive call(s) past this turn's remaining "
+                f"budget ({calls_cap - budget['calls']}) — not dispatched; the round runs what "
+                "the allowance covers and the rest are answered over_budget")
+        suppressed = {**suppressed, **over_budget}
         _charge(calls, suppressed)
         _replay_committed_text(input_items, text)
         await _run_tool_round(

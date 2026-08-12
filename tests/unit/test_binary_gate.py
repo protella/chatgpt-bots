@@ -822,6 +822,29 @@ def test_the_prompt_forbids_the_gate_from_doing_the_responders_job():
     assert "If you cannot tell whether a genuine task or question needs it, wake it" in p
 
 
+def test_the_prompt_wakes_for_banter_that_is_unmistakably_about_this_assistant():
+    """Owner reversal, 2026-08-11: banter about the assistant itself wakes it again — narrowed.
+
+    The earlier removal of assistant-directed wake language was measured and real (see
+    tests/unit/test_participation_tuning.py), so the criterion that came back is deliberately
+    one-sided: it wakes only when the shown messages make it THIS assistant, and general-AI or
+    other-bot talk with nothing asked stays asleep. The gate is never told the assistant's
+    configured name, so "unmistakably, from what the messages themselves show" is the honest
+    standard and the false-negative bias IS the narrowing."""
+    from prompts import WAKE_CLASSIFIER_SYSTEM_PROMPT as p
+
+    # (a) it wakes for banter that is unmistakably about this assistant
+    assert "the room is talking about the assistant ITSELF" in p
+    assert "This means THIS assistant, unmistakably, from what the messages themselves show" in p
+    # (b) general-AI / other-bot banter with nothing asked stays asleep
+    assert ("banter that merely mentions bots or AI in general, or some other bot, with nothing "
+            "asked of anyone, stays ordinary banter and sleeps") in p
+    assert 'an ambiguous "the bot" or "our bot" in a room where it could mean another' in p
+    # (c) the closing doubt rule carries the carve-out rather than contradicting the new bullet
+    assert ("leave it alone; only banter unmistakably about this assistant itself wakes it, "
+            "as above") in p
+
+
 class TestQueueBatchAndCohortInterop:
     """Two different coalescing mechanisms, and they must not double-count each other.
 

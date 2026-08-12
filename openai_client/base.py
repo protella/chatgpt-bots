@@ -718,9 +718,15 @@ class OpenAIClient(LoggerMixin):
         *args,
         timeout_seconds: Optional[float] = None,
         operation_type: str = "general",
+        sensitive: bool = False,
         **kwargs,
     ):
-        """Async wrapper for OpenAI API calls with enforced timeout."""
+        """Async wrapper for OpenAI API calls with enforced timeout.
+
+        `sensitive=True` marks the REQUEST as unloggable: the failure lines below then name the
+        exception CLASS instead of quoting its text, because a provider error routinely echoes
+        the payload that caused it. Consumed here — never forwarded into the API method's kwargs.
+        """
 
         # Determine timeout based on operation type and .env settings
         if timeout_seconds:
@@ -750,7 +756,8 @@ class OpenAIClient(LoggerMixin):
         except Exception as e:
             error_msg = str(e).lower()
             if "timeout" in error_msg or "timed out" in error_msg or "read timeout" in error_msg:
-                self.log_error(f"API call ({operation_type}) timed out after {timeout}s: {e}")
+                detail = type(e).__name__ if sensitive else str(e)
+                self.log_error(f"API call ({operation_type}) timed out after {timeout}s: {detail}")
                 # Create TimeoutError with operation_type attribute for smart retry logic
                 timeout_error = TimeoutError(f"OpenAI API call timed out after {timeout} seconds")
                 # Ad-hoc attribute the retry logic reads back off the exception.
@@ -823,6 +830,8 @@ class OpenAIClient(LoggerMixin):
         model: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
         verbosity: Optional[str] = None,
+        max_output_tokens: Optional[int] = None,
+        sensitive: bool = False,
     ) -> str:
         # enhance_prompt is vestigial: the utility-model rewrite hop it used to gate is gone
         # (the only caller, image_catalog, always passed False). Kept solely so that explicit
@@ -832,6 +841,10 @@ class OpenAIClient(LoggerMixin):
         # analysis_*). The ambient vision worker passes the utility model + clamped utility
         # effort so a message the bot never answered doesn't cost primary-model spend, and the
         # recorded model matches the one that actually ran. Omitted → the original behavior.
+        #
+        # max_output_tokens overrides config.vision_max_tokens (sized for a full description);
+        # sensitive=True keeps the request out of every exception log on this path — see
+        # api.vision.analyze_images. Both default to today's behavior exactly.
         return await vision_api.analyze_images(
             self,
             images=images,
@@ -843,6 +856,8 @@ class OpenAIClient(LoggerMixin):
             model=model,
             reasoning_effort=reasoning_effort,
             verbosity=verbosity,
+            max_output_tokens=max_output_tokens,
+            sensitive=sensitive,
         )
 
     async def edit_image(

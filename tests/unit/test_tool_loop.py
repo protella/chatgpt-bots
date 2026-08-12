@@ -501,6 +501,89 @@ class TestToolLoop:
         assert len(refused) == len(made) - len(executed)
 
     @pytest.mark.asyncio
+    async def test_a_round_cannot_dispatch_more_productive_calls_than_the_budget_has_left(
+            self, monkeypatch):
+        """Codex review. Productive calls were charged only AFTER dispatch_all had already run
+        them in parallel, so the cap could only ever stop the NEXT round — and one response
+        carrying a dozen import_web_image calls means a dozen fetches, vision calls and Slack
+        uploads against a budget of three, all of them spent before anything counted them.
+
+        The excess is refused BEFORE dispatch, and refused rather than dropped: a function_call
+        with no matching function_call_output is a 400 on the very next request."""
+        cap = 3
+        executed = []
+
+        async def _spy(ctx, args):
+            executed.append(args)
+            return {"ok": True}
+
+        state = {"n": 0, "last_input": []}
+
+        async def fake_streaming(client, messages, tools, stream_callback, tool_callback=None,
+                                 function_call_sink=None, tool_choice=None, **params):
+            state["n"] += 1
+            state["last_input"] = list(messages)     # what the NEXT request would send
+            if state["n"] == 1 and function_call_sink is not None:
+                function_call_sink.extend(
+                    _call("import_web_image", f"c{i}") for i in range(cap + 2))
+            return "stopped" if tool_choice == "none" else ""
+
+        monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
+                            fake_streaming)
+        out = await tool_loop.create_streaming_response_with_tool_loop(
+            _Client(), messages=[], tools=[], registry=_registry_with("import_web_image", _spy),
+            tool_context=ToolContext(), stream_callback=lambda c: None,
+            max_tool_rounds=9, max_tool_calls=cap)
+
+        assert out["text"] == "stopped"
+        # Exactly the remaining allowance reached the registry; the other two never ran at all.
+        assert len(executed) == cap, (
+            f"{len(executed)} calls dispatched against an allowance of {cap}")
+        # ...and yet all five were ANSWERED — suppressed is not dropped.
+        replayed = state["last_input"]
+        made = [m for m in replayed if m.get("type") == "function_call"]
+        answered = [m for m in replayed if m.get("type") == "function_call_output"]
+        assert len(made) == cap + 2
+        assert {m["call_id"] for m in made} == {m["call_id"] for m in answered}
+        refused = [m for m in answered if "over_budget" in str(m.get("output"))]
+        assert len(refused) == cap + 2 - len(executed)
+
+    @pytest.mark.asyncio
+    async def test_the_non_streaming_twin_holds_the_same_line_on_a_shotgun_round(
+            self, monkeypatch):
+        """The same gap, on the loop the non-streaming reply path runs. Both loops hand a whole
+        round to dispatch_all at once, so both have to bind the cap BEFORE that call and not on
+        the round after it — and the excess is answered on this path too."""
+        monkeypatch.setattr(config, "max_tool_rounds", 9)
+        monkeypatch.setattr(config, "max_tool_calls_per_turn", 3)
+        cap = 3
+        executed = []
+
+        async def _spy(ctx, args):
+            executed.append(args)
+            return {"ok": True}
+
+        fake = _FakeRounds([
+            ("", [_call("import_web_image", f"c{i}") for i in range(cap + 2)]),
+            ("stopped", []),
+        ])
+        monkeypatch.setattr(tool_loop.responses_api, "create_text_response_with_tools", fake)
+        out = await tool_loop.create_text_response_with_tool_loop(
+            _Client(), messages=[], tools=[], registry=_registry_with("import_web_image", _spy),
+            tool_context=ToolContext())
+
+        assert out["text"] == "stopped"
+        assert len(executed) == cap, (
+            f"{len(executed)} calls dispatched against an allowance of {cap}")
+        replayed = fake.invocations[-1]["messages"]     # what the final request carried
+        made = [m for m in replayed if m.get("type") == "function_call"]
+        answered = [m for m in replayed if m.get("type") == "function_call_output"]
+        assert len(made) == cap + 2
+        assert {m["call_id"] for m in made} == {m["call_id"] for m in answered}
+        refused = [m for m in answered if "over_budget" in str(m.get("output"))]
+        assert len(refused) == cap + 2 - len(executed)
+
+    @pytest.mark.asyncio
     async def test_a_mixed_round_is_charged_normally(self, monkeypatch):
         """Bookkeeping riding ALONGSIDE real work does not launder the round. Only the free
         calls are free; the round itself did real work and is billed for it."""

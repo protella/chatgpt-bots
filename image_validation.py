@@ -131,7 +131,7 @@ def _gif_is_animated(raw: bytes) -> Optional[bool]:
         return None
 
 
-def _decodes_as_image(raw: bytes) -> bool:
+def _decodes_as_image(raw: bytes, max_pixels: Optional[int] = None) -> bool:
     """True only if Pillow can actually PARSE these bytes as an image.
 
     A magic-byte prefix is not proof: "PNG signature + junk" matches the prefix but is not a
@@ -140,11 +140,19 @@ def _decodes_as_image(raw: bytes) -> bool:
     the file object spent, so the image must be REOPENED before `load()` (Pillow's documented
     verify-then-reopen requirement). We do both: verify catches truncation/corruption cheaply,
     load forces the decoder far enough to reject signature-plus-junk.
+
+    `max_pixels`, when set, is a decompression-bomb ceiling read from the HEADER — `im.size` is
+    known as soon as the file is opened, so an oversized frame is refused before `verify()` or
+    `load()` can spend the memory to decode it. None (the default) checks nothing.
     """
     try:
         from PIL import Image
 
         with Image.open(BytesIO(raw)) as im:
+            if max_pixels is not None:
+                width, height = im.size
+                if width * height > max_pixels:
+                    return False
             im.verify()
         with Image.open(BytesIO(raw)) as im2:
             im2.load()
@@ -153,7 +161,8 @@ def _decodes_as_image(raw: bytes) -> bool:
         return False
 
 
-def validate_image_bytes(raw: bytes) -> Tuple[Optional[str], Optional[str]]:
+def validate_image_bytes(raw: bytes,
+                         max_pixels: Optional[int] = None) -> Tuple[Optional[str], Optional[str]]:
     """Decide whether these bytes may ride an API call.
 
     Returns `(mimetype, None)` on success — the SNIFFED mimetype, which the caller should send
@@ -163,6 +172,10 @@ def validate_image_bytes(raw: bytes) -> Tuple[Optional[str], Optional[str]]:
     Two gates: the magic-byte sniff decides the FORMAT (and that it is one the API accepts), then
     Pillow PARSES the bytes so a valid-looking prefix followed by garbage is rejected here rather
     than by a 400 mid-turn.
+
+    `max_pixels` bounds the DECODED frame for callers holding bytes from somewhere hostile (a
+    web import): a sub-10MB PNG can decode to hundreds of megabytes, and this refuses it from
+    the header before any decode happens. Omitting it leaves every existing caller unchanged.
     """
     mime = sniff_image_mimetype(raw)
     if not mime:
@@ -174,7 +187,7 @@ def validate_image_bytes(raw: bytes) -> Tuple[Optional[str], Optional[str]]:
             return None, UNREADABLE
         if animated:
             return None, ANIMATED_GIF
-    if not _decodes_as_image(raw):
+    if not _decodes_as_image(raw, max_pixels):
         return None, UNREADABLE
     return mime, None
 

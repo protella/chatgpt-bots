@@ -145,7 +145,8 @@ def _err(error: str, message: str, **extra: Any) -> Dict[str, Any]:
 MAX_PRODUCED_PER_TURN = 2
 
 
-def stage_produced_image(ctx: Any, image_data: Any, *, label: str) -> bool:
+def stage_produced_image(ctx: Any, image_data: Any, *, label: str,
+                         intro: Optional[str] = None) -> bool:
     """Put an image the bot JUST created in front of the model, before it writes its reply.
 
     Without this the model is blind to its own output: `edit_image` handed back the string "The
@@ -153,6 +154,12 @@ def stage_produced_image(ctx: Any, image_data: Any, *, label: str) -> bool:
     could not describe what it made, and could not sensibly act on "now make the text bigger" —
     it had never seen either version. The tool result even had to instruct it NOT to describe the
     picture, which was papering over the blindness rather than fixing it.
+
+    An IMPORTED image rides the same staging with caller-supplied wording: `intro` replaces the
+    "this is the image you just made" sentence verbatim, because pixels fetched off the open web
+    are neither the model's own work nor trusted. Only `None` — not any falsey value — selects
+    the legacy sentence, so a caller that deliberately passes "" gets no sentence rather than
+    silently getting the generated-image wording back.
 
     Reuses the same staging the tool loop already drains, so the pixels arrive as a user-role
     message on the next round. Returns True when staged. Never raises: failing to show the model
@@ -176,8 +183,9 @@ def stage_produced_image(ctx: Any, image_data: Any, *, label: str) -> bool:
             "_ready": True,
             "parts": [
                 {"type": "input_text",
-                 "text": (f"[{label} — this is the image you just made, now posted in the "
-                          f"thread. Check it actually matches what was asked before you reply.]")},
+                 "text": (f"[{label} — " + (intro if intro is not None else
+                          "this is the image you just made, now posted in the thread. Check it "
+                          "actually matches what was asked before you reply.") + "]")},
                 {"type": "input_image",
                  "image_url": f"data:{mimetype};base64,{b64}",
                  "detail": (getattr(config, "default_detail_level", None) or "high")},

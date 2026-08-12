@@ -115,6 +115,13 @@ def _legacy_fallback_target(overflow: Optional[str], native_current_ts: Optional
 # the eye ended up on nearly every message in a working thread, which is noise rather than a
 # claim. The sandbox, research/background jobs and image builds are the slow work that earns it.
 #
+# ONE search stays silent; the SECOND one claims (amended 2026-08-11). A turn that searches twice
+# is not fact-checking a sentence, it is on a hunt — live, a "find me an image" turn chained web
+# searches for ~90s before any local tool ran, so the user watched a dead-looking message for a
+# minute and a half. That count is per-turn state rather than a member of this set, and it lives
+# on the TURN (`TurnRuntime.note_search_event`) — an MCP failover re-enters this handler, and a
+# counter in the `tool_callback` closure below would start over instead of adding up.
+#
 # KNOWN GAP, and it is structural rather than an oversight: these events only exist while
 # STREAMING. A non-streaming turn resolves its hosted tools server-side inside one response,
 # emitting nothing to react to, so a non-streaming file search claims no 👀. Local slow tools
@@ -2189,6 +2196,15 @@ class TextHandlerMixin(_Host):
             # pass. Fires BEFORE the native-stream guard below (which returns early once the
             # stream owns the message).
             if turn is not None and _claims_work(tool_type, status):
+                await turn.claim_work(client, message)
+
+            # F38 amendment: web_search stays out of that set, because ONE search on a fast reply
+            # would flash an eye that vanishes a second later. The SECOND search is a different
+            # animal — the turn is chasing something and the user is waiting on it (live: ~90s of
+            # chained searches before any local tool ran, and the message looked dead the whole
+            # time), so it claims. The count is kept on the TURN so it survives an MCP failover's
+            # re-entry into this handler; `claim_work` is idempotent, so later searches are free.
+            if turn is not None and turn.note_search_event(tool_type, status):
                 await turn.claim_work(client, message)
 
             # Time the inline sandbox (see sandbox_call_started). "interpreting" is a phase of the

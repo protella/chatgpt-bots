@@ -108,6 +108,35 @@ def _web(ctx: ToolContext):
     return getattr(app, "client", None) if app is not None else None
 
 
+async def _claim_work(ctx: ToolContext) -> None:
+    """Stake the 👀 claim on the triggering message: canvas work is about to start.
+
+    Canvas work is slow and silent — a live edit ran ~40s of read/edit calls with nothing in the
+    room to show for it — so every MUTATING path claims, and claims EARLY.
+
+    Where the line falls (owner ruling, 2026-08-11): early visibility dominates strict
+    refusal-purity. A refusal decidable from the ARGUMENTS alone never claims — the model could
+    have avoided it, and an eye over a call that did nothing is a lie. A refusal that needs a
+    network round-trip to discover (the canvas is not in this channel, the list item is
+    ambiguous) MAY claim: by then real work has genuinely started, the room has been waiting on
+    it, and the turn's eventual reply keeps the eye honest.
+
+    So each site sits after its path's local checks and before that path's first REMOTE call —
+    not merely before the first write. Reads (`read_canvas`, `list_canvases`) do not claim; they
+    are quick and commit to nothing.
+
+    Idempotent and fails silent upstream, so the several canvas calls one turn makes still land
+    exactly one reaction.
+    """
+    turn = getattr(ctx, "turn", None)
+    if turn is None:
+        return
+    try:
+        await turn.claim_work(ctx.client, getattr(ctx, "message", None))
+    except Exception:  # noqa: BLE001 — never let presentation break the edit
+        pass
+
+
 # Markdown scaffolding that `read_canvas` ADDS and the canvas itself does not contain.
 _MD_PREFIX_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+|#{1,6}\s+|>\s+)?(?:\[[ xX]\]\s+)?")
 _MD_MARKS_RE = re.compile(r"[*_`]+")
@@ -150,6 +179,19 @@ def _searchable(text: str) -> str:
     out = _MD_PREFIX_RE.sub("", text or "")
     out = _MD_MARKS_RE.sub("", out)
     return " ".join(out.split())
+
+
+def _is_searchable(text: str) -> bool:
+    """Is `text` an anchor that can actually FIND something, once scaffolding is stripped?
+
+    `_searchable` strips bullets, ticks and emphasis marks, so an anchor made only of those
+    ("**", "- ", "#") survives the "is it empty?" test and then normalises to nothing. An empty
+    needle is contained in every string, which turns a targeted edit into a blind one: it
+    selected the canvas's FIRST list and rewrote it, reporting success (reproduced by codex).
+    So "has any word character left" is the real test, and it is the one every anchor takes.
+    """
+    needle = _searchable(text)
+    return bool(needle and re.search(r"\w", needle))
 
 
 # --- HTML -> markdown (canvas content only ever comes back as HTML) ------------------------
@@ -926,6 +968,11 @@ async def execute_create_channel_canvas(ctx: ToolContext, args: Dict[str, Any]) 
     if web is None or not ctx.channel_id:
         return _err("unavailable", "Canvases aren't available right now.")
 
+    # Before the lock, not inside it: the existence check below is a live files.list round-trip,
+    # which is exactly the wait the claim exists to explain — and the lock is global to the
+    # channel, so a bounded reaction await has no business extending it.
+    await _claim_work(ctx)
+
     # Last line of defence against a second channel canvas: the schema hides this tool once one
     # exists, but the schema is built from a catalog that can be up to _CATALOG_TTL stale, and
     # conversations.canvases.create is NOT idempotent — a second call means a second tab, forever.
@@ -1018,11 +1065,26 @@ async def execute_read_canvas(ctx: ToolContext, args: Dict[str, Any]) -> Dict[st
 
 _LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]\s+(?:\[[ xX]\]\s*)?|\d+[.)]\s+)(.*\S)\s*$")
 _CHECKBOX_RE = re.compile(r"^\s*[-*+]\s*\[[ xX]\]")
+
+# The operations edit_canvas accepts, and the ones that cannot act without an anchor. Named here
+# so both are decidable from the ARGUMENTS, before the work claim — see `_claim_work`.
+_EDIT_OPERATIONS = ("append", "prepend", "replace_list",
+                    "insert_after", "insert_before", "replace_section", "delete_section")
+_NEEDS_FIND_TEXT = ("replace_list", "insert_after", "insert_before",
+                    "replace_section", "delete_section")
 MAX_LIST_ITEMS = 40          # a rewrite costs one API call per item; a runaway is a bug, not a doc
 
 
 def _list_block_around(markdown: str, needle: str) -> Optional[List[str]]:
-    """The contiguous run of list items containing `needle`, as their bare texts, in order."""
+    """The contiguous run of list items containing `needle`, as their bare texts, in order.
+
+    A needle with no word in it matches NOTHING here, deliberately: `needle in text` is true of
+    every item when the needle is empty, so the first list in the canvas would be picked and
+    rewritten with nothing having been searched for. Callers refuse such an anchor long before
+    this (`_is_searchable`, in edit_canvas's argument checks); this is the backstop.
+    """
+    if not _is_searchable(needle):
+        return None
     items: List[Optional[str]] = []
     blocks: List[List[str]] = []
     for line in (markdown or "").splitlines():
@@ -1065,6 +1127,9 @@ async def _rewrite_list(ctx: ToolContext, canvas_id: str, find_text: str, markdo
     The rebuilt list ends up exactly where the old one was — verified with content on both sides
     of it. (`canvases.edit` takes ONE change per call, so this is 1 + N calls, not a batch.)
     """
+    # No _claim_work here: the only caller (execute_edit_canvas) claims before it resolves the
+    # canvas, so this path is already claimed by the time it starts reading. A second call would
+    # be a no-op — claim_work is idempotent — but a future caller must do its own.
     web = _web(ctx)
     current = await _fetch_canvas_markdown(ctx, canvas_id)
     if current is None:
@@ -1156,8 +1221,9 @@ async def _resolve_section(ctx: ToolContext, canvas_id: str, find_text: str,
     """
     needle = _searchable(find_text)
     # A needle with no word in it ("-", "**") is not a search — it is punctuation that would
-    # match half the document and overwrite whichever half Slack returned first.
-    if not needle or not re.search(r"\w", needle):
+    # match half the document and overwrite whichever half Slack returned first. edit_canvas now
+    # refuses this from the arguments alone; kept because this is reachable from elsewhere.
+    if not _is_searchable(find_text):
         return None, _err("missing_find_text",
                           "find_text must contain some actual text from the canvas.")
     try:
@@ -1218,17 +1284,24 @@ async def execute_edit_canvas(ctx: ToolContext, args: Dict[str, Any]) -> Dict[st
     if len(markdown) > MAX_MARKDOWN_CHARS:
         return _err("too_long",
                     f"That is {len(markdown)} characters; the limit is {MAX_MARKDOWN_CHARS}.")
-    canvas = await _canvas_file(ctx, canvas_id)
-    if canvas is None:
-        # Not a guess about what they meant: a file id from another channel is syntactically
-        # perfect, and rewriting the wrong document is not something a user sees coming.
-        return _err("not_in_this_channel", f"{canvas_id} is not a canvas in this channel.")
-    url = canvas.get("permalink")
-    title = (canvas.get("title") or "").strip()
 
-    web = _web(ctx)
-    content = {"type": "markdown", "markdown": markdown}
-
+    # Everything the ARGUMENTS alone can settle is settled here, ahead of the work claim: these
+    # refusals cost the room nothing and must not flash an eye. The checks that need Slack to
+    # answer first (which canvas, which section, is the anchor a list item) come after it.
+    if operation not in _EDIT_OPERATIONS:
+        return _err("bad_operation", f"Unknown operation {operation!r}.")
+    if operation in _NEEDS_FIND_TEXT and not find_text:
+        return _err("missing_find_text",
+                    "replace_list needs find_text — any line of the list you mean."
+                    if operation == "replace_list"
+                    else f"{operation} needs find_text — the block to act on.")
+    # An anchor of pure scaffolding ("**", "-") is not empty but searches for NOTHING, and an
+    # empty needle matches everything — which is how a replace_list rewrote the wrong list and
+    # called it success. Refused here, from the arguments alone: the section operations used to
+    # catch it in `_resolve_section`, but only after a claim and a files.info round-trip.
+    if operation in _NEEDS_FIND_TEXT and not _is_searchable(find_text):
+        return _err("missing_find_text",
+                    "find_text must contain some actual text from the canvas.")
     # A canvas SECTION is one block — a heading, a paragraph, a single list item — not a region.
     # So a find_text spanning several lines can never match anything, and the model reaches for
     # exactly that: it reads the canvas, sees a Steps list, and quotes the whole list to "replace
@@ -1241,21 +1314,42 @@ async def execute_edit_canvas(ctx: ToolContext, args: Dict[str, Any]) -> Dict[st
             "find_text must name one line, not a region. To rewrite a whole list, use "
             "operation='replace_list' with any single line of it as find_text; to change several "
             "unrelated lines, call edit_canvas once per line.")
+    # Ticking a box is NOT an in-place edit. A replacement carrying `- [x]` makes Slack build a
+    # NEW list: the item leaves its place in the document and reappears at the bottom. And
+    # stripping the box (which `_replacement_for_section` does, correctly, for a plain bullet)
+    # would land the text in place with its tick UNCHANGED — a "mark it done" that silently does
+    # nothing. Neither is acceptable, so refuse and name the operation that works.
+    if operation == "replace_section" and _CHECKBOX_RE.match(markdown):
+        return _err(
+            "use_replace_list",
+            "A checkbox cannot be ticked in place — editing one item's section either moves "
+            "it to the bottom of the canvas or leaves the tick untouched. Use "
+            "operation='replace_list' and pass the WHOLE list, with each item's box as it "
+            "should end up.")
+
+    # The arguments are sound, so from here the turn is really working: read the canvas, resolve
+    # sections, write. Claim BEFORE the first Slack call, not before the write — the ~40s the
+    # room stared at nothing was mostly this reading.
+    await _claim_work(ctx)
+
+    canvas = await _canvas_file(ctx, canvas_id)
+    if canvas is None:
+        # Not a guess about what they meant: a file id from another channel is syntactically
+        # perfect, and rewriting the wrong document is not something a user sees coming.
+        return _err("not_in_this_channel", f"{canvas_id} is not a canvas in this channel.")
+    url = canvas.get("permalink")
+    title = (canvas.get("title") or "").strip()
+
+    web = _web(ctx)
+    content = {"type": "markdown", "markdown": markdown}
 
     if operation == "append":
         changes = [{"operation": "insert_at_end", "document_content": content}]
     elif operation == "prepend":
         changes = [{"operation": "insert_at_start", "document_content": content}]
     elif operation == "replace_list":
-        if not find_text:
-            return _err("missing_find_text",
-                        "replace_list needs find_text — any line of the list you mean.")
         return await _rewrite_list(ctx, canvas_id, find_text, markdown, url=url, title=title)
     elif operation in ("insert_after", "insert_before", "replace_section", "delete_section"):
-        if not find_text:
-            return _err("missing_find_text",
-                        f"{operation} needs find_text — the block to act on.")
-
         if operation in ("insert_after", "insert_before") and _LIST_ITEM_RE.match(markdown):
             # An insert cannot put an item INSIDE a list. Probed: insert_after a list item lands
             # the content after the WHOLE list, and list markdown becomes a SECOND, separate list
@@ -1272,19 +1366,6 @@ async def execute_edit_canvas(ctx: ToolContext, args: Dict[str, Any]) -> Dict[st
                     "operation='replace_list' with any line of it as find_text and the COMPLETE "
                     "new list (old items plus new, each box as it should end up) as markdown.")
 
-        # Ticking a box is NOT an in-place edit. A replacement carrying `- [x]` makes Slack build
-        # a NEW list: the item leaves its place in the document and reappears at the bottom. And
-        # stripping the box (which `_replacement_for_section` does, correctly, for a plain bullet)
-        # would land the text in place with its tick UNCHANGED — a "mark it done" that silently
-        # does nothing. Neither is acceptable, so refuse and name the operation that works.
-        if operation == "replace_section" and _CHECKBOX_RE.match(markdown):
-            return _err(
-                "use_replace_list",
-                "A checkbox cannot be ticked in place — editing one item's section either moves "
-                "it to the bottom of the canvas or leaves the tick untouched. Use "
-                "operation='replace_list' and pass the WHOLE list, with each item's box as it "
-                "should end up.")
-
         section_id, error = await _resolve_section(ctx, canvas_id, find_text, occurrence)
         if error:
             return error
@@ -1297,7 +1378,7 @@ async def execute_edit_canvas(ctx: ToolContext, args: Dict[str, Any]) -> Dict[st
         else:
             changes = [{"operation": operation, "section_id": section_id,
                         "document_content": content}]
-    else:
+    else:  # unreachable: _EDIT_OPERATIONS was checked above. Kept so `changes` is provably bound.
         return _err("bad_operation", f"Unknown operation {operation!r}.")
 
     try:
@@ -1371,12 +1452,17 @@ async def execute_delete_canvas(ctx: ToolContext, args: Dict[str, Any]) -> Dict[
     sender_type = (getattr(msg, "metadata", None) or {}).get("sender_type") if msg is not None else None
     if sender_type != "human":
         return _err("not_human_sender", "A canvas can only be deleted at a person's request.")
-    if not await _shared_into_channel(ctx, canvas_id):
-        return _err("not_in_this_channel", f"{canvas_id} is not a canvas in this channel.")
 
     web = _web(ctx)
     if web is None:
         return _err("unavailable", "Canvases aren't available right now.")
+
+    # Authorization is settled and the client is there, so the checks from here are live Slack
+    # calls — claim before them, not before the delete itself.
+    await _claim_work(ctx)
+
+    if not await _shared_into_channel(ctx, canvas_id):
+        return _err("not_in_this_channel", f"{canvas_id} is not a canvas in this channel.")
 
     # Re-checked at execution, not just in the schema: the enum is built from a catalog that can
     # be stale, and an id is not authorization. Slack would happily delete the channel canvas.

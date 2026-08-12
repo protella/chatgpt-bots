@@ -3,6 +3,7 @@ Configuration module for Slack Bot V2
 Handles all environment variables and default settings
 """
 import logging
+import math
 import os
 import random
 import re
@@ -333,6 +334,25 @@ class BotConfig:
     link_fetch_read_timeout_s: float = field(default_factory=lambda: float(os.getenv("LINK_FETCH_READ_TIMEOUT_S", "8")))
     link_fetch_total_timeout_s: float = field(default_factory=lambda: float(os.getenv("LINK_FETCH_TOTAL_TIMEOUT_S", "12")))
     link_fetch_max_redirects: int = field(default_factory=lambda: int(os.getenv("LINK_FETCH_MAX_REDIRECTS", "5")))
+    # import_web_image — the same hardened fetcher again, but keeping the pixels fetch_url has to
+    # discard, so an image that lives at a URL can actually be posted into the conversation.
+    enable_image_import_tool: bool = field(default_factory=lambda: os.getenv(
+        "ENABLE_IMAGE_IMPORT_TOOL", "true").lower() == "true")
+    image_import_max_bytes: int = field(default_factory=lambda: int(os.getenv(
+        "IMAGE_IMPORT_MAX_BYTES", str(10 * 1024 * 1024))))
+    image_import_caption_max_chars: int = field(default_factory=lambda: int(os.getenv(
+        "IMAGE_IMPORT_CAPTION_MAX_CHARS", "500")))
+    image_import_filename_max_chars: int = field(default_factory=lambda: int(os.getenv(
+        "IMAGE_IMPORT_FILENAME_MAX_CHARS", "80")))
+    image_import_upload_margin_s: float = field(default_factory=lambda: float(os.getenv(
+        "IMAGE_IMPORT_UPLOAD_MARGIN_S", "30")))
+    # Verify-before-post: the model says what the pixels must show, and a vision call checks the
+    # fetched bytes against it BEFORE the upload. Live incident — a URL believed to be one thing
+    # was another, and the wrong picture reached the channel before the description caught it.
+    image_import_expected_max_chars: int = field(default_factory=lambda: int(os.getenv(
+        "IMAGE_IMPORT_EXPECTED_MAX_CHARS", "500")))
+    image_import_verify_timeout_s: float = field(default_factory=lambda: float(os.getenv(
+        "IMAGE_IMPORT_VERIFY_TIMEOUT_S", "45")))
     # Ambient file byte ceiling (streamed pre-download gate) — much smaller than addressed docs.
     ambient_file_max_bytes: int = field(default_factory=lambda: int(os.getenv("AMBIENT_FILE_MAX_BYTES", str(8 * 1024 * 1024))))
     ambient_artifact_retention_days: int = field(default_factory=lambda: int(os.getenv("AMBIENT_ARTIFACT_RETENTION_DAYS", "30")))
@@ -1132,6 +1152,30 @@ class BotConfig:
                 f"SEARCH_TOOL_TIMEOUT_SECONDS (got fetch={self.search_fetch_total_seconds}, "
                 f"tool={self.search_tool_timeout_seconds}): the scan has to run out of fetch "
                 "budget while it can still report what it covered.")
+        # The image import's three bounds. `float()` happily accepts 'inf' and 'nan', and both
+        # are worse here than a typo that fails to parse: a non-finite value is ADDED into the
+        # tool's registered timeout, so it silently removes the deadline from a call that posts
+        # a picture — the one place a missing deadline cannot be taken back.
+        if not (math.isfinite(self.image_import_verify_timeout_s)
+                and self.image_import_verify_timeout_s > 0):
+            raise ValueError(
+                "IMAGE_IMPORT_VERIFY_TIMEOUT_S must be a positive, finite number of seconds "
+                f"(got {self.image_import_verify_timeout_s}): it is the pre-post pixel check's "
+                "own deadline, and a check with no usable deadline either never runs or never "
+                "ends — either way an image is posted on a verdict nobody waited for.")
+        if not (math.isfinite(self.image_import_upload_margin_s)
+                and self.image_import_upload_margin_s > 0):
+            raise ValueError(
+                "IMAGE_IMPORT_UPLOAD_MARGIN_S must be a positive, finite number of seconds "
+                f"(got {self.image_import_upload_margin_s}): it is the upload's share of the "
+                "import tool's registered timeout, and without it a slow Slack upload surfaces "
+                "to the model as the import having failed while the picture still lands.")
+        if self.image_import_expected_max_chars <= 0:
+            raise ValueError(
+                "IMAGE_IMPORT_EXPECTED_MAX_CHARS must be a positive character count (got "
+                f"{self.image_import_expected_max_chars}): it caps the description the pixels "
+                "are checked against, and a non-positive cap refuses every description, so no "
+                "image could ever be imported.")
 
     def is_long_context(self, tokens: int) -> bool:
         """True when an input of `tokens` crosses OpenAI's long-context billing tier

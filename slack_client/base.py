@@ -216,6 +216,11 @@ class SlackBot(SlackMessageEventsMixin,  # type: ignore[misc]
         if config.enable_fetch_url_tool and config.enable_link_fetch:
             from message_processor.fetch_url_tool import register_fetch_url_tool
             register_fetch_url_tool(registry)
+        # Import an external image URL into the conversation (same hardened fetcher; posts the
+        # pixels fetch_url must discard). Needs the link fetcher on — the SSRF guard lives there.
+        if config.enable_image_import_tool and config.enable_link_fetch:
+            from message_processor.import_image_tool import register_import_image_tool
+            register_import_image_tool(registry)
         if config.enable_people_tools:
             register_people_tools(registry)  # F29: profile lookup + channel roster (Slack-visible only)
         if config.enable_deep_research:

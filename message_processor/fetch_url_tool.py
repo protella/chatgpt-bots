@@ -64,9 +64,14 @@ async def execute_fetch_url(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str,
         max_chars=int(config.ambient_extract_max_chars))
 
     if result.kind == "image":
+        # The one place the model reliably LEARNS a link is a direct image, so it is also where
+        # it learns there is a tool that can post the pixels this one had to throw away.
+        note = "The URL is a direct image; its content is pixels, not text."
+        if config.enable_image_import_tool and config.enable_link_fetch:
+            note += " To post it into this conversation, call import_web_image with this URL."
         return {"ok": True, "kind": "image", "final_url": result.final_url,
                 "content_type": result.content_type,
-                "note": "The URL is a direct image; its content is pixels, not text."}
+                "note": note}
     if result.kind != "text" or not result.text:
         return {"ok": False, "error": result.error_code or "fetch_failed",
                 "detail": result.error_detail, "url": url}

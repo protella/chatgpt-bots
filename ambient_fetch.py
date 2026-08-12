@@ -29,7 +29,7 @@ import re
 import socket
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from logger import setup_logger
 
@@ -375,12 +375,40 @@ def _content_type_family(content_type: Optional[str]) -> str:
     return ct
 
 
+def redact_url(url: str) -> str:
+    """url minus query, fragment, and userinfo — safe to log, store, or echo.
+
+    THE one redaction definition. A signed URL carries its bearer token in the query string and
+    a rejected `user:pass@host` carries credentials in the netloc, so anything that survives a
+    fetch — a log line, an error detail, a value handed back to the model — goes through here
+    first. Scheme, host and path are kept: that is what makes a redacted ref still identifiable.
+    """
+    try:
+        parts = urlsplit(url)
+        netloc = parts.netloc.rsplit("@", 1)[-1]
+        return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+    except Exception:  # noqa: BLE001 — an unparseable url is redacted to nothing
+        return "<unparseable-url>"
+
+
+def _transport_failure_detail(e: BaseException) -> str:
+    """What an unexpected transport failure is allowed to say: its exception CLASS, nothing else.
+
+    NOT the exception's text, and not that text with the URL substituted out. HTTP stacks
+    NORMALIZE a URL before embedding it in an exception — yarl decodes `?sig=%53ECRET` to
+    `?sig=SECRET` — so the string in the message is not the string we requested, and any
+    redaction by substring silently misses it while looking like it worked. The only detail that
+    cannot leak a signed URL is one that never contains a URL at all.
+    """
+    return type(e).__name__
+
+
 # --------------------------------------------------------------------------- fetch
 
 async def fetch_url(
     url: str, *, max_bytes: int, connect_timeout: float, read_timeout: float,
     total_timeout: float, max_redirects: int, max_chars: int,
-    dns_timeout: Optional[float] = None,
+    dns_timeout: Optional[float] = None, image_only: bool = False,
 ) -> FetchResult:
     """Fetch a URL under all SSRF/size/timeout guards. Never raises for expected failures —
     returns a FetchResult with kind='error' and an error_code from the taxonomy.
@@ -388,7 +416,12 @@ async def fetch_url(
     DNS resolution runs OFF the event loop (executor) under its own `dns_timeout`: the system
     resolver is synchronous and blocking, so a hostname whose resolution stalls would otherwise
     freeze every coroutine on the loop for the OS resolver's duration — outside all the aiohttp
-    timeouts, which only start after connect. Defaults to `connect_timeout` when unset."""
+    timeouts, which only start after connect. Defaults to `connect_timeout` when unset.
+
+    `image_only` is for the caller that wants PIXELS (import_web_image): anything the sniff does
+    not recognise as an image is refused as ERR_UNSUPPORTED_TYPE right there, before the text/PDF
+    branch — so a mislabeled 10MB PDF never reaches the synchronous extractor on the event loop
+    for a caller who would have discarded its text anyway."""
     import asyncio
 
     dns_timeout = float(connect_timeout if dns_timeout is None else dns_timeout)
@@ -404,7 +437,10 @@ async def fetch_url(
     try:
         current = validate_url(url)
     except SSRFError as e:
-        return FetchResult(kind="error", error_code=e.error_code, error_detail=str(e), final_url=url)
+        # Our OWN taxonomy message ("blocked host: x", "userinfo in url"), built from the scheme
+        # and host — structurally incapable of carrying a query string, so it needs no redaction.
+        return FetchResult(kind="error", error_code=e.error_code, error_detail=str(e),
+                           final_url=url)
 
     opener = _opener or _default_opener
     seen = set()
@@ -474,6 +510,13 @@ async def fetch_url(
                 if img_mime:
                     return FetchResult(kind="image", final_url=current, content_type=img_mime,
                                        raw_bytes=raw)
+                if image_only:
+                    # Refused HERE, before extraction: the caller wanted pixels, and running a
+                    # synchronous PDF/HTML extractor on the loop for text nobody will read is
+                    # cost with no upside.
+                    return FetchResult(kind="error", error_code=ERR_UNSUPPORTED_TYPE,
+                                       error_detail=_content_type_family(content_type) or "text",
+                                       final_url=current, content_type=content_type)
                 fam = _content_type_family(content_type)
                 if fam and fam not in _TEXTUAL_MIMES and not fam.startswith("text/"):
                     return FetchResult(kind="error", error_code=ERR_UNSUPPORTED_TYPE,
@@ -494,13 +537,17 @@ async def fetch_url(
                     pass
         return FetchResult(kind="error", error_code=ERR_REDIRECT_LIMIT, final_url=current)
     except SSRFError as e:
-        return FetchResult(kind="error", error_code=e.error_code, error_detail=str(e), final_url=current)
+        return FetchResult(kind="error", error_code=e.error_code, error_detail=str(e),
+                           final_url=current)
     except asyncio.TimeoutError:
         return FetchResult(kind="error", error_code=ERR_TIMEOUT, final_url=current)
     except Exception as e:  # noqa: BLE001 — unexpected transport failure
-        logger.debug(f"fetch_url unexpected error for {current}: {e}")
-        return FetchResult(kind="error", error_code=ERR_DECODE_FAILED, error_detail=str(e),
-                           final_url=current)
+        # The ONE site whose detail is a foreign exception's text with the request URL inside it.
+        # Both the log line and the returned detail take the class alone — see
+        # _transport_failure_detail for why substituting the URL out is not good enough.
+        logger.debug(f"fetch_url unexpected error for {redact_url(current)}: {type(e).__name__}")
+        return FetchResult(kind="error", error_code=ERR_DECODE_FAILED,
+                           error_detail=_transport_failure_detail(e), final_url=current)
 
 
 def _extract(raw: bytes, fam: str, *, max_chars: int) -> Tuple[Optional[str], Optional[str]]:

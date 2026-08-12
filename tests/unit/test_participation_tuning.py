@@ -561,23 +561,41 @@ async def test_name_resolution_budget_favours_the_newest_speakers():
 
 
 def test_no_special_case_and_no_reply_lever_returns_to_the_gate_prompt():
-    """The reverted levers, as one inverted guard against the prompt that exists now.
+    """The reverted levers — one still retired, one deliberately brought back NARROWED.
 
     Two separate reversals, both about the same mistake — teaching the gate to WANT an outcome:
 
     * the room-humour lean. The owner asked for a slight bias toward reacting to funny posts;
       measured live it fired on 5 of 5 jokes and the verdict was that the bot reacts "the same way
       over and over". A per-topic special case is the wrong lever, and the reference implementation
-      has no humour clause at all.
+      has no humour clause at all. This one is STILL retired, and still asserted as an absence.
     * the banter licence. "Playful teasing aimed AT the assistant is participation-worthy... an
       invitation to play along" is why the bot answered "Chatgpt, you are right!" 52 seconds after
       being told to hush. Removing it took that scenario from 0/6 to passing.
 
-    Under a binary gate these would be worse, not better: the gate cannot react or play along at
-    all, so a clause pushing it toward either can only make it wake on things nobody addressed. The
-    emoji-vs-nothing preference the humour lean qualified is the RESPONDER's to make now, which is
-    why nothing positive is asserted here."""
+    OWNER REVERSAL, 2026-08-11: the second lever is back, and this test records it rather than
+    guarding against it. The owner ruled that banter about the assistant is partly the assistant's
+    own moment and should wake it. What returned is NOT the old licence: the old clause told the
+    gate that teasing was "participation-worthy" and "an invitation to play along" — an appetite
+    for an outcome, which is what produced the 52-second incident. The new criterion is one-sided
+    and evidence-bound: it wakes only when the shown messages make it THIS assistant, it says in
+    the same breath that the woken turn may be a reaction or nothing at all, and it explicitly
+    sleeps through general-AI/other-bot banter and ambiguous "the bot". The closing doubt rule
+    carries the same carve-out, so the two do not contradict.
+
+    The 52-second scenario itself is not re-litigated here; a hush is an instruction the responder
+    holds, and the gate's job is still one bit. The emoji-vs-nothing preference the humour lean
+    qualified remains the RESPONDER's to make, which is why nothing positive is asserted about it.
+    """
     p = WAKE_CLASSIFIER_SYSTEM_PROMPT
-    for lever in ("Room-wide humour", "lean slightly toward reacting", "invitation to play along",
-                  "participation-worthy", "prefer nothing"):
+    for lever in ("Room-wide humour", "lean slightly toward reacting", "prefer nothing"):
         assert lever not in p, f"a retired participation lever is back in the gate prompt: {lever}"
+    # The narrowed successor to the banter licence, as it now reads. Asserted positively: absence
+    # of assistant-directed wake language is no longer the contract.
+    assert "the room is talking about the assistant ITSELF" in p
+    assert "This means THIS assistant, unmistakably, from what the messages themselves show" in p
+    assert "it may still answer with just a reaction, or nothing" in p
+    assert ("banter that merely mentions bots or AI in general, or some other bot, with nothing "
+            "asked of anyone, stays ordinary banter and sleeps") in p
+    assert ("leave it alone; only banter unmistakably about this assistant itself wakes it, "
+            "as above") in p

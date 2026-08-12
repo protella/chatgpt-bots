@@ -10,6 +10,16 @@ from config import clamp_effort, config
 _MAX_ANALYSIS_CHARS = 200_000
 
 
+def _safe_detail(error: BaseException, sensitive: bool) -> str:
+    """What an exception is allowed to say in a log line on this path.
+
+    Under `sensitive`, the CLASS is the whole line. Providers quote the offending request back in
+    their error text, so `str(e)` on a vision failure can be the entire payload — which, for the
+    import verifier, is a caller's description plus a base64 picture.
+    """
+    return type(error).__name__ if sensitive else str(error)
+
+
 async def analyze_images(
     client,
     images: List[str],
@@ -21,16 +31,29 @@ async def analyze_images(
     model: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     verbosity: Optional[str] = None,
+    max_output_tokens: Optional[int] = None,
+    sensitive: bool = False,
 ) -> str:
     """Analyze one or more images with a question.
 
     `model`/`reasoning_effort`/`verbosity` override the analysis defaults (config.gpt_model +
     config.analysis_*) — the ambient vision worker routes through the utility model so a message
-    the bot never answered doesn't spend primary-model reasoning. Omitted → original behavior."""
+    the bot never answered doesn't spend primary-model reasoning. Omitted → original behavior.
+
+    `max_output_tokens` overrides `config.vision_max_tokens`, which is sized for a full
+    description; a caller wanting one short line has no business holding an 8192-token budget.
+
+    `sensitive=True` says the REQUEST itself must never reach a log: every exception log on this
+    path then names the exception CLASS and nothing else — no `str(e)`, no `exc_info`. A provider
+    error routinely quotes the request back, and for the import verifier the request is the
+    caller's description plus a base64 picture. Default False keeps the existing logging exactly.
+    """
 
     self = client
     detail = detail or config.default_detail_level
     vision_model = model or config.gpt_model
+    vision_max_output = (config.vision_max_tokens if max_output_tokens is None
+                         else max_output_tokens)
     # Route through clamp_effort so a legacy/stored 'minimal' (a hard 400 on the 5.6 family)
     # can never reach the API. This is the effort used by BOTH request-building branches
     # (streaming + non-streaming), so clamping once here covers them both.
@@ -107,7 +130,7 @@ async def analyze_images(
             request_params = {
                 "model": vision_model,
                 "input": input_messages,
-                "max_output_tokens": config.vision_max_tokens,
+                "max_output_tokens": vision_max_output,
                 "store": False,
                 "stream": True,
             }
@@ -125,6 +148,7 @@ async def analyze_images(
             stream = await self._safe_api_call(
                 self.client.responses.create,
                 operation_type="vision_analysis",
+                sensitive=sensitive,
                 **request_params,
             )
 
@@ -214,12 +238,15 @@ async def analyze_images(
                                 if hasattr(result, '__await__'):
                                     await result
                             except Exception as callback_error:
-                                self.log_warning(f"Stream completion callback error: {callback_error}")
+                                self.log_warning(
+                                    "Stream completion callback error: "
+                                    f"{_safe_detail(callback_error, sensitive)}")
                         break
                     else:
                         continue
                 except Exception as event_error:
-                    self.log_warning(f"Error processing vision stream event: {event_error}")
+                    self.log_warning("Error processing vision stream event: "
+                                     f"{_safe_detail(event_error, sensitive)}")
                     continue
 
             if stream_failed:
@@ -232,7 +259,7 @@ async def analyze_images(
             request_params = {
                 "model": vision_model,
                 "input": input_messages,
-                "max_output_tokens": config.vision_max_tokens,  # Use higher limit for vision with reasoning
+                "max_output_tokens": vision_max_output,  # Vision's own budget unless overridden
                 "store": False,
             }
 
@@ -247,6 +274,7 @@ async def analyze_images(
             response = await self._safe_api_call(
                 self.client.responses.create,
                 operation_type="vision_analysis",
+                sensitive=sensitive,
                 **request_params,
             )
 
@@ -282,5 +310,8 @@ async def analyze_images(
             return output_text
 
     except Exception as e:
-        self.log_error(f"Error analyzing images: {e}", exc_info=True)
+        # `exc_info` is withheld under `sensitive` as deliberately as the message is: a traceback
+        # carries the chained cause, and the cause is the exception that quoted the request.
+        self.log_error(f"Error analyzing images: {_safe_detail(e, sensitive)}",
+                       exc_info=not sensitive)
         raise

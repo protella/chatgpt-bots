@@ -1,4 +1,5 @@
 """F36 — canvas tools: create, read, edit, list."""
+import inspect
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -1471,3 +1472,257 @@ class TestCatalogEvidence:
         # can drop entries without shredding one.
         assert len(lines) == 7
         assert all("\n" not in line for line in lines)
+
+
+_REMOTE_CALLS = ("files_info", "files_list", "conversations_info", "canvases_edit",
+                 "canvases_delete", "canvases_sections_lookup", "canvases_create",
+                 "conversations_canvases_create", "canvases_access_set")
+
+
+def _turn(ctx, *, raises=False):
+    """Attach a stub turn whose claim_work is observable. Returns the mock for assertions."""
+    turn = MagicMock()
+    turn.claim_work = AsyncMock(
+        side_effect=RuntimeError("slack said no") if raises else None)
+    ctx.turn = turn
+    return turn
+
+
+def _ordered(ctx, web):
+    """Record the claim and every Slack call in ONE list, so their ORDER can be asserted.
+
+    That both happened is not the contract: a claim is worthless if it lands after the work it
+    was meant to announce, and a test that only counts calls stays green when the claim slides
+    to the bottom of the function.
+    """
+    calls = []
+    turn = MagicMock()
+
+    async def _claim(*_a, **_k):
+        calls.append("claim")
+
+    turn.claim_work = AsyncMock(side_effect=_claim)
+    ctx.turn = turn
+
+    def _wrap(name, mock):
+        previous, value = mock.side_effect, mock.return_value
+
+        async def recorder(*a, **k):
+            calls.append(name)
+            if previous is None:
+                return value
+            outcome = previous(*a, **k)
+            return await outcome if inspect.isawaitable(outcome) else outcome
+
+        mock.side_effect = recorder
+
+    for attr in _REMOTE_CALLS:
+        _wrap(attr, getattr(web, attr))
+    _wrap("download_file", ctx.client.download_file)
+    return calls
+
+
+@pytest.mark.unit
+class TestTheWorkClaim:
+    """Canvas work stakes the 👀 claim, because it is slow and otherwise invisible.
+
+    Seen live: a canvas edit ran ~40s of read/edit calls with nothing in the room to show the bot
+    was working, then a reply appeared out of nowhere. `TurnRuntime.claim_work` is the standing
+    mechanism; where each call sits is the owner's 2026-08-11 ruling — EARLY visibility beats
+    strict refusal-purity. So the claim goes after the checks the ARGUMENTS alone can settle
+    (those refuse for free and must not flash an eye) and before the path's first REMOTE call,
+    which means a refusal that needed a network round-trip to discover may keep its claim.
+    """
+
+    async def test_an_edit_claims_the_work_once(self):
+        ctx, web = _ctx()
+        turn = _turn(ctx)
+        out = await ct.execute_edit_canvas(
+            ctx, {"canvas_id": "F123", "operation": "append", "markdown": "more"})
+
+        assert out["ok"] is True
+        turn.claim_work.assert_awaited_once()
+        web.canvases_edit.assert_awaited_once()
+
+    async def test_a_create_claims_the_work_once(self):
+        ctx, _ = _ctx()
+        turn = _turn(ctx)
+        out = await ct.execute_create_channel_canvas(ctx, {"title": "Plan", "markdown": "Ship it"})
+
+        assert out["ok"] is True
+        turn.claim_work.assert_awaited_once()
+
+    async def test_a_delete_claims_the_work_once(self):
+        ctx, _ = _delete_ctx()
+        turn = _turn(ctx)
+        out = await ct.execute_delete_canvas(ctx, {"canvas_id": "F123"})
+
+        assert out["ok"] is True
+        turn.claim_work.assert_awaited_once()
+
+    async def test_a_list_rewrite_claims_the_work_once(self):
+        # replace_list leaves execute_edit_canvas early and does its writing in _rewrite_list —
+        # the SLOWEST edit path (1 + N calls). It is claimed by its caller, before the dispatch.
+        ctx, _ = TestChecklists()._ctx_with("- [ ] alpha\n- [ ] beta")
+        turn = _turn(ctx)
+        out = await ct.execute_edit_canvas(ctx, {
+            "canvas_id": "F123", "operation": "replace_list", "find_text": "beta",
+            "markdown": "- [ ] alpha\n- [x] beta"})
+
+        assert out["ok"] is True
+        turn.claim_work.assert_awaited_once()
+
+    async def test_the_claim_comes_before_the_first_slack_call(self):
+        # The ordering is the whole point: a claim that lands after the work announces nothing.
+        # Asserted on every mutating path, against the FIRST remote call each one makes.
+        for label, run in (
+            ("edit", lambda c: ct.execute_edit_canvas(
+                c, {"canvas_id": "F123", "operation": "append", "markdown": "more"})),
+            ("create", lambda c: ct.execute_create_channel_canvas(
+                c, {"title": "Plan", "markdown": "Ship it"})),
+        ):
+            ctx, web = _ctx()
+            calls = _ordered(ctx, web)
+            assert (await run(ctx))["ok"] is True
+            assert calls[0] == "claim", f"{label} talked to Slack before claiming: {calls}"
+
+        ctx, web = _delete_ctx()
+        calls = _ordered(ctx, web)
+        assert (await ct.execute_delete_canvas(ctx, {"canvas_id": "F123"}))["ok"] is True
+        assert calls[0] == "claim", f"delete talked to Slack before claiming: {calls}"
+
+        ctx, web = TestChecklists()._ctx_with("- [ ] alpha\n- [ ] beta")
+        calls = _ordered(ctx, web)
+        assert (await ct.execute_edit_canvas(ctx, {
+            "canvas_id": "F123", "operation": "replace_list", "find_text": "beta",
+            "markdown": "- [ ] alpha\n- [x] beta"}))["ok"] is True
+        assert calls[0] == "claim", f"replace_list talked to Slack before claiming: {calls}"
+
+    async def test_a_refusal_the_arguments_alone_decide_does_not_claim(self):
+        # The eye means "I am doing this". These cost nothing and reach no one, so an eye over
+        # them is a lie — and all four are decidable before a single Slack call.
+        refusals = (
+            ({"canvas_id": "F123", "operation": "replace_section", "markdown": "x"},
+             "missing_find_text"),
+            ({"canvas_id": "F123", "operation": "sideways", "markdown": "x"}, "bad_operation"),
+            ({"canvas_id": "F123", "operation": "replace_section", "markdown": "x",
+              "find_text": "one\ntwo"}, "find_text_spans_multiple_lines"),
+            ({"canvas_id": "F123", "operation": "replace_section", "find_text": "beta",
+              "markdown": "- [x] beta"}, "use_replace_list"),
+            # Scaffolding-only anchors. Nonempty, so the "did you pass find_text?" check waves
+            # them through — and `_searchable` then reduces them to nothing, which matches
+            # everything. Both operations must refuse before spending anything.
+            ({"canvas_id": "F123", "operation": "replace_list", "find_text": "**",
+              "markdown": "- [x] beta"}, "missing_find_text"),
+            ({"canvas_id": "F123", "operation": "replace_section", "find_text": "- ",
+              "markdown": "beta"}, "missing_find_text"),
+        )
+        for args, expected in refusals:
+            ctx, web = _ctx()
+            calls = _ordered(ctx, web)
+            out = await ct.execute_edit_canvas(ctx, args)
+
+            assert out["error"] == expected
+            assert calls == [], f"{expected} claimed or called Slack: {calls}"
+
+    async def test_a_refusal_only_slack_could_reveal_keeps_its_claim(self):
+        # The 2026-08-11 ruling, stated as a test. By the time _rewrite_list finds the list item
+        # ambiguous it has read the canvas and looked its sections up — the room HAS been waiting
+        # on real work, so the eye was earned. Retracting it to keep the gate pure was the thing
+        # the owner rejected.
+        ctx, web = TestChecklists()._ctx_with("- [ ] alpha\n- [ ] beta")
+        web.canvases_sections_lookup = AsyncMock(
+            return_value={"sections": [{"id": "a"}, {"id": "b"}]})
+        turn = _turn(ctx)
+        out = await ct.execute_edit_canvas(ctx, {
+            "canvas_id": "F123", "operation": "replace_list", "find_text": "beta",
+            "markdown": "- [x] beta"})
+
+        assert out["error"] == "ambiguous_list_item"
+        turn.claim_work.assert_awaited_once()
+        web.canvases_edit.assert_not_awaited()
+
+    async def test_a_refused_delete_does_not_claim(self):
+        # Authorization is read off the context, not off Slack, so it is a free refusal.
+        ctx, web = _delete_ctx(authorized=False)
+        turn = _turn(ctx)
+        out = await ct.execute_delete_canvas(ctx, {"canvas_id": "F123"})
+
+        assert out["error"] == "not_authorized"
+        turn.claim_work.assert_not_awaited()
+        web.canvases_delete.assert_not_awaited()
+
+    async def test_a_turnless_context_still_edits(self):
+        # Not every caller has a TurnRuntime (the CLI surface, and every test above this one).
+        # The claim is presentation; its absence must not cost the edit.
+        ctx, web = _ctx()
+        assert getattr(ctx, "turn", None) is None
+        out = await ct.execute_edit_canvas(
+            ctx, {"canvas_id": "F123", "operation": "append", "markdown": "more"})
+
+        assert out["ok"] is True
+        web.canvases_edit.assert_awaited_once()
+
+    async def test_a_failed_claim_does_not_fail_the_edit(self):
+        # An emoji is never worth failing a turn over — claim_work is documented as fails-silent,
+        # and this holds our side of that bargain.
+        ctx, web = _ctx()
+        turn = _turn(ctx, raises=True)
+        out = await ct.execute_edit_canvas(
+            ctx, {"canvas_id": "F123", "operation": "append", "markdown": "more"})
+
+        assert out["ok"] is True
+        turn.claim_work.assert_awaited_once()
+        web.canvases_edit.assert_awaited_once()
+
+    async def test_reads_do_not_claim(self):
+        # Reads are quick and commit to nothing, the same reason a history fetch does not claim.
+        ctx, _ = _ctx()
+        turn = _turn(ctx)
+        assert (await ct.execute_read_canvas(ctx, {"canvas_id": "F123"}))["ok"] is True
+        assert (await ct.execute_list_canvases(ctx, {}))["ok"] is True
+        turn.claim_work.assert_not_awaited()
+
+
+@pytest.mark.unit
+class TestAnAnchorMustNameSomething:
+    """An anchor of pure markdown scaffolding rewrote the WRONG list and reported success.
+
+    `find_text="**"` is not empty, so the "did you pass an anchor?" check let it through, and
+    `_searchable` then stripped it to "" — an empty needle, which `in` finds inside every list
+    item. So `_list_block_around` returned the canvas's FIRST list, `_rewrite_list` rewrote it
+    with the model's markdown, and the tool answered ok. The user's other list, silently gone.
+
+    Two guards, because one was clearly not enough: the arguments are refused up front, and the
+    matcher itself now declines to match on nothing.
+    """
+
+    async def test_scaffolding_only_find_text_never_reaches_a_list(self):
+        ctx, web = TestChecklists()._ctx_with("- [ ] alpha\n- [ ] beta")
+        out = await ct.execute_edit_canvas(ctx, {
+            "canvas_id": "F123", "operation": "replace_list", "find_text": "**",
+            "markdown": "- [x] gamma"})
+
+        assert out["error"] == "missing_find_text"
+        web.canvases_edit.assert_not_awaited()          # the list is untouched
+        web.files_info.assert_not_awaited()             # and nothing was spent finding that out
+
+    async def test_a_section_operation_refuses_the_same_anchor_for_free(self):
+        # It always refused this one — but in `_resolve_section`, after a files.info round trip.
+        ctx, web = _ctx()
+        out = await ct.execute_edit_canvas(ctx, {
+            "canvas_id": "F123", "operation": "replace_section", "find_text": "**",
+            "markdown": "beta"})
+
+        assert out["error"] == "missing_find_text"
+        web.files_info.assert_not_awaited()
+        web.canvases_sections_lookup.assert_not_awaited()
+
+    def test_a_needle_with_no_word_in_it_matches_no_list(self):
+        # The backstop, unit-tested directly: no future caller gets the first list by accident.
+        markdown = "- alpha\n- beta"
+        assert ct._list_block_around(markdown, "") is None
+        assert ct._list_block_around(markdown, "**") is None
+        assert ct._list_block_around(markdown, "- ") is None
+        # ...while a real anchor still finds its list.
+        assert ct._list_block_around(markdown, "beta") == ["alpha", "beta"]

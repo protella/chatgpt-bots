@@ -513,3 +513,36 @@ def test_the_answering_path_defaults_to_full_fidelity():
     with patch.dict(os.environ, {}, clear=True):
         fresh = BotConfig()
     assert fresh.default_detail_level == "auto"
+
+
+# ------------------------------------------------------- the decompression-bomb ceiling (F51b)
+#
+# `import_web_image` holds bytes off the open web, and a sub-10MB PNG can declare a frame that
+# decodes to hundreds of megabytes. `max_pixels` refuses that from the HEADER — before the decode
+# that would spend the memory. Every existing caller omits it and is unaffected.
+
+def test_an_over_cap_frame_is_refused_before_verify_or_load(monkeypatch):
+    """The point of a header check is that no decode happens. If either of these runs, the guard
+    is doing its work after the cost it exists to avoid."""
+    from PIL import Image as PILImage
+
+    raw = _png()   # encoded BEFORE the patch — Pillow's own save() calls load()
+
+    def _forbidden(self, *a, **k):
+        raise AssertionError("the image was decoded despite the pixel cap")
+
+    monkeypatch.setattr(PILImage.Image, "verify", _forbidden)
+    monkeypatch.setattr(PILImage.Image, "load", _forbidden)
+
+    mime, reason = validate_image_bytes(raw, max_pixels=0)
+    assert mime is None and reason == UNREADABLE
+
+
+def test_a_small_image_passes_with_the_cap_set():
+    mime, reason = validate_image_bytes(_png(), max_pixels=image_validation._MAX_TRANSCODE_PIXELS)
+    assert mime == "image/png" and reason is None
+
+
+def test_omitting_the_cap_leaves_existing_behavior_exactly_as_it_was():
+    assert validate_image_bytes(_png()) == ("image/png", None)
+    assert validate_image_bytes(b"\x89PNG\r\n\x1a\n" + b"junk" * 8) == (None, UNREADABLE)
