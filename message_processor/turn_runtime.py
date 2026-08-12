@@ -93,10 +93,6 @@ class AuthorizedEditTarget:
 # alternative is settling this turn's receipts while a task that can still post is running.
 TOOL_FLIGHT_CANCEL_GRACE_SECONDS = 5.0
 
-# How many hosted web searches a turn makes before the 👀 is earned. One is a fact-check on a
-# fast reply; two means the turn is hunting, and the user is now waiting with nothing to look at.
-_WEB_SEARCH_CLAIM_AT = 2
-
 # NO fixed bound on waiting for a held lease. There was one (30s), and it was shorter than a
 # single Slack multipart send can legitimately take — so settlement could finalize a turn's
 # receipts while its own post was still being accepted, which is the exact race the lease exists
@@ -491,11 +487,6 @@ class TurnRuntime:
     ack_attempt_id: Optional[str] = None
     visible_action_committed: bool = False
     _claiming: bool = field(default=False, repr=False)
-    # Web searches this turn has STARTED, counted by note_search_event. On the TURN rather than in
-    # the streaming handler's closure because an MCP failover RE-ENTERS that handler with a fresh
-    # closure: one search before the failover and one after is still a hunt, but a closure counter
-    # restarts at zero and the eye never lands.
-    _web_search_starts: int = field(default=0, repr=False)
     # --- the channel stream this turn is answering from (spec §1-§4) ---
     # H, pinned at admission and NEVER refreshed. Every fetch, every window predicate and every
     # retry reads this one value, so two attempts of one turn cannot answer different questions.
@@ -777,25 +768,6 @@ class TurnRuntime:
         for name in (names or ()):
             if name and name not in self.provenance_external_tools:
                 self.provenance_external_tools.append(str(name))
-
-    def note_search_event(self, tool_type: str, status: str) -> bool:
-        """Record one hosted-search event and say whether the 👀 work claim is now earned.
-
-        Only a web_search "started" event counts: "searching" is a phase of a call already
-        running and "completed" is its end, so neither is a new search. The first search stays
-        silent (a fact-check on a fast reply); the second means the turn is hunting and the user
-        is waiting on it, so it claims.
-
-        Returns True on the crossing search AND on every one after it — `claim_work` is already
-        the idempotent guard against a second eye, and a "have I claimed?" flag here could only
-        disagree with the lease it duplicates.
-
-        Never raises: a counter does not get to break a stream.
-        """
-        if tool_type != "web_search" or status != "started":
-            return False
-        self._web_search_starts += 1
-        return self._web_search_starts >= _WEB_SEARCH_CLAIM_AT
 
     @property
     def committed_destinations(self) -> List[DestinationRecord]:

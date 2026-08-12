@@ -725,9 +725,8 @@ class TestServiceTier:
 # ============================================ import_web_image's knobs
 
 class TestImageImportConfig:
-    """Limits approved by the owner (10 MB / 500 / 80 / +30s, and 500 / 45s for the pre-post
-    check). The byte cap is deliberately LARGER than LINK_FETCH_MAX_BYTES: a page's text fits in
-    2 MB and a radar loop does not."""
+    """Limits approved by the owner (10 MB / 500 / 80 / +30s). The byte cap is deliberately
+    LARGER than LINK_FETCH_MAX_BYTES: a page's text fits in 2 MB and a radar loop does not."""
 
     def test_defaults(self):
         config = BotConfig()
@@ -736,8 +735,6 @@ class TestImageImportConfig:
         assert config.image_import_caption_max_chars == 500
         assert config.image_import_filename_max_chars == 80
         assert config.image_import_upload_margin_s == 30.0
-        assert config.image_import_expected_max_chars == 500
-        assert config.image_import_verify_timeout_s == 45.0
 
     @patch.dict(os.environ, {
         "ENABLE_IMAGE_IMPORT_TOOL": "false",
@@ -745,8 +742,6 @@ class TestImageImportConfig:
         "IMAGE_IMPORT_CAPTION_MAX_CHARS": "40",
         "IMAGE_IMPORT_FILENAME_MAX_CHARS": "12",
         "IMAGE_IMPORT_UPLOAD_MARGIN_S": "5.5",
-        "IMAGE_IMPORT_EXPECTED_MAX_CHARS": "120",
-        "IMAGE_IMPORT_VERIFY_TIMEOUT_S": "7.5",
     })
     def test_env_overrides(self):
         config = BotConfig()
@@ -755,25 +750,17 @@ class TestImageImportConfig:
         assert config.image_import_caption_max_chars == 40
         assert config.image_import_filename_max_chars == 12
         assert config.image_import_upload_margin_s == 5.5
-        assert config.image_import_expected_max_chars == 120
-        assert config.image_import_verify_timeout_s == 7.5
 
     @pytest.mark.parametrize("var,bad", [
-        ("IMAGE_IMPORT_VERIFY_TIMEOUT_S", "0"),
-        ("IMAGE_IMPORT_VERIFY_TIMEOUT_S", "-1"),
-        ("IMAGE_IMPORT_VERIFY_TIMEOUT_S", "inf"),
-        ("IMAGE_IMPORT_VERIFY_TIMEOUT_S", "nan"),
         ("IMAGE_IMPORT_UPLOAD_MARGIN_S", "0"),
         ("IMAGE_IMPORT_UPLOAD_MARGIN_S", "-30"),
         ("IMAGE_IMPORT_UPLOAD_MARGIN_S", "inf"),
         ("IMAGE_IMPORT_UPLOAD_MARGIN_S", "nan"),
-        ("IMAGE_IMPORT_EXPECTED_MAX_CHARS", "0"),
-        ("IMAGE_IMPORT_EXPECTED_MAX_CHARS", "-5"),
-        ("IMAGE_IMPORT_VERIFY_TIMEOUT_S", "-inf"),
+        ("IMAGE_IMPORT_UPLOAD_MARGIN_S", "-inf"),
     ])
     def test_an_unusable_value_refuses_to_boot_and_names_itself(self, var, bad):
-        """`float()` accepts 'inf' and 'nan', so parsing is not validation. Both timeouts are
-        ADded into the import tool's registered timeout — a non-finite one silently removes the
+        """`float()` accepts 'inf' and 'nan', so parsing is not validation. The margin is ADDED
+        into the import tool's registered timeout — a non-finite one silently removes the
         deadline from the one call that posts a picture, and there is no taking that back."""
         with patch.dict(os.environ, {var: bad}):
             with pytest.raises(ValueError) as excinfo:
@@ -783,9 +770,7 @@ class TestImageImportConfig:
         assert bad in message, f"the refusal must quote the value it rejected, got: {message}"
 
     @pytest.mark.parametrize("var,good", [
-        ("IMAGE_IMPORT_VERIFY_TIMEOUT_S", "0.5"),
         ("IMAGE_IMPORT_UPLOAD_MARGIN_S", "0.5"),
-        ("IMAGE_IMPORT_EXPECTED_MAX_CHARS", "1"),
     ])
     def test_a_small_but_usable_value_still_loads(self, var, good):
         """The check rejects unusable, not unusual — a short deadline is an owner's choice."""

@@ -346,13 +346,6 @@ class BotConfig:
         "IMAGE_IMPORT_FILENAME_MAX_CHARS", "80")))
     image_import_upload_margin_s: float = field(default_factory=lambda: float(os.getenv(
         "IMAGE_IMPORT_UPLOAD_MARGIN_S", "30")))
-    # Verify-before-post: the model says what the pixels must show, and a vision call checks the
-    # fetched bytes against it BEFORE the upload. Live incident — a URL believed to be one thing
-    # was another, and the wrong picture reached the channel before the description caught it.
-    image_import_expected_max_chars: int = field(default_factory=lambda: int(os.getenv(
-        "IMAGE_IMPORT_EXPECTED_MAX_CHARS", "500")))
-    image_import_verify_timeout_s: float = field(default_factory=lambda: float(os.getenv(
-        "IMAGE_IMPORT_VERIFY_TIMEOUT_S", "45")))
     # Ambient file byte ceiling (streamed pre-download gate) — much smaller than addressed docs.
     ambient_file_max_bytes: int = field(default_factory=lambda: int(os.getenv("AMBIENT_FILE_MAX_BYTES", str(8 * 1024 * 1024))))
     ambient_artifact_retention_days: int = field(default_factory=lambda: int(os.getenv("AMBIENT_ARTIFACT_RETENTION_DAYS", "30")))
@@ -1152,17 +1145,10 @@ class BotConfig:
                 f"SEARCH_TOOL_TIMEOUT_SECONDS (got fetch={self.search_fetch_total_seconds}, "
                 f"tool={self.search_tool_timeout_seconds}): the scan has to run out of fetch "
                 "budget while it can still report what it covered.")
-        # The image import's three bounds. `float()` happily accepts 'inf' and 'nan', and both
-        # are worse here than a typo that fails to parse: a non-finite value is ADDED into the
-        # tool's registered timeout, so it silently removes the deadline from a call that posts
-        # a picture — the one place a missing deadline cannot be taken back.
-        if not (math.isfinite(self.image_import_verify_timeout_s)
-                and self.image_import_verify_timeout_s > 0):
-            raise ValueError(
-                "IMAGE_IMPORT_VERIFY_TIMEOUT_S must be a positive, finite number of seconds "
-                f"(got {self.image_import_verify_timeout_s}): it is the pre-post pixel check's "
-                "own deadline, and a check with no usable deadline either never runs or never "
-                "ends — either way an image is posted on a verdict nobody waited for.")
+        # `float()` happily accepts 'inf' and 'nan', and both are worse here than a typo that
+        # fails to parse: a non-finite value is ADDED into the tool's registered timeout, so it
+        # silently removes the deadline from a call that posts a picture — the one place a
+        # missing deadline cannot be taken back.
         if not (math.isfinite(self.image_import_upload_margin_s)
                 and self.image_import_upload_margin_s > 0):
             raise ValueError(
@@ -1170,12 +1156,6 @@ class BotConfig:
                 f"(got {self.image_import_upload_margin_s}): it is the upload's share of the "
                 "import tool's registered timeout, and without it a slow Slack upload surfaces "
                 "to the model as the import having failed while the picture still lands.")
-        if self.image_import_expected_max_chars <= 0:
-            raise ValueError(
-                "IMAGE_IMPORT_EXPECTED_MAX_CHARS must be a positive character count (got "
-                f"{self.image_import_expected_max_chars}): it caps the description the pixels "
-                "are checked against, and a non-positive cap refuses every description, so no "
-                "image could ever be imported.")
 
     def is_long_context(self, tokens: int) -> bool:
         """True when an input of `tokens` crosses OpenAI's long-context billing tier

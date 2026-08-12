@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.1.1] - 2026-08-12
+
+### 🔧 Changed
+
+- **The bot posts the picture when the question is what something looks like.** "What does X
+  look like?" now gets the photo itself (checked before posting, as always) with the words as
+  caption, instead of a link to go look at.
+- **The 👀 acknowledgment appears on the first web search**, not the second — any web hunt
+  shows it's being worked on immediately.
+- **Animated GIFs are declined by the image import** (their pixels can't be checked frame by
+  frame); still images, including single-frame GIFs, are checked and posted as before. A
+  declined import is final — the bot won't fetch the same image another way.
+- **The default per-reply tool budget is now 10** (`MAX_TOOL_CALLS_PER_TURN`, was 8).
+
+### 🔥 Removed
+
+- **The 3.1.0 image-import check lost its over-engineering.** Gone: the separate verify
+  timeout and description length cap (`IMAGE_IMPORT_VERIFY_TIMEOUT_S` and
+  `IMAGE_IMPORT_EXPECTED_MAX_CHARS` no longer exist — delete them from your `.env` if
+  present), the strict verdict grammar, the output sanitizers, and the special error
+  routing. The check itself is unchanged: wrong pixels still never get posted; if the check
+  itself errors, the image posts and the reply says the check was skipped.
+
 ## [3.1.0] - 2026-08-12
 
 ### ✨ Added

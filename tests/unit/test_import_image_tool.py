@@ -15,9 +15,8 @@ promises rather than the download:
 * once the picture is IN Slack, nothing afterwards may report failure — a bookkeeping error that
   surfaced as `import_failed` would invite a retry that posts it a second time;
 * the pixels are CHECKED before they are posted — the live miss this closes had a supermarket
-  aisle reaching the channel under the belief it was the White House. So the verdict matrix
-  fails CLOSED: only the checker's own transport failure or deadline lets an unverified picture
-  through, and `expected` never survives into a log line, a row or the catalog.
+  aisle reaching the channel under the belief it was the White House. A verifier that says no
+  posts nothing; a check that could not run at all posts the image and says so.
 
 `publish_image` is mocked in the executor tests, so its own new branches are covered directly
 further down.
@@ -33,8 +32,6 @@ from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
-import httpx
-import openai
 import pytest
 from PIL import Image
 
@@ -44,7 +41,6 @@ from config import config
 from message_processor import image_delivery, image_view
 from message_processor import import_image_tool as iit
 from message_processor.turn_runtime import TurnRuntime
-from openai_client.base import OpenAIClient
 from openai_client.utilities import ImageData
 from tool_registry import ToolContext, ToolRegistry
 
@@ -70,9 +66,14 @@ def _gif() -> bytes:
 
 
 def _animated_gif() -> bytes:
-    """A REAL two-frame animation — a still GIF would prove nothing about frame extraction."""
+    """A REAL two-frame animation — a still GIF would prove nothing about the animation check.
+
+    The frames must differ in RENDERED pixels, not just in palette index: two `P`-mode frames
+    filled with indices that resolve to the same colour are identical once written, and Pillow
+    collapses them into a one-frame GIF that reads back as `is_animated=False`.
+    """
     buf = BytesIO()
-    frames = [Image.new("P", (4, 4), 0), Image.new("P", (4, 4), 1)]
+    frames = [Image.new("RGB", (4, 4), colour).convert("P") for colour in ("red", "blue")]
     frames[0].save(buf, format="GIF", save_all=True, append_images=frames[1:], duration=100)
     return buf.getvalue()
 
@@ -83,9 +84,9 @@ JUNK_WITH_PNG_MAGIC = b"\x89PNG\r\n\x1a\n" + b"not actually a png" * 8
 
 # --------------------------------------------------------------------------------- the seams
 
-# What a well-behaved verifier says about the 1×1 red PNG above, in the machine grammar the
-# executor parses. Every test that expects a POST relies on this default.
-VERDICT_OK = "YES|a small solid red image"
+# What a well-behaved verifier says about the 1×1 red PNG above. Every test that expects a POST
+# relies on this default.
+VERDICT_OK = "YES — a small solid red image"
 EXPECTED = "a solid red test image"
 
 
@@ -625,8 +626,8 @@ async def test_a_cancelled_dispatch_does_not_stop_the_upload_it_already_started(
 #
 # The live miss: a URL the model believed showed the White House was a supermarket aisle, and the
 # picture was in the channel before the detached description ever looked at it. The check is a
-# GATE, so what these tests hold is that it fails CLOSED — a verdict that is not a plain YES, and
-# a reply this code cannot read, both post nothing at all.
+# GATE on one outcome only — the verifier looked and said no. A check that never ran is not
+# evidence about the pixels, so it posts.
 
 def _verifying(reply):
     """A processor whose vision call answers `reply` (a str) or raises/sleeps (a side_effect)."""
@@ -638,35 +639,7 @@ def _verifying(reply):
     return processor
 
 
-class _Records(logging.Handler):
-    """Every captured line INCLUDING its traceback.
-
-    `record.getMessage()` alone would miss the leak that matters most: `exc_info=True` renders
-    the chained cause, and the cause is the exception that quoted the request back at us.
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.messages: list = []
-        self._formatter = logging.Formatter()
-
-    def emit(self, record):
-        self.messages.append(self._formatter.format(record))
-
-
-_HTTP_REQUEST = httpx.Request("POST", "https://api.openai.com/v1/responses")
-
-
-def _openai_error(cls):
-    """A real instance of one of the SDK's error classes — they need a request/response."""
-    if issubclass(cls, openai.APIStatusError):
-        status = 429 if cls is openai.RateLimitError else 500
-        return cls("upstream said no", response=httpx.Response(status, request=_HTTP_REQUEST),
-                   body=None)
-    return cls(request=_HTTP_REQUEST)
-
-
-async def test_the_verifier_runs_on_the_utility_model_and_is_told_the_grammar(monkeypatch):
+async def test_the_verifier_runs_on_the_utility_model_and_is_told_the_policy(monkeypatch):
     """Same model and settings as the detached description path — describing pixels is not worth
     primary-model spend, and the recorded model must be the one that actually ran."""
     from config import clamp_effort
@@ -685,16 +658,9 @@ async def test_the_verifier_runs_on_the_utility_model_and_is_told_the_grammar(mo
                                                   config.utility_reasoning_effort)
     assert kw["verbosity"] == config.utility_verbosity
     assert kw["images"][0]["detail"] == config.default_detail_level
-    # One short line, not the 8192-token budget a full description gets — with enough headroom
-    # that reasoning tokens cannot truncate the line into MALFORMED, which fails closed.
-    assert kw["max_output_tokens"] == 1000
-    # The request is `expected` plus a base64 picture, so no exception log on this path may
-    # quote it.
-    assert kw["sensitive"] is True
-    # The policy and the output contract ride the DEVELOPER role, where the untrusted material
+    # The policy and the answer shape ride the DEVELOPER role, where the untrusted material
     # cannot reach them.
-    assert "VERDICT|observation" in kw["system_prompt"]
-    for token in ("YES", "NO", "UNCERTAIN"):
+    for token in ("YES", "NO"):
         assert token in kw["system_prompt"]
     # `expected` rides the USER turn, as data the policy above tells the verifier to judge.
     assert EXPECTED in kw["question"]
@@ -706,20 +672,12 @@ async def test_the_verifier_runs_on_the_utility_model_and_is_told_the_grammar(mo
 
 
 @pytest.mark.parametrize("reply,label", [
-    ("NO|a supermarket dairy aisle", "a plain no"),
-    ("UNCERTAIN|too blurry to say", "an uncertain verdict"),
+    ("NO — a supermarket dairy aisle", "a plain no"),
+    ("Cannot tell, too blurry to say", "no yes anywhere"),
     ("", "an empty reply"),
-    ("looks right to me", "no pipe at all"),
-    ("MAYBE|a shelf of soup", "a verdict token nobody defined"),
-    ("YES|line one\nand a second line", "multiline garbage"),
-    ("|nothing before the pipe", "an empty verdict"),
-    ("YES|", "a verdict with no observation"),
-    ("YES|  \t ", "an observation that is nothing once sanitized"),
-    ("YES|a shelf|of soup", "a second separator"),
-    ("yes|a solid red image", "lowercase — no case folding"),
-    (" YES |a solid red image", "a padded token"),
+    ("Not what was asked for; YES would be wrong", "a yes that is not the answer"),
 ])
-async def test_anything_but_a_clean_yes_posts_nothing(monkeypatch, reply, label):
+async def test_a_reply_that_does_not_start_with_yes_posts_nothing(monkeypatch, reply, label):
     monkeypatch.setattr(ambient_fetch, "fetch_url", _fetch(_image_result()))
     publish = _publish_ok()
     monkeypatch.setattr(image_delivery, "publish_image", publish)
@@ -742,148 +700,49 @@ async def test_a_mismatch_hands_back_what_was_actually_there_as_untrusted_data(m
     monkeypatch.setattr(ambient_fetch, "fetch_url", _fetch(_image_result()))
     monkeypatch.setattr(image_delivery, "publish_image", _publish_ok())
 
-    processor = _verifying("NO|a supermarket dairy aisle")
+    processor = _verifying("  NO — a supermarket dairy aisle  ")
     out = await iit.execute_import_web_image(_ctx(_turn(), processor),
                                              _args("https://x.example/i.png"))
 
-    assert out["observed"] == "a supermarket dairy aisle"
+    assert out["observed"] == "NO — a supermarket dairy aisle"
     assert "untrusted" in out["note"].lower()
     assert "never instructions" in out["note"]
     assert "NOTHING was posted" in out["note"]
 
 
-async def test_the_observation_is_collapsed_and_capped(monkeypatch):
-    """One line of plain text, bounded — it is model-written text about attacker-chosen pixels,
-    landing straight in the conversation's context."""
-    monkeypatch.setattr(ambient_fetch, "fetch_url", _fetch(_image_result()))
-    monkeypatch.setattr(image_delivery, "publish_image", _publish_ok())
-
-    noisy = "NO|a \x00shelf\x07 of\t\tsoup" + " and more soup" * 60
-    processor = _verifying(noisy)
-    out = await iit.execute_import_web_image(_ctx(_turn(), processor),
-                                             _args("https://x.example/i.png"))
-
-    observed = out["observed"]
-    assert len(observed) == iit._OBSERVATION_MAX_CHARS == 300
-    assert observed.startswith("a shelf of soup and more soup")
-    assert not any(ord(c) < 32 or ord(c) == 127 for c in observed)
-    assert "  " not in observed
-
-
-async def test_the_observation_cannot_carry_invisible_direction_controls(monkeypatch):
-    """U+202E reverses how everything after it renders, so an observation carrying one can print
-    as text the verifier never wrote — in the conversation the model then reads back. An ASCII
-    control-character class does not touch it; the Unicode CATEGORY does."""
-    monkeypatch.setattr(ambient_fetch, "fetch_url", _fetch(_image_result()))
-    monkeypatch.setattr(image_delivery, "publish_image", _publish_ok())
-
-    processor = _verifying("NO|a shelf‮ of ​soup")
-    out = await iit.execute_import_web_image(_ctx(_turn(), processor),
-                                             _args("https://x.example/i.png"))
-
-    assert "‮" not in out["observed"] and "​" not in out["observed"]
-    assert out["observed"] == "a shelf of soup"
-
-
-@pytest.mark.parametrize("cls", [openai.APIConnectionError, openai.APITimeoutError,
-                                 openai.RateLimitError, openai.InternalServerError])
-async def test_a_provider_that_never_answered_posts_anyway_as_unverified(monkeypatch, cls):
-    """The narrow fail-open, one class at a time. Each of these means a working provider simply
-    did not answer — nothing was JUDGED, so it is not a mismatch — but the result admits the
-    check did not run. The list is the WHOLE list; anything outside it fails closed below."""
-    monkeypatch.setattr(ambient_fetch, "fetch_url", _fetch(_image_result()))
-    publish = _publish_ok()
-    monkeypatch.setattr(image_delivery, "publish_image", publish)
-
-    processor = _verifying(_openai_error(cls))
-    out = await iit.execute_import_web_image(_ctx(_turn(), processor),
-                                             _args("https://x.example/i.png"))
-
-    assert out["ok"] is True and out["posted"] is True
-    assert out["verification"] == "unavailable"
-    assert "unverified" in out["verification_note"]
-    assert "do not promise to send it again" in out["note"]
-    publish.assert_awaited_once()
-
-
-async def test_an_unexpected_verifier_error_posts_nothing_at_all(monkeypatch):
-    """The taxonomy's other half. A RuntimeError out of the checker is a bug, an auth failure or
-    an invalid request — OUR breakage, not a provider that went quiet — and a broken checker is
-    no more evidence about the pixels than a mismatched one. It fails CLOSED."""
-    monkeypatch.setattr(ambient_fetch, "fetch_url", _fetch(_image_result()))
-    publish = _publish_ok()
-    monkeypatch.setattr(image_delivery, "publish_image", publish)
-
-    processor = _verifying(RuntimeError("someone changed the signature"))
-    out = await iit.execute_import_web_image(_ctx(_turn(), processor),
-                                             _args("https://x.example/i.png"))
-
-    assert out["ok"] is False and out["error"] == "verification_failed"
-    assert "NOTHING" in out["message"]
-    publish.assert_not_awaited()
-
-
-@pytest.mark.parametrize("client,label", [
-    (None, "no vision client at all"),
-    (SimpleNamespace(), "a client with no analyze_images seam"),
+@pytest.mark.parametrize("processor_over,label", [
+    (lambda p: setattr(p, "openai_client", None), "no vision client at all"),
+    (lambda p: setattr(p, "openai_client", SimpleNamespace()), "no analyze_images seam"),
+    (lambda p: setattr(p.openai_client, "analyze_images",
+                       AsyncMock(side_effect=RuntimeError("the checker is broken"))),
+     "a checker that raised"),
 ])
-async def test_a_missing_vision_seam_posts_nothing_at_all(monkeypatch, client, label):
-    """The seam being gone is the loudest version of the same thing: no check ran, and it is not
-    the provider's doing. Fail-open here would make every image import unverified the day
-    somebody renames a method."""
+async def test_a_check_that_could_not_run_posts_the_image_anyway(monkeypatch, processor_over,
+                                                                 label):
+    """A broken checker is not evidence about the pixels. Blocking on it would refuse every
+    import the day a vision seam breaks, so the image goes up and the result says nothing
+    checked it."""
     monkeypatch.setattr(ambient_fetch, "fetch_url", _fetch(_image_result()))
     publish = _publish_ok()
     monkeypatch.setattr(image_delivery, "publish_image", publish)
 
     processor = _FakeProcessor()
-    processor.openai_client = client
+    processor_over(processor)
     out = await iit.execute_import_web_image(_ctx(_turn(), processor),
                                              _args("https://x.example/i.png"))
 
-    assert out["ok"] is False and out["error"] == "verification_failed", label
-    publish.assert_not_awaited()
-
-
-async def test_a_verifier_that_outruns_its_own_deadline_posts_unverified(monkeypatch):
-    """The check gets its own bound, so a stalled vision call cannot hold the import hostage for
-    the whole tool timeout."""
-    monkeypatch.setattr(ambient_fetch, "fetch_url", _fetch(_image_result()))
-    publish = _publish_ok()
-    monkeypatch.setattr(image_delivery, "publish_image", publish)
-    monkeypatch.setattr(config, "image_import_verify_timeout_s", 0.02)
-
-    async def _never(**kwargs):
-        await asyncio.sleep(30)
-        return VERDICT_OK
-
-    processor = _verifying(_never)
-    out = await iit.execute_import_web_image(_ctx(_turn(), processor),
-                                             _args("https://x.example/i.png"))
-
-    assert out["ok"] is True and out["verification"] == "unavailable"
+    assert out["ok"] is True and out["posted"] is True, label
+    assert out["verification"] == "skipped"
+    assert "unverified" in out["verification_note"]
+    assert "do not promise to send it again" in out["note"]
     publish.assert_awaited_once()
 
 
-async def test_a_gif_discloses_that_only_its_first_frame_was_checked(monkeypatch):
+async def test_an_animated_gif_is_refused_before_anything_is_checked_or_posted(monkeypatch):
+    """One frame is not the animation, so no verdict on it would cover the rest. Refused outright
+    rather than posted unchecked — the model can go and find a still image instead."""
     monkeypatch.setattr(ambient_fetch, "fetch_url",
-                        _fetch(_image_result(raw=_gif(), final_url="https://x.example/KLOT_0.gif",
-                                             mime="image/gif")))
-    monkeypatch.setattr(image_delivery, "publish_image", _publish_ok())
-
-    out = await iit.execute_import_web_image(_ctx(_turn()),
-                                             _args("https://x.example/KLOT_0.gif"))
-
-    assert out["ok"] is True and out["filename"] == "KLOT_0.gif"
-    assert "first frame" in out["verification_note"]
-
-
-async def test_only_the_first_frame_reaches_the_verifier_and_the_upload_keeps_the_gif(monkeypatch):
-    """The note claims frame 1 was checked, so frame 1 is what the checker gets — a whole
-    animation sent under that note would be a verdict covering pixels the model was told nobody
-    judged. The UPLOAD is untouched by any of it: what lands in Slack is the original GIF."""
-    animated = _animated_gif()
-    monkeypatch.setattr(ambient_fetch, "fetch_url",
-                        _fetch(_image_result(raw=animated, mime="image/gif",
+                        _fetch(_image_result(raw=_animated_gif(), mime="image/gif",
                                              final_url="https://x.example/KLOT_0.gif")))
     publish = _publish_ok()
     monkeypatch.setattr(image_delivery, "publish_image", publish)
@@ -892,39 +751,30 @@ async def test_only_the_first_frame_reaches_the_verifier_and_the_upload_keeps_th
     out = await iit.execute_import_web_image(_ctx(_turn(), processor),
                                              _args("https://x.example/KLOT_0.gif"))
 
-    assert out["ok"] is True
-    sent = processor.openai_client.analyze_images.await_args.kwargs["images"][0]["image_url"]
-    assert sent.startswith("data:image/png;base64,")
-    with Image.open(BytesIO(base64.b64decode(sent.split(",", 1)[1]))) as seen:
-        assert seen.format == "PNG"
-        assert getattr(seen, "n_frames", 1) == 1
-
-    # Byte for byte the animation that was fetched — the frame extraction is the VERIFIER's
-    # business and must never reach the file anybody downloads.
-    posted = publish.await_args.kwargs["image_data"]
-    assert base64.b64decode(posted.base64_data) == animated
-    assert posted.format == "gif"
+    assert out["ok"] is False and out["error"] == "animated_gif_unsupported"
+    assert "NOTHING was posted" in out["note"]
+    publish.assert_not_awaited()
+    processor.openai_client.analyze_images.assert_not_awaited()
 
 
-async def test_a_frame_that_cannot_be_extracted_posts_nothing(monkeypatch):
-    """Extraction is ours, so its failure is ours: fail CLOSED, exactly like any other break in
-    the checker."""
+async def test_a_still_gif_goes_through_the_normal_check_and_posts(monkeypatch):
+    """The API reads a non-animated GIF like any other image, so it earns no special case."""
     monkeypatch.setattr(ambient_fetch, "fetch_url",
-                        _fetch(_image_result(raw=_animated_gif(), mime="image/gif",
-                                             final_url="https://x.example/KLOT_0.gif")))
-    publish = _publish_ok()
-    monkeypatch.setattr(image_delivery, "publish_image", publish)
-    monkeypatch.setattr(iit, "_first_frame_png_b64",
-                        MagicMock(side_effect=OSError("truncated frame")))
+                        _fetch(_image_result(raw=_gif(), final_url="https://x.example/KLOT_0.gif",
+                                             mime="image/gif")))
+    monkeypatch.setattr(image_delivery, "publish_image", _publish_ok())
 
-    out = await iit.execute_import_web_image(_ctx(_turn()),
+    processor = _verifying(VERDICT_OK)
+    out = await iit.execute_import_web_image(_ctx(_turn(), processor),
                                              _args("https://x.example/KLOT_0.gif"))
 
-    assert out["ok"] is False and out["error"] == "verification_failed"
-    publish.assert_not_awaited()
+    assert out["ok"] is True and out["filename"] == "KLOT_0.gif"
+    assert "verification" not in out
+    sent = processor.openai_client.analyze_images.await_args.kwargs["images"][0]["image_url"]
+    assert sent.startswith("data:image/gif;base64,")
 
 
-async def test_a_still_image_carries_no_frame_note(monkeypatch):
+async def test_a_still_image_carries_no_verification_note(monkeypatch):
     monkeypatch.setattr(ambient_fetch, "fetch_url", _fetch(_image_result()))
     monkeypatch.setattr(image_delivery, "publish_image", _publish_ok())
 
@@ -952,42 +802,17 @@ async def test_a_missing_expected_is_refused_before_the_claim_and_the_fetch(monk
     publish.assert_not_awaited()
 
 
-async def test_an_over_long_expected_is_refused_with_its_limit_never_truncated(monkeypatch):
-    """Silently shortening it would leave the model believing it asked for a stricter check than
-    the one that ran."""
-    calls: list = []
-    monkeypatch.setattr(ambient_fetch, "fetch_url", _fetch(_image_result(), calls))
-    monkeypatch.setattr(config, "image_import_expected_max_chars", 40)
-
-    turn = _turn()
-    out = await iit.execute_import_web_image(
-        _ctx(turn), {"url": "https://x.example/i.png", "expected": "a" * 41})
-
-    assert out["ok"] is False and out["error"] == "expected_too_long"
-    assert out["limit"] == 40
-    assert calls == []
-    turn.claim_work.assert_not_awaited()
-
-
 async def test_expected_reaches_the_verifier_and_nothing_else(monkeypatch):
     """It is a check instruction, not provenance: the catalog's `prompt` stays the neutral
-    constant, the row never carries it, and no log line repeats it. A description written from
-    someone's request must not become durable text the model later reads back as evidence."""
+    constant and the row never carries it. A description written from someone's request must not
+    become durable text the model later reads back as evidence."""
     secret = "the north facade under a marmalade sky"
     monkeypatch.setattr(ambient_fetch, "fetch_url", _fetch(_image_result()))
 
     client, processor, db = _delivery_client(), _verifying(VERDICT_OK), AsyncMock()
-    records = _Records()
-    iit.logger.addHandler(records)
-    previous = iit.logger.level
-    iit.logger.setLevel(logging.DEBUG)
-    try:
-        out = await iit.execute_import_web_image(
-            _ctx(_turn(), processor, client=client, db=db),
-            {"url": "https://x.example/i.png", "expected": secret})
-    finally:
-        iit.logger.removeHandler(records)
-        iit.logger.setLevel(previous)
+    out = await iit.execute_import_web_image(
+        _ctx(_turn(), processor, client=client, db=db),
+        {"url": "https://x.example/i.png", "expected": secret})
 
     assert out["ok"] is True
     assert secret in processor.openai_client.analyze_images.await_args.kwargs["question"]
@@ -997,62 +822,6 @@ async def test_expected_reaches_the_verifier_and_nothing_else(monkeypatch):
     assert secret not in json.dumps(row, default=str)
     assert secret not in json.dumps(out)
     assert secret not in "".join(str(a) for a in client.send_image.await_args.args)
-    assert not any(secret in m for m in records.messages)
-
-
-class _PayloadEchoingClient(OpenAIClient):
-    """The REAL vision path — real `analyze_images`, real `_safe_api_call` — over a transport
-    that fails the way providers actually do: by quoting the request back in the error.
-
-    `__init__` is replaced rather than called: constructing the SDK client needs an API key and
-    buys nothing here. Everything the path touches (`self.client`, the LoggerMixin logger, the
-    timeout table) is either set below or config-only.
-    """
-
-    def __init__(self):
-        async def _create(**kwargs):
-            # "timeout" in the text on purpose: it is what routes this through _safe_api_call's
-            # own error log, the second of the two sites that could echo the payload.
-            raise RuntimeError(f"read timeout while POSTing {kwargs}")
-
-        self.client = SimpleNamespace(responses=SimpleNamespace(create=_create))
-
-
-async def test_a_failed_verify_call_never_logs_the_payload(monkeypatch):
-    """The request IS the secret: `expected` plus a base64 picture. A provider error quotes the
-    request, `_safe_api_call` used to log that text, and the vision helper logged it AGAIN with
-    `exc_info=True` — where the chained cause carries it even if the message does not.
-
-    Driven through the real logging path, not a mocked `analyze_images`: a mock proves the caller
-    is quiet and nothing about the two log sites underneath it."""
-    secret = "the north facade under a marmalade sky"
-    monkeypatch.setattr(ambient_fetch, "fetch_url", _fetch(_image_result()))
-    monkeypatch.setattr(image_delivery, "publish_image", _publish_ok())
-
-    processor = _FakeProcessor()
-    processor.openai_client = _PayloadEchoingClient()
-    b64_fragment = base64.b64encode(PNG).decode()[:24]
-
-    records = _Records()
-    watched = [iit.logger, processor.openai_client.logger]
-    levels = [log.level for log in watched]
-    for log in watched:
-        log.addHandler(records)
-        log.setLevel(logging.DEBUG)
-    try:
-        out = await iit.execute_import_web_image(
-            _ctx(_turn(), processor), {"url": "https://x.example/i.png", "expected": secret})
-    finally:
-        for log, level in zip(watched, levels):
-            log.removeHandler(records)
-            log.setLevel(level)
-
-    assert out["ok"] is True, "a provider deadline is the fail-open case, so the import stands"
-    assert records.messages, "the failure still logs — silence would be its own bug"
-    assert not any(secret in m for m in records.messages)
-    assert not any(b64_fragment in m for m in records.messages)
-    # What is left is the diagnosis: the class, and nothing that could reconstruct the request.
-    assert any("timed out" in m for m in records.messages)
 
 
 async def test_a_verifier_slower_than_the_tool_bound_cannot_post_late(monkeypatch):
@@ -1079,7 +848,6 @@ async def test_a_verifier_slower_than_the_tool_bound_cannot_post_late(monkeypatc
 
     monkeypatch.setattr(image_delivery, "publish_image", _publish)
     monkeypatch.setattr(config, "link_fetch_total_timeout_s", 0.1)
-    monkeypatch.setattr(config, "image_import_verify_timeout_s", 0.1)
     monkeypatch.setattr(config, "image_import_upload_margin_s", 0.1)
 
     async def _slow_verify(**kwargs):
@@ -1088,10 +856,7 @@ async def test_a_verifier_slower_than_the_tool_bound_cannot_post_late(monkeypatc
 
     processor = _verifying(_slow_verify)
     reg = ToolRegistry()
-    iit.register_import_image_tool(reg)          # bound stamped HERE: 0.3s
-    # Raised only now, so the verifier's OWN deadline outlives the tool bound — otherwise the
-    # check would give up first and this would be the fail-open test again.
-    monkeypatch.setattr(config, "image_import_verify_timeout_s", 30.0)
+    iit.register_import_image_tool(reg)          # bound stamped HERE: 0.2s
     turn = TurnRuntime()
     ctx = _ctx(turn, processor)
     out = await reg.dispatch_all(ctx, [{"name": "import_web_image", "call_id": "slow-1",
@@ -1162,17 +927,14 @@ def test_the_schema_requires_expected_and_offers_an_optional_caption():
     assert "verif" in schema["description"] or "checked against" in schema["description"]
 
 
-def test_the_registered_timeout_covers_fetch_verify_and_upload(monkeypatch):
-    """A verifier allowed 45s inside a bound that never budgeted for it would surface as the
-    IMPORT timing out — a failure of the wrong thing."""
+def test_the_registered_timeout_covers_fetch_and_upload(monkeypatch):
     monkeypatch.setattr(config, "link_fetch_total_timeout_s", 12.0)
-    monkeypatch.setattr(config, "image_import_verify_timeout_s", 45.0)
     monkeypatch.setattr(config, "image_import_upload_margin_s", 30.0)
 
     reg = ToolRegistry()
     iit.register_import_image_tool(reg)
 
-    assert reg._tools["import_web_image"]["timeout"] == 87.0
+    assert reg._tools["import_web_image"]["timeout"] == 42.0
 
 
 async def test_fetch_url_points_at_the_import_tool_when_a_link_is_an_image(monkeypatch):
