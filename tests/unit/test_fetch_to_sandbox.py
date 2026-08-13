@@ -26,6 +26,21 @@ FETCH_KW = dict(max_bytes=1_000_000, connect_timeout=1, read_timeout=1, total_ti
                 max_redirects=3, max_chars=0)
 
 
+@pytest.fixture(autouse=True)
+def _reset_published_memory():
+    """The staging tests below use file id "f1", which is the id half the artifact suites reach
+    for, and publish_artifacts remembers published ids process-wide. Any earlier test that
+    published an "f1" makes this file's candidate look already-published, and it is dropped
+    before staging can hold it back — which reads as the suppression guard failing. Clearing at
+    both ends protects this file whichever way the suite is ordered. Same fixture as
+    test_artifacts.py."""
+    from message_processor import artifacts as artifacts_mod
+
+    artifacts_mod._published_file_ids.clear()
+    yield
+    artifacts_mod._published_file_ids.clear()
+
+
 @pytest.fixture
 def _fetch_seams():
     yield

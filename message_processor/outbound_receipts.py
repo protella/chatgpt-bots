@@ -65,6 +65,10 @@ the ledger API takes it as a required keyword, there is no default and no infere
                                                             the share, not an editable
                                                             reply)
   image-gen handler notices                        turn     finalized              system_notice
+  scheduled message delivery (schedule_message)    sys      expectation at         assistant_reply
+                                                            schedule time ->
+                                                            finalized when Slack
+                                                            delivers it
   channel-join hello + findings                    sys      finalized              system_notice
   channel welcome / reminder / settings-button     sys      chrome                 chrome
   settings "saved" confirmations in a channel      sys      finalized              system_notice
@@ -76,10 +80,11 @@ the ledger API takes it as a required keyword, there is no default and no infere
 from __future__ import annotations
 
 import asyncio
+import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 
 from logger import setup_logger
 from runtime_identity import SESSION_ID
@@ -1516,6 +1521,523 @@ async def recover_pending_shares(db: Any, client: Any) -> int:
     if resolved:
         logger.info("Receipts: recovered %d pending share(s) at boot", resolved)
     return resolved
+
+
+# --- scheduled deliveries -----------------------------------------------------------------
+#
+# T1. A scheduled post (`schedule_tools.schedule_message`) is delivered by SLACK, minutes or days
+# after the turn that asked for it. Nothing on the normal posting path is left to register it: that
+# turn ended long ago. With no receipt it is a post-epoch own message with no row — permanently
+# outside the rebuilt stream, so the bot cannot see the reminder it just posted and will answer
+# "what reminder?" (`channel_stream`: "has no receipt row and cannot be grandfathered").
+#
+# THE DELIVERY EVENT NEVER ARRIVES. Measured live, twice, 2026-08-13: Slack Bolt's default
+# `ignoring_self_events` middleware drops every own-bot message event BEFORE any app handler runs,
+# so a bot-token post into a channel produces zero handler activity. Waiting for the delivery to
+# come back as an own-message event — the shape this section was originally built in — can never
+# finalize anything.
+#
+# So the receipt is PRE-REGISTERED as an expectation at schedule time and RECONCILED from the
+# events that DO arrive: the next human message in that channel. `reconcile_overdue_scheduled`
+# reads the delivered message back out of Slack (`conversations.history`, or
+# `conversations.replies` when the expectation was scheduled into a thread) and finalizes it.
+# Three things make that cheap and safe:
+#
+#   * SLACK holds the schedule server-side, so the expectation needs no table of ours. A restart
+#     re-reads it from `chat.scheduledMessages.list` (`rehydrate_scheduled_deliveries`) — the same
+#     source of truth the tools themselves read, and the reason this needs no crash window.
+#   * The seam asks an IN-MEMORY question first (`has_overdue_scheduled_delivery`): no expectation
+#     for this channel with `post_at` in the past means zero Slack calls, which is every message
+#     event on an ordinary day.
+#   * There is no id to resolve AGAINST: neither the delivered message nor the event carries a
+#     scheduled_message_id. The match is (channel, exact text, ts >= post_at, ours). `post_at` is
+#     Slack's own echo of the scheduled time and `ts` is Slack's delivery time, so both sides of
+#     that comparison come from Slack's clock and it needs no tolerance window.
+#
+# `finalize_scheduled_delivery` (the own-message path) is KEPT: it is correct, it costs nothing,
+# and it is what runs if Bolt's self-event filter is ever turned off.
+#
+# ACCEPTED GAP: a delivery nobody can find stays unaccounted. A probe that comes up empty inside
+# the grace below is simply retried by the next human message; past it the entry is abandoned with
+# one log line and no retry machinery, and eviction bounds the registry as it always did. A channel
+# that never sees another human message never reconciles — same class as the upload crash window
+# documented at the top of this module.
+#
+# DMs never reach any of this: receipts do not exist there (`receipts_apply`), so a DM-scheduled
+# message registers no expectation and needs none.
+
+
+@dataclass
+class _ScheduledDelivery:
+    """One scheduled post, waiting for Slack to deliver it."""
+    scheduled_message_id: str
+    team_id: Optional[str]
+    channel_id: str
+    text: str
+    post_at: float
+    receipt_class: Optional[str]
+    # The thread the post was scheduled INTO, when it was. `conversations.history` does not return
+    # thread replies, so without this the reconciler would look for a threaded delivery in a
+    # listing that structurally cannot contain it. None = top level.
+    thread_root_ts: Optional[str] = None
+    # Set once the grace has passed with no delivery found. The entry stays (the own-message path
+    # can still match it) but is never probed again — one log line, no retry machinery.
+    abandoned: bool = False
+
+
+# How many pending scheduled posts the registry remembers, oldest evicted first. Slack keeps at
+# most 30 pending per channel, so this is dozens of channels' worth. The bound exists for the same
+# reason `_DELETED_FILE_MEMORY` does — an unbounded map would grow for the life of the process —
+# and evicting one costs a single delivered message its receipt, nothing else.
+_SCHEDULED_DELIVERY_MEMORY = 1024
+
+# How long past `post_at` a probe may keep coming up empty before the expectation is abandoned.
+# Slack delivers at post_at but not to the millisecond, and the first human message after post_at
+# can easily land before the delivery does — so an empty probe inside this window is retried by
+# the next message rather than believed. Past it, the delivery is not coming and further probes
+# would spend a Slack call per human message for the life of the registry entry.
+_SCHEDULED_PROBE_GRACE_SECONDS = 180.0
+
+# How many messages one probe reads. The delivered message sits at the very start of the window
+# (`oldest=post_at`), so a page is plenty; a channel busy enough to bury it is one where the next
+# probe would not find it either, and the miss is logged rather than paged around.
+_SCHEDULED_PROBE_LIMIT = 50
+
+_scheduled_deliveries: "OrderedDict[str, _ScheduledDelivery]" = OrderedDict()
+
+# The one rehydrate this process performs, as a task every caller joins rather than repeats.
+#
+# It has to be a shared FUTURE and not a "did we do it yet" flag. Boot starts it (main.initialize)
+# and the first own-message event would otherwise arrive while it is still in flight: a flag set
+# before the await makes that event skip a listing that has not answered yet, and the delivery it
+# was about to match is lost — the exact first-event race this shape exists to remove. A caller
+# that joins is guaranteed to see the finished registry.
+#
+# A failed attempt is not retried. The alternative is one Slack call per own-message for the life
+# of a broken token; what is lost is restart durability, and it is logged as such.
+_scheduled_rehydrate: Optional["asyncio.Future[int]"] = None
+
+
+def _normalized_post_text(text: Any) -> str:
+    """Whitespace-collapsed text, the form both sides of the delivery match are compared in."""
+    return " ".join(str(text or "").split())
+
+
+def expect_scheduled_delivery(*, team_id: Optional[str], channel_id: Optional[str],
+                              scheduled_message_id: Any, text: Any, post_at: Any,
+                              receipt_class: Optional[str],
+                              thread_root_ts: Optional[str] = None) -> bool:
+    """Record that Slack owes us a delivery. True when the expectation was taken.
+
+    False is not a failure: a DM has no receipts to pre-register, and neither does a call with
+    nothing to key on. The scheduled message itself is unaffected either way — this is bookkeeping
+    for the rebuilt stream, never a precondition for posting.
+
+    `thread_root_ts` is the thread the post was scheduled into (`schedule_message` knows it), and
+    is what sends the reconciler to `conversations.replies` instead of a channel listing that
+    cannot contain a thread reply. The rehydrate has no equivalent — `chat.scheduledMessages.list`
+    does not report the thread — so a thread-scheduled message that outlives a restart reconciles
+    only if it was also broadcast to the channel.
+    """
+    if not (channel_id and scheduled_message_id and receipts_apply(channel_id)):
+        return False
+    try:
+        when = float(post_at)
+    except (TypeError, ValueError):
+        logger.warning("Scheduled delivery %s has no usable post_at (%r) — not expected",
+                       scheduled_message_id, post_at)
+        return False
+    entry = _ScheduledDelivery(
+        scheduled_message_id=str(scheduled_message_id),
+        team_id=str(team_id) if team_id else None,
+        channel_id=str(channel_id),
+        text=str(text or ""),
+        post_at=when,
+        receipt_class=_checked_class(receipt_class, site="expect_scheduled_delivery",
+                                     message_ts=scheduled_message_id),
+        thread_root_ts=str(thread_root_ts) if thread_root_ts else None,
+    )
+    _scheduled_deliveries[entry.scheduled_message_id] = entry
+    _scheduled_deliveries.move_to_end(entry.scheduled_message_id)
+    while len(_scheduled_deliveries) > _SCHEDULED_DELIVERY_MEMORY:
+        dropped, _ = _scheduled_deliveries.popitem(last=False)
+        logger.warning("Scheduled-delivery registry full — forgetting %s; if it posts, it will "
+                       "not enter the channel stream", dropped)
+    return True
+
+
+def forget_scheduled_delivery(scheduled_message_id: Any) -> bool:
+    """Drop an expectation that will never be delivered (the schedule was cancelled).
+
+    The cancellation counterpart of `delete_pending_shares_for_file`: an entry nobody removes sits
+    in the registry until eviction, and the delivery it is waiting for is never coming.
+    """
+    if not scheduled_message_id:
+        return False
+    return _scheduled_deliveries.pop(str(scheduled_message_id), None) is not None
+
+
+def _take_scheduled_delivery(channel_id: Any, text: Any,
+                             message_ts: Any) -> Optional[_ScheduledDelivery]:
+    """The expectation this delivered message satisfies, removed from the registry.
+
+    First match wins and is consumed, so two identical texts scheduled into one channel finalize
+    one delivery each rather than both racing for the same row.
+    """
+    try:
+        when = float(message_ts)
+    except (TypeError, ValueError):
+        return None
+    wanted = _normalized_post_text(text)
+    if not wanted:
+        return None
+    for smid, entry in list(_scheduled_deliveries.items()):
+        if entry.channel_id != str(channel_id or ""):
+            continue
+        if _normalized_post_text(entry.text) != wanted:
+            continue
+        if when < entry.post_at:
+            # Slack does not deliver early, so this is our own text posted by an ordinary turn
+            # before the schedule fires — that message has its own receipt already.
+            continue
+        del _scheduled_deliveries[smid]
+        return entry
+    return None
+
+
+async def finalize_scheduled_delivery(*, team_id: Optional[str],
+                                      event: Dict[str, Any]) -> Optional[str]:
+    """Finalize a delivery that arrived as an OWN-MESSAGE EVENT. Kept, but it does not run.
+
+    Bolt's default `ignoring_self_events` middleware drops own-bot message events before any app
+    handler sees them (measured live 2026-08-13), so in the shipped configuration nothing ever
+    reaches this with a delivered scheduled post. `reconcile_overdue_scheduled` is the mechanism
+    that actually finalizes one. This stays because it is correct, costs a dict scan, and is what
+    runs if that middleware is ever disabled.
+
+    Returns the scheduled_message_id it accounted for, or None when the event matches nothing.
+    """
+    channel_id = event.get("channel")
+    message_ts = event.get("ts")
+    if not (channel_id and message_ts and receipts_apply(channel_id)):
+        return None
+    entry = _take_scheduled_delivery(channel_id, event.get("text"), message_ts)
+    if entry is None:
+        if _scheduled_deliveries:
+            # Almost every own-message event lands here; log only while something is actually
+            # waiting, so a delivery that fails its match leaves evidence of WHY.
+            logger.debug(
+                "Own message %s/%s matched no scheduled expectation (%d waiting: %s)",
+                channel_id, message_ts, len(_scheduled_deliveries),
+                [(e.channel_id, _normalized_post_text(e.text)[:60])
+                 for e in _scheduled_deliveries.values()][:3])
+        return None
+    await record_transport_post(
+        team_id=team_id or entry.team_id, channel_id=str(channel_id), message_ts=str(message_ts),
+        receipts=None, receipt_kind=STATE_FINALIZED, receipt_class=entry.receipt_class,
+        thread_root_ts=event.get("thread_ts"), site="scheduled_delivery")
+    logger.info("Scheduled message %s delivered as %s/%s — receipt finalized",
+                entry.scheduled_message_id, channel_id, message_ts)
+    return entry.scheduled_message_id
+
+
+def has_overdue_scheduled_delivery(channel_id: Any, now: Optional[float] = None) -> bool:
+    """Is a delivery owed to THIS channel already past its post_at? Pure memory, no Slack call.
+
+    The whole point of the reconciler being affordable: this is what every message event asks, and
+    the answer is False for every channel that is not waiting on a scheduled post.
+    """
+    if not channel_id:
+        return False
+    when = time.time() if now is None else float(now)
+    wanted = str(channel_id)
+    return any(entry.channel_id == wanted and not entry.abandoned and entry.post_at <= when
+               for entry in _scheduled_deliveries.values())
+
+
+def _looks_like_own_post(message: Dict[str, Any]) -> bool:
+    """Fallback authorship test for a history row when no host predicate was supplied.
+
+    Presence-keyed, exactly like `classify_sender`: a scheduled post is delivered by the bot token
+    and carries a bot_id/app_id, and a human who typed the same words does not.
+    """
+    return bool(message.get("bot_id") or message.get("app_id") or message.get("api_app_id"))
+
+
+async def _find_delivered_message(
+        web: Any, entry: _ScheduledDelivery,
+        is_own: Optional[Callable[[Dict[str, Any]], bool]],
+        claimed: Optional[set] = None) -> Optional[Dict[str, Any]]:
+    """Read the delivered post back out of Slack, or None if it is not there (yet).
+
+    One call. `oldest` is a second under post_at rather than post_at exactly, because `oldest` is
+    exclusive unless `inclusive` is set and a delivery landing ON the second would sit on the
+    boundary. The match is the same rule the own-message path uses — normalized text, ts >= post_at
+    — plus authorship, which the event path got for free from the ingress and this one must ask.
+
+    `claimed` holds the timestamps other expectations in this pass have already taken. Two
+    identically-worded schedules into one channel see the SAME window, so without it both would
+    match the first delivered post: one ts written twice, and the second delivery left with no
+    receipt at all. Matches are taken OLDEST FIRST so the earlier schedule gets the earlier post
+    rather than whichever order Slack happened to return.
+    """
+    wanted = _normalized_post_text(entry.text)
+    if not wanted:
+        return None
+    oldest = f"{max(0.0, entry.post_at - 1.0):.6f}"
+    if entry.thread_root_ts:
+        res = await web.conversations_replies(
+            channel=entry.channel_id, ts=entry.thread_root_ts, oldest=oldest, inclusive=True,
+            limit=_SCHEDULED_PROBE_LIMIT)
+    else:
+        res = await web.conversations_history(
+            channel=entry.channel_id, oldest=oldest, inclusive=True,
+            limit=_SCHEDULED_PROBE_LIMIT)
+    matches: List[Tuple[float, Dict[str, Any]]] = []
+    for message in (res.get("messages") or []):
+        if not isinstance(message, dict):
+            continue
+        if _normalized_post_text(message.get("text")) != wanted:
+            continue
+        try:
+            when = float(str(message.get("ts") or ""))
+        except ValueError:
+            continue
+        if when < entry.post_at:
+            continue  # our own text posted by an ordinary turn before the schedule fired
+        if not (is_own(message) if is_own is not None else _looks_like_own_post(message)):
+            continue
+        if claimed is not None and str(message.get("ts")) in claimed:
+            continue
+        matches.append((when, message))
+    if not matches:
+        return None
+    matches.sort(key=lambda pair: pair[0])
+    return matches[0][1]
+
+
+async def reconcile_overdue_scheduled(
+        web: Any, *, team_id: Optional[str], channel_id: Optional[str],
+        is_own: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        now: Optional[float] = None) -> int:
+    """Finalize the deliveries this channel is overdue on. Returns how many were accounted for.
+
+    The mechanism that replaces waiting for an own-message event that Bolt never delivers (see the
+    section comment). Called from the ingress seam on a message event whose channel is already
+    known to owe one, so a call here means a probe is genuinely wanted.
+
+    Never raises: a receipt is bookkeeping about a message that is already in the room, and this
+    runs on the event path where an exception costs the whole event.
+    """
+    if web is None or not channel_id or not receipts_apply(channel_id):
+        return 0
+    when = time.time() if now is None else float(now)
+    wanted = str(channel_id)
+    due = [entry for entry in list(_scheduled_deliveries.values())
+           if entry.channel_id == wanted and not entry.abandoned and entry.post_at <= when]
+    # Oldest schedule first, so which expectation claims which of two identical deliveries is
+    # decided by when they were due rather than by registry insertion order.
+    due.sort(key=lambda entry: (entry.post_at, entry.scheduled_message_id))
+    claimed: set = set()
+    finalized = 0
+    for entry in due:
+        try:
+            message = await _find_delivered_message(web, entry, is_own, claimed)
+            if message is None:
+                if when - entry.post_at >= _SCHEDULED_PROBE_GRACE_SECONDS:
+                    entry.abandoned = True
+                    logger.warning(
+                        "Scheduled message %s was never found in %s %.0fs after it was due — it "
+                        "stays outside the channel stream and will not be probed again",
+                        entry.scheduled_message_id, wanted, when - entry.post_at)
+                continue
+            message_ts = str(message.get("ts"))
+            # Claimed for the rest of this pass whatever the write below does. One delivered post
+            # accounts for exactly one expectation: the alternative is two expectations writing
+            # the same ts while the second delivery goes unreceipted.
+            claimed.add(message_ts)
+            await record_transport_post(
+                team_id=team_id or entry.team_id, channel_id=wanted, message_ts=message_ts,
+                receipts=None, receipt_kind=STATE_FINALIZED, receipt_class=entry.receipt_class,
+                thread_root_ts=message.get("thread_ts") or entry.thread_root_ts,
+                site="scheduled_delivery_reconcile")
+            # Removed only AFTER the row is written. Dropping it first meant a cancellation or a
+            # raise mid-write lost the expectation permanently, with nothing in the database to
+            # show for it and no way back — the entry is what a later pass, or the own-message
+            # path, needs in order to try again. Repeating a write that DID land is harmless: same
+            # ts, same owner, same class, and finalize is idempotent.
+            _scheduled_deliveries.pop(entry.scheduled_message_id, None)
+            logger.info(
+                "Scheduled message %s reconciled from channel history as %s/%s — receipt finalized",
+                entry.scheduled_message_id, wanted, message_ts)
+            finalized += 1
+        except Exception as e:  # noqa: BLE001 — an ingress hook never fails on bookkeeping
+            logger.warning("Could not reconcile scheduled message %s in %s: %s",
+                           entry.scheduled_message_id, wanted, e)
+    return finalized
+
+
+async def rehydrate_scheduled_deliveries(web: Any, *, team_id: Optional[str]) -> int:
+    """Once per process: re-learn what Slack still owes us, so a restart keeps its expectations.
+
+    Started at boot, before the client serves anything, and joined — never repeated — by the first
+    own-message event. The count is what THIS call learned: a caller that finds the work already
+    finished learns nothing new and says 0.
+    """
+    task = _scheduled_rehydrate or start_scheduled_rehydrate(web, team_id=team_id)
+    if task is None or task.done():
+        return 0
+    # Shielded: an event handler that is cancelled mid-await must not take the listing with it —
+    # every other caller is waiting on this same task, and boot has no second attempt to give.
+    # Shutdown cancels the TASK itself, which does end this await, and correctly so.
+    return await asyncio.shield(task)
+
+
+def start_scheduled_rehydrate(web: Any, *,
+                              team_id: Optional[str]) -> Optional["asyncio.Task[int]"]:
+    """Begin that one listing without waiting for it. Boot's entry point (main.initialize).
+
+    Returns the task so its owner can stop it at shutdown; None when there is nothing to start or
+    one is already running. Everything else joins it through `rehydrate_scheduled_deliveries`.
+    """
+    global _scheduled_rehydrate
+    if web is None or _scheduled_rehydrate is not None:
+        return None
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:  # no running loop (sync test context)
+        return None
+    task = loop.create_task(_rehydrate_scheduled_once(web, team_id))
+    _scheduled_rehydrate = task
+    return task
+
+
+async def _rehydrate_scheduled_once(web: Any, team_id: Optional[str]) -> int:
+    """The listing itself. Slack is the durable store — `chat.scheduledMessages.list` returns every
+    pending post with the id, channel, text and post_at the delivery match needs.
+
+    Merged rather than assigned: a message scheduled since boot is in both the registry and this
+    listing, and Slack's copy of it says the same thing.
+    """
+    learned = 0
+    cursor: Optional[str] = None
+    seen_cursors = set()
+    try:
+        while True:
+            kwargs: Dict[str, Any] = {"cursor": cursor} if cursor else {}
+            res = await web.chat_scheduledMessages_list(**kwargs)
+            for raw in (res.get("scheduled_messages") or []):
+                if not isinstance(raw, dict):
+                    continue
+                if expect_scheduled_delivery(
+                        team_id=team_id, channel_id=raw.get("channel_id"),
+                        scheduled_message_id=raw.get("id"), text=raw.get("text"),
+                        post_at=raw.get("post_at"), receipt_class=CLASS_ASSISTANT_REPLY):
+                    learned += 1
+            cursor = ((res.get("response_metadata") or {}).get("next_cursor") or "") or None
+            if not cursor or cursor in seen_cursors:
+                break
+            seen_cursors.add(cursor)
+    except Exception as e:  # noqa: BLE001 — an ingress hook never fails on bookkeeping
+        logger.warning(
+            "Could not re-read pending scheduled messages (%s) — any message scheduled before "
+            "this restart will post normally but stay out of the channel stream", e)
+        return learned
+    if learned:
+        logger.info("Receipts: expecting %d scheduled message(s) still pending at Slack", learned)
+    return learned
+
+
+def reset_scheduled_deliveries() -> None:
+    """Test seam: forget every expectation and allow the rehydrate to run again."""
+    global _scheduled_rehydrate
+    _scheduled_deliveries.clear()
+    # Dropped rather than cancelled: the reference is what makes it single-flight, and a task from
+    # a closed test loop must not be awaited by the next one.
+    _scheduled_rehydrate = None
+
+
+# --- retention ----------------------------------------------------------------------------
+#
+# A receipt row must not outlive the message it describes. Slack's own retention policy deletes
+# messages in bulk by age, and it tells us NOTHING when it does: there is no event, and no
+# retention-policy API outside Grid. So the boundary is INFERRED from what still answers — if the
+# oldest message a channel will return is newer than our oldest receipt, everything at or below
+# that receipt has been swept and its rows are describing messages that no longer exist.
+#
+# One probe per channel per night answers it, and in the normal case (retention has not reached
+# our oldest receipt) that single call is the whole cost and nothing is deleted. Only when the
+# probe comes back EMPTY does anything get pruned, and then the walk repeats from the new oldest
+# receipt so a policy change that swept months at once is caught in one night rather than one
+# night per boundary.
+#
+# This tracks RETENTION only — bulk, age-ordered deletion. A one-off manual delete leaves a hole
+# in the middle of a channel that this can never see, and does not need to: the delete event path
+# (`delete_receipt_async`) removes that row live, as it happens.
+
+
+async def _sweep_channel_receipts(db: Any, web: Any, team_id: str, channel_id: str) -> int:
+    """Prune one channel back to Slack's retention boundary. Returns rows deleted.
+
+    Terminates by construction: every iteration either returns or deletes the row it just read as
+    the oldest, so the worklist strictly shrinks.
+    """
+    pruned = 0
+    while True:
+        oldest = await db.get_oldest_receipt_ts_async(team_id, channel_id)
+        if not oldest:
+            return pruned
+        try:
+            boundary = float(str(oldest))
+        except ValueError:
+            logger.warning("Receipt retention sweep skipped %s: oldest receipt ts %r is not a "
+                           "timestamp", channel_id, oldest)
+            return pruned
+        # `latest` is a hair PAST the receipt so the message it describes is inside the window,
+        # and `oldest="0"` opens the other end: this asks "does ANY message that old survive?".
+        res = await web.conversations_history(
+            channel=channel_id, latest=f"{boundary + 1:.6f}", oldest="0", inclusive=True, limit=1)
+        # `is_limited` means the workspace's plan HIDES history beyond its window, not that Slack
+        # deleted anything: the messages are still there and come back the day the plan changes.
+        # An empty-and-limited answer is therefore the same answer as "something survives" —
+        # deleting on it would throw away receipts for messages that still exist.
+        if (res.get("messages") or []) or res.get("is_limited"):
+            return pruned  # the boundary has not reached us; the normal answer
+        removed = await db.delete_receipts_through_async(team_id, channel_id, oldest)
+        if not removed:
+            # Nothing matched the row we just read as oldest — a concurrent delete got there
+            # first. Re-reading would ask the same question forever.
+            return pruned
+        pruned += removed
+
+
+async def sweep_receipts_past_retention(db: Any, web: Any) -> int:
+    """Nightly: drop receipts for messages Slack's retention policy has already deleted.
+
+    Best-effort per channel and never raises: this runs inside the cleanup task, alongside the
+    backup and the other sweeps, and a rate-limited channel is worth skipping until tomorrow
+    rather than losing the rest of the cleanup over.
+    """
+    if db is None or web is None:
+        return 0
+    try:
+        channels = await db.get_receipt_channels_async()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Receipt retention sweep could not read its channels: %s", e)
+        return 0
+    pruned_total = 0
+    for team_id, channel_id in channels or []:
+        try:
+            pruned = await _sweep_channel_receipts(db, web, team_id, channel_id)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Receipt retention sweep skipped %s until tomorrow: %s", channel_id, e)
+            continue
+        if pruned:
+            pruned_total += pruned
+            logger.info(
+                "Receipts: pruned %d row(s) in %s whose messages are past Slack's retention",
+                pruned, channel_id)
+    return pruned_total
 
 
 async def reconcile_dead_sessions(db: Any, live_session_id: Optional[str] = None) -> int:

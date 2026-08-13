@@ -69,6 +69,16 @@ class SandboxHolder:
             return None
         return await self.manager.bridge_container(self.thread_key, self)
 
+    def replace(self, container_id: Optional[str]) -> None:
+        """Point the turn at a DIFFERENT container (`reset_sandbox`).
+
+        For the same reason the holder is an object at all: the per-call copies and the tool loop
+        share THIS instance, so the swap has to happen in it. Writing a new id anywhere else would
+        leave the loop pinning the abandoned sandbox into the next round's declaration, and the
+        model would be told to open files in a container it can no longer reach.
+        """
+        self.container_id = container_id or None
+
 
 @dataclass
 class ToolContext:

@@ -2545,6 +2545,124 @@ class SlackMessagingMixin(_Host):
                     detail=(result.get("error") if isinstance(result, dict) else None))
         return result
 
+    # --- remove_reaction local tool (T5b) ---
+
+    def get_remove_reaction_tool_schema(self) -> dict:
+        """T5b: one static schema, both surfaces. No emoji enum even under a REACTION_EMOJIS
+        allowlist — the allowlist governs what may be PLACED, and an emoji that is already on a
+        message must stay removable after the list changes underneath it."""
+        return {
+            "type": "function",
+            "name": "remove_reaction",
+            "description": (
+                "Take one of YOUR OWN emoji reactions back off a Slack message — when someone "
+                "asks you to remove it, or when a reaction you left no longer fits what the "
+                "message turned out to mean. Slack scopes this to your own reactions, so it can "
+                "never remove anyone else's, and there is nothing to remove from a message you "
+                "never reacted to. Defaults to the message you are answering. Call once per "
+                "emoji."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "emoji": {"type": "string",
+                              "description": ("Emoji shorthand name to take off, no colons — "
+                                              "the same name you reacted with.")},
+                    "ts": {"type": "string",
+                           "description": ("Optional ts of another recent message in this "
+                                           "channel; defaults to the message you are "
+                                           "answering.")},
+                },
+                "required": ["emoji"],
+            },
+        }
+
+    async def execute_remove_reaction_tool(self, ctx, args: dict) -> dict:
+        """Executor for remove_reaction. Never raises (returns ``{"ok": False, ...}``).
+
+        `remove_owned_reaction` is NOT the path here, and cannot be: it proves ownership from a
+        LEASE, and `react_to_message` settles its lease into an unowned slot the moment the
+        reaction lands (`_reserve_and_react`), so by the time anybody could ask for a removal
+        there is no lease left to present. What makes the raw call safe instead is Slack itself —
+        `reactions.remove` acts as the authenticated user, so the only reaction it can take off
+        is one this bot put there.
+
+        The guard slot goes WITH the reaction. A committed slot answers a later re-add of the
+        same emoji with idempotent success without calling Slack at all, and after this removal
+        that answer would describe a reaction that is no longer on the message.
+        """
+        channel_id = getattr(ctx, "channel_id", None)
+        trigger_ts = getattr(ctx, "trigger_ts", None)
+        attempt_id = getattr(ctx, "attempt_id", None)
+
+        raw_emoji = args.get("emoji")
+        emoji = raw_emoji.strip().strip(":") if isinstance(raw_emoji, str) else ""
+        raw_ts = args.get("ts")
+        ts = (raw_ts.strip() if isinstance(raw_ts, str) and raw_ts.strip()
+              else trigger_ts or getattr(ctx, "thread_ts", None))
+
+        def _record(result_name: str, *, detail=None) -> None:
+            if not attempt_id:
+                return
+            participation_telemetry.reaction(
+                channel_id, trigger_ts, operation="remove", result=result_name,
+                origin="responder", emoji=emoji or None, target_ts=ts,
+                attempt_id=attempt_id, detail=detail)
+
+        if not (config.enable_reactions and config.enable_react_tool):
+            return {"ok": False, "error": "disabled", "message": "Reactions are disabled."}
+        if not valid_emoji_name(emoji):
+            return {"ok": False, "error": "invalid_emoji",
+                    "message": "Not a valid emoji shorthand name."}
+        if not channel_id or not ts:
+            return {"ok": False, "error": "no_target",
+                    "message": "No message to remove a reaction from."}
+
+        # An ADD is in flight for this exact emoji (a sibling call in this same round). Removing
+        # underneath it would race its own bookkeeping, and whichever landed last would decide an
+        # outcome neither caller asked for.
+        slots = (getattr(self, "_reaction_guard", None) or {}).get((channel_id, ts))
+        slot = slots.get(emoji) if slots is not None else None
+        if slot is not None and not self._is_committed(slot):
+            return {"ok": False, "error": "reaction_busy",
+                    "message": f"Could not settle :{emoji}: — it is being added right now. "
+                               f"Try again."}
+
+        if _epoch_refused(self, channel_id, "reactions_remove"):
+            # The helper already warned.
+            return {"ok": False, "error": "workspace_unavailable"}
+
+        try:
+            await self.app.client.reactions_remove(
+                channel=channel_id, name=emoji, timestamp=ts)
+        except SlackApiError as e:
+            resp = getattr(e, "response", None)
+            err = (resp.get("error")
+                   if resp is not None and callable(getattr(resp, "get", None)) else None)
+            if err == "no_reaction":
+                # The end state is right and the bookkeeping was wrong, so it is corrected: a
+                # stale committed slot here is exactly what would refuse a later honest re-add.
+                self._clear_reaction_guard_slot(channel_id, ts, emoji)
+                _record("removed", detail="no_reaction")
+                return {"ok": True, "emoji": emoji, "ts": ts, "removed": False,
+                        "message": f"There was no :{emoji}: of yours on that message."}
+            self.log_warning(f"Could not remove reaction :{emoji}: ({err})")
+            _record("remove_failed", detail=err)
+            return {"ok": False, "error": err or "reaction_remove_failed",
+                    "message": f"Could not remove :{emoji}:."}
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — a tool contract is a dict, never a raise
+            self.log_error(f"Unexpected error removing reaction :{emoji}: {e}")
+            _record("remove_failed", detail="exception")
+            return {"ok": False, "error": "reaction_remove_failed",
+                    "message": f"Could not remove :{emoji}:."}
+
+        self._clear_reaction_guard_slot(channel_id, ts, emoji)
+        _record("removed")
+        return {"ok": True, "emoji": emoji, "ts": ts, "removed": True,
+                "message": f"Took :{emoji}: back off that message."}
+
     # --- pin_message local tool (PIN §2/§3/§4) ---
 
     def get_pin_message_tool_schema(self) -> dict:
@@ -2789,6 +2907,31 @@ class SlackMessagingMixin(_Host):
             if ts_map is not None:
                 ts_map.pop((channel_id, ts), None)
         self.log_debug(f"Took back :{emoji}: — the turn produced nothing")
+
+    def _clear_reaction_guard_slot(self, channel_id: str, ts: str, emoji: str) -> None:
+        """Forget the guard's record of ONE emoji on ONE message (T5b).
+
+        `_settle_removal_slot` does this for a removal that went through the LEASE, and its
+        cleanup rules are what this copies: drop the emoji, then drop the (channel, ts) entry and
+        its touch time once nothing is left — and only while the guard still maps that key to the
+        SAME slots object, since a concurrent recreate after an eviction installs a different
+        dict that is not ours to delete.
+
+        What it is FOR: a committed slot is the guard's promise that the emoji is on the message,
+        and `_reserve_once` answers a re-add of a committed emoji with idempotent success without
+        calling Slack. After a raw removal that promise is false, and the next honest attempt to
+        put the emoji back would be told it is already there.
+        """
+        guard = getattr(self, "_reaction_guard", None)
+        slots: Any = (guard or {}).get((channel_id, ts))
+        if slots is None:
+            return
+        slots.pop(emoji, None)
+        if not slots and guard is not None and guard.get((channel_id, ts)) is slots:
+            guard.pop((channel_id, ts), None)
+            ts_map = getattr(self, "_reaction_guard_ts", None)
+            if ts_map is not None:
+                ts_map.pop((channel_id, ts), None)
 
     async def _run_reaction_removal(self, channel_id: str, ts: str, emoji: str,
                                     token: str) -> bool:
@@ -3868,6 +4011,204 @@ class SlackMessagingMixin(_Host):
         if shape_kind == "footer":
             return _blocks_match(fetched.get("blocks"), rebuilt_blocks)
         return True
+
+    # --- delete_own_message local tool (T5a) ---
+
+    def get_delete_own_message_tool_schema(self) -> dict:
+        """T5a: one static schema, CHANNELS ONLY (the DM surface never exposes it, and the
+        executor re-refuses DM contexts as defense in depth). No channel_id property — the
+        conversation comes from the ToolContext, exactly as pin_message's target does."""
+        return {
+            "type": "function",
+            "name": "delete_own_message",
+            "description": (
+                "Delete one of YOUR OWN earlier messages in this channel — only when a person "
+                "here explicitly asks for that specific message to be removed. Deletion is "
+                "PERMANENT: the message is gone for everyone, there is no undo, and nothing "
+                "brings it back. Never delete on your own initiative, and never delete anyone "
+                "else's message — only your own posts can be removed and the tool refuses the "
+                "rest. If something you posted is wrong and nobody asked you to delete it, "
+                "correct it with edit_own_message and say so instead."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_ts": {
+                        "type": "string",
+                        "description": ("Exact ts of one of YOUR OWN messages in THIS "
+                                        "conversation, as an id you can actually see this turn: "
+                                        "a message header in the stream or a tool result about "
+                                        "this conversation. Never guess or derive one."),
+                    },
+                },
+                "required": ["message_ts"],
+            },
+        }
+
+    async def execute_delete_own_message(self, ctx, args: dict) -> dict:
+        """Shim: result observability + never-raise, the same shape pin_message uses."""
+        try:
+            result = await self._execute_delete_own_message(ctx, args)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — the tool contract is a dict, never a raise
+            self.log_error(f"delete_own_message failed: {e}")
+            return {"ok": False, "error": "delete_failed",
+                    "message": "Could not delete that message."}
+        if isinstance(result, dict) and not result.get("ok") \
+                and result.get("error") != "workspace_unavailable":
+            self.log_info(f"delete_own_message refused: {result.get('error')}")
+        return result
+
+    async def _execute_delete_own_message(self, ctx, args: dict) -> dict:
+        """T5a: permanently delete ONE own message of this channel, on explicit request.
+
+        Two things are load-bearing and neither is negotiable:
+
+        * **The author is proved BEFORE the delete**, by an exact read of the target and
+          `is_own_message` — not by the model's word for it, and not by anything the model can
+          supply. A context with no bot identity resolved fails that test, which is the right way
+          round: an unproved author authorizes nothing.
+        * **`chat.delete` first, then the receipt.** A receipt describes a post that is really
+          there; dropping the row before the API call would leave a deleted-but-receipted message
+          on a failure, which is the one state nothing downstream can tell from a normal one. The
+          order is the settings cleanup's, verbatim (`_drop_settings_receipt` after a confirmed
+          `chat_delete`).
+
+        Every model-supplied value is TYPE-CHECKED before any coercion, so a malformed argument
+        can never reach Slack.
+        """
+        channel_id = getattr(ctx, "channel_id", None)
+        # Owner ruling: channels only. Mirrors edit_own_message, whose registration hides it on
+        # the DM surface and whose executor refuses one anyway.
+        if getattr(ctx, "is_dm", False) or str(channel_id or "").startswith("D"):
+            return {"ok": False, "error": "channel_only",
+                    "message": "Deleting your own messages is only available in channels."}
+        if not channel_id:
+            return {"ok": False, "error": "no_channel_context"}
+        raw_ts = args.get("message_ts")
+        if not isinstance(raw_ts, str):
+            return {"ok": False, "error": "invalid_ts"}
+        message_ts = raw_ts.strip()
+        try:
+            parse_ts(message_ts)
+        except TimestampError:
+            return {"ok": False, "error": "invalid_ts"}
+
+        live = await self._read_deletable_message(channel_id, message_ts,
+                                                  getattr(ctx, "thread_ts", None))
+        if live is None:
+            return {"ok": False, "error": "message_not_found",
+                    "message": ("That message could not be found in this conversation, so "
+                                "nothing was deleted.")}
+        if not self.is_own_message(live):
+            return {"ok": False, "error": "not_own_message",
+                    "message": ("That message was posted by someone else. You can only delete "
+                                "your own messages.")}
+
+        turn = getattr(ctx, "turn", None)
+        team_id = getattr(self, "self_team_id", None)
+        lock_key = (team_id, channel_id, message_ts)
+        lock = _edit_transaction_lock(*lock_key)
+
+        async def _transaction() -> dict:
+            # The same keyed lock edit_own_message and pin_message use, so two turns aiming at
+            # one message serialize rather than racing a delete against an edit.
+            async with lock:
+                # Epoch check INSIDE the lock, at the mutation point: a turn parked here must
+                # not spend an authorization that went stale while it waited.
+                if _epoch_refused(self, channel_id, "chat_delete"):
+                    return {"ok": False, "error": "workspace_unavailable"}
+                # Recorded immediately before the irreversible step, with no await between the
+                # two: a replay of this call id must never delete a second message, and a
+                # cancellation from here on must keep the key.
+                mark_tool_launched(ctx)
+                try:
+                    # NOT stale-guarded, deliberately. The send lease refuses CONTENT that would
+                    # otherwise land in a conversation that has moved on, and a deletion carries
+                    # no text — it can never be the turn's first visible word, which is the whole
+                    # hazard the guard exists for. Handing it a lease would be worse than
+                    # pointless: `authorize` raises StaleSendSuppressed once anyone else has
+                    # spoken, so a person's explicit "delete that message" would silently do
+                    # nothing, and the passage of time makes a requested deletion MORE wanted,
+                    # not less. What a delete genuinely needs — revocation after a cut-short turn
+                    # and no second delete on a replayed call id — is already held by the
+                    # run_effect lease around this transaction and by mark_tool_launched above.
+                    # Same reasoning `delete_message` is marked with: removing a surface can
+                    # never be a stale answer.
+                    await self.app.client.chat_delete(  # unleased-ok: a deletion posts no text, so it cannot be a stale answer; run_effect covers revocation
+                        channel=channel_id, ts=message_ts)
+                except SlackApiError as e:
+                    resp = getattr(e, "response", None)
+                    err = (resp.get("error")
+                           if resp is not None and callable(getattr(resp, "get", None))
+                           else None)
+                    if err == "message_not_found":
+                        # Confirmed absent — the end state asked for. The receipt still
+                        # describes a post that is not there, so it goes too.
+                        await self._drop_own_message_receipt(channel_id, message_ts)
+                        return {"ok": True, "deleted": False, "message_ts": message_ts,
+                                "message": "That message was already gone."}
+                    return {"ok": False, "error": err or "delete_failed",
+                            "message": "Could not delete that message."}
+                except (asyncio.TimeoutError, aiohttp.ClientError):
+                    # No answer is not a failed write. A retry could delete a message a person
+                    # posted in the meantime under a reused ts, so this settles nothing and
+                    # says so — the receipt stays, because it may still be accurate.
+                    return {"ok": False, "error": "outcome_unknown",
+                            "message": ("Slack never confirmed the deletion, so that message "
+                                        "may or may not still be there. Check before trying "
+                                        "again.")}
+                # CONFIRMED gone (chat_delete raises otherwise): the receipt goes with it.
+                await self._drop_own_message_receipt(channel_id, message_ts)
+                return {"ok": True, "deleted": True, "message_ts": message_ts,
+                        "message": "That message is permanently deleted."}
+
+        try:
+            # LEASED: a deletion is irreversible, so it runs under the turn's effect lease like
+            # every other effect that cannot be taken back.
+            return await run_effect(turn, "delete_own_message", _transaction)
+        except EffectRevoked:
+            return {"ok": False, "error": "turn_cancelled",
+                    "message": ("This turn was cut short before the deletion ran, so nothing "
+                                "was deleted.")}
+        except LaunchNotRecorded as e:
+            self.log_error(
+                f"delete_own_message: launch not recorded for {channel_id}/{message_ts}: {e}")
+            return {"ok": False, "error": "launch_not_recorded",
+                    "message": "Something went wrong before the deletion ran; nothing changed."}
+        finally:
+            _prune_edit_transaction_lock(lock_key, lock)
+
+    async def _read_deletable_message(self, channel_id: str, message_ts: str,
+                                      thread_root_ts: Optional[str]) -> Optional[dict]:
+        """One exact read of the delete target, from whichever surface holds it.
+
+        A thread REPLY is not in `conversations.history` at all, and a top-level message of
+        another thread is not in this thread's `conversations.replies` — so the current thread is
+        tried first and the channel timeline second. Both are the same single-message exact read
+        `edit_own_message` uses; neither reveals anything a failure would not.
+        """
+        live = None
+        if thread_root_ts and thread_root_ts != message_ts:
+            live = await self._read_exact_message(channel_id, message_ts, thread_root_ts)
+        if live is None:
+            live = await self._read_exact_message(channel_id, message_ts, None)
+        return live
+
+    async def _drop_own_message_receipt(self, channel_id: str, message_ts: str) -> None:
+        """The message is gone from Slack and we saw it go, so its receipt goes too.
+
+        Imported lazily for the same reason the settings handler does it: this module sits under
+        `message_processor` in the import graph.
+        """
+        from message_processor.outbound_receipts import delete_receipt_for
+        try:
+            await delete_receipt_for(team_id=getattr(self, "self_team_id", None),
+                                     channel_id=channel_id, message_ts=message_ts,
+                                     site="delete_own_message")
+        except Exception as e:  # noqa: BLE001 — a stranded row never fails a landed deletion
+            self.log_debug(f"delete_own_message receipt deletion failed: {e}")
 
     def get_no_reply_tool_schema(self) -> dict:
         """Function-tool schema for the F2 terminal no-reply action (silence-capable turns only).

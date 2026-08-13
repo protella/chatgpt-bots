@@ -2030,3 +2030,98 @@ async def test_the_outer_pipeline_leaves_a_dm_on_the_legacy_read(temp_db):
     seen = []
     await _run_pipeline(_processor(temp_db, seen), DM)
     assert seen and not any(seen)
+
+
+# ============================================================ retention: rows outliving the message
+#
+# Slack deletes messages in bulk by age and announces none of it — no event, and no
+# retention-policy API off Grid. So the sweep infers the boundary from what still answers: one
+# `conversations.history` probe per channel per night, and rows are pruned only when that probe
+# comes back empty. A one-off manual delete is NOT this sweep's job (the delete event path handles
+# it live), and nothing here tries to detect one.
+
+
+def _retention_web(*, surviving=None, error=None):
+    """A Slack client whose history probe answers what retention has left behind."""
+    if error is not None:
+        return SimpleNamespace(conversations_history=AsyncMock(side_effect=error))
+    return SimpleNamespace(conversations_history=AsyncMock(
+        return_value={"ok": True, "messages": list(surviving or [])}))
+
+
+async def _seed_receipts(db, *timestamps):
+    for ts in timestamps:
+        await db.register_receipt_async(TEAM, CH, ts, "S:1", "finalized", None,
+                                        receipt_class=orx.CLASS_ASSISTANT_REPLY)
+
+
+async def test_receipts_are_pruned_when_slack_no_longer_has_the_messages(temp_db):
+    """The probe comes back empty: everything at or below that ts has aged out of Slack, so the
+    rows describing those messages are describing nothing."""
+    await _seed_receipts(temp_db, "100.000100", "200.000100", "900.000100")
+    web = _retention_web(surviving=[])
+
+    pruned = await orx.sweep_receipts_past_retention(temp_db, web)
+
+    assert pruned == 3
+    assert await temp_db.get_channel_receipts_async(TEAM, CH) == []
+
+
+async def test_the_sweep_stops_at_the_first_surviving_message(temp_db):
+    """The normal night: retention has not reached our oldest receipt, so ONE call is the whole
+    cost and nothing is deleted."""
+    await _seed_receipts(temp_db, "100.000100", "200.000100")
+    web = _retention_web(surviving=[{"ts": "100.000100", "text": "still here"}])
+
+    pruned = await orx.sweep_receipts_past_retention(temp_db, web)
+
+    assert pruned == 0
+    assert web.conversations_history.await_count == 1
+    assert len(await temp_db.get_channel_receipts_async(TEAM, CH)) == 2
+    kwargs = web.conversations_history.await_args.kwargs
+    assert kwargs["channel"] == CH and kwargs["oldest"] == "0" and kwargs["limit"] == 1
+    # A hair past the receipt, so the message it describes is inside the probed window.
+    assert float(kwargs["latest"]) > 100.000100
+
+
+async def test_only_the_aged_rows_go_and_the_newer_ones_stay(temp_db):
+    """The walk repeats from the new oldest, so a boundary that moved months is caught in one
+    night — and stops the moment something survives."""
+    await _seed_receipts(temp_db, "100.000100", "200.000100", "900.000100")
+    answers = [{"ok": True, "messages": []},
+               {"ok": True, "messages": []},
+               {"ok": True, "messages": [{"ts": "900.000100", "text": "still here"}]}]
+    web = SimpleNamespace(conversations_history=AsyncMock(side_effect=answers))
+
+    pruned = await orx.sweep_receipts_past_retention(temp_db, web)
+
+    assert pruned == 2
+    assert [row["message_ts"] for row in await temp_db.get_channel_receipts_async(TEAM, CH)] == [
+        "900.000100"]
+
+
+async def test_a_failing_probe_skips_that_channel_rather_than_the_cleanup(temp_db):
+    """This runs inside the nightly cleanup task, next to the database backup. A rate-limited
+    channel is worth losing until tomorrow; the rest of the cleanup is not."""
+    await _seed_receipts(temp_db, "100.000100")
+    web = _retention_web(error=RuntimeError("ratelimited"))
+
+    pruned = await orx.sweep_receipts_past_retention(temp_db, web)
+
+    assert pruned == 0
+    assert len(await temp_db.get_channel_receipts_async(TEAM, CH)) == 1, "nothing was deleted"
+
+
+async def test_hidden_history_is_not_deleted_history(temp_db):
+    """A free-plan workspace answers an out-of-window probe with NO messages and `is_limited`. The
+    messages are still there — they come back the day the plan changes — so pruning on that would
+    throw away receipts for messages that still exist."""
+    await _seed_receipts(temp_db, "100.000100", "200.000100")
+    web = SimpleNamespace(conversations_history=AsyncMock(
+        return_value={"ok": True, "messages": [], "is_limited": True}))
+
+    pruned = await orx.sweep_receipts_past_retention(temp_db, web)
+
+    assert pruned == 0
+    assert web.conversations_history.await_count == 1, "and it stops asking about that channel"
+    assert len(await temp_db.get_channel_receipts_async(TEAM, CH)) == 2

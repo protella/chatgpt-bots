@@ -653,16 +653,32 @@ def test_the_channel_etiquette_drops_the_bullet_that_contradicts_the_schema():
     assert "post_to_thread" not in CHANNEL_LOCAL_TOOLS_GUIDANCE
 
 
-def test_the_channel_etiquette_is_the_dm_etiquette_minus_exactly_that_bullet():
+def test_the_channel_etiquette_is_the_dm_etiquette_minus_and_plus_exactly_the_declared_bullets():
     """Derived, not copied — and this is the assertion that keeps the derivation honest. Renaming
-    the DM bullet would make the filter a no-op and quietly restore the contradiction; a divergence
-    anywhere else means somebody edited one surface's etiquette and not the other's."""
+    a DM bullet would make the filter a no-op and quietly restore the contradiction; a divergence
+    anywhere else means somebody edited one surface's etiquette and not the other's.
+
+    The toolbelt round (2026-08-12) made the difference two-way. It is still DECLARED, in the two
+    prompts.py tuples read here rather than in a literal pinned to this test: a DM-only bullet is
+    filtered out (post_to_thread, whose channel instruction is the opposite; personal memory, which
+    a channel turn has no store for) and a channel-only bullet is spliced in (delete_own_message
+    and the topic/purpose pair, none of which the DM surface is registered for at all). Every other
+    line must still be identical on both surfaces."""
     dm_lines = LOCAL_TOOLS_GUIDANCE.split("\n")
     channel_lines = CHANNEL_LOCAL_TOOLS_GUIDANCE.split("\n")
+
     removed = [line for line in dm_lines if line not in channel_lines]
-    assert len(removed) == 1, f"expected exactly one bullet to differ, got {len(removed)}"
-    assert removed[0].startswith("- post_to_thread:")
-    assert channel_lines == [line for line in dm_lines if line != removed[0]]
+    assert len(removed) == 2, f"expected exactly two DM-only bullets, got {len(removed)}"
+    assert [line for line in removed
+            if line.startswith(prompts.DM_ONLY_TOOL_BULLET_PREFIXES)] == removed
+    assert any(line.startswith("- post_to_thread:") for line in removed)
+
+    added = [line for line in channel_lines if line not in dm_lines]
+    assert added == list(prompts.CHANNEL_ONLY_TOOL_BULLETS)
+
+    # And nothing else moved: strip each surface's own bullets and the two texts are the same.
+    assert ([line for line in channel_lines if line not in added]
+            == [line for line in dm_lines if line not in removed])
 
 
 def test_no_origin_ack_instruction_survives_anywhere_on_the_channel_surface():

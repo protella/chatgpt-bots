@@ -413,6 +413,27 @@ not `<pre>`. Table cells hold `<p>`, so walking every `<p>` shreds a table into 
   anything. Absent → fail closed. The channel canvas is never offered, and a canvas the bot did
   not create refuses deletion anyway (`restricted_action`).
 
+## Scheduled deliveries: our own message events never arrive (T1)
+
+**Bolt's default `ignoring_self_events` middleware swallows every own-bot message event before any
+app handler runs.** Probed live 2026-08-13, twice: a direct bot-token `chat.postMessage` into a
+channel produced zero handler activity — `handle_message` was never called at all. So no seam in
+`slack_client/event_handlers/` can be built on "our message comes back to us".
+
+That broke scheduled-message receipts, and visibly: a reminder posted, no receipt was written, and
+the channel-stream rebuild then logged *"has no receipt row and cannot be grandfathered … excluding
+it from the stream"* — the bot denied its own reminder ("it didn't fire") while it sat in the
+channel above.
+
+Scheduled deliveries therefore **reconcile from the events that DO arrive**: the next human message
+in that channel. `outbound_receipts.reconcile_overdue_scheduled` reads the delivered message back
+out of Slack (`conversations.history`, or `conversations.replies` when the post was scheduled into
+a thread — a thread reply is not in a channel listing) and finalizes the receipt. The seam
+(`message_events._finalize_scheduled_delivery`) asks an in-memory question first
+(`has_overdue_scheduled_delivery`), so an ordinary message event costs **zero Slack calls**; a call
+happens only in a channel that is genuinely overdue on a delivery. The own-message finalize path is
+kept — correct, free, and what runs if that middleware is ever disabled.
+
 ## Scanned / image-only PDF handling
 
 - On the attach turn, PDFs within the native limits ride the message as `input_file` parts, so the

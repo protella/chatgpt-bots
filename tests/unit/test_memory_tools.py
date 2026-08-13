@@ -1,9 +1,13 @@
-"""Phase C — model-invoked channel-memory tools.
+"""Phase C — model-invoked memory tools, CHANNEL surface.
 
-Covers: the three executors (happy paths, cap-hit with oldest-3 listing,
-wrong-channel not_found, workspace-scope write refusal, DM refusal), author
-attribution, [#id]-prefixed deterministic injection rendering, extractor
-fallback gating, registry gating on ENABLE_CHANNEL_MEMORY, and guidance text.
+Covers: the executors on a channel (happy paths, cap-hit with oldest-3 listing,
+wrong-channel not_found, workspace-scope write refusal), author attribution,
+[#id]-prefixed deterministic injection rendering, extractor fallback gating,
+registry gating on ENABLE_CHANNEL_MEMORY, and guidance text.
+
+The DM surface — where the same tool names reach the per-user store instead —
+lives in tests/unit/test_user_memory.py, including the DM behaviour that used to
+be a flat refusal here.
 """
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -14,6 +18,7 @@ from message_processor.memory_tools import (
     execute_remember_fact,
     execute_update_fact,
     get_forget_fact_schema,
+    get_list_facts_schema,
     get_remember_fact_schema,
     get_update_fact_schema,
     register_memory_tools,
@@ -53,6 +58,7 @@ def test_schema_shapes():
         (get_remember_fact_schema(), "remember_fact", {"content"}),
         (get_update_fact_schema(), "update_fact", {"id", "content"}),
         (get_forget_fact_schema(), "forget_fact", {"id"}),
+        (get_list_facts_schema(), "list_facts", set()),
     ]:
         assert schema["type"] == "function"
         assert schema["name"] == name
@@ -104,12 +110,15 @@ async def test_remember_empty_content_refused():
 
 
 @pytest.mark.asyncio
-async def test_remember_dm_refused():
+async def test_remember_in_a_dm_never_touches_the_channel_store():
+    """A DM call is not refused any more — it is ROUTED. The channel store stays untouched."""
     db = _db()
+    db.get_user_memory_async = AsyncMock(return_value=[])
+    db.add_user_memory_async = AsyncMock(return_value=3)
     result = await execute_remember_fact(_ctx(db, is_dm=True, channel_id="D1"), {"content": "x"})
-    assert result == {"ok": False, "error": "memory_is_channel_only",
-                      "message": "Channel memory is not available in DMs."}
+    assert result["ok"] is True
     db.get_channel_memory_async.assert_not_awaited()
+    db.add_channel_memory_async.assert_not_awaited()
 
 
 # --- update_fact ---
@@ -139,12 +148,6 @@ async def test_update_workspace_scope_refused():
     db.update_channel_fact_async.assert_not_awaited()
 
 
-@pytest.mark.asyncio
-async def test_update_dm_refused():
-    result = await execute_update_fact(_ctx(_db(), is_dm=True), {"id": 1, "content": "x"})
-    assert result["error"] == "memory_is_channel_only"
-
-
 # --- forget_fact ---
 
 @pytest.mark.asyncio
@@ -161,12 +164,6 @@ async def test_forget_not_found_and_bad_id():
     assert (await execute_forget_fact(_ctx(db), {"id": 8}))["error"] == "not_found"
     assert (await execute_forget_fact(_ctx(db), {"id": "abc"}))["error"] == "bad_arguments"
     db.delete_channel_memory_async.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_forget_dm_refused():
-    result = await execute_forget_fact(_ctx(_db(), is_dm=True), {"id": 1})
-    assert result["error"] == "memory_is_channel_only"
 
 
 # --- injection rendering ---
@@ -230,11 +227,13 @@ async def test_extractor_runs_when_fallback_on():
 
 # --- registry gating ---
 
-def test_register_memory_tools_registers_all_three():
+def test_register_memory_tools_registers_every_tool():
+    from tool_registry import SURFACE_CHANNEL
+
     registry = ToolRegistry()
     register_memory_tools(registry)
-    names = {s["name"] for s in registry.schemas()}
-    assert {"remember_fact", "update_fact", "forget_fact"} <= names
+    names = {s["name"] for s in registry.schemas(surface=SURFACE_CHANNEL)}
+    assert {"remember_fact", "update_fact", "forget_fact", "list_facts"} <= names
 
 
 def test_registry_gating_on_enable_channel_memory():
@@ -253,12 +252,18 @@ def test_registry_gating_on_enable_channel_memory():
              patch.object(config, "enable_deep_research", False):
             with patch.object(SlackBot, "get_history_tools_for_openai", return_value=[], create=True):
                 registry = SlackBot._build_tool_registry(bot)
-        return {s["name"] for s in registry.schemas()}
+            # The CHANNEL surface is the one ENABLE_CHANNEL_MEMORY governs. (The DM surface
+            # answers to ENABLE_USER_MEMORY and a different store; test_user_memory.py owns that
+            # half.) Read INSIDE the patch: the client now registers the memory tools
+            # unconditionally and `channel_enabled` reads the flag per request, so a listing taken
+            # after the patch lifts would answer to the real config rather than to `flag`.
+            from tool_registry import SURFACE_CHANNEL
+            return {s["name"] for s in registry.schemas(surface=SURFACE_CHANNEL)}
 
     # Assert about the memory tools themselves, not the whole registry: tools registered
     # unconditionally by other features (F34's generate_image) are legitimately present in
     # both builds and say nothing about this gate.
-    memory_tools = {"remember_fact", "update_fact", "forget_fact"}
+    memory_tools = {"remember_fact", "update_fact", "forget_fact", "list_facts"}
     assert memory_tools <= build(True)
     assert memory_tools.isdisjoint(build(False))
 

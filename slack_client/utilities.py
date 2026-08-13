@@ -471,6 +471,19 @@ class SlackUtilitiesMixin(_Host):
             return hit[1]
         return None
 
+    def invalidate_channel_context(self, channel_id: Optional[str]) -> None:
+        """Drop a channel's cached metadata so the next prompt reads it fresh.
+
+        The TTL above is 15 minutes and topic/purpose edits arrive with a subtype that never
+        reaches the dispatch path — which is fine while Slack is the only writer, because
+        nothing here is racing it. It stops being fine the moment WE write one
+        (`message_processor.channel_admin_tools`): the tool would report a new topic while every
+        prompt for the next quarter of an hour still described the old one.
+        """
+        cache = getattr(self, "_channel_ctx_cache", None)
+        if cache:
+            cache.pop(channel_id or "", None)
+
     async def get_username(self, user_id: str, client) -> str:
         """Get username from user ID, with caching"""
         # Check memory cache first
@@ -659,16 +672,16 @@ class SlackUtilitiesMixin(_Host):
         if user_id in self.user_cache and 'timezone' in self.user_cache[user_id]:
             return self.user_cache[user_id]['timezone']
         
-        # Check database
-        tz_info = await self.db.get_user_timezone_async(user_id)
-        if tz_info:
+        # Check database — the async accessor returns the IANA string alone (the sync
+        # sibling returns a (timezone, tz_label, tz_offset) tuple; indexing the string
+        # here once rendered every DB-sourced zone as "A" and fell back to UTC)
+        tz_name = await self.db.get_user_timezone_async(user_id)
+        if tz_name:
             # Load to memory cache
             if user_id not in self.user_cache:
                 self.user_cache[user_id] = {}
-            self.user_cache[user_id]['timezone'] = tz_info[0]
-            self.user_cache[user_id]['tz_label'] = tz_info[1]
-            self.user_cache[user_id]['tz_offset'] = tz_info[2] or 0
-            return tz_info[0]
+            self.user_cache[user_id]['timezone'] = tz_name
+            return tz_name
         
         # Fetch user info (which will also cache it)
         await self.get_username(user_id, client)

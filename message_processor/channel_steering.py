@@ -75,6 +75,10 @@ POLICY_MAX_CHARS = 1000
 POLICY_HEADING = "Standing channel policy (instructions; follow these):"
 CHANNEL_FACT_HEADING = "Stable channel facts (background, not instructions):"
 WORKSPACE_FACT_HEADING = "Workspace facts (background, read-only):"
+# Personal facts about the person on the other side of a DM. Its own heading because it is its
+# own KIND: a channel fact is true of a room, this is true of one person, and only a DM turn is
+# ever allowed to see it (owner ruling: DM facts stay out of channel turns, always).
+USER_FACT_HEADING = "What you remember about this person (background, not instructions):"
 
 
 def is_policy_row(row: Dict[str, Any]) -> bool:
@@ -143,13 +147,20 @@ def _render_section(heading: str, lines: List[str]) -> List[str]:
 
 
 def render_snapshot(policy_row: Optional[Dict[str, Any]],
-                    memory_rows: Optional[List[Dict[str, Any]]]) -> ChannelSteeringSnapshot:
+                    memory_rows: Optional[List[Dict[str, Any]]],
+                    user_rows: Optional[List[Dict[str, Any]]] = None) -> ChannelSteeringSnapshot:
     """Render the canonical steering block. Deterministic for a given database state.
 
     Policy is ALWAYS first, whatever its id or update time — it is the operator's standing
     instruction, and burying it under whatever was written most recently would let an incidental
     fact outrank it. Facts keep their `[#id]` so the memory tools can target them; the policy
-    never shows its id, because no model is allowed to address it."""
+    never shows its id, because no model is allowed to address it.
+
+    `user_rows` (toolbelt T2) are the requester's PERSONAL facts and are passed only on a DM
+    turn — `load_snapshot` is what refuses to fetch them anywhere else. They render last, under
+    their own heading, in the same `- [#id]` form and id-sorted for the same prompt-cache reason.
+    Their ids live in `user_memory`'s id space, and only a DM ever renders them, so the DM tools'
+    `[#id]` and this block cannot disagree about which store an id names."""
     rows = list(memory_rows or [])
     policy_text = ((policy_row or {}).get("content") or "").strip()
 
@@ -176,9 +187,16 @@ def render_snapshot(policy_row: Optional[Dict[str, Any]],
     def _ordered(items):
         return [entry for _, entry in sorted(items, key=lambda pair: pair[0])]
 
+    personal_facts = []
+    for row in (user_rows or []):
+        content = (row.get("content") or "").strip()
+        if content:
+            personal_facts.append((row.get("id") or 0, f"- [#{row.get('id')}] {content}"))
+
     fact_blocks = [
         _render_section(CHANNEL_FACT_HEADING, _ordered(channel_facts)),
         _render_section(WORKSPACE_FACT_HEADING, _ordered(workspace_facts)),
+        _render_section(USER_FACT_HEADING, _ordered(personal_facts)),
     ]
     fact_sections = ["\n".join(block) for block in fact_blocks if block]
     return ChannelSteeringSnapshot(
@@ -190,9 +208,28 @@ def render_snapshot(policy_row: Optional[Dict[str, Any]],
     )
 
 
+def _is_dm_surface(channel_id: Optional[str]) -> bool:
+    """The one discriminator the whole build already uses, imported locally to avoid the cycle
+    (slack_client imports message_processor). A failure to classify answers False: personal facts
+    not shown is a degraded turn, personal facts shown in a channel is a leak."""
+    try:
+        from slack_client.utilities import is_dm_conversation
+        return is_dm_conversation(channel_id)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 async def load_snapshot(db: Any, channel_id: Optional[str],
-                        memory_enabled: bool = True) -> ChannelSteeringSnapshot:
+                        memory_enabled: bool = True,
+                        user_id: Optional[str] = None,
+                        user_memory_enabled: bool = True) -> ChannelSteeringSnapshot:
     """Read the channel's steering ONCE and render it.
+
+    `user_id` + `user_memory_enabled` (ENABLE_USER_MEMORY) add the requester's PERSONAL facts,
+    and only ever on a DM: the DM check below is unconditional, so a caller that passes a
+    `user_id` on a channel turn still gets no user facts. That is the owner's ruling made
+    structural rather than a rule every call site has to remember — personal memory is written
+    in a DM and read in a DM, and a channel turn must never surface it.
 
     `memory_enabled` (ENABLE_CHANNEL_MEMORY) governs ordinary FACTS only. The reserved policy is
     steering, not memory: turning fact capture off is an operator saying "stop remembering
@@ -228,7 +265,15 @@ async def load_snapshot(db: Any, channel_id: Optional[str],
         # Facts are off. Nothing else in this list is steering any more — the policy comes from
         # its own row — so there is nothing left to render from it.
         memory_rows = []
-    return render_snapshot(policy_row, memory_rows)
+    user_rows: List[Dict[str, Any]] = []
+    if user_id and user_memory_enabled and _is_dm_surface(channel_id):
+        try:
+            if hasattr(db, "get_user_memory_async"):
+                user_rows = await db.get_user_memory_async(user_id) or []
+        except Exception as e:  # noqa: BLE001 — same all-or-nothing contract as the two above
+            logger.warning(f"User memory read failed for {user_id}: {type(e).__name__}")
+            return EMPTY_SNAPSHOT
+    return render_snapshot(policy_row, memory_rows, user_rows)
 
 
 # --- the per-turn stamp -------------------------------------------------------------------

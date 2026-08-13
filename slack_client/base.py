@@ -23,8 +23,12 @@ from .channel_lookup_tool import (SlackChannelLookupToolMixin,
                                   register_channel_lookup_tool)
 from .search_tool import SlackSearchToolMixin
 from tool_registry import Executor, ToolRegistry
+from message_processor.bookmark_tools import register_bookmark_tools
+from message_processor.channel_admin_tools import register_channel_admin_tools
 from message_processor.destination_tools import register_destination_tools
+from message_processor.knowledge_tools import register_knowledge_tools
 from message_processor.memory_tools import register_memory_tools
+from message_processor.schedule_tools import register_schedule_tools
 from message_processor.participation_tools import register_participation_tools
 from message_processor.document_tools import register_document_tools
 from message_processor.image_tools import register_image_tools
@@ -129,6 +133,11 @@ class SlackBot(SlackMessageEventsMixin,  # type: ignore[misc]
             registry.register(self.get_react_tool_schema, self.execute_react_tool,
                               name="react_to_message", dynamic=True,
                               channel_schema=self.get_react_tool_schema_static)
+            # T5b: take one of OUR OWN reactions back off. One static schema on both surfaces,
+            # with no emoji enum: a REACTION_EMOJIS allowlist governs what may be PLACED, and an
+            # emoji already on a message must stay removable after that list changes under it.
+            registry.register(self.get_remove_reaction_tool_schema(),
+                              self.execute_remove_reaction_tool)
             # Discovery for the ~1,400 custom emoji that cannot all fit in a schema description.
             # Hidden entirely under a REACTION_EMOJIS allowlist: there, the enum IS the palette
             # and searching a catalog the model may not draw from would only invite refusals.
@@ -151,6 +160,13 @@ class SlackBot(SlackMessageEventsMixin,  # type: ignore[misc]
         # visible mutations. No feature flag, per the spec.
         registry.register(self.get_edit_own_message_tool_schema(),
                           self.execute_edit_own_message,
+                          enabled=lambda _cfg: False)
+        # T5a: delete ONE own message, on an explicit human request. Same surface stance as
+        # edit_own_message — CHANNELS ONLY (owner ruling 2026-08-12): `enabled` is always False
+        # so the DM surface never sees it, and the executor re-refuses a DM context as defense
+        # in depth. Budgeted, not free: the mutation is visible and irreversible. No flag.
+        registry.register(self.get_delete_own_message_tool_schema(),
+                          self.execute_delete_own_message,
                           enabled=lambda _cfg: False)
         # PIN_MESSAGE: pin/unpin a message by ts ON REQUEST, both surfaces. Budgeted; no flag.
         # Request-only policy lives in the schema; Slack's message_not_found confines targets
@@ -192,8 +208,12 @@ class SlackBot(SlackMessageEventsMixin,  # type: ignore[misc]
                 # channel, `thread_ts` on results, no `scope`. The DM schema is unchanged.
                 channel_schema=self.get_search_tool_channel_schema,
             )
-        if config.enable_channel_memory:
-            register_memory_tools(registry)  # channel-only; executors refuse DMs
+        # Memory tools on BOTH surfaces, each behind its own flag and its own schema text: the
+        # channel surface (ENABLE_CHANNEL_MEMORY) reads and writes this channel's facts, the DM
+        # surface (ENABLE_USER_MEMORY) the requester's personal ones. Registered unconditionally —
+        # the flags decide which SURFACE exposes the tools, not whether they exist, and
+        # register_memory_tools carries both gates. Either flag off disables exactly its surface.
+        register_memory_tools(registry)
         # Decision #4: the gated set_channel_participation tool — the ONLY path that writes
         # structural participation/placement settings, and only on an explicit instruction.
         # Channel-only (executor refuses DMs), same as the memory tools.
@@ -211,6 +231,12 @@ class SlackBot(SlackMessageEventsMixin,  # type: ignore[misc]
         register_destination_tools(registry)
         if config.enable_read_document_tool:
             register_document_tools(registry)  # summary+ref rows; content re-derived in memory
+        # T3: search_stored_knowledge — keyword search over what the bot ALREADY derived in this
+        # channel (document SUMMARIES, image ANALYSES), so a file from a scrolled-away thread is
+        # findable rather than merely having happened. Both surfaces, no flag: reading back your
+        # own notes on this conversation is recall, not a capability. It sits beside
+        # read_document because that is the tool its document handles feed.
+        register_knowledge_tools(registry)
         # F51: fetch_url — the SAME hardened fetcher as ambient link capture, so a directly-asked
         # "read this link" opens the URL instead of relying on web_search luck.
         if config.enable_fetch_url_tool and config.enable_link_fetch:
@@ -256,6 +282,24 @@ class SlackBot(SlackMessageEventsMixin,  # type: ignore[misc]
         # F36: canvases — the one Slack surface meant to be EDITED rather than appended to,
         # so it is where a spec/checklist/plan the thread keeps revisiting belongs.
         register_canvas_tools(registry)
+        # T6: the conversation's bookmark bar — list/add/remove. Both surfaces, ungated: there
+        # is no feature flag for these, and the request-only policy for the two writes lives in
+        # their descriptions, exactly as pin_message's does. `remove_bookmark` re-reads the live
+        # listing itself before removing anything, so an id the model remembered from an earlier
+        # round — or invented — removes nothing.
+        register_bookmark_tools(registry)
+        # T1: schedule_message / list_scheduled_messages / cancel_scheduled_message. The only
+        # future this process has — Slack holds the schedule server-side, so a reminder survives
+        # a restart. Both surfaces, no flag: "remind me tomorrow" is at least as common in a DM,
+        # and the DM schedules into that DM. Request-only policy lives in the schemas.
+        register_schedule_tools(registry)
+        # T7: set_channel_topic / set_channel_purpose. CHANNEL surface only (the DM gate is
+        # `enabled=lambda _cfg: False`, the edit_own_message idiom — a DM has no topic). HUMAN
+        # REQUEST ONLY, and enforced in the executors on the set_channel_participation gate shape
+        # rather than by prompt: a channel's own description is exactly what a quoted line or an
+        # ambient turn would otherwise talk us into rewriting. MPIMs are refused there too —
+        # channel-shaped everywhere else, but the app carries no MPIM topic scope.
+        register_channel_admin_tools(registry)
         return registry
 
     # Async versions required by BaseClient

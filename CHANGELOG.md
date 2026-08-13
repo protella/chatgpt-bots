@@ -4,6 +4,45 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.3.0] - 2026-08-13
+
+### ✨ Added
+
+- **Scheduled messages.** Ask for a reminder or a future post and the bot schedules it through
+  Slack itself, so delivery survives restarts. It confirms the resolved time in your own
+  timezone, and can list or cancel pending ones on request.
+- **Personal memory in DMs.** The bot can remember, update, and forget facts about you — private
+  to your DMs, never shown in channels. View and delete everything from personal settings
+  (next to Custom Instructions), including a "forget everything" option. A `list_facts` tool
+  also reads back channel memory with the same ids the bot acts on. New `ENABLE_USER_MEMORY`
+  flag (default on).
+- **Stored-knowledge search.** The bot can find files and images from earlier threads by
+  searching what it wrote about them (summaries and image descriptions) — "which file was the
+  broken spreadsheet?" now gets an answer instead of a shrug.
+- **Sandbox management.** The bot can list what's in its code sandbox and, when one is genuinely
+  wedged, replace it with a fresh one on request.
+- **Self-delete and reaction removal.** On an explicit ask, the bot deletes a message it posted
+  (channels only, never anyone else's) or takes one of its own reactions back off.
+- **Bookmarks.** List, add, and remove entries in the channel bookmark bar, on request only.
+- **Channel topic & purpose.** Set on a direct human request only; the confirmation quotes the
+  previous value verbatim so any change is one ask away from restored.
+
+### 🐛 Fixed
+
+- **The bot now sees its own delivered scheduled messages.** Slack Bolt silently drops an app's
+  own message events, so a fired reminder was invisible to the bot's rebuilt context — it would
+  deny the reminder ever fired. Deliveries are now reconciled from channel history.
+- **Timestamps no longer fall back to UTC after a restart** for users whose timezone was loaded
+  from the database.
+
+### 🔧 Changed
+
+- **Background build jobs get 30 minutes** (was 10). A full-channel export alone can spend five
+  minutes honoring Slack's rate limits, which starved report-scale builds mid-work.
+- **Receipt bookkeeping now tracks Slack's retention.** The nightly cleanup prunes internal
+  receipt rows for messages Slack's retention has already deleted (one cheap probe per active
+  channel; workspaces with unlimited retention never prune).
+
 ## [3.2.0] - 2026-08-12
 
 ### ✨ Added

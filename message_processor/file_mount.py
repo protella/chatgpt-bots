@@ -413,6 +413,190 @@ def mounted_digests(ctx: ToolContext) -> List[str]:
     return out
 
 
+def get_list_sandbox_files_schema() -> Dict[str, Any]:
+    """T4: what is actually IN the sandbox right now. One static schema, both surfaces —
+    nothing about it varies with the thread (the container is the executor's question)."""
+    return {
+        "type": "function",
+        "name": "list_sandbox_files",
+        "description": (
+            "List the files currently in this conversation's code sandbox: path, size, and "
+            "whether each one was put there as an INPUT (source 'user' — a file you mounted or "
+            "staged) or WRITTEN by your own code (source 'assistant').\n\n"
+            "Use it to check what a previous turn left behind before rebuilding it, to confirm a "
+            "mount or a write actually landed, or to find the path of something you made earlier "
+            "in this conversation. The sandbox is per-conversation and does not survive long "
+            "gaps, so an empty listing usually means it was rebuilt, not that the work was lost."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    }
+
+
+def get_reset_sandbox_schema() -> Dict[str, Any]:
+    """T4: the escape hatch, described as one. The registry gets a static dict — a reset is the
+    same offer on every turn."""
+    return {
+        "type": "function",
+        "name": "reset_sandbox",
+        "description": (
+            "Throw away this conversation's code sandbox and start a clean, empty one.\n\n"
+            "Reach for this only when the sandbox itself looks poisoned or corrupted: an "
+            "environment your code keeps failing against for no reason it can see, a half-written "
+            "or unreadable file that will not go away, state left behind by earlier work that is "
+            "now getting in the way. It is a judgment call and nothing more — there is no routine "
+            "to follow, no cadence to keep, and no need to reset before or after any other tool.\n"
+            "\n"
+            "Everything in the old sandbox becomes unreachable, so anything still needed must be "
+            "mounted or rebuilt afterwards. Files the user shared are unaffected and can be "
+            "mounted again."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    }
+
+
+async def execute_list_sandbox_files(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
+    """List the CURRENT container, without creating one.
+
+    Deliberately `sandbox_container_id()` rather than `ensure_sandbox()`: minting a container in
+    order to list it would spend a create to prove the obvious — a container made this instant is
+    empty. A turn with no sandbox yet is answered honestly instead.
+    """
+    processor = getattr(ctx, "processor", None)
+    if processor is None:
+        return _err("unavailable", "The code sandbox isn't reachable right now.")
+
+    container_id = ctx.sandbox_container_id()
+    if not container_id:
+        return {
+            "ok": True,
+            "container_id": None,
+            "files": [],
+            "count": 0,
+            "message": ("There is no code sandbox on this turn yet, so nothing is in one. "
+                        "Mounting a file or running code creates it."),
+        }
+    if ctx.container_recycled():
+        return _err("container_recycled",
+                    "The code sandbox was recycled mid-turn, so its earlier contents are gone. "
+                    "Ask again and it will be set up fresh.")
+
+    try:
+        raw = processor.openai_client.client
+    except AttributeError:
+        return _err("unavailable", "The code sandbox isn't reachable right now.")
+
+    files: List[Dict[str, Any]] = []
+
+    async def _walk() -> None:
+        pager = raw.containers.files.list(container_id=container_id)
+        async for f in pager:  # auto-paginates
+            path = getattr(f, "path", "") or ""
+            size = getattr(f, "bytes", None)
+            files.append({
+                "path": path,
+                "filename": path.rsplit("/", 1)[-1],
+                "size_bytes": size if isinstance(size, int) else None,
+                # `source` is the API's own word for who put the file there — "user" for
+                # anything WE staged (mounts, fetches, generated assets) and "assistant" for
+                # what the model's code wrote. It is the same distinction the publisher fails
+                # closed on, so it is worth showing rather than flattening.
+                "source": getattr(f, "source", None) or "unknown",
+            })
+
+    try:
+        await asyncio.wait_for(_walk(), timeout=float(config.tool_call_timeout))
+    except Exception as e:  # noqa: BLE001 — a listing failure is a result, never a raise
+        logger.warning(f"Could not list sandbox {container_id}: {e}")
+        return _err("listing_failed", "Could not read the sandbox's file listing.")
+
+    return {
+        "ok": True,
+        "container_id": container_id,
+        "files": files,
+        "count": len(files),
+        "message": ("The sandbox is empty." if not files else
+                    "These are the paths your code can open right now."),
+    }
+
+
+async def execute_reset_sandbox(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Abandon this thread's container and bind a brand-new one.
+
+    `invalidate` + `get_or_create` cannot do this: `get_or_create` answers `{"type": "auto"}` for
+    an unbound thread rather than creating anything, and the turn's shared holder would keep
+    handing every other tool the old id. So the binding is dropped, a container is created
+    EXPLICITLY, and the holder is repointed at it — which is what makes the next round's
+    `code_interpreter` declaration name the replacement.
+
+    The mount cache needs no cleanup: it is keyed by container id, so every entry for the
+    abandoned sandbox simply misses and the file is re-mounted into the new one.
+    """
+    holder = getattr(ctx, "sandbox", None)
+    manager = getattr(holder, "manager", None) if holder is not None else None
+    thread_key = getattr(holder, "thread_key", None) if holder is not None else None
+    if holder is None or manager is None or not thread_key:
+        # A hand-built context (a background job, a stand-in) owns its container elsewhere;
+        # replacing an id we do not hold would strand the caller on the old one silently.
+        return _err("unavailable", "This conversation's sandbox can't be replaced from here.")
+
+    old_container_id = ctx.sandbox_container_id()
+
+    # A create is a real round-trip to OpenAI, and this is past every rejection: the honest
+    # moment to stake the 👀, exactly where mount_file stakes it.
+    turn = getattr(ctx, "turn", None)
+    if turn is not None:
+        try:
+            await turn.claim_work(getattr(ctx, "client", None), getattr(ctx, "message", None))
+        except Exception:  # noqa: BLE001 — presentation never breaks the reset
+            pass
+
+    try:
+        # Drop the binding FIRST. `create_explicit` reuses a live binding when it finds one, so
+        # without this the "replacement" would be the very container being reset.
+        await manager.invalidate(thread_key, old_container_id)
+        created = await manager.create_explicit(thread_key)
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"Sandbox reset failed for {thread_key}: {e}", exc_info=True)
+        return _err("reset_failed", "Could not replace the code sandbox.")
+
+    if not isinstance(created, str) or not created:
+        # AUTO_CONTAINER is a dict — a fresh throwaway the model may end up in, but not an
+        # addressable one we can hand back or push bytes into.
+        logger.warning(f"Sandbox reset for {thread_key} produced no addressable container")
+        return _err("reset_failed", "Could not replace the code sandbox.")
+
+    if old_container_id and created == old_container_id:
+        # The binding SURVIVED the drop. `invalidate` is best-effort by contract — it logs a
+        # durable-delete failure and swallows it — and a row that is still there is one
+        # `create_explicit` rediscovers as a live binding and hands straight back. So the same id
+        # returning means nothing was reset, and reporting success would send the model back into
+        # the very sandbox it asked to escape, believing it was clean.
+        logger.warning(
+            f"Sandbox reset for {thread_key} came back with the same container {created} — "
+            f"the binding outlived its invalidation")
+        return _err("reset_failed",
+                    "The code sandbox could not be replaced — it is still the same one, so "
+                    "nothing was cleared.")
+
+    holder.replace(created)
+    logger.info(f"Reset sandbox for {thread_key}: {old_container_id or 'none'} -> {created}")
+    return {
+        "ok": True,
+        "container_id": created,
+        "previous_container_id": old_container_id,
+        "message": ("The sandbox is now a clean, empty one. Nothing from before is in it — "
+                    "mount or rebuild anything you still need."),
+    }
+
+
 def sandbox_enabled(thread_config: Optional[Dict[str, Any]] = None) -> bool:
     """Is the code sandbox switched on for THIS turn?
 
@@ -438,3 +622,10 @@ def register_file_mount_tools(registry: ToolRegistry) -> None:
                       timeout=float(getattr(config, "read_document_timeout", 60.0)) + 30.0,
                       dynamic=True, channel_schema=get_mount_file_schema_static,
                       channel_enabled=sandbox_enabled)
+    # T4: the two sandbox-management tools ride the same switch — with the sandbox off there is
+    # nothing to list and nothing to reset. Static schemas on both surfaces, so `channel_enabled`
+    # is given explicitly (a tool with no channel gate is exposed there unconditionally).
+    registry.register(get_list_sandbox_files_schema(), execute_list_sandbox_files,
+                      enabled=sandbox_enabled, channel_enabled=sandbox_enabled)
+    registry.register(get_reset_sandbox_schema(), execute_reset_sandbox,
+                      enabled=sandbox_enabled, channel_enabled=sandbox_enabled)

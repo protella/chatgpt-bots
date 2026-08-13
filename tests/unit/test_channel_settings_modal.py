@@ -400,12 +400,16 @@ async def test_an_old_modal_submission_preserves_the_new_fields(capability_db):
     assert (row["model"], row["verbosity"]) == ("gpt-5.5", "high")
 
 
-# The personal/DM view is byte-identical to before W4 (RULING-8). The digest below was captured
-# from the tree at the head of this wave, over a matrix that reaches both personal-modal branches
-# the settings can steer: the welcome variant, and the reasoning=none variant that reveals the
-# temperature / top-p inputs. `private_metadata` is dropped because it carries a fresh session
-# uuid per open — a pointer to DB state, not part of the view.
-_PERSONAL_MODAL_GOLDEN = "14404f33ede4b39c88ddf103aac8ce0bb33a5737383735e8edb23383e3afaa82"
+# The personal/DM view is pinned byte-for-byte (RULING-8), over a matrix that reaches both
+# personal-modal branches the settings can steer: the welcome variant, and the reasoning=none
+# variant that reveals the temperature / top-p inputs. `private_metadata` is dropped because it
+# carries a fresh session uuid per open — a pointer to DB state, not part of the view.
+#
+# RE-CAPTURED for toolbelt T2, which adds the personal-memory section (textarea, "+N more"
+# context, and the "forget everything" checkbox) directly under Custom Instructions. That is the
+# ONLY intended change to this view; the digest is what makes a second, unintended one loud. The
+# AsyncMock db yields no rows, so this pins the empty-store rendering.
+_PERSONAL_MODAL_GOLDEN = "2f7d6b5c6427dcf11b3302d1a764f1e8850a423c56cb88a3cc2e95c6ce8f4775"
 
 
 @pytest.mark.asyncio

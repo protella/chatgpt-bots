@@ -217,7 +217,12 @@ class MessageProcessor(ThreadManagementMixin,
             if not gate_required:
                 channel_steering.stamp(message, await channel_steering.load_snapshot(
                     self.db, message.channel_id,
-                    memory_enabled=bool(getattr(config, "enable_channel_memory", True))))
+                    memory_enabled=bool(getattr(config, "enable_channel_memory", True)),
+                    # T2: the requester's PERSONAL facts. Safe on every path this line serves —
+                    # load_snapshot refuses to read them off anything but a DM, so an @mention or
+                    # a thread continuation passes a user_id here and still gets nothing.
+                    user_id=message.user_id,
+                    user_memory_enabled=bool(getattr(config, "enable_user_memory", True))))
 
             # Step 2. A channel turn CREATES its state and never rebuilds one: the rebuild exists
             # to reconstruct a transcript from conversations.replies, and the room the turn needs

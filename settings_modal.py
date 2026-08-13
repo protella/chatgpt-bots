@@ -23,7 +23,10 @@ class SettingsModal(LoggerMixin):
                             thread_id: Optional[str] = None,
                             in_thread: bool = False,
                             scope: Optional[str] = None,
-                            pending_message: Optional[Dict] = None) -> Dict:
+                            pending_message: Optional[Dict] = None,
+                            user_memory_value: Optional[str] = None,
+                            user_mem_seed: Optional[List] = None,
+                            user_memory_forget_all: bool = False) -> Dict:
         """
         Build the complete settings modal.
 
@@ -36,6 +39,14 @@ class SettingsModal(LoggerMixin):
             in_thread: Whether modal was opened from within a thread
             scope: Selected scope ('thread' or 'global')
             pending_message: Pending message to process after settings save (for new users)
+            user_memory_value / user_mem_seed / user_memory_forget_all: the personal-memory box's
+                state on a RE-RENDER (a model change, a scope toggle — anything that rebuilds the
+                view with views_update). Both None means a FRESH open: the value and the
+                open-time seed ``[[id, hash], ...]`` are computed from the user's rows here. On a
+                re-render the caller hands both back verbatim, so an in-flight edit survives and
+                the seed stays anchored to the rows the user first saw — the same bargain the
+                channel modal makes, except the seed rides the `modal_sessions` row instead of
+                `private_metadata`, which is already at its size limit here.
 
         Returns:
             Modal view dictionary for Slack API
@@ -64,8 +75,33 @@ class SettingsModal(LoggerMixin):
             else:
                 scope = 'thread' if in_thread else 'global'
         
+        # Personal memory (T2). Off → no section, no seed, nothing to reconcile on submit. A DB
+        # hiccup degrades to an empty box rather than blocking the modal, and an empty SEED is
+        # what stops that from reading as "the user deleted everything" on save.
+        user_memory: Optional[Dict[str, Any]] = None
+        if config.enable_user_memory:
+            hidden_count = 0
+            try:
+                rows = list(await self.db.get_user_memory_async(user_id) or [])
+            except Exception as e:
+                self.log_error(f"Failed to load user memory for {user_id}: {e}")
+                rows = []
+            if user_memory_value is None and user_mem_seed is None:
+                user_memory_value, user_mem_seed, hidden_count = self._compute_memory_seed(rows)
+            else:
+                # Re-render: the value and seed come back verbatim, so "+N more" is derived from
+                # what the seed omits (normalize returns "" for whitespace-only, so a bare strip
+                # test matches the fresh-open blank drop).
+                user_mem_seed = user_mem_seed or []
+                user_memory_value = user_memory_value or ""
+                non_blank = sum(1 for m in rows if (m.get("content") or "").strip())
+                hidden_count = max(0, non_blank - len(user_mem_seed))
+            user_memory = {"value": user_memory_value, "hidden": hidden_count,
+                           "forget_all": user_memory_forget_all}
+
         # Build modal blocks
-        blocks = self._build_modal_blocks(current_settings, selected_model, is_new_user, in_thread, scope)
+        blocks = self._build_modal_blocks(current_settings, selected_model, is_new_user, in_thread,
+                                          scope, user_memory)
         
         # Determine callback ID based on user status
         callback_id = "welcome_settings_modal" if is_new_user else "settings_modal"
@@ -89,6 +125,12 @@ class SettingsModal(LoggerMixin):
         # Include pending message if provided (for new users)
         if pending_message:
             session_state["pending_message"] = pending_message
+
+        # The personal-memory seed rides the session row, not private_metadata (which holds only
+        # the session id here — the user modal's metadata is already at its size limit). Submit
+        # reconciles against EXACTLY these rows, so it can never delete one the user never saw.
+        if user_memory is not None:
+            session_state["user_mem_seed"] = user_mem_seed or []
 
         # Store session in database
         await self.db.create_modal_session_async(session_id, user_id, session_state, modal_type='settings')
@@ -350,7 +392,7 @@ class SettingsModal(LoggerMixin):
         workspace_rows = [m for m in memories if m.get("scope") != "channel"]
 
         if memory_textarea_value is None and mem_seed is None:
-            memory_textarea_value, mem_seed, hidden_count = self._compute_channel_memory_seed(channel_rows)
+            memory_textarea_value, mem_seed, hidden_count = self._compute_memory_seed(channel_rows)
         else:
             mem_seed = mem_seed or []
             memory_textarea_value = memory_textarea_value or ""
@@ -388,9 +430,13 @@ class SettingsModal(LoggerMixin):
         text = (text or "").strip()
         return text if len(text) <= limit else text[: max(0, limit - 1)].rstrip() + "…"
 
-    def _compute_channel_memory_seed(self, channel_rows: List[Dict]):
-        """From channel-scope rows (oldest-first, as ``get_channel_memory_async`` returns them),
+    def _compute_memory_seed(self, rows: List[Dict]):
+        """From memory rows (oldest-first, as the `get_*_memory_async` accessors return them),
         build the textarea `initial_value` and the open-time seed ``[[id, hash], ...]``.
+
+        Shared by the channel modal's channel-memory box and the user modal's personal-memory box:
+        both stores hand back ``id``/``content`` rows and both textareas make the same bargain, so
+        one budget rule serves both and they cannot drift.
 
         Each row is normalized and blank rows are dropped. Rows are included oldest-first only while
         the joined value stays within the textarea budget; on the first row that would overflow we
@@ -400,7 +446,7 @@ class SettingsModal(LoggerMixin):
         """
         from database import normalize_memory_line, memory_content_hash
 
-        normed = [(m.get("id"), normalize_memory_line(m.get("content") or "")) for m in channel_rows]
+        normed = [(m.get("id"), normalize_memory_line(m.get("content") or "")) for m in rows]
         normed = [(mid, content) for mid, content in normed if content]  # drop blanks
 
         included: List[str] = []
@@ -464,17 +510,85 @@ class SettingsModal(LoggerMixin):
 
         return blocks
 
+    # The personal-memory box's Slack ids, named once so the builder and the submit handler
+    # cannot drift about what to read out of `view['state']`.
+    USER_MEMORY_BLOCK = "user_memory_block"
+    USER_MEMORY_ACTION = "user_memory"
+    USER_MEMORY_FORGET_BLOCK = "user_memory_forget_block"
+    USER_MEMORY_FORGET_ACTION = "user_memory_forget_all"
+    USER_MEMORY_FORGET_VALUE = "forget_all"
+
+    def _build_user_memory_blocks(self, textarea_value: str, hidden_count: int,
+                                  forget_all: bool = False) -> List[Dict]:
+        """Blocks for the personal-memory editor in the USER settings modal.
+
+        The channel modal's bargain, for one person's own store: one multiline textarea, one note
+        per line, edit or delete lines and Save to reconcile against the open-time seed.
+
+        THE CHECKBOX IS NOT REDUNDANT. The textarea is seeded only up to `_MEMORY_TEXTAREA_MAX`
+        and the reconciler deletes only rows it seeded, so blanking the box forgets what was
+        SHOWN and silently keeps everything past the budget — a delete affordance that quietly
+        under-delivers on "forget everything". The checkbox is wired to a full-store delete, which
+        is the only control that means what it says. `list_facts` is where anything past the
+        budget can still be read in full.
+        """
+        memory_input: Dict[str, Any] = {
+            "type": "plain_text_input", "action_id": self.USER_MEMORY_ACTION,
+            "multiline": True, "max_length": self._MEMORY_TEXTAREA_MAX,
+            "placeholder": {"type": "plain_text",
+                            "text": "e.g. Prefers short answers with the code first."},
+        }
+        # Slack rejects an empty initial_value, so only set it when there's something to seed.
+        if textarea_value:
+            memory_input["initial_value"] = textarea_value
+
+        blocks: List[Dict[str, Any]] = [
+            {"type": "section",
+             "text": {"type": "mrkdwn", "text": "*What I remember about you*"}},
+            {"type": "input", "block_id": self.USER_MEMORY_BLOCK, "optional": True,
+             "element": memory_input,
+             "label": {"type": "plain_text", "text": "Personal memory"},
+             "hint": {"type": "plain_text",
+                      "text": "One note per line. Private to your DMs — never shown in channels."}},
+        ]
+        if hidden_count > 0:
+            blocks.append({"type": "context", "elements": [
+                {"type": "mrkdwn", "text": f"_+{hidden_count} more not shown_"}]})
+
+        forget_option = {
+            "text": {"type": "plain_text", "text": "Forget everything, including items not shown"},
+            "value": self.USER_MEMORY_FORGET_VALUE,
+        }
+        forget_element: Dict[str, Any] = {
+            "type": "checkboxes", "action_id": self.USER_MEMORY_FORGET_ACTION,
+            "options": [forget_option],
+        }
+        if forget_all:
+            forget_element["initial_options"] = [forget_option]
+        blocks.append({
+            "type": "input", "block_id": self.USER_MEMORY_FORGET_BLOCK, "optional": True,
+            "element": forget_element,
+            "label": {"type": "plain_text", "text": "Clear personal memory"},
+            "hint": {"type": "plain_text",
+                     "text": "Deletes every note above and any beyond what fits here. No undo."},
+        })
+        blocks.append({"type": "divider"})
+        return blocks
+
     def _build_modal_blocks(self, settings: Dict, selected_model: str,
                            is_new_user: bool = False, in_thread: bool = False,
-                           scope: Optional[str] = None) -> List[Dict]:
+                           scope: Optional[str] = None,
+                           user_memory: Optional[Dict[str, Any]] = None) -> List[Dict]:
         """Build the modal blocks based on current settings and model selection
-        
+
         Args:
             settings: Current settings dictionary
             selected_model: Currently selected model
             is_new_user: Whether this is a new user
             in_thread: Whether modal was opened from within a thread
             scope: The selected scope ('thread' or 'global')
+            user_memory: Rendered personal-memory state (`value`/`hidden`/`forget_all`), or None
+                to omit the section entirely — which is what ENABLE_USER_MEMORY off looks like
         """
         blocks: List[Dict[str, Any]] = []
         
@@ -618,8 +732,8 @@ class SettingsModal(LoggerMixin):
         blocks.extend(self._add_gpt55_settings(settings, selected_model))
         
         # Add common settings (features and image settings)
-        blocks.extend(self._add_common_settings(settings))
-        
+        blocks.extend(self._add_common_settings(settings, user_memory))
+
         return blocks
     
     def _add_gpt55_settings(self, settings: Dict, selected_model: str = 'gpt-5.6-sol') -> List[Dict]:
@@ -767,7 +881,8 @@ class SettingsModal(LoggerMixin):
         blocks.append({"type": "divider"})
         return blocks
 
-    def _add_common_settings(self, settings: Dict) -> List[Dict]:
+    def _add_common_settings(self, settings: Dict,
+                            user_memory: Optional[Dict[str, Any]] = None) -> List[Dict]:
         """Add settings common to all models"""
         blocks: List[Dict[str, Any]] = []
         
@@ -806,9 +921,19 @@ class SettingsModal(LoggerMixin):
             },
             "optional": True
         })
-        
+
         blocks.append({"type": "divider"})
-        
+
+        # Personal memory sits directly under Custom Instructions on purpose: both are "what the
+        # bot knows about me", one written by hand and one written by the bot, and separating them
+        # would leave a person hunting for where the facts they were told about live.
+        if user_memory is not None:
+            blocks.extend(self._build_user_memory_blocks(
+                user_memory.get("value") or "",
+                int(user_memory.get("hidden") or 0),
+                bool(user_memory.get("forget_all")),
+            ))
+
         # Feature toggles
         blocks.append({
             "type": "section",
@@ -1037,6 +1162,37 @@ class SettingsModal(LoggerMixin):
         
         return blocks
     
+    def extract_user_memory(self, view_state: Dict) -> Optional[Dict[str, Any]]:
+        """The personal-memory box as submitted, or None when the section was not in the view.
+
+        None is the "nothing to reconcile" answer and is deliberately distinct from an empty
+        textarea: a modal opened before this section existed, or with ENABLE_USER_MEMORY off, must
+        not be read as the user asking to forget everything. Returns
+        ``{'raw': str, 'lines': [normalized], 'forget_all': bool}``; `lines` are normalized,
+        blank-dropped and deduped in submitted order, exactly as the channel path does it.
+        """
+        from database import normalize_memory_line
+
+        values = (view_state or {}).get('values', {})
+        block = values.get(self.USER_MEMORY_BLOCK)
+        forget_block = values.get(self.USER_MEMORY_FORGET_BLOCK)
+        if block is None and forget_block is None:
+            return None
+
+        raw = ((block or {}).get(self.USER_MEMORY_ACTION, {}) or {}).get('value') or ""
+        lines: List[str] = []
+        seen: set = set()
+        for ln in raw.split("\n"):
+            norm = normalize_memory_line(ln)
+            if norm and norm not in seen:
+                seen.add(norm)
+                lines.append(norm)
+
+        selected = ((forget_block or {}).get(self.USER_MEMORY_FORGET_ACTION, {}) or {}
+                    ).get('selected_options') or []
+        forget_all = any(o.get('value') == self.USER_MEMORY_FORGET_VALUE for o in selected)
+        return {"raw": raw, "lines": lines, "forget_all": forget_all}
+
     def extract_form_values(self, view_state: Dict) -> Dict:
         """Extract form values from modal submission"""
         values = view_state.get('values', {})

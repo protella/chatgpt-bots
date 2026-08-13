@@ -1074,6 +1074,26 @@ class DatabaseManager(LoggerMixin):
             "CREATE INDEX IF NOT EXISTS idx_channel_memory_lookup ON channel_memory (scope, channel_id)"
         )
 
+        # Per-USER durable memory (toolbelt round T2). Deliberately a separate table rather than
+        # a third `scope` value on channel_memory: these rows are personal, they are keyed by a
+        # user id instead of a channel id, and a shared table would make "never load a DM fact on
+        # a channel surface" a WHERE clause everyone has to remember instead of a table nobody
+        # channel-side reads. There is no scope column for the same reason — a user store has
+        # exactly one kind of row.
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                author TEXT,
+                created_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_memory_lookup ON user_memory (user_id)"
+        )
+
         # NOTE: there was an `emoji_usage` table here — a workspace-wide reaction tally that
         # ranked the custom-emoji shortlist injected into the old rich participation gate. The
         # gate is now one bit and reads no shortlist, so nothing writes or reads it. We stop
@@ -2129,6 +2149,31 @@ class DatabaseManager(LoggerMixin):
                 self.conn.execute(
                     "ALTER TABLE pending_share_receipts ADD COLUMN receipt_class TEXT")
                 self.conn.commit()
+
+        with self._migration_step("user_memory table"):
+            # Toolbelt T2. `init_schema` already creates this with CREATE TABLE IF NOT EXISTS, so
+            # on every DB this step reaches it is a no-op — it exists for the same reason its
+            # siblings do: an existing installation whose init path is ever reordered or skipped
+            # still converges here. Idempotent and re-runnable, like every step in this chain.
+            cursor = self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='user_memory'")
+            if not cursor.fetchone():
+                self.log_info("DB: Creating user_memory table")
+                self.conn.execute("""
+                    CREATE TABLE user_memory (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        author TEXT,
+                        created_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                self.conn.commit()
+                self.log_info("DB: Successfully created user_memory table")
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_user_memory_lookup ON user_memory (user_id)")
+            self.conn.commit()
 
     def _migrate_participation_redesign(self):
         """Layer 0 of the participation-backoff redesign. Idempotent and re-runnable.
@@ -5220,6 +5265,178 @@ class DatabaseManager(LoggerMixin):
                 await db.execute("ROLLBACK")
                 raise
 
+    # --- Per-USER memory (toolbelt round T2), async only ---
+    #
+    # The channel accessors above have sync siblings because they predate the async DB layer;
+    # these have none, because every caller (the memory tools, the DM snapshot, the settings
+    # modal) is already async. Row ids come from `user_memory`'s own AUTOINCREMENT and are
+    # therefore in a different id space from `channel_memory` — a user fact [#7] and a channel
+    # fact [#7] are unrelated rows, and no surface ever shows both at once.
+    #
+    # No epoch-overlay routing: the fences are registered per (team, channel) and a user store
+    # has no channel to route by. Nothing in the battery writes a user fact today.
+
+    async def get_user_memory_async(self, user_id: str) -> List[Dict]:
+        """This user's durable facts, oldest-updated first (same order as the channel twin)."""
+        if not user_id:
+            return []
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            async with db.execute(
+                "SELECT id, user_id, content, author, created_ts, updated_ts "
+                "FROM user_memory WHERE user_id = ? ORDER BY updated_ts ASC",
+                (user_id,)
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+
+    async def add_user_memory_async(self, user_id: str, content: str,
+                                    author: Optional[str] = None) -> int:
+        """Insert one user fact; returns the new id."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            cursor = await db.execute(
+                "INSERT INTO user_memory (user_id, content, author) VALUES (?, ?, ?)",
+                (user_id, content, author)
+            )
+            await db.commit()
+            return cast(int, cursor.lastrowid)
+
+    async def update_user_fact_async(self, user_id: str, memory_id: int, content: str) -> bool:
+        """Revise one of THIS user's facts. Returns True when a row actually changed.
+
+        The owning user rides in the WHERE clause rather than in a caller's check, for the same
+        reason `update_channel_fact_async` puts scope there: the id comes from a model, and an id
+        it never saw is either a hallucination or another person's row. A mismatch updates nothing.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            cursor = await db.execute(
+                "UPDATE user_memory SET content = ?, updated_ts = CURRENT_TIMESTAMP "
+                "WHERE id = ? AND user_id = ?",
+                (content, memory_id, user_id))
+            await db.commit()
+            return (cursor.rowcount or 0) > 0
+
+    async def delete_user_memory_async(self, user_id: str, memory_id: int) -> bool:
+        """Delete one of THIS user's facts. Returns True when a row was actually removed."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            cursor = await db.execute(
+                "DELETE FROM user_memory WHERE id = ? AND user_id = ?", (memory_id, user_id))
+            await db.commit()
+            return (cursor.rowcount or 0) > 0
+
+    async def delete_all_user_memory_async(self, user_id: str) -> int:
+        """Delete EVERY fact this user has, shown in the settings modal or not; returns the count.
+
+        The settings textarea seeds only what fits its budget and the reconciler deletes only
+        seeded rows, so blanking the box cannot forget a row the user never saw. This is the
+        explicit "forget everything, including items not shown" path — it exists precisely
+        because the textarea's delete affordance is partial.
+        """
+        if not user_id:
+            return 0
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            cursor = await db.execute("DELETE FROM user_memory WHERE user_id = ?", (user_id,))
+            await db.commit()
+            return cursor.rowcount or 0
+
+    async def reconcile_user_memory_from_textarea_async(
+        self, user_id: str, seed: list, lines: list, author: str, max_rows: int
+    ) -> dict:
+        """The user-store twin of ``reconcile_channel_memory_from_textarea_async``.
+
+        Same bargain, same guarantees, same return shape
+        (``{'deleted': [ids], 'added': [contents], 'conflicts': int, 'over_cap': int}``): keep a
+        seeded row still present in the textarea, delete one that left it ONLY if its content
+        still hashes to the seed hash, count a conflict when it changed since open, and add every
+        line matching no seed and no surviving row until ``max_rows`` is reached. One
+        ``BEGIN IMMEDIATE`` transaction, so a concurrent save serializes and a partial failure
+        rolls back.
+
+        The differences from the channel version are only the ones the store forces: rows are
+        selected by ``user_id`` instead of (scope, channel_id), and there are no participation
+        preference markers to exclude — a user store holds nothing but ordinary facts.
+        """
+        result: Dict[str, Any] = {"deleted": [], "added": [], "conflicts": 0, "over_cap": 0}
+        if not user_id:
+            return result
+
+        # Defensive re-normalize + dedup by hash, order preserved (the handler already did this).
+        norm_lines: List[str] = []
+        line_hashes: set = set()
+        for raw in (lines or []):
+            n = normalize_memory_line(raw)
+            if not n:
+                continue
+            h = memory_content_hash(n)
+            if h in line_hashes:
+                continue
+            line_hashes.add(h)
+            norm_lines.append(n)
+
+        cap = max(1, int(max_rows)) if max_rows is not None else None
+
+        async with aiosqlite.connect(self.db_path, isolation_level=None) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA busy_timeout=5000")
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute(
+                    "SELECT id, content FROM user_memory WHERE user_id = ?", (user_id,),
+                ) as cur:
+                    current = {row["id"]: row["content"] for row in await cur.fetchall()}
+
+                deleted_ids: List[Any] = []
+                seed_hashes: set = set()
+                for entry in (seed or []):
+                    try:
+                        mem_id, seed_hash = entry[0], entry[1]
+                    except (TypeError, IndexError, KeyError):
+                        continue
+                    seed_hashes.add(seed_hash)
+                    if seed_hash in line_hashes:
+                        continue  # KEEP — still in the textarea, leave untouched.
+                    cur_content = current.get(mem_id)
+                    if cur_content is None:
+                        continue  # Already deleted elsewhere.
+                    if memory_content_hash(cur_content) == seed_hash:
+                        await db.execute("DELETE FROM user_memory WHERE id = ?", (mem_id,))
+                        deleted_ids.append(mem_id)
+                        current.pop(mem_id, None)
+                    else:
+                        result["conflicts"] += 1
+
+                surviving_hashes: set = {memory_content_hash(c) for c in current.values()}
+                remaining = len(current)
+                added: List[str] = []
+                for n in norm_lines:
+                    h = memory_content_hash(n)
+                    if h in seed_hashes or h in surviving_hashes:
+                        continue
+                    if cap is not None and remaining >= cap:
+                        result["over_cap"] += 1
+                        continue
+                    await db.execute(
+                        "INSERT INTO user_memory (user_id, content, author) VALUES (?, ?, ?)",
+                        (user_id, n, author),
+                    )
+                    added.append(n)
+                    surviving_hashes.add(h)
+                    remaining += 1
+
+                await db.execute("COMMIT")
+                result["deleted"] = deleted_ids
+                result["added"] = added
+                return result
+            except Exception:
+                await db.execute("ROLLBACK")
+                raise
+
     # --- Response feedback (Phase H) ---
     async def record_response_feedback_async(self, channel_id: str, thread_ts: Optional[str],
                                              message_ts: str, user_id: str, signal: int,
@@ -5873,6 +6090,88 @@ class DatabaseManager(LoggerMixin):
                         del doc["metadata_json"]
                     documents.append(doc)
                 return documents
+
+    @staticmethod
+    def _like_contains(term: str) -> str:
+        """A substring LIKE pattern for MODEL-SUPPLIED text, with LIKE's wildcards neutralised.
+
+        A query containing `%` or `_` would otherwise match far more than it says (`100_` reads
+        as "100 then any character"), and a lone `%` would match every row in the channel. Paired
+        with ``ESCAPE '\\'`` on the comparison. The backslash goes first, or it would escape the
+        escapes added after it."""
+        escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        return f"%{escaped}%"
+
+    async def search_channel_documents_async(self, channel_id: str, query: str,
+                                             limit: int = 10) -> List[Dict]:
+        """Documents in a channel whose FILENAME or SUMMARY contains `query`, NEWEST FIRST.
+
+        The search half of get_channel_documents_async, and it inherits that method's privacy
+        boundary verbatim: thread_id is stored as "channel:thread", so a channel's rows are the
+        ones whose thread_id starts with ``channel_id + ':'``, and channel ids are alphanumeric
+        (no LIKE metacharacters) so the prefix match cannot escape the channel.
+
+        SUMMARY, not content: the documents table holds a summary + metadata + the Slack ref and
+        never the body (CLAUDE.md pitfall 6a). A row that does not match here may still say the
+        thing — read_document re-derives the real text on demand.
+        """
+        if not channel_id or not (query or "").strip():
+            return []
+        pattern = self._like_contains(query.strip())
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            async with db.execute(
+                r"""SELECT * FROM documents
+                    WHERE thread_id LIKE ?
+                      AND (filename LIKE ? ESCAPE '\' OR summary LIKE ? ESCAPE '\')
+                    ORDER BY created_at DESC, id DESC LIMIT ?""",
+                (f"{channel_id}:%", pattern, pattern, max(1, int(limit))),
+            ) as cursor:
+                documents = []
+                async for row in cursor:
+                    doc = dict(row)
+                    if doc.get("page_structure"):
+                        doc["page_structure"] = json.loads(doc["page_structure"])
+                    if doc.get("metadata_json"):
+                        doc["metadata"] = json.loads(doc["metadata_json"])
+                        del doc["metadata_json"]
+                    documents.append(doc)
+                return documents
+
+    async def search_channel_image_analyses_async(self, channel_id: str, query: str,
+                                                  limit: int = 10) -> List[Dict]:
+        """Images in a channel whose ANALYSIS text contains `query`, NEWEST FIRST.
+
+        The image twin of search_channel_documents_async, same channel-prefix boundary as
+        find_channel_images_async. `original_analysis` (an edited image's pre-edit description)
+        is searched too — it describes a picture this conversation actually saw.
+
+        The `prompt` column is deliberately NOT searched: it is what was ASKED for, often the
+        enhanced generation text, and matching on it would answer "what did the picture show?"
+        with a request nobody has confirmed the picture satisfied.
+        """
+        if not channel_id or not (query or "").strip():
+            return []
+        pattern = self._like_contains(query.strip())
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            async with db.execute(
+                r"""SELECT * FROM images
+                    WHERE thread_id LIKE ?
+                      AND (analysis LIKE ? ESCAPE '\' OR original_analysis LIKE ? ESCAPE '\')
+                    ORDER BY created_at DESC, id DESC LIMIT ?""",
+                (f"{channel_id}:%", pattern, pattern, max(1, int(limit))),
+            ) as cursor:
+                images = []
+                async for row in cursor:
+                    img = dict(row)
+                    if img.get("metadata_json"):
+                        img["metadata"] = json.loads(img["metadata_json"])
+                        del img["metadata_json"]
+                    images.append(img)
+                return images
 
     async def get_document_by_filename_async(self, thread_id: str, filename: str) -> Optional[Dict]:
         """Async version of get_document_by_filename (newest matching row)."""
@@ -6580,6 +6879,51 @@ class DatabaseManager(LoggerMixin):
             ) as cursor:
                 row = await cursor.fetchone()
                 return dict(row) if row else None
+
+    async def get_receipt_channels_async(self) -> List[Tuple[str, str]]:
+        """Every (team, channel) that currently holds a receipt row.
+
+        The retention sweep's worklist. Distinct rather than a full scan: the sweep asks Slack one
+        question per channel, and the number of channels is the number of questions.
+        """
+        async with self._stream_conn() as db:
+            async with db.execute(
+                "SELECT DISTINCT team_id, channel_id FROM outbound_receipts"
+            ) as cursor:
+                return [(row["team_id"], row["channel_id"]) for row in await cursor.fetchall()]
+
+    async def get_oldest_receipt_ts_async(self, team_id: str,
+                                          channel_id: str) -> Optional[str]:
+        """The earliest message_ts this channel holds a receipt for, or None.
+
+        Ordered by CAST, not by the TEXT column: a Slack ts sorts correctly as a string only
+        while every one of them has the same number of digits before the dot, which is true today
+        and is not a property worth depending on.
+        """
+        async with self._stream_conn() as db:
+            async with db.execute(
+                "SELECT message_ts FROM outbound_receipts "
+                "WHERE team_id = ? AND channel_id = ? "
+                "ORDER BY CAST(message_ts AS REAL) LIMIT 1", (team_id, channel_id)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return row["message_ts"] if row else None
+
+    async def delete_receipts_through_async(self, team_id: str, channel_id: str,
+                                            message_ts: str) -> int:
+        """Drop every receipt in this channel at or older than `message_ts`. Returns the count.
+
+        The retention counterpart of `delete_receipt_async`, and deliberately NOT a transition:
+        these rows describe messages Slack itself has aged out, so there is no state to report and
+        nothing downstream that could act on one.
+        """
+        async with self._stream_conn() as db:
+            cursor = await db.execute(
+                "DELETE FROM outbound_receipts "
+                "WHERE team_id = ? AND channel_id = ? "
+                "AND CAST(message_ts AS REAL) <= CAST(? AS REAL)",
+                (team_id, channel_id, message_ts))
+            return int(cursor.rowcount or 0)
 
     async def finalize_dead_session_receipts_async(self, live_session_id: str) -> List[Dict]:
         """Boot reconciliation: finalize every in_flight row owned by a DEAD session.

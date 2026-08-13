@@ -514,12 +514,70 @@ class SlackMessageEventsMixin(_Host):
             except Exception as e:  # noqa: BLE001
                 self.log_debug(f"mark_needs_refresh failed: {e}")
 
+    async def _finalize_scheduled_delivery(self, event: Dict[str, Any]) -> None:
+        """T1: give a scheduled post the receipt its schedule promised it.
+
+        Slack delivers a scheduled message minutes or days after the turn that asked for it, and
+        no turn is left to claim it — so without this the bot posts a reminder and can never
+        afterwards see it in the channel stream. The obvious seam, "catch the delivery as an
+        own-message event", DOES NOT EXIST: Bolt's default `ignoring_self_events` middleware drops
+        own-bot message events before any app handler runs (measured live 2026-08-13 — a bot-token
+        post produced zero handler activity here).
+
+        So the trigger is the events that DO arrive. Any message event in a channel that is
+        already overdue on a delivery sends `reconcile_overdue_scheduled` to read the delivered
+        message back out of Slack. The overdue question is answered from memory, so an ordinary
+        message event makes NO Slack call. The own-message finalize below it is kept and costs a
+        dict scan; it is what runs if that middleware is ever disabled.
+
+        Best-effort by contract: a missed receipt costs one message its place in the stream, an
+        exception here would cost the whole event.
+        """
+        try:
+            if event.get("subtype") in self._TAIL_FEED_SKIP_SUBTYPES:
+                return  # an edit/deletion/system post, not a delivery
+            from message_processor.outbound_receipts import (finalize_scheduled_delivery,
+                                                             has_overdue_scheduled_delivery,
+                                                             reconcile_overdue_scheduled,
+                                                             rehydrate_scheduled_deliveries)
+            team_id = getattr(self, "self_team_id", None)
+            web = getattr(getattr(self, "app", None), "client", None)
+            # JOINS boot's rehydrate rather than repeating or skipping it. A restart forgets what
+            # it was waiting for, and Slack — which holds the schedule anyway — is the one place
+            # that remembers; main.initialize starts that listing before the client serves
+            # anything, and awaiting it here is what stops a delivery arriving mid-listing from
+            # being matched against a registry that is not populated yet. Already finished is the
+            # normal case and costs nothing.
+            await rehydrate_scheduled_deliveries(web, team_id=team_id)
+            if self.is_own_message(event):
+                # Only reachable with Bolt's self-event filter off. Logged because a delivery that
+                # never matches is otherwise indistinguishable from the event never arriving.
+                self.log_debug(
+                    f"own-message event at scheduled-delivery seam: ts={event.get('ts')} "
+                    f"subtype={event.get('subtype')!r} "
+                    f"text={str(event.get('text') or '')[:80]!r}")
+                await finalize_scheduled_delivery(team_id=team_id, event=event)
+                return
+            channel_id = event.get("channel")
+            if not has_overdue_scheduled_delivery(channel_id):
+                return  # the normal case, and the reason this seam is free
+            await reconcile_overdue_scheduled(web, team_id=team_id, channel_id=channel_id,
+                                              is_own=self.is_own_message)
+        except Exception as e:  # noqa: BLE001
+            self.log_debug(f"scheduled delivery receipt hook failed: {e}")
+
     async def _ambient_ingest(self, event: Dict[str, Any], client) -> None:
         """F51 capture + lifecycle seam, invoked at the registered Slack message event BEFORE the
         channel_type / channel-listening branch — so ambient content is captured even when
         listening or participation is off. Handles new content (enqueue), edits (reconcile +
         re-enqueue), and deletions (purge artifacts). Best-effort; never raises, never blocks the
         wake path (offer_event only enqueues)."""
+        # T1: the seam runs before every filter below it, so a scheduled delivery is reconciled off
+        # ANY message event that reaches the client — not only the ones this channel's listening,
+        # participation or wake settings let through. Ahead of the ambient service check on purpose:
+        # whether receipts get written must not depend on whether ambient memory happens to be
+        # wired.
+        await self._finalize_scheduled_delivery(event)
         svc = self._ambient_service()
         if svc is None:
             return

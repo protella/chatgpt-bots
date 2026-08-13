@@ -217,6 +217,11 @@ def test_gate_registers_react_with_empty_default(monkeypatch):
         "type": "function", "name": "post_to_thread", "parameters": {}}
     s.get_edit_own_message_tool_schema.return_value = {
         "type": "function", "name": "edit_own_message", "parameters": {}}
+    # T5: the toolbelt round's two new client-side schemas.
+    s.get_delete_own_message_tool_schema.return_value = {
+        "type": "function", "name": "delete_own_message", "parameters": {}}
+    s.get_remove_reaction_tool_schema.return_value = {
+        "type": "function", "name": "remove_reaction", "parameters": {}}
     s.get_pin_message_tool_schema.return_value = {
         "type": "function", "name": "pin_message", "parameters": {}}
     s.get_no_reply_tool_schema.return_value = {

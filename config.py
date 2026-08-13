@@ -973,7 +973,7 @@ class BotConfig:
     # It needs a bigger round budget than the research phase: mount, write code, read the
     # traceback, fix, re-run, verify. Running out of rounds mid-build is the difference between
     # a deck and an apology.
-    deep_research_build_timeout: float = field(default_factory=lambda: float(os.getenv("DEEP_RESEARCH_BUILD_TIMEOUT", "600")))
+    deep_research_build_timeout: float = field(default_factory=lambda: float(os.getenv("DEEP_RESEARCH_BUILD_TIMEOUT", "1800")))
     deep_research_max_build_rounds: int = field(default_factory=lambda: max(1, int(os.getenv("DEEP_RESEARCH_MAX_BUILD_ROUNDS", "16"))))
     # Label the findings post with a chat.postMessage username override ("<bot> [research: …]").
     # Needs the chat:write.customize scope, which the app may not have — on the first failure the
@@ -1066,6 +1066,12 @@ class BotConfig:
     # Hard cap on channel-scope memory rows per channel — keeps the injected block small and
     # bounded; at the cap the remember tool refuses and points at the oldest rows instead.
     memory_max_rows: int = field(default_factory=lambda: int(os.getenv("MEMORY_MAX_ROWS", "25")))
+    # --- Per-user memory (toolbelt round T2) ---
+    # The DM twin of enable_channel_memory: read = inject the requester's own durable facts into
+    # the DM prompt, write = the same remember/update/forget/list tools, routed to the user store.
+    # A feature flag, not a tuning knob — off means DMs have no personal memory at all, and the
+    # channel surface is unaffected either way. MEMORY_MAX_ROWS caps both stores.
+    enable_user_memory: bool = field(default_factory=lambda: os.getenv("ENABLE_USER_MEMORY", "true").lower() == "true")
     # Legacy post-response extraction pass (pre-Phase-C write path). Kept one release as a
     # fallback in case tool-driven memory writes under-perform; costs one utility-model call
     # per exchange when on. Default OFF now that the model writes memory via tools.

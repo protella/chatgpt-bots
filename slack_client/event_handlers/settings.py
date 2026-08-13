@@ -121,6 +121,67 @@ class SlackSettingsHandlersMixin(_Host):
             self.log_error(f"Failed to update session data: {e}")
         return False
 
+    async def _reconcile_user_memory(self, user_id: str, submitted: Optional[dict],
+                                     seed: Optional[list]) -> str:
+        """Apply the user settings modal's personal-memory edit. Returns warning text ("" if none).
+
+        Isolated in its own try/except for the same reason the channel reconcile is: a memory
+        failure must never sink the settings save — we still confirm, just with a warning.
+
+        ORDER MATTERS. "Forget everything, including items not shown" wins outright and short-
+        circuits the reconcile: a user who ticked it and also left text in the box asked for an
+        empty store, and re-adding the lines they were shown would honour the smaller half of a
+        request they made explicitly.
+        """
+        if submitted is None or not config.enable_user_memory:
+            return ""
+        try:
+            if submitted.get('forget_all'):
+                removed = await self.db.delete_all_user_memory_async(user_id)
+                self.log_info(f"Personal memory cleared for {user_id}: {removed} row(s)")
+                return "\n🧹 Personal memory cleared."
+            result = await self.db.reconcile_user_memory_from_textarea_async(
+                user_id, seed or [], submitted.get('lines') or [], author=user_id,
+                max_rows=config.memory_max_rows)
+            over_cap = result.get('over_cap', 0)
+            conflicts = result.get('conflicts', 0)
+            warning = ""
+            if over_cap:
+                warning += (f"\n⚠️ {over_cap} note(s) not saved — your personal memory is full "
+                            f"({config.memory_max_rows} max).")
+            if conflicts:
+                warning += (f"\n⚠️ {conflicts} note(s) were changed elsewhere while this was open "
+                            "and left unchanged.")
+            self.log_info(
+                f"Personal memory reconciled for {user_id}: "
+                f"+{len(result.get('added', []))} -{len(result.get('deleted', []))} "
+                f"conflicts={conflicts} over_cap={over_cap}")
+            return warning
+        except Exception as me:  # noqa: BLE001 — a memory failure never sinks the settings save
+            self.log_error(f"Error reconciling personal memory for {user_id}: {me}")
+            return "\n⚠️ Couldn't fully update personal memory — please try again."
+
+    def _carry_user_memory(self, body: dict, session_data: Optional[dict]) -> dict:
+        """Rebuild kwargs that keep an in-flight personal-memory edit across a views_update.
+
+        Every re-render (model change, scope toggle, reasoning change, feature toggle) rebuilds
+        the whole view from the DB, which would otherwise discard whatever the person had typed
+        into the memory box and re-seed from storage. The SEED is carried from the session rather
+        than recomputed, so it keeps pointing at the rows the modal first showed — recomputing it
+        would silently re-anchor the CAS check to rows the user never saw.
+        """
+        try:
+            submitted = self.settings_modal.extract_user_memory(
+                body.get('view', {}).get('state', {}))
+            if submitted is None:
+                return {}
+            return {"user_memory_value": submitted.get('raw') or "",
+                    "user_mem_seed": (session_data or {}).get('user_mem_seed') or [],
+                    "user_memory_forget_all": bool(submitted.get('forget_all'))}
+        except Exception as e:  # noqa: BLE001 — a carry failure costs the edit, not the modal
+            self.log_error(f"Failed to carry personal memory across rebuild: {e}")
+            return {}
+
     async def _load_channel_modal_extras(self, channel_id: str):
         """Fetch the channel memory list surfaced in the channel settings modal.
 
@@ -707,7 +768,12 @@ class SlackSettingsHandlersMixin(_Host):
             
             # Extract form values
             form_values = self.settings_modal.extract_form_values(view['state'])
-            
+            # The personal-memory box, read once here. The confirmation branch below returns
+            # before any save happens, so the edit is stashed on the session row (which has no
+            # size limit, unlike private_metadata) and applied by the confirmation handler.
+            user_memory_submitted = self.settings_modal.extract_user_memory(view['state'])
+            user_mem_seed = (session_data or {}).get('user_mem_seed') or []
+
             # Check if we need confirmation for global custom instructions from thread
             needs_confirmation = False
             if (in_thread and selected_scope == 'global' and
@@ -746,8 +812,34 @@ class SlackSettingsHandlersMixin(_Host):
                     })
                 }
                 
+                # Carry the personal-memory edit forward on the session row; the confirmation
+                # view has no memory blocks of its own to read it back from. The session row is
+                # the ONLY copy at this point, so a failed write means the edit is gone — say so
+                # rather than confirming a save that will silently drop it.
+                memory_carry_failed = False
+                if user_memory_submitted is not None:
+                    if session_data is None:
+                        memory_carry_failed = True
+                    else:
+                        session_data['user_memory_pending'] = user_memory_submitted
+                        memory_carry_failed = not await self._update_session_data(
+                            body, session_data)
+
                 # Use 'push' to stack this modal on top, preserving the settings modal
                 await ack(response_action="push", view=confirmation_modal)
+
+                if memory_carry_failed:
+                    self.log_error(
+                        f"Personal-memory edit could not be stashed for {user_id} before the "
+                        f"custom-instructions confirmation; it will not be applied")
+                    try:
+                        await client.chat_postMessage(
+                            channel=user_id,
+                            text=("⚠️ Your personal-memory edit couldn't be carried into the "
+                                  "confirmation step and was NOT saved. Your other settings are "
+                                  "unaffected — please reopen settings and make that edit again."))
+                    except Exception as e:  # noqa: BLE001 — the modal flow continues regardless
+                        self.log_error(f"Failed to warn {user_id} about the dropped memory edit: {e}")
                 return
             
             # Normal flow - acknowledge immediately
@@ -800,7 +892,12 @@ class SlackSettingsHandlersMixin(_Host):
                 success = await self.db.update_user_preferences_async(user_id, validated_settings)
                 save_location = "global"
                 self.log_info(f"Global settings saved for user {user_id}: {validated_settings}")
-            
+
+            # Personal memory is per-USER, not per-scope: a thread-scoped save edits the same
+            # store as a global one, so this runs on both branches.
+            warning_message += await self._reconcile_user_memory(
+                user_id, user_memory_submitted, user_mem_seed)
+
             if success:
                 # Clean up the session from database
                 if session_data:
@@ -1005,7 +1102,16 @@ class SlackSettingsHandlersMixin(_Host):
             
             # Update user preferences with the confirmed custom instructions
             success = await self.db.update_user_preferences_async(user_id, validated_settings)
-            
+
+            # The personal-memory edit the pushed confirmation could not carry in its own blocks.
+            # It was stashed on the session row by the submission that pushed this modal, and the
+            # confirmation's private_metadata still carries that session id.
+            memory_session = await self._get_session_data(body)
+            memory_warning = await self._reconcile_user_memory(
+                user_id,
+                (memory_session or {}).get('user_memory_pending'),
+                (memory_session or {}).get('user_mem_seed'))
+
             if success:
                 self.log_info(f"Global settings saved after confirmation for user {user_id}: {validated_settings}")
                 
@@ -1016,7 +1122,9 @@ class SlackSettingsHandlersMixin(_Host):
                             "type": "section",
                             "text": {
                                 "type": "mrkdwn",
-                                "text": "✅ Your global settings have been saved successfully!\n_Your custom instructions have been updated and will apply to all conversations._"
+                                "text": ("✅ Your global settings have been saved successfully!"
+                                         "\n_Your custom instructions have been updated and will "
+                                         "apply to all conversations._" + memory_warning)
                             }
                         },
                         {
@@ -1036,7 +1144,8 @@ class SlackSettingsHandlersMixin(_Host):
                     
                     await client.chat_postMessage(
                         channel=user_id,
-                        text="✅ Your global settings have been saved successfully!",
+                        text=("✅ Your global settings have been saved successfully!"
+                              + memory_warning),
                         blocks=blocks
                     )
                 except SlackApiError as e:
@@ -1099,7 +1208,8 @@ class SlackSettingsHandlersMixin(_Host):
                 thread_id=metadata_context.get('thread_id'),
                 in_thread=metadata_context.get('in_thread', False),
                 scope=metadata_context.get('scope'),  # Preserve selected scope
-                pending_message=metadata_context.get('pending_message')  # Preserve pending message
+                pending_message=metadata_context.get('pending_message'),  # Preserve pending message
+                **self._carry_user_memory(body, session_data)
             )
             
             # Update the modal view
@@ -1218,7 +1328,8 @@ class SlackSettingsHandlersMixin(_Host):
                 thread_id=metadata_context.get('thread_id'),
                 in_thread=metadata_context.get('in_thread', False),
                 scope=metadata_context.get('scope'),  # Preserve selected scope
-                pending_message=metadata_context.get('pending_message')  # Preserve pending message
+                pending_message=metadata_context.get('pending_message'),  # Preserve pending message
+                **self._carry_user_memory(body, session_data)
             )
             
             # Validate the modal before sending (debug)
@@ -1306,7 +1417,8 @@ class SlackSettingsHandlersMixin(_Host):
                 thread_id=metadata_context.get('thread_id'),
                 in_thread=metadata_context.get('in_thread', False),
                 scope=selected_scope,  # Pass the new scope
-                pending_message=metadata_context.get('pending_message')  # Preserve pending message
+                pending_message=metadata_context.get('pending_message'),  # Preserve pending message
+                **self._carry_user_memory(body, session_data)
             )
             
             # Update the modal
@@ -1371,7 +1483,8 @@ class SlackSettingsHandlersMixin(_Host):
                 thread_id=metadata_context.get('thread_id'),
                 in_thread=metadata_context.get('in_thread', False),
                 scope=metadata_context.get('scope'),
-                pending_message=metadata_context.get('pending_message')
+                pending_message=metadata_context.get('pending_message'),
+                **self._carry_user_memory(body, session_data)
             )
 
             try:

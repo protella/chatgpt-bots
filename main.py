@@ -213,6 +213,7 @@ class ChatBotV2:
         self.receipt_service = None  # spec §5 outbound receipts
         self.pending_share_recovery = False
         self._pending_share_task = None
+        self._scheduled_rehydrate_task: Optional[asyncio.Task] = None  # T1 scheduled deliveries
         self.running = False
         self._admitting = True
         self.sigint_count = 0  # Track number of SIGINT received
@@ -344,6 +345,24 @@ class ChatBotV2:
             self._pending_share_task.add_done_callback(
                 lambda t: t.cancelled() or (t.exception() and main_logger.warning(
                     f"Pending share recovery error: {t.exception()}")))
+
+        # T1: re-learn the scheduled messages Slack is still holding for us. Same seam and same
+        # reason as the share recovery above — it needs the client, and one listing must not sit
+        # on the boot path — but its OWN condition, because it is not that recovery.
+        #
+        # Starting it at boot rather than lazily is what closes the first-event race: a delivery
+        # can easily be the first own post a restarted process sees, and by then Slack no longer
+        # lists that message as pending, so a listing beginning at that moment can never find it.
+        # The ingress hook JOINS this task (rehydrate_scheduled_deliveries is single-flight), so an
+        # event arriving mid-listing waits for it instead of matching an empty registry.
+        if self.receipt_service is not None and self.client is not None:
+            self._scheduled_rehydrate_task = outbound_receipts.start_scheduled_rehydrate(
+                getattr(getattr(self.client, "app", None), "client", None),
+                team_id=getattr(self.client, "self_team_id", None))
+            if self._scheduled_rehydrate_task is not None:
+                self._scheduled_rehydrate_task.add_done_callback(
+                    lambda t: t.cancelled() or (t.exception() and main_logger.warning(
+                        f"Scheduled-delivery rehydrate error: {t.exception()}")))
 
         # Set up signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -1880,6 +1899,21 @@ class ChatBotV2:
                             except Exception as e:
                                 main_logger.debug(f"Container reap skipped: {e}")
 
+                            # Receipts for messages Slack's own retention policy has already
+                            # deleted. Slack announces none of that and exposes no retention API
+                            # off Grid, so the boundary is inferred: one conversations.history
+                            # probe per channel holding receipts, and in the normal case (nothing
+                            # has aged out yet) that probe is the whole cost and nothing is
+                            # deleted. Best-effort — a skipped channel is retried tomorrow.
+                            try:
+                                from message_processor.outbound_receipts import (
+                                    sweep_receipts_past_retention)
+                                await sweep_receipts_past_retention(
+                                    self.processor.db,
+                                    getattr(getattr(self.client, "app", None), "client", None))
+                            except Exception as e:
+                                main_logger.debug(f"Receipt retention sweep skipped: {e}")
+
                             # Scheduled database backup. Until now backup_database()
                             # was only ever called by the one-time migrations, so a
                             # steady-state bot took no backups at all despite the
@@ -2140,6 +2174,18 @@ class ChatBotV2:
                 pass
             except Exception as e:  # noqa: BLE001
                 main_logger.warning(f"Pending share recovery stopped with: {e}")
+
+        # T1: the same, for the scheduled-message listing. It writes no rows — the expectations it
+        # rebuilds are in memory and die with the process — so it is simply stopped, not drained.
+        task = getattr(self, "_scheduled_rehydrate_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:  # noqa: BLE001
+                main_logger.warning(f"Scheduled-delivery rehydrate stopped with: {e}")
 
         # Spec §5: the generic background set produces receipts too (image share resolution),
         # and it is the ONLY producer nothing else here waits on. It must be off the field

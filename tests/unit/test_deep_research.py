@@ -17,6 +17,19 @@ from tool_registry import ToolContext, ToolRegistry
 import message_processor.research_tools as rt
 
 
+@pytest.fixture(autouse=True)
+def _reset_published_memory():
+    """publish_artifacts remembers ids process-wide (the reused-container guard), and the
+    delivery tests here publish file id "f1" — an id half the artifact suites share. Left behind,
+    it makes a LATER file of that id look already-published: test_fetch_to_sandbox.py's
+    suppression test went red only when this file ran first. Same fixture as test_artifacts.py."""
+    from message_processor import artifacts as artifacts_mod
+
+    artifacts_mod._published_file_ids.clear()
+    yield
+    artifacts_mod._published_file_ids.clear()
+
+
 # --------------------------------------------------------------- fakes
 
 class _FakeClient:
