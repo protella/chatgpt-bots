@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [3.3.0] - 2026-08-13
+## [3.1.0] - 2026-08-13
 
 ### ✨ Added
 
@@ -16,9 +16,30 @@ All notable changes to this project will be documented in this file.
   (next to Custom Instructions), including a "forget everything" option. A `list_facts` tool
   also reads back channel memory with the same ids the bot acts on. New `ENABLE_USER_MEMORY`
   flag (default on).
+- **`export_conversation` — complete channel reads for report-scale work.** The bot can now
+  pull a conversation's full history (every page, every thread reply, names resolved) into its
+  code sandbox as a data file and compute from it — exact counts, timelines, full-coverage
+  summaries, built documents. Works wherever the person asking and the bot are both members;
+  anything else is refused without confirming the channel exists. Big channels just take
+  minutes; nothing is truncated.
+- **Share an image link and the bot can now post the picture itself.** A new import tool
+  fetches a direct image URL (PNG, JPEG, WebP, single-frame GIF), posts it into the
+  conversation, and the imported image can be viewed or edited on later turns like any other.
+  The bot checks the fetched pixels first and confirms they actually show what was asked for;
+  a wrong image is refused with a one-line description of what the picture really shows, and
+  the bot tries a better source instead of posting it. Pages, documents, and animated GIFs
+  are declined honestly.
+- **`fetch_url_to_sandbox` — web assets the sandbox can work on.** Any fetchable URL's raw
+  bytes (an SVG logo, an odd image format, a data file) can be staged into the sandbox for
+  conversion or analysis — closing the gap where official assets were SVGs the bot could only
+  link to. Fetched files are ingredients: only genuinely transformed outputs get posted; the
+  as-is route remains `import_web_image` with its pixel check.
 - **Stored-knowledge search.** The bot can find files and images from earlier threads by
   searching what it wrote about them (summaries and image descriptions) — "which file was the
   broken spreadsheet?" now gets an answer instead of a shrug.
+- **Legacy and mislabeled spreadsheets now parse.** Old binary `.xls` opens (new `xlrd`
+  dependency), and an HTML table exported under a `.xlsx` name — the shape many BI tools
+  produce — is recovered and read (new `lxml`/`html5lib`). See UPGRADING.md for the reinstall.
 - **Sandbox management.** The bot can list what's in its code sandbox and, when one is genuinely
   wedged, replace it with a fresh one on request.
 - **Self-delete and reaction removal.** On an explicit ask, the bot deletes a message it posted
@@ -32,43 +53,16 @@ All notable changes to this project will be documented in this file.
 - **The bot now sees its own delivered scheduled messages.** Slack Bolt silently drops an app's
   own message events, so a fired reminder was invisible to the bot's rebuilt context — it would
   deny the reminder ever fired. Deliveries are now reconciled from channel history.
-- **Timestamps no longer fall back to UTC after a restart** for users whose timezone was loaded
-  from the database.
-
-### 🔧 Changed
-
-- **Background build jobs get 30 minutes** (was 10). A full-channel export alone can spend five
-  minutes honoring Slack's rate limits, which starved report-scale builds mid-work.
-- **Receipt bookkeeping now tracks Slack's retention.** The nightly cleanup prunes internal
-  receipt rows for messages Slack's retention has already deleted (one cheap probe per active
-  channel; workspaces with unlimited retention never prune).
-
-## [3.2.0] - 2026-08-12
-
-### ✨ Added
-
-- **`export_conversation` — complete channel reads for report-scale work.** The bot can now
-  pull a conversation's full history (every page, every thread reply, names resolved) into its
-  code sandbox as a data file and compute from it — exact counts, timelines, full-coverage
-  summaries, built documents. Works wherever the person asking and the bot are both members;
-  anything else is refused without confirming the channel exists. Big channels just take
-  minutes; nothing is truncated.
-- **`fetch_url_to_sandbox` — web assets the sandbox can work on.** Any fetchable URL's raw
-  bytes (an SVG logo, an odd image format, a data file) can be staged into the sandbox for
-  conversion or analysis — closing the gap where official assets were SVGs the bot could only
-  link to. Fetched files are ingredients: only genuinely transformed outputs get posted; the
-  as-is route remains `import_web_image` with its pixel check.
-- **Legacy and mislabeled spreadsheets now parse.** Old binary `.xls` opens (new `xlrd`
-  dependency), and an HTML table exported under a `.xlsx` name — the shape many BI tools
-  produce — is recovered and read (new `lxml`/`html5lib`). See UPGRADING.md for the reinstall.
-
-### 🐛 Fixed
-
 - **A corrupt spreadsheet no longer kills the whole message.** Files whose bytes don't match
   their claimed format are never uploaded to OpenAI (this caused a 400 that took every other
   attachment down with it). The reply now answers the good attachments and names the bad file
   with the actual reason — and offers the sandbox conversion route — instead of a generic
   "Something Went Wrong".
+- **Timestamps no longer fall back to UTC after a restart** for users whose timezone was loaded
+  from the database.
+- **One reply can no longer fire more tool calls than its budget allows.** Both tool loops
+  now enforce the per-turn cap before dispatch, so a single model response can't shotgun a
+  burst of paid fetches past the limit.
 - **Background jobs no longer misreport held-back files.** When the publisher declines to post
   a fetched file that came back unchanged, the delivering model is now told exactly that, so it
   stops claiming the file "didn't survive the build".
@@ -78,66 +72,23 @@ All notable changes to this project will be documented in this file.
 
 ### 🔧 Changed
 
-- **The tool-round cap no longer cuts turns short.** `MAX_TOOL_ROUNDS` now defaults to 10,
-  matching the per-turn call budget — it had been silently forcing final answers at 4 rounds
-  while calls remained.
-
-## [3.1.1] - 2026-08-12
-
-### 🔧 Changed
-
+- **Background build jobs get 30 minutes** (was 10). A full-channel export alone can spend five
+  minutes honoring Slack's rate limits, which starved report-scale builds mid-work.
+- **The default per-reply tool budget is now 10 calls and 10 rounds** (was 8 and 4) — the old
+  round cap silently forced final answers while call budget remained.
 - **The bot posts the picture when the question is what something looks like.** "What does X
   look like?" now gets the photo itself (checked before posting, as always) with the words as
   caption, instead of a link to go look at.
-- **The 👀 acknowledgment appears on the first web search**, not the second — any web hunt
-  shows it's being worked on immediately.
-- **Animated GIFs are declined by the image import** (their pixels can't be checked frame by
-  frame); still images, including single-frame GIFs, are checked and posted as before. A
-  declined import is final — the bot won't fetch the same image another way.
-- **The default per-reply tool budget is now 10** (`MAX_TOOL_CALLS_PER_TURN`, was 8).
-
-### 🔥 Removed
-
-- **The 3.1.0 image-import check lost its over-engineering.** Gone: the separate verify
-  timeout and description length cap (`IMAGE_IMPORT_VERIFY_TIMEOUT_S` and
-  `IMAGE_IMPORT_EXPECTED_MAX_CHARS` no longer exist — delete them from your `.env` if
-  present), the strict verdict grammar, the output sanitizers, and the special error
-  routing. The check itself is unchanged: wrong pixels still never get posted; if the check
-  itself errors, the image posts and the reply says the check was skipped.
-
-## [3.1.0] - 2026-08-12
-
-### ✨ Added
-
-- **Share an image link and the bot can now post the picture itself.** A new import tool
-  fetches a direct image URL (PNG, JPEG, GIF, WebP), posts it into the conversation, and the
-  imported image can be viewed or edited on later turns like any other. Pages and documents
-  are declined honestly.
-- **Imported images are checked before they're posted.** The bot looks at the fetched pixels
-  and confirms they actually show what was asked for; a wrong image (the link said White
-  House, the pixels said supermarket aisle) is refused with a one-line description of what
-  the picture really shows, and the bot tries a better source instead of posting it.
-
-### 🔧 Changed
-
-- **The progress line on an image no longer sits frozen while you wait.** It re-words itself
-  every so often, and once a render runs long it says so plainly instead of repeating the
-  same line.
 - **The bot notices when a channel is joking about it specifically.** Banter unmistakably
   about the bot now wakes it for a possible reaction or comeback; talk about AI or other
   bots in general still leaves it asleep.
-- **Canvas requests show they're being worked on.** Creating, editing, or deleting a canvas
-  now stakes the 👀 acknowledgment on your message as soon as the work starts, instead of
-  running silently until the reply.
-- **Long web hunts show they're being worked on too.** One quick web search stays quiet, but
-  the moment a reply turns into a real multi-search hunt the 👀 acknowledgment appears,
-  instead of the bot looking dead for a minute.
-
-### 🩹 Fixed
-
-- **One reply can no longer fire more tool calls than its budget allows.** Both tool loops
-  now enforce the per-turn cap before dispatch, so a single model response can't shotgun a
-  burst of paid fetches past the limit.
+- **Work-in-progress is visible.** The 👀 acknowledgment appears on the first web search, on
+  long multi-search hunts, and on canvas work as soon as it starts; the progress line on an
+  image re-words itself every so often instead of sitting frozen, and says so plainly once a
+  render runs long.
+- **Receipt bookkeeping now tracks Slack's retention.** The nightly cleanup prunes internal
+  receipt rows for messages Slack's retention has already deleted (one cheap probe per active
+  channel; workspaces with unlimited retention never prune).
 
 ## [3.0.3] - 2026-08-11
 

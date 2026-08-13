@@ -1,6 +1,6 @@
 # Upgrading
 
-## Since v3.1.1
+## v3.0.x → v3.1.0
 
 **Reinstall dependencies before deploying** — this release adds three:
 ```bash
