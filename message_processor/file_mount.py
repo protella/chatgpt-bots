@@ -19,9 +19,19 @@ Two properties are load-bearing:
   files — so a user's own spreadsheet cannot be posted back at them. We also record each
   mount's digest so that a model which merely *copies* an input to a new name (making an
   assistant-owned, byte-identical twin) still cannot round-trip it into the channel.
+
+**The upload endpoint judges CONTENT, not filenames** (measured live 2026-08-12). Raw SVG bytes
+are 400-refused — "You uploaded an invalid file", no error code — under ``logo.svg``, ``.xml``,
+``.dat``, ``.bin`` and ``.svg.txt`` alike, while the SAME bytes gzip-compressed or base64-encoded
+go straight in, as do plain text, JSON, PNG and HTML. No rename talks it round, so ``stage_bytes``
+does not try to: it offers the real bytes, and on a 400 retries ONCE through gzip, which the
+sandbox undoes in one line. We keep no allowlist and sniff nothing on our side — a format that
+fails both ways fails honestly.
 """
 from __future__ import annotations
 
+import asyncio
+import gzip
 import hashlib
 import io
 from collections import OrderedDict
@@ -231,9 +241,11 @@ async def execute_mount_file(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str
         # could post the user's own file back at them.
         if not any(m.get("key") == key for m in ctx.mounted_files):
             ctx.mounted_files.append(cached)
-        return {"ok": True, "path": cached["path"], "filename": cached["filename"],
-                "already_mounted": True,
-                "message": "Already in the sandbox from earlier — open it from this path."}
+        hit = _mount_result(cached)
+        hit["already_mounted"] = True
+        if not cached.get("gzipped"):
+            hit["message"] = "Already in the sandbox from earlier — open it from this path."
+        return hit
 
     # F38: past every rejection AND past the cache hit above (which returns in microseconds) —
     # a real Slack download plus a container upload is about to happen. This is the honest
@@ -252,42 +264,131 @@ async def execute_mount_file(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str
                     f"{entry['filename']} is {len(data) / (1024 * 1024):.1f} MB, over the "
                     f"{config.artifact_max_mb} MB mount limit.")
 
-    filename = _safe_name(entry["filename"])
-    try:
-        raw = processor.openai_client.client
-        buf = io.BytesIO(data)
-        buf.name = filename
-        created = await raw.containers.files.create(container_id=container_id, file=buf)
-    except Exception as e:  # noqa: BLE001
-        logger.error(f"Mount upload failed ({container_id}): {e}", exc_info=True)
-        return _err("mount_failed", f"Could not place {filename} in the sandbox.")
+    # The upload itself is `stage_bytes` — one place where bytes enter a container, so a user's
+    # own SVG gets the same gzip transport a fetched one does instead of the raw 400. The
+    # idempotency cache stays HERE, on top: it is mount_file's contract, not the uploader's.
+    record = await stage_bytes(ctx, container_id, entry["filename"], data, source_id=file_id)
+    if record is None:
+        return _err("mount_failed",
+                    f"Could not place {_safe_name(entry['filename'])} in the sandbox.")
 
-    # The API assigns the path; assuming /mnt/data/<name> would be a guess.
-    path = getattr(created, "path", None)
-    if not path:
-        return _err("mount_failed", f"The sandbox accepted {filename} but returned no path.")
-
-    record = {
-        "key": key,
-        "file_id": file_id,
-        "path": path,
-        "filename": filename,
-        "container_file_id": getattr(created, "id", None),
-        "digest": hashlib.sha256(data).hexdigest(),
-    }
-    ctx.mounted_files.append(record)
     _remember_mount(key, record)
-    logger.info(f"Mounted {file_id} ({filename}, {len(data)} bytes) at {path}")
+    logger.info(f"Mounted {file_id} ({record['filename']}, {len(data)} bytes) "
+                f"at {record['path']}")
 
-    return {
+    return _mount_result(record, size_bytes=len(data), mime_type=entry["mime_type"])
+
+
+def _mount_result(record: Dict[str, Any], *, size_bytes: Optional[int] = None,
+                  mime_type: Optional[str] = None) -> Dict[str, Any]:
+    """The success payload, shared by the fresh mount and the cache hit — so a file that could
+    only be carried gzip-wrapped says so on EVERY round, not just the one that uploaded it."""
+    result: Dict[str, Any] = {
         "ok": True,
-        "path": path,
-        "filename": filename,
-        "size_bytes": len(data),
-        "mime_type": entry["mime_type"],
+        "path": record["path"],
+        "filename": record["filename"],
         "message": ("Open it from this path in your next code_interpreter call. It has NOT "
                     "been posted to the user."),
     }
+    if size_bytes is not None:
+        result["size_bytes"] = size_bytes
+    if mime_type is not None:
+        result["mime_type"] = mime_type
+    if record.get("gzipped"):
+        result["gzipped"] = True
+        result["message"] = (
+            "The sandbox refused this file's bytes as-is, so it is mounted GZIP-COMPRESSED at "
+            "this path. Decompress it first in your code (the `gzip` module), then work on the "
+            "real bytes. It has NOT been posted to the user.")
+    return result
+
+
+async def stage_bytes(ctx: ToolContext, container_id: str, filename: str, data: bytes, *,
+                      source_id: str) -> Optional[Dict[str, Any]]:
+    """Push in-memory bytes into `container_id` and record them the way a mount is recorded.
+
+    The other two tools that put bytes in the sandbox from OUTSIDE the conversation — the channel
+    export and the web fetch — need exactly what the tail of ``execute_mount_file`` does: a safe
+    filename, one ``containers.files.create``, and a digest on ``ctx.mounted_files`` so the
+    artifact publisher cannot post the ingredient back out. That record shape is this module's,
+    so the helper lives here rather than being copied twice.
+
+    Returns None when the upload failed or the API returned no path; the caller owns the wording
+    of its own failure. A record with ``gzipped`` True means the bytes are in the container
+    COMPRESSED and the caller must say so — see ``_upload`` for why. Deliberately NOT cached in
+    ``_MOUNTS``: a thread file is the same bytes every time, while a re-export or a re-fetch is a
+    request for the CURRENT ones.
+    """
+    processor = getattr(ctx, "processor", None)
+    if processor is None:
+        return None
+    safe = _safe_name(filename)
+    try:
+        raw = processor.openai_client.client
+    except AttributeError:
+        return None
+
+    payload = data
+    gzipped = False
+    try:
+        created = await _upload(raw, container_id, safe, payload)
+    except Exception as e:  # noqa: BLE001
+        if not _is_bad_request(e):
+            logger.error(f"Staging {safe} failed ({container_id}): {e}", exc_info=True)
+            return None
+        # Refused on CONTENT — try the one transport that is not content (see below).
+        payload = await asyncio.to_thread(gzip.compress, data)
+        safe = f"{safe}.gz"
+        gzipped = True
+        logger.info(f"The sandbox refused {filename!r} as-is; retrying gzip-wrapped as {safe}")
+        try:
+            created = await _upload(raw, container_id, safe, payload)
+        except Exception as e2:  # noqa: BLE001
+            logger.error(f"Staging {safe} failed after gzip-wrapping ({container_id}): {e2}",
+                         exc_info=True)
+            return None
+    path = getattr(created, "path", None)
+    if not path:
+        logger.error(f"The sandbox accepted {safe} but returned no path ({container_id})")
+        return None
+    record: Dict[str, Any] = {
+        "key": _mount_key(container_id, source_id),
+        "file_id": source_id,
+        "path": path,
+        "filename": safe,
+        "container_file_id": getattr(created, "id", None),
+        # The digest of what is ACTUALLY in the container, so the publisher's byte-identical
+        # check works against the file that exists there.
+        "digest": hashlib.sha256(payload).hexdigest(),
+        "gzipped": gzipped,
+    }
+    if gzipped:
+        # …and the digest of what it decompresses to, because the obvious first thing the model
+        # does with a wrapped ingredient is write the real bytes out beside it. That copy is
+        # still the ingredient and still must not be posted.
+        record["digest_raw"] = hashlib.sha256(data).hexdigest()
+    if ctx.mounted_files is None:
+        ctx.mounted_files = []
+    ctx.mounted_files.append(record)
+    return record
+
+
+async def _upload(raw: Any, container_id: str, filename: str, payload: bytes) -> Any:
+    buf = io.BytesIO(payload)
+    buf.name = filename
+    return await raw.containers.files.create(container_id=container_id, file=buf)
+
+
+def _is_bad_request(exc: BaseException) -> bool:
+    """A 400 from the container upload — the API refusing the CONTENT.
+
+    Matched by status AND by class name, the same belt-and-braces `is_container_gone` uses: the
+    SDK raises `openai.BadRequestError` (status_code 400), but an exception that reaches here
+    through a wrapper or a stub may carry only one of the two.
+    """
+    if getattr(exc, "status_code", None) == 400:
+        return True
+    return type(exc).__name__ == "BadRequestError"
 
 
 def _safe_name(name: str) -> str:
@@ -298,8 +399,18 @@ def _safe_name(name: str) -> str:
 
 
 def mounted_digests(ctx: ToolContext) -> List[str]:
-    """Digests of everything mounted this run — the publisher refuses to post these back."""
-    return [m["digest"] for m in (getattr(ctx, "mounted_files", None) or []) if m.get("digest")]
+    """Digests of everything mounted this run — the publisher refuses to post these back.
+
+    A gzip-wrapped staging contributes TWO: the compressed bytes sitting in the container, and
+    what they decompress to, which is what a model writes out beside them before working on it.
+    """
+    out: List[str] = []
+    for m in (getattr(ctx, "mounted_files", None) or []):
+        for key in ("digest", "digest_raw"):
+            digest = m.get(key)
+            if digest:
+                out.append(digest)
+    return out
 
 
 def sandbox_enabled(thread_config: Optional[Dict[str, Any]] = None) -> bool:

@@ -282,7 +282,9 @@ async def execute_import_web_image(ctx: ToolContext, args: Dict[str, Any]) -> Di
                 return {"ok": False, "error": "not_an_image",
                         "content_type": result.content_type,
                         "note": ("The URL is a page or document, not a direct image. fetch_url "
-                                 "reads pages.")}
+                                 "reads pages. If this is a vector or unusual-format asset "
+                                 "(SVG etc.), fetch_url_to_sandbox can stage it in the sandbox "
+                                 "for conversion.")}
             return {"ok": False, "error": result.error_code or "fetch_failed",
                     "detail": result.error_detail, "source_url": source_ref}
         if not result.raw_bytes:

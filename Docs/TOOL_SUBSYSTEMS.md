@@ -131,11 +131,75 @@ bridge; `thread_files.py` is the unified catalog (images + documents behind one 
   container skips the upload, an expired one (new id) misses and re-mounts from Slack.
 - Pushed bytes land as `source="user"`, so the publisher (assistant-only) never posts them back.
   A digest guard (`suppress_digests`) also catches a model that copies an input to a new name.
+  When that guard fires in a background build, the held-back NAMES now reach the delivery model
+  (`suppressed_inputs_out` → `build["suppressed_inputs"]` → `_DELIVERY_SUPPRESSED_INPUTS_BLOCK`);
+  without them it read an empty manifest as a failed build and told the user so — live 2026-08-12.
+- The upload itself is `stage_bytes` (below), shared with the export and fetch tools, so a
+  user-shared file the API refuses on content gets the same gzip transport rather than a 400.
+  `mount_file` keeps its `(container_id, file_id)` idempotency cache on top of it, and a cached
+  hit repeats the gzip note — a wrapper mentioned only on the uploading round is a wrapper the
+  next round hands to a parser that chokes on it.
 - **Cataloguing must not depend on replying.** Document/image rows used to be written only inside
   a turn, so a file shared in a message the bot stayed quiet about — or one superseded during the
   participation gate's debounce — vanished for good. `thread_files.catalog_unattended()` (called
   from `main.py`'s gate on any non-respond verdict) fixes that. Found live: a CSV dropped 2s
   before another file was lost, and the model then correctly refused to build the report.
+
+## export_conversation — a whole channel INTO the sandbox
+
+`message_processor/export_tool.py`. The history tools are a WINDOW (`fetch_channel_history` is
+newest-N with no cursor), which is wrong for report-scale work: asked to produce an incident
+report, the bot correctly self-diagnosed COLLECTION as the only thing it could not do. This tool
+cursor-pages `conversations.history` + `conversations.replies` in the BOT process and stages JSONL
+into `/mnt/data` — the model's context sees a path, a count and a date span, never the transcript.
+
+- **Same gate as every channel read**: `_authorize_channel_read` (both-members), refusal is the
+  canonical `ACCESS_DENIED_MESSAGE` — never a reason-carrying variant.
+- **Completeness, not nearly**: ts-deduped globally (`conversations.replies` re-includes the
+  root); with `oldest` set, history is paged PAST it and any root whose `latest_reply` is in range
+  is walked, because a recent reply can hang off an ancient root a bounded history call cannot
+  see. A partial walk (Slack refusing mid-way) stages NOTHING and says so.
+- **Chunked, never truncated**: parts are `export-part-NNN.jsonl`, split at `artifact_max_mb` —
+  the same transfer bound `mount_file` moves bytes under.
+- **600s explicit timeout** (module constant, not an env knob): the registry default is 20s, and a
+  big channel is minutes of paging. Local tool time runs between API rounds, so it isn't fighting
+  the stream timeout. `_PAGE_PAUSE_S = 1.2` between pages is the cadence that ran two channels
+  without a 429; `fetch_page`'s ladder honors Retry-After when one arrives anyway.
+- Memory only — no disk, no DB. Slack stays the only transcript.
+
+## fetch_url_to_sandbox — web bytes INTO the sandbox
+
+`message_processor/fetch_to_sandbox.py`. The container has cairosvg, svglib, LibreOffice, ffmpeg
+and PIL, and no egress; the fetcher has egress and every SSRF guard. Until this hop, the two could
+not be connected: an official logo published as SVG was refused by `fetch_url`
+(`unsupported_type`) AND by `import_web_image` (`not_an_image`), with converters sitting one call
+away. `ambient_fetch.fetch_url(raw_mode=True)` returns `kind="bytes"` — the same validation,
+redirect re-validation, `link_fetch_max_bytes` cap and timeouts, minus the MIME allowlist, which
+only ever existed because the caller was about to read the body as text.
+
+The fetch runs BEFORE `ensure_sandbox()` (a blocked or dead URL should not mint a container), then
+the `container_recycled()` guard, then `containers.files.create`. The staged file is an
+**ingredient** — its digest lands in `ctx.mounted_files`, so the publisher will not post it back
+out; what the model BUILDS from it publishes normally. Both tools stage through
+`file_mount.stage_bytes`, which owns that record shape.
+
+**`containers.files.create` judges CONTENT, not the filename** (probed live 2026-08-12, on the
+logo scenario this round exists to fix). Raw SVG bytes are 400-refused — "You uploaded an invalid
+file", no error code — under `logo.svg`, `.xml`, `.dat`, `.bin` AND `.svg.txt`; the SAME bytes
+gzip-compressed (`.gz`) or base64-encoded are accepted, as are plain text, JSON, PNG and HTML. So
+no rename talks it round. `stage_bytes` offers the real bytes and, on a 400 only, retries ONCE
+gzip-wrapped with `.gz` appended; the record carries `gzipped: True` and both tools then say in
+their result that the file is compressed and must be decompressed in the sandbox first — without
+that sentence the model hands a gzip blob to cairosvg and reports the ASSET as broken. A gzipped
+staging contributes two suppression digests (the compressed bytes and what they decompress to).
+We keep no content-type allowlist and sniff nothing on our side; a format that fails both ways
+fails honestly.
+
+Both are registered in the background BUILD phase too (owner decision): they run in the bot
+process, so the container's no-egress boundary is untouched. That is why `_run_build_phase` now
+carries the dispatching user's `user_id` / `requester_is_human` / `is_dm` onto the job's
+ToolContext — the canonical gate refuses a context with no requester. `origin_membership_attested`
+is deliberately NOT propagated; it is a claim only a live entry point can make.
 
 ## Publishing: only the deliverable, never its ingredients
 

@@ -774,6 +774,24 @@ _DELIVERY_NO_FILES_BLOCK = (
     "honestly and do not imply that one is coming.\n\n"
 )
 
+# The other reason a manifest can be short, and the one the model cannot infer.
+#
+# Live 2026-08-12: a build fetched a logo into the sandbox, checked it, then copied it to a new
+# name. Byte-identical, so the publisher refused it as a mounted input — correctly; an ingredient
+# is not a deliverable. But the delivery model saw an empty manifest with no reason attached,
+# reached for the only explanation available to it, and told the user the file "didn't make it
+# back from the build". Nothing had failed, two routes to delivering it were open, and the user
+# got nothing. The guard is right; being silent about it is what turned it into a false report.
+_DELIVERY_SUPPRESSED_INPUTS_BLOCK = (
+    "HELD BACK AS INPUTS, NOT OUTPUT: {names}. These came back from the sandbox byte-identical "
+    "to what went in, so they were kept out of the manifest — an ingredient is not a "
+    "deliverable. NOTHING FAILED and nothing was lost: do not tell the user a file could not be "
+    "built or did not survive the build. A file has to be genuinely TRANSFORMED (converted, "
+    "resized, composited, assembled into a document) to be publishable. If the user's ask really "
+    "is one of these files exactly as it was, say so plainly and name the route: an image from "
+    "the web can be posted directly with import_web_image.\n\n"
+)
+
 # Corrections the run actually APPLIED, repeated for the model that decides what ships.
 #
 # Found live: a steered build correctly dropped a section and added another, and the delivery
@@ -1600,7 +1618,13 @@ async def execute_start_background_job(ctx: ToolContext, args: Dict[str, Any]) -
         thread_root=thread_root, thread_key=thread_key, job_id=job_id,
         task=task, mode=mode, label_hint=label_hint, snapshot=snapshot,
         system_prompt=system_prompt, model=model, plan=plan,
-        deliverables=deliverables, thread_config=thread_config, revises=revises)
+        deliverables=deliverables, thread_config=thread_config, revises=revises,
+        # WHO asked, carried into the job so its build phase can authorize a channel read on
+        # their behalf. Read here, off the live turn's context, because that is the only place
+        # the identity exists — a detached job has no event to re-derive it from.
+        requester_user_id=getattr(ctx, "user_id", None),
+        requester_is_human=bool(getattr(ctx, "requester_is_human", False)),
+        requester_is_dm=bool(getattr(ctx, "is_dm", False)))
     try:
         task_handle = processor._schedule_async_call(coro)
     except Exception as e:  # scheduling failed — the job will never run; clear the registry
@@ -1994,6 +2018,9 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
                            steering_callback: Optional[_SteeringCallback] = None,
                            applied_notes: Optional[List[str]] = None,
                            revises: Optional[List[str]] = None,
+                           requester_user_id: Optional[str] = None,
+                           requester_is_human: bool = False,
+                           requester_is_dm: bool = False,
                            ) -> Optional[Dict[str, Any]]:
     """Phase 2: turn the findings into the files the user asked for.
 
@@ -2011,7 +2038,8 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
 
     Never raises: a build failure costs the file, not the research report.
     """
-    from message_processor import channel_request, file_mount, image_tools
+    from message_processor import (channel_request, export_tool, fetch_to_sandbox, file_mount,
+                                   image_tools)
     from message_processor.artifacts import collect_container_ids
     from message_processor.containers import AUTO_CONTAINER
 
@@ -2064,16 +2092,31 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
                       name="create_image_asset", dynamic=True,
                       timeout=float(config.api_timeout_image) + 60.0)
     file_mount.register_file_mount_tools(registry)
+    # A build is exactly where full-coverage collection belongs — nobody is watching a blank
+    # reply while it pages — so the export tool is here too, with the SAME authorization gate it
+    # has interactively (which is why the requester's identity is on the context below). It reads
+    # Slack with the bot's own token and breaches no boundary the build phase has: the container
+    # still has no egress. Same for the URL fetch, which runs in the BOT process.
+    export_tool.register_export_tool(registry)
+    if config.enable_link_fetch:
+        fetch_to_sandbox.register_fetch_to_sandbox_tool(registry)
 
     tools = list(registry.schemas(build_config))
     tools.append({"type": "code_interpreter", "container": container})
 
+    # The DISPATCHING user's identity, carried into the detached job. The canonical channel-read
+    # gate refuses a context with no requester or a non-human one, so without these the export
+    # tool would be on the table and deny every call. `origin_membership_attested` is deliberately
+    # NOT propagated: it attests that Slack delivered THIS turn from that conversation, which is
+    # a claim only a live entry point can make — a detached job re-verifies membership properly.
     build_ctx = ToolContext(
         channel_id=channel_id, thread_ts=thread_root, trigger_ts=thread_root,
         client=client, processor=processor, db=getattr(processor, "db", None),
         thread_config=build_config, container_id=container,
         image_catalog=[], sandbox_image_assets=[],
         thread_files=build_config[file_mount.FILES_KEY], mounted_files=[],
+        user_id=requester_user_id, requester_is_human=requester_is_human,
+        is_dm=requester_is_dm,
     )
 
     # A `build` job ran no research, so there are no findings to hand over. Saying "use these
@@ -2207,11 +2250,17 @@ async def _stage_build(processor, *, job_id: str, build: Dict[str, Any]) -> List
     would put a model call on the critical path of a expiring resource, and eventually lose a
     deliverable to it.
 
+    Whatever the publisher held back as an unchanged INPUT is written back onto ``build`` under
+    ``suppressed_inputs`` — the same way ``notes`` rides that dict to the delivery phase. The
+    delivery model has to be told WHY its manifest is short: left to infer it, it reads an empty
+    manifest as a build that lost its output, which is exactly what happened live.
+
     Never raises: a staging failure costs the files, not the report.
     """
     from message_processor.artifacts import stage_artifacts
 
     manager = getattr(processor, "container_manager", None)
+    suppressed_inputs: List[str] = []
     try:
         # The time budget lives INSIDE stage_artifacts (per-file, deadline-bounded) rather than
         # as an outer wait_for: a wrap-and-cancel discarded a deck that had already been staged
@@ -2225,11 +2274,16 @@ async def _stage_build(processor, *, job_id: str, build: Dict[str, Any]) -> List
             container_manager=manager,
             suppress_digests=build["suppress_digests"],
             expect_filenames=build["expect_filenames"],
-            time_budget=config.artifact_publish_timeout)
+            time_budget=config.artifact_publish_timeout,
+            suppressed_inputs_out=suppressed_inputs)
     except Exception as e:  # noqa: BLE001
         processor.log_error(f"Build phase {job_id} staging failed: {e}", exc_info=True)
         staged = []
 
+    if suppressed_inputs:
+        build["suppressed_inputs"] = list(dict.fromkeys(suppressed_inputs))
+        processor.log_info(f"Build phase {job_id} held back {len(suppressed_inputs)} unchanged "
+                           f"input(s): {build['suppressed_inputs']}")
     processor.log_info(f"Build phase {job_id} staged {len(staged)} file(s)")
     return staged
 
@@ -2272,7 +2326,10 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
                               plan: Optional[List[str]] = None,
                               deliverables: Optional[List[Dict[str, str]]] = None,
                               thread_config: Optional[Dict[str, Any]] = None,
-                              revises: Optional[List[str]] = None) -> None:
+                              revises: Optional[List[str]] = None,
+                              requester_user_id: Optional[str] = None,
+                              requester_is_human: bool = False,
+                              requester_is_dm: bool = False) -> None:
     """The detached job. It PRODUCES; it does not deliver.
 
     Post the live status card, RESEARCH (web_search + MCP, consumed as an internal stream so the
@@ -2446,7 +2503,10 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
                 task=task, findings=text, deliverables=deliverables, snapshot=snapshot,
                 thread_config=thread_config, system_prompt=system_prompt, model=model,
                 card=card, steering_callback=steering_callback,
-                applied_notes=applied_notes, revises=revises)
+                applied_notes=applied_notes, revises=revises,
+                requester_user_id=requester_user_id,
+                requester_is_human=requester_is_human,
+                requester_is_dm=requester_is_dm)
             # UNCONDITIONALLY here, and here rather than inside the phase: the helper can return
             # None before a stream ever exists (no addressable container), and a gate that only
             # closed "after the build stream" would then stay open over a job with no rounds
@@ -2472,7 +2532,8 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
             snapshot=snapshot, system_prompt=system_prompt, model=model,
             channel_id=channel_id, thread_root=thread_root,
             build_notes=(build or {}).get("notes") or "", late_notes=late_notes,
-            applied_notes=applied_notes)
+            applied_notes=applied_notes,
+            suppressed_inputs=(build or {}).get("suppressed_inputs"))
 
         _mark_delivering()
         ack: Dict[str, bool] = {}
@@ -2603,6 +2664,7 @@ async def _plan_delivery(processor, *, job_id: str, task: str, report: str, stag
                          build_notes: str = "",
                          late_notes: Optional[List[str]] = None,
                          applied_notes: Optional[List[str]] = None,
+                         suppressed_inputs: Optional[List[str]] = None,
                          ) -> Optional[Dict[str, Any]]:
     """F37 — the POKE. Hand the finished job's output back to the model and let IT decide what
     the user sees: which files ship, whether the full report is posted, and what the message says.
@@ -2627,6 +2689,11 @@ async def _plan_delivery(processor, *, job_id: str, task: str, report: str, stag
         manifest_block = _DELIVERY_MANIFEST_BLOCK.format(manifest=manifest)
     else:
         manifest_block = _DELIVERY_NO_FILES_BLOCK
+    if suppressed_inputs:
+        # AFTER the manifest, whichever manifest it is: this explains a gap in it, and it is
+        # needed most in the "none" case — that is the one the model misread live.
+        manifest_block += _DELIVERY_SUPPRESSED_INPUTS_BLOCK.format(
+            names=", ".join(dict.fromkeys(suppressed_inputs)))
 
     plan: Dict[str, Any] = {}
 

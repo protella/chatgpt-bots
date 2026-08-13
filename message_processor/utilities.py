@@ -13,6 +13,8 @@ import pytz  # type: ignore[import-untyped]  # no stubs shipped; types-pytz isn'
 
 import prompts
 from base_client import BaseClient, Message
+from canvas_content import CANVAS_MIMETYPE
+from document_handler import container_magic_mismatch
 from config import config, pipeline_status
 from image_validation import ensure_api_compatible, TOO_LARGE_AFTER_CONVERSION
 from message_processor._host import _Host
@@ -276,8 +278,18 @@ class MessageUtilitiesMixin(_Host):
 
     def _native_file_eligible(self, mimetype: str, size_bytes: int,
                               total_pages: Optional[int],
-                              code_interpreter_enabled: Optional[bool] = None) -> bool:
+                              code_interpreter_enabled: Optional[bool] = None,
+                              file_data: Optional[bytes] = None) -> bool:
         """Decide native input_file vs local extraction for the attach turn.
+
+        ``file_data`` is the downloaded bytes. When they are supplied — the attach path always
+        supplies them — a mimetype that names a CONTAINER format must actually BE that
+        container before the file may ride the native route, however well its text extraction
+        went. The API opens the bytes by their declared type, so bytes that are not that type
+        earn a 400 `invalid_file` that kills the entire turn, innocent co-attachments included.
+        Extraction success is not evidence here: a fake .xlsx with a CSV-shaped head parses
+        perfectly well as a CSV and is still not a workbook. Its recovered text still reaches
+        the model as extracted text — only the upload is refused.
 
         Two ways to qualify:
         - PDF: the API renders its pages, so the model sees text + page images.
@@ -294,6 +306,8 @@ class MessageUtilitiesMixin(_Host):
         native files too (feeding the summary, the schema, and read_document).
         """
         if not config.enable_native_file_input:
+            return False
+        if file_data is not None and container_magic_mismatch(mimetype, file_data):
             return False
         # Resolve the SAME way _build_tools_array does. Reading the global here while the tools
         # array reads the per-thread override desynchronizes the two: a thread with CI off would
@@ -530,6 +544,42 @@ class MessageUtilitiesMixin(_Host):
             "url_private": url_private,
             "size_bytes": size_bytes,
         }
+
+    def _persist_failed_document(self, message: Message, filename: str, mimetype: str,
+                                 failure_reason: str, *, file_id: Optional[str],
+                                 url_private: Optional[str],
+                                 size_bytes: Optional[int]) -> bool:
+        """Record a document whose extraction failed, so it still has a mount id.
+
+        Metadata + Slack ref only, like every other document row — the summary is the failure
+        reason rather than a summary of content there isn't any of. Without this row the file
+        is invisible to `mount_file`'s catalog, and "convert it in the sandbox" is advice the
+        model has no id to act on. Rows the catalog would skip anyway (no ref at all, or a
+        canvas, whose bytes are a web page rather than a build input) are not written.
+
+        Returns whether the row exists — which is exactly whether the failure notice may offer
+        the sandbox as a next step, so the advice and the id can never drift apart.
+        """
+        if not (file_id or url_private) or mimetype == CANVAS_MIMETYPE:
+            return False
+        try:
+            document_ledger = self.thread_manager.get_or_create_document_ledger(message.thread_id)
+            document_ledger.add_document(
+                content="",
+                filename=filename,
+                mime_type=mimetype,
+                summary=f"[Could not be read: {failure_reason}]",
+                db=self.db,
+                thread_id=f"{message.channel_id}:{message.thread_id}",
+                message_ts=(message.metadata or {}).get("ts"),
+                file_id=file_id,
+                url_private=url_private,
+                size_bytes=size_bytes,
+            )
+            return True
+        except Exception as e:  # noqa: BLE001
+            self.log_warning(f"Could not record failed document {filename}: {e}")
+            return False
 
     async def _finalize_document_summary(self, entry: Dict, client: BaseClient, message: Message,
                                          thinking_id: Optional[str] = None,
@@ -858,15 +908,24 @@ class MessageUtilitiesMixin(_Host):
                             ocr_images=not maybe_native
                         )
                         
-                        if extracted_content and extracted_content.get("content"):
+                        # Extraction FAILURE is `format == 'error'`, not any set `error` key:
+                        # a partial extraction legitimately returns recovered text plus an
+                        # error note and must stay usable. A failure's "content" is a
+                        # placeholder, and a placeholder that reads as success is what sent
+                        # unparseable bytes to the API as an input_file and 400'd the turn.
+                        extraction_failed = bool(extracted_content) and \
+                            extracted_content.get("format") == "error"
+                        if extracted_content and extracted_content.get("content") \
+                                and not extraction_failed:
                             # Native-vs-local decision (one place, documented in
                             # _native_file_eligible). Local extraction already ran —
                             # it always does: it feeds the summary, page count,
                             # spreadsheet schema, and warms the read_document cache.
-                            native = self._native_file_eligible(
+                            native = (not extraction_failed) and self._native_file_eligible(
                                 mimetype, len(document_data),
                                 extracted_content.get("total_pages"),
-                                code_interpreter_enabled=code_interpreter_enabled)
+                                code_interpreter_enabled=code_interpreter_enabled,
+                                file_data=document_data)
 
                             if native:
                                 # Model reads the actual PDF this turn (text +
@@ -939,16 +998,29 @@ class MessageUtilitiesMixin(_Host):
                                           f"({extracted_content.get('total_pages', 'unknown')} pages, {route})")
                         else:
                             self.log_warning(f"Failed to extract content from document: {file_name}")
+                            error_msg = (extracted_content or {}).get(
+                                "error") or "Unable to extract content"
                             # Update status to show extraction failed
                             if thinking_id:
-                                error_msg = extracted_content.get("error", "Unable to extract content")
-                                self._update_status(client, message.channel_id, thinking_id, 
+                                self._update_status(client, message.channel_id, thinking_id,
                                                   f"⚠️ {file_name}: {error_msg}", thread_id=message.thread_id)
-                            # Add to unsupported if extraction failed
+                            # The bytes are still reachable through Slack, so the file earns a
+                            # metadata-only row: that row is what gives it a mount id, and the
+                            # sandbox can convert what our parsers could not read.
+                            mountable = self._persist_failed_document(
+                                message, file_name, mimetype, error_msg,
+                                file_id=file_id,
+                                url_private=attachment.get("url"),
+                                size_bytes=len(document_data))
+                            # Add to unsupported if extraction failed. The specific category —
+                            # and with it the "convert it in the sandbox" advice — is claimed
+                            # only when there is a row to mount.
                             unsupported_files.append({
                                 "name": file_name,
                                 "type": "file",
-                                "mimetype": mimetype
+                                "mimetype": mimetype,
+                                **({"error": "extraction_failed", "detail": error_msg}
+                                   if mountable else {}),
                             })
                     else:
                         # Download failed — tell the user instead of answering

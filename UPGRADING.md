@@ -1,5 +1,22 @@
 # Upgrading
 
+## Since v3.1.1
+
+**Reinstall dependencies before deploying** — this release adds three:
+```bash
+make install   # python3 -m pip install --require-hashes -r requirements.txt
+```
+`xlrd` reads legacy `.xls` (the OLE2 binary format openpyxl cannot open at all), and
+`lxml` + `html5lib` are what recover an HTML table exported under a `.xlsx` name — the shape
+most BI tools produce. Both were previously present only as transitive pins. Without them
+those files fall back to a "couldn't read it" note instead of parsing.
+
+**Reinstall the Slack app from the updated manifest** — the toolbelt round adds two bot
+scopes, `channels:manage` and `groups:write` (channel topic/purpose tools, human-request-only).
+Update the app's manifest from `slack_app_manifest.example.yml` (keep your names/commands) and
+reinstall to the workspace; without the scopes those two tools return Slack's `missing_scope`
+error and everything else works unchanged.
+
 ## v2.x → v3.0.0
 
 Follow the steps in order — steps 2 and 5 are the ones that bite.

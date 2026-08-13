@@ -774,8 +774,10 @@ class BotConfig:
     enable_tool_loop: bool = field(default_factory=lambda: os.getenv("ENABLE_TOOL_LOOP", "true").lower() == "true")
     # Runaway caps: max loop rounds per response / max total local calls per response. On cap,
     # one final round runs with tool_choice="none" so the model answers with what it has.
-    max_tool_rounds: int = field(default_factory=lambda: int(os.getenv("MAX_TOOL_ROUNDS", "4")))
-    max_tool_calls_per_turn: int = field(default_factory=lambda: int(os.getenv("MAX_TOOL_CALLS_PER_TURN", "8")))
+    # The rounds default matches the calls default: a round spends at least one call, so the
+    # calls cap is the binding budget and the rounds cap is a runaway backstop only.
+    max_tool_rounds: int = field(default_factory=lambda: int(os.getenv("MAX_TOOL_ROUNDS", "10")))
+    max_tool_calls_per_turn: int = field(default_factory=lambda: int(os.getenv("MAX_TOOL_CALLS_PER_TURN", "10")))
     # Per-executor timeout (seconds); a timed-out tool returns an error result to the model.
     tool_call_timeout: float = field(default_factory=lambda: float(os.getenv("TOOL_CALL_TIMEOUT", "20")))
     # Truncation cap on a single tool result fed back to the model (characters).

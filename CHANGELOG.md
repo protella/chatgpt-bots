@@ -4,6 +4,45 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.2.0] - 2026-08-12
+
+### ✨ Added
+
+- **`export_conversation` — complete channel reads for report-scale work.** The bot can now
+  pull a conversation's full history (every page, every thread reply, names resolved) into its
+  code sandbox as a data file and compute from it — exact counts, timelines, full-coverage
+  summaries, built documents. Works wherever the person asking and the bot are both members;
+  anything else is refused without confirming the channel exists. Big channels just take
+  minutes; nothing is truncated.
+- **`fetch_url_to_sandbox` — web assets the sandbox can work on.** Any fetchable URL's raw
+  bytes (an SVG logo, an odd image format, a data file) can be staged into the sandbox for
+  conversion or analysis — closing the gap where official assets were SVGs the bot could only
+  link to. Fetched files are ingredients: only genuinely transformed outputs get posted; the
+  as-is route remains `import_web_image` with its pixel check.
+- **Legacy and mislabeled spreadsheets now parse.** Old binary `.xls` opens (new `xlrd`
+  dependency), and an HTML table exported under a `.xlsx` name — the shape many BI tools
+  produce — is recovered and read (new `lxml`/`html5lib`). See UPGRADING.md for the reinstall.
+
+### 🐛 Fixed
+
+- **A corrupt spreadsheet no longer kills the whole message.** Files whose bytes don't match
+  their claimed format are never uploaded to OpenAI (this caused a 400 that took every other
+  attachment down with it). The reply now answers the good attachments and names the bad file
+  with the actual reason — and offers the sandbox conversion route — instead of a generic
+  "Something Went Wrong".
+- **Background jobs no longer misreport held-back files.** When the publisher declines to post
+  a fetched file that came back unchanged, the delivering model is now told exactly that, so it
+  stops claiming the file "didn't survive the build".
+- **Files OpenAI's container API refuses by content (SVGs, notably) now stage anyway**,
+  gzip-wrapped automatically with instructions to decompress in the sandbox — measured live:
+  the API rejects SVG bytes under any filename.
+
+### 🔧 Changed
+
+- **The tool-round cap no longer cuts turns short.** `MAX_TOOL_ROUNDS` now defaults to 10,
+  matching the per-turn call budget — it had been silently forcing final answers at 4 rounds
+  while calls remained.
+
 ## [3.1.1] - 2026-08-12
 
 ### 🔧 Changed

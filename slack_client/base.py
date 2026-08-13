@@ -221,6 +221,12 @@ class SlackBot(SlackMessageEventsMixin,  # type: ignore[misc]
         if config.enable_image_import_tool and config.enable_link_fetch:
             from message_processor.import_image_tool import register_import_image_tool
             register_import_image_tool(registry)
+        # Bytes the sandbox can massage, from a URL. The container has the converters
+        # (cairosvg, soffice, ffmpeg) and no egress, so a vector logo or an odd-format file was
+        # unreachable from both ends until this hop existed. Same hardened fetcher, same guards.
+        if config.enable_link_fetch:
+            from message_processor.fetch_to_sandbox import register_fetch_to_sandbox_tool
+            register_fetch_to_sandbox_tool(registry)
         if config.enable_people_tools:
             register_people_tools(registry)  # F29: profile lookup + channel roster (Slack-visible only)
         if config.enable_deep_research:
@@ -242,6 +248,11 @@ class SlackBot(SlackMessageEventsMixin,  # type: ignore[misc]
         # F35: mount_file — the bytes of a file the user SHARED (or one we built earlier) into
         # the sandbox. Without it the model could see an attachment but never compute on it.
         register_file_mount_tools(registry)
+        # export_conversation — a WHOLE conversation into the sandbox as JSONL. The history
+        # tools return a window and cannot page; report-scale work needs coverage, and the
+        # collection belongs in the bot process rather than in the model's context.
+        from message_processor.export_tool import register_export_tool
+        register_export_tool(registry)
         # F36: canvases — the one Slack surface meant to be EDITED rather than appended to,
         # so it is where a spec/checklist/plan the thread keeps revisiting belongs.
         register_canvas_tools(registry)

@@ -752,13 +752,22 @@ def _declared_candidate_ids(candidates: List[Dict[str, Any]],
 
 
 def _select_candidates(candidates: List[Dict[str, Any]], *, suppress_digests: set,
-                       expect_filenames: List[str]) -> List[Dict[str, Any]]:
+                       expect_filenames: List[str],
+                       suppressed_inputs_out: Optional[List[str]] = None
+                       ) -> List[Dict[str, Any]]:
     """Phase 2: decide which downloaded candidates are DELIVERABLES rather than working
     material. Pure selection, no I/O — which is what lets a background job run it, show the
     result to the model, and upload only later (F37).
 
     Every rule below answers one question: the model wrote this file, but did the user ask for
     it?
+
+    ``suppressed_inputs_out``, when given, is FILLED IN PLACE with the names held back as
+    unchanged mounted inputs. The guard itself is not up for negotiation, but a caller that hands
+    the result to a MODEL needs to be able to say why a file is missing: live 2026-08-12, a build
+    copied a fetched PNG to a new name (byte-identical, correctly refused) and the delivery model,
+    seeing an empty manifest and no reason for it, told the user the file "didn't make it back
+    from the build". Silence read as breakage.
     """
     # A .pptx/.docx/.xlsx is a zip, and an image embedded into one is stored as a verbatim zip
     # entry — so the deck itself tells us which of the other files were merely its ingredients.
@@ -837,6 +846,8 @@ def _select_candidates(candidates: List[Dict[str, Any]], *, suppress_digests: se
             # Byte-identical to something WE mounted into the container. The user already has
             # this file — they gave it to us. Posting it back is noise at best.
             logger.info(f"Artifact suppressed (this is a mounted input, not output): {filename}")
+            if suppressed_inputs_out is not None and filename not in suppressed_inputs_out:
+                suppressed_inputs_out.append(filename)
             continue
 
         if digest in embedded:
@@ -1006,12 +1017,17 @@ async def stage_artifacts(
     suppress_digests: Optional[Iterable[str]] = None,
     expect_filenames: Optional[Iterable[str]] = None,
     time_budget: Optional[float] = None,
+    suppressed_inputs_out: Optional[List[str]] = None,
 ) -> List[StagedArtifact]:
     """Gather + select + hold in memory. Publishes NOTHING. Never raises.
 
     ``time_budget`` (seconds) bounds the download loop from the inside: on expiry the files
     staged SO FAR are returned, never discarded. This replaces an outer ``wait_for`` that
     cancelled the whole coroutine and lost every file a slow container had already produced.
+
+    ``suppressed_inputs_out`` is filled in place with the names held back as unchanged mounted
+    inputs, so a caller whose next step is a MODEL can explain an empty manifest instead of
+    letting it read as a failed build (see ``_select_candidates``).
     """
     lock = publication_lock(ledger_key)
     try:
@@ -1033,7 +1049,8 @@ async def stage_artifacts(
                 return []
             accepted = _select_candidates(
                 candidates, suppress_digests=set(suppress_digests or ()),
-                expect_filenames=[f.lower() for f in (expect_filenames or ())])
+                expect_filenames=[f.lower() for f in (expect_filenames or ())],
+                suppressed_inputs_out=suppressed_inputs_out)
     except Exception as e:  # noqa: BLE001 — a staging failure costs the files, not the job
         logger.error(f"Artifact staging failed for {ledger_key}: {e}", exc_info=True)
         return []

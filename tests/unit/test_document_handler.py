@@ -444,8 +444,10 @@ class TestDocumentHandlerSpreadsheets:
         mock_pd.read_excel.side_effect = ImportError("pandas not available")
         mock_pd.read_csv.side_effect = ImportError("pandas not available")
         
-        # Should raise an exception when pandas is not available
-        with pytest.raises(Exception, match="Spreadsheet parsing failed"):
+        # Should raise an exception when pandas is not available. The bytes are not a
+        # workbook of any kind, so the mismatch is what surfaces once the CSV fallback
+        # fails too.
+        with pytest.raises(Exception, match="not a readable spreadsheet"):
             handler.parse_excel_adaptive(b'excel data', 'test.xlsx')
     
     def test_parse_csv_success(self, handler_with_pandas):
@@ -507,7 +509,9 @@ class TestDocumentHandlerSpreadsheets:
         
         with patch.object(handler_with_pandas, '_dataframe_to_markdown', return_value="| mock table |"):
             with patch.object(handler_with_pandas, '_is_simple_table', return_value=True):
-                result = handler_with_pandas._parse_excel_with_pandas(b'data', 'test.xlsx', mock_pd)
+                # ZIP magic: the engine is chosen by the leading bytes, and a real .xlsx is one.
+                result = handler_with_pandas._parse_excel_with_pandas(
+                    b'PK\x03\x04data', 'test.xlsx', mock_pd)
         
         assert result['format'] == 'excel'
         assert result['total_sheets'] == 2

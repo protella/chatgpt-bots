@@ -10,7 +10,7 @@ import asyncio
 import subprocess
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
-from io import BytesIO
+from io import BytesIO, StringIO
 from typing import Any, Dict, List, Optional, Sequence
 import pdfplumber
 import pypdf
@@ -35,6 +35,50 @@ EXTRACTION_TIMEOUT_SECONDS = 30
 # Office XML formats are ZIP archives; refuse anything that would decompress
 # past this (zip-bomb guard).
 MAX_OFFICE_DECOMPRESSED_BYTES = 200 * 1024 * 1024
+# force_text_extraction has no failure channel of its own: it returns a bracketed
+# placeholder when there is nothing decodable. The placeholder is truthy, and every
+# caller reads truthy content as success, so the prefix is what tells "recovered some
+# text" apart from "recovered nothing" (a placeholder is not content).
+NO_CONTENT_PLACEHOLDER_PREFIX = '[Unable to extract'
+
+
+class SpreadsheetFormatMismatch(Exception):
+    """The bytes under a spreadsheet name are not a spreadsheet in any readable format."""
+
+
+# C0 control bytes that text files do contain (tab, the newline family). Any OTHER byte below
+# 0x20 is the standard binary/text discriminator, and it is what separates a real CSV saved
+# under a spreadsheet name — which must keep parsing — from a binary blob that pandas would
+# decode into mojibake and hand back as a one-column table.
+_TEXT_CONTROL_BYTES = frozenset({0x09, 0x0a, 0x0b, 0x0c, 0x0d})
+
+
+def looks_binary(data: bytes) -> bool:
+    """True when the bytes carry control characters no text file would."""
+    return any(b < 0x20 and b not in _TEXT_CONTROL_BYTES for b in data)
+
+
+# A mimetype naming a CONTAINER format is a claim the bytes can be held to: OOXML files are ZIP
+# archives, legacy Office files are OLE2 compound binaries. Formats that make no container claim
+# (text/csv, text/plain) are deliberately absent — there is nothing to check them against.
+CONTAINER_MAGIC = {
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": b'PK',           # .xlsx
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": b'PK',     # .docx
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": b'PK',   # .pptx
+    "application/vnd.ms-excel": b'\xd0\xcf\x11\xe0',                                      # .xls
+    "application/msword": b'\xd0\xcf\x11\xe0',                                            # .doc
+    "application/vnd.ms-powerpoint": b'\xd0\xcf\x11\xe0',                                 # .ppt
+}
+
+
+def container_magic_mismatch(mimetype: str, file_data: bytes) -> bool:
+    """True when the mimetype claims a container format that the leading bytes are not."""
+    magic = CONTAINER_MAGIC.get(mimetype)
+    if magic is None:
+        return False
+    return not file_data.startswith(magic)
+
+
 # Dedicated bounded pool so a slow parse can't exhaust the default executor.
 # NOTE: a timed-out parse keeps its worker thread until it finishes — the pool
 # being bounded caps how many can be stuck at once. Size via DOC_EXTRACTION_WORKERS
@@ -392,6 +436,18 @@ class DocumentHandler(LoggerMixin):
             # Fallback: try basic text extraction
             try:
                 raw_text = self.force_text_extraction(file_data, mime_type, filename)
+                if raw_text.startswith(NO_CONTENT_PLACEHOLDER_PREFIX):
+                    # Nothing was recovered. Marking it `error` — rather than passing the
+                    # placeholder off as text — is what keeps the raw bytes out of the API
+                    # payload and routes the file to the failed-files path.
+                    return {
+                        'content': raw_text,
+                        'filename': filename,
+                        'mime_type': mime_type,
+                        'size_bytes': len(file_data),
+                        'error': f'Document could not be parsed: {str(e)}',
+                        'format': 'error',
+                    }
                 return {
                     'content': self.sanitize_content(raw_text),
                     'filename': filename,
@@ -916,6 +972,21 @@ class DocumentHandler(LoggerMixin):
                 return self._parse_csv_with_pandas(file_data, filename, pd)
             else:
                 return self._parse_excel_with_pandas(file_data, filename, pd)
+        except SpreadsheetFormatMismatch as mismatch:
+            # A genuine CSV under a spreadsheet name still parses — BI tools rename constantly —
+            # so the fallback keeps its turn. But an empty parse is not data: pandas will decode
+            # arbitrary bytes into mojibake or into no columns at all, and returning that as
+            # content is how unreadable bytes came to read as a successful extraction (and were
+            # then shipped to the API as an input_file).
+            if looks_binary(file_data[:8192]):
+                raise mismatch from None
+            try:
+                recovered = self._parse_csv_with_pandas(file_data, filename, pd)
+            except Exception:
+                raise mismatch from None
+            if not recovered.get('rows'):
+                raise mismatch from None
+            return recovered
         except Exception as e:
             # Try CSV interpretation as fallback
             try:
@@ -924,13 +995,55 @@ class DocumentHandler(LoggerMixin):
             except Exception as csv_error:
                 raise Exception(f"Spreadsheet parsing failed: {e}, CSV fallback: {csv_error}")
     def _parse_excel_with_pandas(self, file_data: bytes, filename: str, pd) -> Dict[str, Any]:
-        """Parse Excel file using pandas"""
-        # Read all sheets
+        """Parse Excel file using pandas, choosing the engine by magic bytes.
+
+        The extension lies often enough to be the normal case: legacy .xls is an OLE2
+        compound binary that openpyxl cannot open at all, and BI tools routinely export an
+        HTML table under a .xlsx name. The leading bytes are the only honest signal, so
+        they pick the reader — the same sniff parse_docx_alternative does.
+        """
+        if file_data[:2] == b'PK':
+            try:
+                all_sheets = pd.read_excel(BytesIO(file_data), sheet_name=None, engine='openpyxl')
+            except Exception as e:
+                try:
+                    # Try without specifying engine
+                    all_sheets = pd.read_excel(BytesIO(file_data), sheet_name=None)
+                except Exception:
+                    # The magic bytes named the container and its readers still failed, so
+                    # there is nothing left to guess at — a CSV re-read of ZIP bytes is noise.
+                    raise SpreadsheetFormatMismatch(
+                        f"{filename} is a ZIP archive but not a readable workbook: {e}") from e
+        elif file_data[:4] == b'\xd0\xcf\x11\xe0':
+            try:
+                all_sheets = pd.read_excel(BytesIO(file_data), sheet_name=None, engine='xlrd')
+            except Exception as e:
+                raise SpreadsheetFormatMismatch(
+                    f"{filename} is an OLE2 file but not a readable .xls workbook: {e}") from e
+        elif file_data.lstrip(b'\xef\xbb\xbf \t\r\n')[:1] == b'<':
+            return self._parse_html_tables_with_pandas(file_data, filename, pd)
+        else:
+            # Not a ZIP, not OLE2, not HTML. Every reader is out of guesses, and the DOCX
+            # sibling's rule applies: say so instead of guessing further.
+            raise SpreadsheetFormatMismatch(
+                f"{filename} is not a readable spreadsheet — its contents are neither an "
+                "Excel workbook nor an HTML table")
+        return self._sheets_to_result(all_sheets)
+
+    def _parse_html_tables_with_pandas(self, file_data: bytes, filename: str, pd) -> Dict[str, Any]:
+        """Recover an HTML table export that arrived under a spreadsheet name."""
         try:
-            all_sheets = pd.read_excel(BytesIO(file_data), sheet_name=None, engine='openpyxl')
-        except Exception:
-            # Try without specifying engine
-            all_sheets = pd.read_excel(BytesIO(file_data), sheet_name=None)
+            text = file_data.decode('utf-8')
+        except UnicodeDecodeError:
+            text = file_data.decode('latin-1', errors='ignore')
+        frames = pd.read_html(StringIO(text))
+        if not frames:
+            raise ValueError(f"No HTML tables found in {filename}")
+        return self._sheets_to_result(
+            {f"Table {i}": df for i, df in enumerate(frames, start=1)})
+
+    def _sheets_to_result(self, all_sheets: Dict[str, Any]) -> Dict[str, Any]:
+        """Render parsed sheets into the spreadsheet extraction dict."""
         sheets = []
         content_parts = []
         # Limit number of sheets

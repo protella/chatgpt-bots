@@ -92,7 +92,8 @@ class SSRFError(Exception):
 @dataclass
 class FetchResult:
     """Outcome of a fetch. `kind`: 'text' (extracted textual content), 'image' (bytes sniffed as
-    an image — route to the vision worker), or 'error' (see error_code)."""
+    an image — route to the vision worker), 'bytes' (raw mode: the body itself, whatever type it
+    is), or 'error' (see error_code)."""
     kind: str
     final_url: Optional[str] = None
     content_type: Optional[str] = None
@@ -104,7 +105,7 @@ class FetchResult:
 
     @property
     def ok(self) -> bool:
-        return self.kind in ("text", "image")
+        return self.kind in ("text", "image", "bytes")
 
 
 # --------------------------------------------------------------------------- URL validation
@@ -409,6 +410,7 @@ async def fetch_url(
     url: str, *, max_bytes: int, connect_timeout: float, read_timeout: float,
     total_timeout: float, max_redirects: int, max_chars: int,
     dns_timeout: Optional[float] = None, image_only: bool = False,
+    raw_mode: bool = False,
 ) -> FetchResult:
     """Fetch a URL under all SSRF/size/timeout guards. Never raises for expected failures —
     returns a FetchResult with kind='error' and an error_code from the taxonomy.
@@ -421,7 +423,14 @@ async def fetch_url(
     `image_only` is for the caller that wants PIXELS (import_web_image): anything the sniff does
     not recognise as an image is refused as ERR_UNSUPPORTED_TYPE right there, before the text/PDF
     branch — so a mislabeled 10MB PDF never reaches the synchronous extractor on the event loop
-    for a caller who would have discarded its text anyway."""
+    for a caller who would have discarded its text anyway.
+
+    `raw_mode` is for the caller that wants the BODY (fetch_url_to_sandbox): the bytes are
+    returned as kind='bytes' whatever their type, with no MIME allowlist and no extraction. It
+    changes nothing above this line — the SSRF validation, per-hop redirect revalidation, the
+    `max_bytes` cap and every timeout are the same code on the same path. What it removes is the
+    type judgement, which belongs to the text branch: an SVG or a legacy .xls is not "unsupported"
+    to a caller that is going to convert it in a sandbox with no egress."""
     import asyncio
 
     dns_timeout = float(connect_timeout if dns_timeout is None else dns_timeout)
@@ -505,6 +514,14 @@ async def fetch_url(
                 if too_large:
                     return FetchResult(kind="error", error_code=ERR_TOO_LARGE, final_url=current)
                 raw = bytes(buf)
+                # Raw mode returns the body before any type judgement is made. The declared
+                # Content-Type is kept as sent (it is the only thing that names a vector or an
+                # Office format); the magic sniff only fills in for a server that declared
+                # nothing.
+                if raw_mode:
+                    return FetchResult(kind="bytes", final_url=current,
+                                       content_type=content_type or _sniff_image(raw[:16]),
+                                       raw_bytes=raw)
                 # Direct image? Route to vision instead of rejecting.
                 img_mime = _sniff_image(raw[:16])
                 if img_mime:

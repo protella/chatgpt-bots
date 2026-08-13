@@ -1034,6 +1034,19 @@ class MessageProcessor(ThreadManagementMixin,
                 # IMPORTANT: Check MCP errors FIRST before generic "context" check (which would match "context7" server names)
                 if "mcp server" in error_details.lower() and ("404" in error_details or "424" in error_details):
                     error_message = f"{config.error_emoji} **MCP Connection Failed**\n\nCouldn't connect to one or more MCP servers. Please check your MCP configuration or try again later."
+                elif "invalid_file" in error_details.lower():
+                    # A file the API refused to open. Naming it beats the generic card: the
+                    # bytes are still in Slack, so re-saving (or the sandbox) is a real fix.
+                    named = ", ".join(
+                        f"*{a.get('name')}*" for a in (message.attachments or [])
+                        if a.get("name"))
+                    which = f" ({named})" if named else ""
+                    error_message = (
+                        f"{config.error_emoji} **Couldn't Read That File**\n\n"
+                        f"One of the attached files{which} couldn't be opened — its contents "
+                        "don't match its file type. Re-saving it usually fixes it, or ask me "
+                        "to open it in the sandbox and convert it."
+                    )
                 elif "rate" in error_details.lower() or "limit" in error_details.lower():
                     error_message = f"{config.error_emoji} **Too Many Requests**\n\nOpenAI is busy. Please wait a minute and try again."
                 elif "context_length_exceeded" in error_details.lower() or "maximum context length" in error_details.lower():
@@ -1470,7 +1483,7 @@ class MessageProcessor(ThreadManagementMixin,
 
     @staticmethod
     def _failed_file_reasons(unsupported_files: list) -> tuple:
-        """The same four failures `_build_failed_files_notice` distinguishes, as (name, reason)
+        """The same failures `_build_failed_files_notice` distinguishes, as (name, reason)
         pairs for the MODEL rather than a card for the user.
 
         Reasons are verb phrases so a renderer can write "{name} {reason}" and get a sentence.
@@ -1494,6 +1507,10 @@ class MessageProcessor(ThreadManagementMixin,
                           f"max {_mb(f.get('limit_bytes'))})")
             elif f.get("error") == "download_failed":
                 reason = "could not be downloaded — re-uploading it may work"
+            elif f.get("error") == "extraction_failed":
+                reason = (f"could not be read ({f.get('detail') or 'extraction failed'}) — "
+                          "the bytes are still there, so mount_file it and convert it in the "
+                          "sandbox (LibreOffice is available there)")
             elif f.get("reason"):
                 # An image we FETCHED and then turned away (F50) says exactly what was wrong;
                 # the generic explainer would print "GIF is supported" under a rejected GIF.
@@ -1511,24 +1528,30 @@ class MessageProcessor(ThreadManagementMixin,
         one reply in the bot's own voice. This text posts only where no reply carries the news:
         an all-failed turn (no model call at all) or a turn that ended without words.
 
-        Four different failures, four different things worth saying. Oversized documents
+        Each failure gets its own thing worth saying. Oversized documents
         (fix-a1's `too_large` flag) get an honest size-vs-limit line — routing them through the
         download bucket read "Couldn't Download — try re-uploading", which is misleading advice
         for a file that arrived fine and was simply too big. Download failures get their own
         actionable line (re-upload). Images we FETCHED and then turned away (F50) carry a
         `reason` and get told exactly what was wrong with them — routing those through the
         generic explainer below would print "GIF is supported" underneath a rejected animated
-        GIF, which is worse than saying nothing. Everything else keeps the supported-formats
-        explainer.
+        GIF, which is worse than saying nothing. A document of a SUPPORTED type whose contents
+        could not be parsed (a fake .xlsx, a corrupt .docx) gets its own line too — the
+        supported-formats explainer would list .xlsx as supported directly under a failed
+        .xlsx. Everything else keeps that explainer.
         """
         too_large = [f for f in unsupported_files if f.get('too_large')]
         download_failures = [f for f in unsupported_files
                              if not f.get('too_large') and f.get('error') == 'download_failed']
+        unreadable_docs = [f for f in unsupported_files
+                           if not f.get('too_large') and f.get('error') == 'extraction_failed']
         rejected_images = [f for f in unsupported_files
-                           if not f.get('too_large') and f.get('error') != 'download_failed'
+                           if not f.get('too_large')
+                           and f.get('error') not in ('download_failed', 'extraction_failed')
                            and f.get('reason')]
         truly_unsupported = [f for f in unsupported_files
-                             if not f.get('too_large') and f.get('error') != 'download_failed'
+                             if not f.get('too_large')
+                             and f.get('error') not in ('download_failed', 'extraction_failed')
                              and not f.get('reason')]
 
         def _mb(n):
@@ -1546,6 +1569,14 @@ class MessageProcessor(ThreadManagementMixin,
             sections.append(
                 "⚠️ *Couldn't Download File*\n\n"
                 f"I couldn't download {failed_str} — try re-uploading."
+            )
+        if unreadable_docs:
+            lines = "\n".join(f"*{f['name']}*" for f in unreadable_docs)
+            sections.append(
+                "⚠️ *Couldn't Read File*\n\n" + lines + "\n\n"
+                "The contents don't match the file type — it may be damaged, or saved in a "
+                "different format than its name suggests. Re-saving it usually fixes it, or "
+                "ask me to open it in the sandbox and convert it."
             )
         if rejected_images:
             from image_validation import rejection_text

@@ -85,6 +85,9 @@ oauth_config:
       - users.profile:read
       - users:read
       - users:read.email
+      # --- toolbelt round (T7: topic/purpose, human-request-only tools) ---
+      - channels:manage      # conversations.setTopic / setPurpose (public channels)
+      - groups:write         # same, for private channels
 settings:
   event_subscriptions:
     bot_events:

@@ -1,13 +1,24 @@
 """F35 — mount_file: putting a thread file's REAL bytes into the code sandbox."""
+import gzip
 import hashlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+
 from message_processor import file_mount
 from message_processor.image_tools import CI_CONTAINER_KEY
 from tool_registry import ToolContext
+
+
+class _BadRequest(Exception):
+    """The upload endpoint's CONTENT refusal, in the shape the SDK raises it: the class name
+    and `status_code` 400 are both what file_mount's classifier reads."""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.status_code = 400
 
 
 @pytest.fixture(autouse=True)
@@ -282,6 +293,73 @@ class TestExecute:
         await file_mount.execute_mount_file(ctx, {"file_id": "file_doc_1"})
 
         assert file_mount.mounted_digests(ctx) == [hashlib.sha256(data).hexdigest()]
+
+
+@pytest.mark.unit
+class TestRefusedBytesRideGzip:
+    """The upload endpoint judges CONTENT, not filenames (probed live 2026-08-12: SVG refused
+    under .svg/.xml/.dat/.bin/.svg.txt; the same bytes gzipped accepted). A file a USER shared
+    hits that wall exactly like a fetched one, so mount_file goes through the same transport."""
+
+    async def test_a_refused_file_is_mounted_gzip_wrapped_and_says_so(self):
+        svg = b'<svg xmlns="http://www.w3.org/2000/svg"><rect width="4" height="4"/></svg>'
+        ctx, raw = _ctx(entries=[_entry(filename="logo.svg", mime_type="image/svg+xml")],
+                        data=svg)
+        seen = []
+
+        async def _create(container_id, file):
+            seen.append((file.name, file.getvalue()))
+            if len(seen) == 1:
+                raise _BadRequest("You uploaded an invalid file")
+            return SimpleNamespace(id="cfile_1", path=f"/mnt/data/{file.name}")
+
+        raw.containers.files.create = AsyncMock(side_effect=_create)
+
+        result = await file_mount.execute_mount_file(ctx, {"file_id": "file_doc_1"})
+
+        assert result["ok"] is True and result["gzipped"] is True
+        assert seen[0] == ("logo.svg", svg)          # the real bytes were offered first
+        assert seen[1][0] == "logo.svg.gz"
+        assert gzip.decompress(seen[1][1]) == svg
+        assert "GZIP-COMPRESSED" in result["message"]
+
+    async def test_the_cache_hit_repeats_the_gzip_note(self):
+        """Round two returns from the cache. Saying it plainly only on the round that uploaded
+        would leave the next round handing a gzip blob to a parser that fails on it."""
+        svg = b"<svg/>"
+        ctx, raw = _ctx(entries=[_entry(filename="logo.svg")], data=svg)
+        seen = []
+
+        async def _create(container_id, file):
+            seen.append(file.name)
+            if len(seen) == 1:
+                raise _BadRequest("You uploaded an invalid file")
+            return SimpleNamespace(id="cfile_1", path=f"/mnt/data/{file.name}")
+
+        raw.containers.files.create = AsyncMock(side_effect=_create)
+        await file_mount.execute_mount_file(ctx, {"file_id": "file_doc_1"})
+
+        again = await file_mount.execute_mount_file(ctx, {"file_id": "file_doc_1"})
+
+        assert again["already_mounted"] is True and again["gzipped"] is True
+        assert "GZIP-COMPRESSED" in again["message"]
+        assert len(seen) == 2  # nothing re-uploaded
+
+    async def test_an_ordinary_mount_says_nothing_about_gzip(self):
+        ctx, _ = _ctx()
+        result = await file_mount.execute_mount_file(ctx, {"file_id": "file_doc_1"})
+
+        assert "gzipped" not in result and "GZIP" not in result["message"]
+
+    async def test_a_refusal_that_survives_gzipping_fails_honestly(self):
+        ctx, raw = _ctx()
+        raw.containers.files.create = AsyncMock(
+            side_effect=_BadRequest("You uploaded an invalid file"))
+
+        result = await file_mount.execute_mount_file(ctx, {"file_id": "file_doc_1"})
+
+        assert result["ok"] is False and result["error"] == "mount_failed"
+        assert raw.containers.files.create.await_count == 2  # one retry, not a loop
 
 
 @pytest.mark.unit
