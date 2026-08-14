@@ -43,7 +43,7 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
-from base_client import HistoryFetchError
+from message_processor.client_contract import HistoryFetchError
 from config import config
 from logger import setup_logger
 from slack_client.normalizer import parse_ts, ts_max

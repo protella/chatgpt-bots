@@ -2,7 +2,7 @@
 Unit tests for thread_manager.py module
 """
 from unittest.mock import MagicMock
-from thread_manager import ThreadState, AssetLedger
+from message_processor.thread_manager import ThreadState, AssetLedger
 
 
 class TestThreadState:

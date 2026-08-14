@@ -20,7 +20,7 @@ import pytest
 from slack_sdk.errors import SlackApiError
 
 from message_processor import bookmark_tools as bt
-from tool_registry import ToolContext, ToolRegistry
+from message_processor.tool_registry import ToolContext, ToolRegistry
 
 CH = "C1000000000"
 USER = "U_REQUESTER"

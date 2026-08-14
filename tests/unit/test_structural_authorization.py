@@ -39,10 +39,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from base_client import Message
+from message_processor.client_contract import Message
 from message_processor.handlers.text import TextHandlerMixin
 from message_processor.participation_tools import execute_set_channel_participation
-from tool_registry import ToolContext
+from message_processor.tool_registry import ToolContext
 
 CHANNEL = "C0BKX77NU66"
 

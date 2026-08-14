@@ -5,8 +5,8 @@ import zipfile
 
 import pytest
 
-import document_handler as dh
-from document_handler import (
+import message_processor.ingestion.document_handler as dh
+from message_processor.ingestion.document_handler import (
     DOCUMENT_EXTENSIONS,
     MIME_TYPE_HANDLERS,
     SUPPORTED_DOCUMENT_MIMETYPES,

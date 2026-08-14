@@ -5,7 +5,7 @@ Test script for URL image detection and downloading functionality
 
 import sys
 import logging
-from image_url_handler import ImageURLHandler
+from message_processor.ingestion.image_url_handler import ImageURLHandler
 
 # Setup logging
 logging.basicConfig(

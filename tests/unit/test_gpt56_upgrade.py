@@ -12,7 +12,7 @@ import pytest
 
 from config import (GPT55_EFFORTS, GPT56_EFFORTS, SUPPORTED_CHAT_MODELS,
                     clamp_effort, config)
-from settings_modal import SettingsModal
+from slack_client.settings_modal import SettingsModal
 
 
 @pytest.fixture

@@ -3,7 +3,7 @@ import pytest
 from unittest.mock import Mock, patch
 import json
 from slack_client import SlackBot
-from base_client import Message
+from message_processor.client_contract import Message
 
 @pytest.fixture
 def slack_client():

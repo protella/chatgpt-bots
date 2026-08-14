@@ -40,7 +40,7 @@ from typing import Any, Dict, List, Optional
 from config import config
 from logger import setup_logger
 from message_processor import thread_files
-from tool_registry import ToolContext, ToolRegistry
+from message_processor.tool_registry import ToolContext, ToolRegistry
 
 logger = setup_logger(name="slack_bot.FileMount")
 

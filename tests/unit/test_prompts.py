@@ -1,7 +1,7 @@
 """Unit tests for prompts.py (modernized prompt contracts)"""
 
 import pytest
-from prompts import (
+from message_processor.prompts import (
     CODE_INTERPRETER_GUIDANCE,
     SLACK_SYSTEM_PROMPT,
     CLI_SYSTEM_PROMPT,
@@ -187,7 +187,7 @@ class TestPrompts:
         """Live 2026-08-09: the bot agreed to stand down on a doc job and the job ran on for
         eight more minutes, then delivered the doc. The tool now exists; the guidance has to
         say that agreeing is not stopping, or the model keeps agreeing and nothing happens."""
-        from prompts import LOCAL_TOOLS_GUIDANCE
+        from message_processor.prompts import LOCAL_TOOLS_GUIDANCE
         assert "cancel_background_job" in LOCAL_TOOLS_GUIDANCE
         assert "agreeing to a change in words changes nothing" in LOCAL_TOOLS_GUIDANCE
         assert "posts whatever it built" in LOCAL_TOOLS_GUIDANCE
@@ -199,7 +199,7 @@ class TestPrompts:
         and the only tool that existed would have thrown the work away. Cancel and update have
         to be told apart by what is being asked, or the model reaches for the brake when it
         needs the steering wheel — and, worse, replies to a correction without sending it."""
-        from prompts import LOCAL_TOOLS_GUIDANCE
+        from message_processor.prompts import LOCAL_TOOLS_GUIDANCE
         assert "update_background_job(job_id, note)" in LOCAL_TOOLS_GUIDANCE
         # Abandon vs. modify, named as the thing that picks between them.
         assert "ABANDONING the deliverable entirely" in LOCAL_TOOLS_GUIDANCE

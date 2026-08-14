@@ -35,14 +35,14 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from PIL import Image
 
-import ambient_fetch
-import image_validation
+import message_processor.ingestion.ambient_fetch as ambient_fetch
+import message_processor.ingestion.image_validation as image_validation
 from config import config
 from message_processor import image_delivery, image_view
 from message_processor import import_image_tool as iit
 from message_processor.turn_runtime import TurnRuntime
 from openai_client.utilities import ImageData
-from tool_registry import ToolContext, ToolRegistry
+from message_processor.tool_registry import ToolContext, ToolRegistry
 
 # asyncio_mode=auto collects the coroutine tests; an explicit asyncio mark would only warn on
 # the synchronous ones in this file.

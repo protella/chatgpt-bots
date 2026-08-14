@@ -44,7 +44,7 @@ from config import config
 from message_processor.channel_steering import POLICY_MAX_CHARS
 from message_processor.participation import (LEVEL_TO_MODE, VALID_LEVELS,
                                              resolve_participation_level)
-from tool_registry import ToolContext, ToolRegistry
+from message_processor.tool_registry import ToolContext, ToolRegistry
 
 # placement enum → the reply_in_channel column value it maps to.
 _PLACEMENT_TO_RIC = {"threads_only": False, "channel_allowed": True}

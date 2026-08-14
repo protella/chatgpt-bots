@@ -23,7 +23,7 @@ from message_processor.memory_tools import (
     get_update_fact_schema,
     register_memory_tools,
 )
-from tool_registry import ToolContext, ToolRegistry
+from message_processor.tool_registry import ToolContext, ToolRegistry
 
 CHANNEL = "C0BKX77NU66"
 
@@ -228,7 +228,7 @@ async def test_extractor_runs_when_fallback_on():
 # --- registry gating ---
 
 def test_register_memory_tools_registers_every_tool():
-    from tool_registry import SURFACE_CHANNEL
+    from message_processor.tool_registry import SURFACE_CHANNEL
 
     registry = ToolRegistry()
     register_memory_tools(registry)
@@ -257,7 +257,7 @@ def test_registry_gating_on_enable_channel_memory():
             # half.) Read INSIDE the patch: the client now registers the memory tools
             # unconditionally and `channel_enabled` reads the flag per request, so a listing taken
             # after the patch lifts would answer to the real config rather than to `flag`.
-            from tool_registry import SURFACE_CHANNEL
+            from message_processor.tool_registry import SURFACE_CHANNEL
             return {s["name"] for s in registry.schemas(surface=SURFACE_CHANNEL)}
 
     # Assert about the memory tools themselves, not the whole registry: tools registered
@@ -272,7 +272,7 @@ def test_registry_gating_on_enable_channel_memory():
 
 def test_tool_context_carries_user_id():
     from message_processor.handlers.text import TextHandlerMixin
-    from base_client import Message
+    from message_processor.client_contract import Message
 
     class _P(TextHandlerMixin):
         def __init__(self): self.db = MagicMock()
@@ -285,6 +285,6 @@ def test_tool_context_carries_user_id():
 
 
 def test_guidance_mentions_memory_tools():
-    from prompts import LOCAL_TOOLS_GUIDANCE
+    from message_processor.prompts import LOCAL_TOOLS_GUIDANCE
     for needle in ("remember_fact", "update_fact", "forget_fact", "[#id]", "forget"):
         assert needle in LOCAL_TOOLS_GUIDANCE

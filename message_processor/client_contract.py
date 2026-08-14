@@ -55,7 +55,7 @@ class ChannelStreamError(Exception):
     The base of every FAIL-CLOSED context failure: the turn says honestly that it cannot see
     the room rather than answering from a partial view. It lives HERE, not beside its channel
     subclasses, because `HistoryFetchError` below is one of them and predates all of them —
-    base_client sits under message_processor in the import graph, so this is the only place a
+    client_contract sits under message_processor in the import graph, so this is the only place a
     single hierarchy can be rooted (message_processor/channel_stream.py imports it).
     """
 

@@ -555,7 +555,7 @@ def _pipeline_processor(handler):
 
 
 def _pipeline_message():
-    from base_client import Message
+    from message_processor.client_contract import Message
     return Message(text="hi", user_id="U1", channel_id=CHANNEL, thread_id="10.0",
                    metadata={"ts": "10.0"})
 
@@ -606,7 +606,7 @@ async def test_the_timeout_retry_carries_the_same_snapshot():
     that times out is re-dispatched with a shorter timeout. It re-enters the handler, so without
     the snapshot riding along the second attempt would either re-read the table or run with no
     memory at all — and the user would see a reply that forgot facts the first attempt had."""
-    from base_client import Response
+    from message_processor.client_contract import Response
 
     timeout = TimeoutError("upstream")
     timeout.operation_type = "text_normal"          # the only kind base.py retries

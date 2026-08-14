@@ -25,7 +25,7 @@ from slack_sdk.errors import SlackApiError
 
 from slack_client.messaging import SlackMessagingMixin
 from slack_client.utilities import SlackUtilitiesMixin
-from tool_registry import ToolContext
+from message_processor.tool_registry import ToolContext
 
 TEAM = "T1"
 CH = "C1"
@@ -278,7 +278,7 @@ class TestDeleteRegistrationStance:
     def test_channel_only_registration_mirrors_edit_own_message(self):
         """The registration the tool must be given: hidden on the DM surface by an `enabled`
         gate that is always False, exposed on the channel surface with no channel gate."""
-        from tool_registry import SURFACE_CHANNEL, ToolRegistry
+        from message_processor.tool_registry import SURFACE_CHANNEL, ToolRegistry
 
         host = _host()
         registry = ToolRegistry()

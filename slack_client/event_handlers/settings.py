@@ -348,7 +348,7 @@ class SlackSettingsHandlersMixin(_Host):
                     thread_id=None,  # Always None for slash commands
                     in_thread=False  # Always False for slash commands
                 )
-                # Keep default title "ChatGPT Settings (Dev)" from settings_modal.py
+                # Keep default title "ChatGPT Settings (Dev)" from slack_client/settings_modal.py
                 
                 # Open the modal
                 response = await client.views_open(
@@ -1776,7 +1776,7 @@ class SlackSettingsHandlersMixin(_Host):
                     thread_id=thread_id,
                     in_thread=True  # Always true for message shortcuts
                 )
-                # Keep default title "ChatGPT Settings (Dev)" from settings_modal.py
+                # Keep default title "ChatGPT Settings (Dev)" from slack_client/settings_modal.py
                 # The header inside will say "Configure Thread Preferences"
                 
                 # Open the modal

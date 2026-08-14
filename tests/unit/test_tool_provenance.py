@@ -11,12 +11,12 @@ import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from base_client import Message
+from message_processor.client_contract import Message
 from config import config
 from message_processor import tool_provenance as tp
 from message_processor.thread_management import ThreadManagementMixin
 from message_processor.utilities import MessageUtilitiesMixin
-from thread_manager import AsyncThreadStateManager
+from message_processor.thread_manager import AsyncThreadStateManager
 
 
 # --------------------------------------------------------------------------- harness

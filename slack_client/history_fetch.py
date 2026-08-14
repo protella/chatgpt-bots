@@ -26,7 +26,7 @@ from typing import (Any, AsyncIterator, Awaitable, Callable, Dict, List, Mapping
 
 from slack_sdk.errors import SlackApiError
 
-from base_client import HistoryFetchError
+from message_processor.client_contract import HistoryFetchError
 from config import config
 from logger import setup_logger
 from slack_client.normalizer import TimestampError, parse_ts

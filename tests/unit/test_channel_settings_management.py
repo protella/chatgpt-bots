@@ -15,7 +15,7 @@ import json
 from typing import Optional
 
 from database import memory_content_hash, normalize_memory_line
-from settings_modal import SettingsModal
+from slack_client.settings_modal import SettingsModal
 
 
 # --------------------------------------------------------------------------- helpers

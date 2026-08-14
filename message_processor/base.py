@@ -6,8 +6,8 @@ import asyncio
 import logging
 import time
 from typing import Any, Optional, cast
-from base_client import BaseClient, ChannelStreamError, HistoryFetchError, Message, Response
-from thread_manager import AsyncThreadStateManager
+from message_processor.client_contract import BaseClient, ChannelStreamError, HistoryFetchError, Message, Response
+from message_processor.thread_manager import AsyncThreadStateManager
 from openai_client import OpenAIClient
 from config import config, pipeline_status
 from logger import LoggerMixin
@@ -21,11 +21,11 @@ from .turn_runtime import TurnRuntime
 from .handlers.text import TextHandlerMixin, pinned_thread_config
 from .handlers.image_gen import ImageJobMixin
 from .utilities import MessageUtilitiesMixin, effective_request_model
-from image_url_handler import ImageURLHandler
-from mcp_manager import MCPManager
-from tool_registry import SURFACE_CHANNEL
+from message_processor.ingestion.image_url_handler import ImageURLHandler
+from openai_client.mcp_manager import MCPManager
+from message_processor.tool_registry import SURFACE_CHANNEL
 try:
-    from document_handler import DocumentHandler
+    from message_processor.ingestion.document_handler import DocumentHandler
     DOCUMENT_HANDLER_AVAILABLE = True
 except ImportError:
     DocumentHandler = None  # type: ignore[assignment,misc]  # optional dep: the flag below gates it
@@ -1497,7 +1497,7 @@ class MessageProcessor(ThreadManagementMixin,
         "budget.numbers is too large (60.0MB, max 50.0MB)" can. Kept beside the card builder so
         the two never drift into telling different stories about the same file.
         """
-        from image_validation import rejection_text
+        from message_processor.ingestion.image_validation import rejection_text
 
         def _mb(n: Any) -> str:
             return f"{n / (1024 * 1024):.1f}MB" if isinstance(n, (int, float)) else "?"
@@ -1584,7 +1584,7 @@ class MessageProcessor(ThreadManagementMixin,
                 "ask me to open it in the sandbox and convert it."
             )
         if rejected_images:
-            from image_validation import rejection_text
+            from message_processor.ingestion.image_validation import rejection_text
             lines = "\n".join(f"*{f['name']}* {rejection_text(f.get('reason'))}"
                               for f in rejected_images)
             sections.append("⚠️ *Couldn't Read Image*\n\n" + lines)
@@ -1600,7 +1600,7 @@ class MessageProcessor(ThreadManagementMixin,
             # Generated from the handler's own table so this list can't lie. The set is
             # now large (dozens of code/config/text extensions), so we surface the common
             # ones and honestly summarize the tail as "and N more" rather than dumping all.
-            from document_handler import DOCUMENT_EXTENSIONS
+            from message_processor.ingestion.document_handler import DOCUMENT_EXTENSIONS
             common = ["PDF", "DOCX", "XLSX", "CSV", "TSV", "PPTX", "TXT", "MD", "JSON", "RTF"]
             shown = [t for t in common if f".{t.lower()}" in DOCUMENT_EXTENSIONS]
             remaining = len(DOCUMENT_EXTENSIONS) - len(shown)

@@ -21,13 +21,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-import prompts
+import message_processor.prompts as prompts
 from config import config
 from message_processor import channel_stream, participation_telemetry
 from message_processor.destination_tools import register_destination_tools
 from message_processor.utilities import MessageUtilitiesMixin, local_tools_guidance_for
 from tests.unit import channel_turn_harness as harness
-from tool_registry import SURFACE_CHANNEL, SURFACE_DM, ToolRegistry
+from message_processor.tool_registry import SURFACE_CHANNEL, SURFACE_DM, ToolRegistry
 
 
 # ----------------------------------------------------------- the tool-etiquette selector

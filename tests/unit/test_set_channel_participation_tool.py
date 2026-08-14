@@ -13,7 +13,7 @@ from config import config
 from message_processor.participation_tools import (
     execute_set_channel_participation, get_set_channel_participation_schema,
     register_participation_tools)
-from tool_registry import ToolContext, ToolRegistry
+from message_processor.tool_registry import ToolContext, ToolRegistry
 
 CHANNEL = "C0BKX77NU66"
 

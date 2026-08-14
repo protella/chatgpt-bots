@@ -11,12 +11,12 @@ import pytest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
-from base_client import Message
+from message_processor.client_contract import Message
 from config import config
 from message_processor import tool_provenance as tp
 from message_processor.thread_management import ThreadManagementMixin
 from message_processor.utilities import MessageUtilitiesMixin
-from thread_manager import AsyncThreadStateManager
+from message_processor.thread_manager import AsyncThreadStateManager
 
 
 # --------------------------------------------------------------------------- harness
@@ -401,7 +401,7 @@ async def test_rebuild_config_off_stores_no_results(temp_db, monkeypatch):
 # ------------------------------------------------------------------ prompt instruction
 
 def test_prompt_has_tool_results_trust_instruction():
-    from prompts import SLACK_SYSTEM_PROMPT
+    from message_processor.prompts import SLACK_SYSTEM_PROMPT
     assert "[tool results:" in SLACK_SYSTEM_PROMPT
     # the retraction half is present
     assert "never retract" in SLACK_SYSTEM_PROMPT.lower()
@@ -554,7 +554,7 @@ async def test_f16_summarize_tool_result_method_wires_utility_call():
 
 
 def test_f16_summarize_prompt_has_verbatim_preservation_contract():
-    from prompts import TOOL_RESULT_SUMMARIZE_PROMPT
+    from message_processor.prompts import TOOL_RESULT_SUMMARIZE_PROMPT
     assert "Preserve verbatim every URL, report title, date, figure, and ID" in TOOL_RESULT_SUMMARIZE_PROMPT
     assert "SINGLE LINE" in TOOL_RESULT_SUMMARIZE_PROMPT
     # {max_chars} is filled at call time from the per-call cap

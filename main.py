@@ -25,8 +25,8 @@ from message_processor.turn_runtime import (DEST_KIND_CORRECTION_ANNOUNCEMENT,
                                             DEST_KIND_POST_TO_THREAD, DEST_KIND_RECONCILED,
                                             DEST_KIND_REPLY, DEST_KIND_SPLIT, TurnRuntime)
 from message_processor import thread_files
-import token_counter
-from base_client import BaseClient, Message
+import message_processor.token_counter as token_counter
+from message_processor.client_contract import BaseClient, Message
 from slack_client import admission_watermark
 from slack_client.event_handlers import registration
 from slack_client.utilities import is_dm_conversation

@@ -23,15 +23,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-import prompts
+import message_processor.prompts as prompts
 from config import config
-from markdown_converter import MarkdownConverter
+from slack_client.markdown_converter import MarkdownConverter
 from message_processor.turn_runtime import (DEST_KIND_POST_TO_THREAD, POST_TO_THREAD_TOOL,
                                            TurnRuntime)
 from slack_client.formatting.text import SlackFormattingMixin
 from slack_client.messaging import SlackMessagingMixin
 from tests.unit import channel_turn_harness as harness
-from tool_registry import SURFACE_CHANNEL, ToolContext, ToolRegistry
+from message_processor.tool_registry import SURFACE_CHANNEL, ToolContext, ToolRegistry
 
 
 def _ctx(channel="C1", thread="root.1", trigger="msg.1", *, trusted=None, turn=None):
@@ -635,7 +635,7 @@ def _completion_host(loop_result, *, streaming=False):
 
 
 async def _drive(host, turn, *, streaming=False):
-    from base_client import Message
+    from message_processor.client_contract import Message
 
     message = Message(text="hi", user_id="U1", channel_id="C1", thread_id="10.0",
                       metadata={"ts": "10.0"})

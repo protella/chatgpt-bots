@@ -15,7 +15,7 @@ import pytest
 
 from slack_sdk.errors import SlackApiError
 
-from base_client import HistoryFetchError
+from message_processor.client_contract import HistoryFetchError
 from config import config
 from message_processor import channel_stream
 from message_processor.channel_stream import (

@@ -340,7 +340,7 @@ class TestBridgeContainer:
     turns now, so the first one to need an id pays for the create and everyone else reuses it."""
 
     async def test_creates_adopts_and_fills_the_holder(self, temp_db):
-        from tool_registry import SandboxHolder
+        from message_processor.tool_registry import SandboxHolder
 
         client, raw = _openai("cntr_bridge")
         cm = ContainerManager(client, db=temp_db)
@@ -353,7 +353,7 @@ class TestBridgeContainer:
         assert temp_db.get_thread_container("C1:111.1")["container_id"] == "cntr_bridge"
 
     async def test_a_filled_holder_costs_nothing(self, temp_db):
-        from tool_registry import SandboxHolder
+        from message_processor.tool_registry import SandboxHolder
 
         client, raw = _openai("cntr_new")
         cm = ContainerManager(client, db=temp_db)
@@ -372,7 +372,7 @@ class TestBridgeContainer:
         thing standing between three tool calls and three containers."""
         import asyncio as aio
 
-        from tool_registry import SandboxHolder
+        from message_processor.tool_registry import SandboxHolder
 
         client, raw = _openai()
         minted = iter(["cntr_1", "cntr_2", "cntr_3"])
@@ -395,13 +395,13 @@ class TestBridgeContainer:
         assert holder.container_id == "cntr_1"
 
     async def test_no_manager_means_no_bridge(self):
-        from tool_registry import SandboxHolder
+        from message_processor.tool_registry import SandboxHolder
 
         assert await SandboxHolder(thread_key="C1:111.1").ensure() is None
         assert await SandboxHolder(manager=MagicMock()).ensure() is None
 
     async def test_a_failed_create_answers_none(self, temp_db):
-        from tool_registry import SandboxHolder
+        from message_processor.tool_registry import SandboxHolder
 
         client, _ = _openai(create_error=_api_error(500, "no capacity"))
         cm = ContainerManager(client, db=temp_db)

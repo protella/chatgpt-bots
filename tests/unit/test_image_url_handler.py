@@ -5,8 +5,8 @@ import socket
 import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
 import base64
-import image_url_handler
-from image_url_handler import ImageURLHandler
+import message_processor.ingestion.image_url_handler as image_url_handler
+from message_processor.ingestion.image_url_handler import ImageURLHandler
 
 
 @pytest.fixture(autouse=True)

@@ -22,13 +22,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from slack_sdk.errors import SlackApiError
 
-from base_client import Message, Response
-from markdown_converter import MarkdownConverter
+from message_processor.client_contract import Message, Response
+from slack_client.markdown_converter import MarkdownConverter
 from message_processor.turn_runtime import TurnRuntime
 from slack_client.formatting.text import SlackFormattingMixin
 from slack_client.messaging import Delivery, SlackMessagingMixin
 from slack_client.utilities import SlackUtilitiesMixin
-from tool_registry import ToolContext
+from message_processor.tool_registry import ToolContext
 
 
 class _Bot(SlackMessagingMixin, SlackFormattingMixin, SlackUtilitiesMixin):
@@ -113,7 +113,7 @@ async def test_a_split_that_aborts_reports_only_what_slack_took(monkeypatch):
 async def test_a_split_that_lands_whole_reports_exactly_what_slack_was_given():
     """r2-10: this used to report the caller's own markdown for a complete split — a delivery
     described in text the room never received."""
-    from message_markers import CONTINUATION_HEAD
+    from message_processor.message_markers import CONTINUATION_HEAD
 
     b = _Bot()
     posted = []

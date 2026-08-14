@@ -24,7 +24,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from base_client import Message
+from message_processor.client_contract import Message
 from config import config
 from message_processor import participation_telemetry as pt
 from message_processor.participation import ParticipationEngine, WakeDecision
@@ -375,7 +375,7 @@ async def test_an_ungated_turn_claims_nothing_until_it_holds_the_lock(sink):
     merely INTENDED can never be corrected downstream: if the turn then queues instead of
     answering, the ledger says an ungated turn absorbed messages it never answered. So the write
     waits for the lock — the point where the turn is genuinely running."""
-    from thread_manager import AsyncThreadStateManager
+    from message_processor.thread_manager import AsyncThreadStateManager
 
     manager = AsyncThreadStateManager(db=None)
     proc = _LockOnlyProcessor(manager)

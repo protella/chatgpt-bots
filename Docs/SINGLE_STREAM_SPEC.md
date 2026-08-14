@@ -133,7 +133,7 @@ Channel turns resolve capability-affecting settings (model, web search, MCP set,
 tool exposure) from a **channel-owned profile** (channel settings → global defaults), never from
 the requester. Requester cosmetic prefs ride the suffix. DMs keep per-user settings verbatim.
 **OWNER-APPROVED 2026-07-29, conditional on the channel settings modal being updated in the same
-work**: the modal (settings_modal.py) grows the channel capability profile controls (model, web,
+work**: the modal (`slack_client/settings_modal.py`) grows the channel capability profile controls (model, web,
 MCP, image model) so the channel-owned values are visible and editable where the other channel
 settings live — approval assumed this is included; it is in scope, not a follow-up.
 

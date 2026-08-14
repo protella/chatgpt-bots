@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from message_processor import canvas_tools as ct
-from tool_registry import ToolContext
+from message_processor.tool_registry import ToolContext
 
 
 def _ctx():

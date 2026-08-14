@@ -16,8 +16,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from slack_sdk.errors import SlackApiError
 
-from base_client import HistoryFetchError, Message
-from message_markers import (
+from message_processor.client_contract import HistoryFetchError, Message
+from message_processor.message_markers import (
     CONTINUATION_HEAD,
     CONTINUATION_TRAILER,
     continuation_trailer,

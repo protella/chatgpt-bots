@@ -9,8 +9,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from config import config, clamp_effort
 from openai_client.container_errors import (demote_container_tools, is_container_gone,
                                             mark_adoption_blocked, persistent_container_ids)
-from prompts import (MEMORY_EXTRACTION_SYSTEM_PROMPT, TOOL_RESULT_SUMMARIZE_PROMPT,
-                     WAKE_CLASSIFIER_SYSTEM_PROMPT)
+from message_processor.prompts import (MEMORY_EXTRACTION_SYSTEM_PROMPT, TOOL_RESULT_SUMMARIZE_PROMPT,
+                                       WAKE_CLASSIFIER_SYSTEM_PROMPT)
 
 
 _SUPPRESSED_CLASS: Any = None

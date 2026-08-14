@@ -34,7 +34,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from base_client import Message
+from message_processor.client_contract import Message
 from config import config
 from database import DatabaseManager
 from message_processor.participation import (
@@ -866,7 +866,7 @@ class TestDBAndModal:
 
     def test_modal_participation_select_no_snooze_block(self):
         # F15: the snooze early-resume control is retired — the modal never renders it.
-        from settings_modal import SettingsModal
+        from slack_client.settings_modal import SettingsModal
         builder = SettingsModal.__new__(SettingsModal)
         view = builder.build_channel_settings_modal(
             "C1", {"participation_level": "on"}, "tag_only")
@@ -881,7 +881,7 @@ class TestDBAndModal:
         assert "snooze_block" not in blocks
 
     def test_modal_legacy_mode_row_maps_and_no_snooze_block(self):
-        from settings_modal import SettingsModal
+        from slack_client.settings_modal import SettingsModal
         builder = SettingsModal.__new__(SettingsModal)
         view = builder.build_channel_settings_modal("C1", {"response_mode": "auto_respond"}, "tag_only")
         blocks = {b.get("block_id"): b for b in view["blocks"] if b.get("block_id")}
@@ -893,7 +893,7 @@ class TestDBAndModal:
 
 class TestNeedsRefresh:
     def test_mark_and_consume_semantics(self):
-        from thread_manager import AsyncThreadStateManager
+        from message_processor.thread_manager import AsyncThreadStateManager
         mgr = AsyncThreadStateManager.__new__(AsyncThreadStateManager)
         mgr._needs_refresh = set()
         AsyncThreadStateManager.mark_needs_refresh(mgr, "C1:10.0")
@@ -910,7 +910,7 @@ class TestNeedsRefresh:
         queued_idx = src.index('type="queued"')
         assert "enqueue_pending" in src[:queued_idx]
         # overflow/failure still flags a transcript refetch
-        from thread_manager import AsyncThreadStateManager
+        from message_processor.thread_manager import AsyncThreadStateManager
         assert "mark_needs_refresh" in inspect.getsource(AsyncThreadStateManager.enqueue_pending)
 
     def test_rebuild_consumes_refresh_flag(self):

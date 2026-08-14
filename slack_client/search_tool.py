@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from slack_sdk.errors import SlackApiError
 
-from base_client import HistoryFetchError
+from message_processor.client_contract import HistoryFetchError
 from config import config
 from slack_client._host import _Host
 from slack_client.history_fetch import (FetchBudget, HistoryPageError, iter_pages,
@@ -20,7 +20,7 @@ from slack_client.history_fetch import (FetchBudget, HistoryPageError, iter_page
 from slack_client.messaging import is_self_chrome_message
 from slack_client.normalizer import (ORIGIN_HISTORY, ORIGIN_REPLIES, TimestampError,
                                      normalize_slack_message, parse_ts, prime_bot_actor_ids)
-from tool_registry import stage_discovered_edit_target, stage_discovered_root
+from message_processor.tool_registry import stage_discovered_edit_target, stage_discovered_root
 
 
 class SearchBackend(Enum):

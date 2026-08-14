@@ -185,7 +185,7 @@ def test_the_pulse_config_keys_are_gone():
 def test_thread_state_no_longer_carries_a_dead_system_prompt():
     """It was written and never read — for months the channel-memory block went into it and
     reached no model call at all. The field outliving that bug is how the next one starts."""
-    from thread_manager import ThreadState
+    from message_processor.thread_manager import ThreadState
 
     assert "system_prompt" not in ThreadState.__dataclass_fields__
 

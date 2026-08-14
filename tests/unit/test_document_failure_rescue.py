@@ -19,13 +19,13 @@ import os
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from base_client import Message
-from document_handler import DocumentHandler, SpreadsheetFormatMismatch
+from message_processor.client_contract import Message
+from message_processor.ingestion.document_handler import DocumentHandler, SpreadsheetFormatMismatch
 from message_processor.base import MessageProcessor
 from message_processor.thread_files import build_catalog
 from message_processor.utilities import MessageUtilitiesMixin
 from message_processor.thread_management import ThreadManagementMixin
-from thread_manager import AsyncThreadStateManager
+from message_processor.thread_manager import AsyncThreadStateManager
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
@@ -214,7 +214,7 @@ async def test_a_workbook_mimetype_that_is_not_a_workbook_is_never_uploaded(temp
 
 def test_the_container_claim_is_checked_for_every_office_mimetype():
     """A real workbook still uploads; the OLE2 family is held to its own magic."""
-    from document_handler import container_magic_mismatch
+    from message_processor.ingestion.document_handler import container_magic_mismatch
 
     docx = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     assert container_magic_mismatch(XLSX_MIME, b"region,units\n1,2\n") is True

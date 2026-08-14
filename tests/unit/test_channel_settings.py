@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from base_client import Message
+from message_processor.client_contract import Message
 from config import config
 from database import DatabaseManager
 from message_processor.utilities import MessageUtilitiesMixin

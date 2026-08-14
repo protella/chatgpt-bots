@@ -20,7 +20,7 @@ import pytest
 import message_processor.document_tools as dt
 import message_processor.research_tools as rt
 from config import config
-from tool_registry import ToolContext
+from message_processor.tool_registry import ToolContext
 
 
 # --------------------------------------------------------------------------- harness
@@ -163,7 +163,7 @@ class TestExplicitOnly:
         assert "Omit for genuinely new work" in desc
 
     def test_prompt_nudge_names_the_argument(self):
-        from prompts import LOCAL_TOOLS_GUIDANCE
+        from message_processor.prompts import LOCAL_TOOLS_GUIDANCE
         assert ("Revising a file the thread already has? Pass revises with its exact filename"
                 in LOCAL_TOOLS_GUIDANCE)
 

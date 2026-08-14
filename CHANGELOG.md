@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.1.1] - 2026-08-13
+
+### 🔧 Changed
+
+- **Repository restructure — no behavior change.** Fourteen root modules moved into the
+  packages that own them (`message_processor/` — including a new `ingestion/` subpackage for
+  document and image intake — `slack_client/`, `openai_client/`); `base_client.py` is now
+  `message_processor/client_contract.py`. The repo root is down to six Python files
+  (`slackbot.py`, `main.py`, `config.py`, `logger.py`, `database.py`, `runtime_identity.py`).
+  `message_processor` and `slack_client` resolve their package classes lazily, which removes a
+  latent circular-import ordering hazard. Imports, tests, and docs follow; nothing else changed.
+
+### 🔥 Removed
+
+- **Tracked editor configuration** (`.cursor/`, 23 files) and stale test documentation
+  (`tests/TEST_REQUEST_TEMPLATE.md`; `tests/README.md` is now a short, current run guide).
+
 ## [3.1.0] - 2026-08-13
 
 ### ✨ Added

@@ -155,7 +155,7 @@ async def test_slimmed_row_still_readable_via_read_document(temp_db, monkeypatch
     read_document re-resolves the Slack ref and re-extracts on demand — the summary is never on
     the read path."""
     from message_processor import document_tools
-    from tool_registry import ToolContext
+    from message_processor.tool_registry import ToolContext
 
     _save(temp_db)
     temp_db.conn.execute("UPDATE documents SET created_at = datetime('now', '-200 days')")

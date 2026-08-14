@@ -12,7 +12,7 @@ from slack_client._host import _Host
 from slack_client.formatting.blocks import extract_supplementary_text
 from slack_client.normalizer import ORIGIN_HISTORY, normalize_slack_message
 from slack_client.utilities import is_dm_conversation
-from tool_registry import stage_discovered_edit_target, stage_discovered_root
+from message_processor.tool_registry import stage_discovered_edit_target, stage_discovered_root
 
 
 # Safety ceiling on how many conversations_replies pages a single thread fetch will

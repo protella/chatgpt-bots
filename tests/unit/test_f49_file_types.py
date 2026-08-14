@@ -9,7 +9,7 @@ import json
 
 import pytest
 
-from document_handler import (
+from message_processor.ingestion.document_handler import (
     DENIED_EXTENSIONS,
     DOCUMENT_EXTENSIONS,
     EXTENSION_HANDLERS,

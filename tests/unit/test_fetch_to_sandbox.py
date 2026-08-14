@@ -15,9 +15,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-import ambient_fetch
+import message_processor.ingestion.ambient_fetch as ambient_fetch
 from message_processor import fetch_to_sandbox
-from tool_registry import ToolContext, ToolRegistry
+from message_processor.tool_registry import ToolContext, ToolRegistry
 
 SVG = b'<svg xmlns="http://www.w3.org/2000/svg"><rect width="4" height="4"/></svg>'
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32

@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from base_client import HistoryFetchError
+from message_processor.client_contract import HistoryFetchError
 from slack_client import admission_watermark
 from slack_client.admission_watermark import FAILED, AdmissionWatermark
 from slack_client.event_handlers import activity_index

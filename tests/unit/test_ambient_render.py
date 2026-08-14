@@ -6,7 +6,7 @@ import types
 
 import pytest
 
-import ambient_fetch
+import message_processor.ingestion.ambient_fetch as ambient_fetch
 from database import DatabaseManager
 from message_processor.utilities import MessageUtilitiesMixin, _render_ambient_artifact
 
@@ -184,7 +184,7 @@ def test_render_ambient_artifact_frames_untrusted():
 
 def test_fetch_url_registration():
     from message_processor.fetch_url_tool import register_fetch_url_tool
-    from tool_registry import ToolRegistry
+    from message_processor.tool_registry import ToolRegistry
     reg = ToolRegistry()
     register_fetch_url_tool(reg)
     schema = reg.get_schema("fetch_url") if hasattr(reg, "get_schema") else None
@@ -195,7 +195,7 @@ def test_fetch_url_registration():
 
 async def test_fetch_url_tool_returns_untrusted_and_persists(db, monkeypatch):
     from message_processor.fetch_url_tool import execute_fetch_url
-    from tool_registry import ToolContext
+    from message_processor.tool_registry import ToolContext
 
     async def fake_fetch(url, **kw):
         return ambient_fetch.FetchResult(kind="text", final_url=url, title="Reuters",
@@ -213,7 +213,7 @@ async def test_fetch_url_tool_returns_untrusted_and_persists(db, monkeypatch):
 
 async def test_fetch_url_tool_error(db, monkeypatch):
     from message_processor.fetch_url_tool import execute_fetch_url
-    from tool_registry import ToolContext
+    from message_processor.tool_registry import ToolContext
 
     async def fake_fetch(url, **kw):
         return ambient_fetch.FetchResult(kind="error", error_code=ambient_fetch.ERR_BLOCKED_SSRF)

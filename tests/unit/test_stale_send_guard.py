@@ -440,7 +440,7 @@ async def test_only_messages_that_reach_a_turn_raise_the_watermark():
     before dispatch — our own post, a lifecycle subtype, a participation-off channel, the
     app_mention duplicate of a message event — owns no successor, and letting it raise the mark
     would silence an answer that nothing is going to replace."""
-    from base_client import Message
+    from message_processor.client_contract import Message
     from main import ChatBotV2
 
     app = ChatBotV2.__new__(ChatBotV2)
@@ -468,7 +468,7 @@ async def test_only_messages_that_reach_a_turn_raise_the_watermark():
 async def test_a_turn_holds_its_scope_for_exactly_its_own_lifetime():
     """Barrier-driven: the older turn is INSIDE handle_message when the newer one is admitted,
     which is the only interleaving where the guard has anything to do."""
-    from base_client import Message
+    from message_processor.client_contract import Message
     from main import ChatBotV2
 
     app = ChatBotV2.__new__(ChatBotV2)
@@ -513,7 +513,7 @@ async def test_a_turn_holds_its_scope_for_exactly_its_own_lifetime():
 def test_a_refused_turn_with_nothing_else_visible_is_stale_suppressed():
     """Not a silence — nobody chose it, and there is no silence reason to record. Not
     delivery_failed — Slack was never called, so nothing failed."""
-    from base_client import Message
+    from message_processor.client_contract import Message
     from main import ChatBotV2
     from message_processor.turn_runtime import TurnRuntime
 
@@ -523,7 +523,7 @@ def test_a_refused_turn_with_nothing_else_visible_is_stale_suppressed():
 
 
 def test_a_refused_turn_that_still_reacted_keeps_the_louder_label():
-    from base_client import Message
+    from message_processor.client_contract import Message
     from main import ChatBotV2
     from message_processor.turn_runtime import TurnRuntime
 
@@ -545,7 +545,7 @@ def test_a_refused_turn_that_still_reacted_keeps_the_louder_label():
 def test_a_refused_turn_with_a_detached_surface_is_detached():
     """A background job posted its own card. The turn is not silent, whatever happened to the
     words that would have accompanied it."""
-    from base_client import Message
+    from message_processor.client_contract import Message
     from main import ChatBotV2
     from message_processor.turn_runtime import TurnRuntime
 
@@ -640,7 +640,7 @@ async def test_tool_dispatch_re_raises_instead_of_reporting_a_broken_tool():
     """post_to_thread declining because the room moved on is control flow. Reported as
     `execution_error` the model reads a broken tool and tries again — causing the very post the
     guard just refused."""
-    from tool_registry import ToolContext, ToolRegistry
+    from message_processor.tool_registry import ToolContext, ToolRegistry
 
     async def _refuses(ctx, args):
         raise StaleSendSuppressed(scope=("top", "C1", "U1"), last_seen_ts="100.0",
@@ -657,7 +657,7 @@ async def test_tool_dispatch_re_raises_instead_of_reporting_a_broken_tool():
 async def test_an_ordinary_tool_error_is_still_reported_not_raised():
     """The re-raise must be surgical: a genuine tool bug still becomes a result the model can
     read, exactly as before."""
-    from tool_registry import ToolContext, ToolRegistry
+    from message_processor.tool_registry import ToolContext, ToolRegistry
 
     async def _boom(ctx, args):
         raise RuntimeError("the tool is broken")
@@ -673,14 +673,14 @@ async def test_an_ordinary_tool_error_is_still_reported_not_raised():
 async def test_process_message_never_turns_a_suppression_into_an_error_response():
     """It would put "something went wrong" in a channel where nothing did — INSTEAD of the
     answer the guard correctly withheld."""
-    from base_client import Message
+    from message_processor.client_contract import Message
     from message_processor.base import MessageProcessor
 
     class _Proc:
         process_message = MessageProcessor.process_message
 
         def __init__(self):
-            from thread_manager import AsyncThreadStateManager
+            from message_processor.thread_manager import AsyncThreadStateManager
             self.thread_manager = AsyncThreadStateManager(db=None)
             self.db = None
 
@@ -716,7 +716,7 @@ async def test_a_prior_timeout_notice_is_guarded_like_any_first_surface(supersed
     """It promises "picking up from here" and the work it promises takes time. A newer message
     during that window must not leave the promise standing alone with no answer behind it."""
     import contextlib
-    from base_client import Message
+    from message_processor.client_contract import Message
     from message_processor.base import MessageProcessor
     from message_processor.turn_runtime import TurnRuntime
 
@@ -726,7 +726,7 @@ async def test_a_prior_timeout_notice_is_guarded_like_any_first_surface(supersed
         _post_prior_timeout_notice = MessageProcessor._post_prior_timeout_notice
 
         def __init__(self):
-            from thread_manager import AsyncThreadStateManager
+            from message_processor.thread_manager import AsyncThreadStateManager
             self.thread_manager = AsyncThreadStateManager(db=None)
             self.db = None
 
@@ -940,7 +940,8 @@ async def test_a_committed_split_still_posts_its_remaining_chunks_and_notice():
 
 DELIVERY_FILES = ["main.py", "message_processor/base.py", "message_processor/handlers/text.py",
                   "message_processor/reconsideration.py",
-                  "slack_client/messaging.py", "streaming/native_sink.py", "tool_registry.py"]
+                  "slack_client/messaging.py", "streaming/native_sink.py",
+                  "message_processor/tool_registry.py"]
 
 # Functions that MUTATE Slack. A call to one of these without a lease cannot be refused, so on
 # any path where a lease may still be pending it is an unguarded first-visible write waiting to
@@ -1193,7 +1194,7 @@ async def test_a_superseded_error_notice_is_never_written():
 async def test_handle_error_carries_the_lease_end_to_end(superseded):
     """On a turn with no thinking surface — every silence-capable buffered turn — the error
     notice is the room's FIRST and only word from us, so it is guarded like any first surface."""
-    from base_client import BaseClient
+    from message_processor.client_contract import BaseClient
 
     marks = ConversationWatermarks()
     lease = marks.begin_turn(_msg("100.0"))
@@ -1230,7 +1231,7 @@ async def test_the_timeout_notice_is_awaited_with_the_lease_not_scheduled(supers
     suppression raised inside one can never reach the turn that caused it. This notice is
     terminal, so it is awaited directly with the lease."""
     import contextlib
-    from base_client import Message
+    from message_processor.client_contract import Message
     from message_processor.base import MessageProcessor
     from message_processor.turn_runtime import TurnRuntime
 
@@ -1238,7 +1239,7 @@ async def test_the_timeout_notice_is_awaited_with_the_lease_not_scheduled(supers
         process_message = MessageProcessor.process_message
 
         def __init__(self):
-            from thread_manager import AsyncThreadStateManager
+            from message_processor.thread_manager import AsyncThreadStateManager
             self.thread_manager = AsyncThreadStateManager(db=None)
             self.db = None
 

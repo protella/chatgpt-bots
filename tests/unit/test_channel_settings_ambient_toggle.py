@@ -26,7 +26,7 @@ import pytest
 
 from config import config
 from database import DatabaseManager
-from settings_modal import SettingsModal
+from slack_client.settings_modal import SettingsModal
 from slack_client.event_handlers.settings import SlackSettingsHandlersMixin
 
 

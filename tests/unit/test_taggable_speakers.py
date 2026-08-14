@@ -174,7 +174,7 @@ def test_the_channel_roster_is_not_the_thread_roster():
 # ---------------------------------------------------------------- prompt nudge (A4)
 
 def test_prompt_nudge_points_at_a_roster_and_the_fallback_lookup():
-    from prompts import LOCAL_TOOLS_GUIDANCE
+    from message_processor.prompts import LOCAL_TOOLS_GUIDANCE
     g = LOCAL_TOOLS_GUIDANCE
     assert "@-mention" in g
     assert "list_channel_members" in g             # …for someone the roster doesn't name

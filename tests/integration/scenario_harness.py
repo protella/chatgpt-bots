@@ -40,7 +40,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from unittest.mock import AsyncMock, MagicMock
 
-from base_client import Message
+from message_processor.client_contract import Message
 from config import config
 from message_processor import channel_request
 from message_processor.channel_request import to_input_items
@@ -50,7 +50,7 @@ from message_processor.routing_facts import stamp_routing_facts
 from message_processor.turn_runtime import DESTINATION_CHANNEL, TurnRuntime
 from tests.live.battery_harness import origin_ack_violation
 from tests.unit.channel_turn_harness import (build_stream, normalized, sidecars, thread_config)
-from tool_registry import SURFACE_CHANNEL, ToolContext, ToolRegistry
+from message_processor.tool_registry import SURFACE_CHANNEL, ToolContext, ToolRegistry
 
 # --------------------------------------------------------------------------- outcomes
 

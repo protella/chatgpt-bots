@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from message_markers import (
+from message_processor.message_markers import (
     CONTINUATION_TRAILER,
     continuation_trailer_markdown,
     ends_with_continuation,
@@ -304,7 +304,7 @@ async def test_participation_ignore_never_touches_status_or_indicator():
     """The engine's non-respond verdict must return BEFORE any indicator/setStatus
     call — on the agent_view surface setStatus auto-opens the thread (Phase G guard)."""
     from main import ChatBotV2
-    from base_client import Message
+    from message_processor.client_contract import Message
 
     handler = ChatBotV2.__new__(ChatBotV2)  # skip heavy __init__
     handler.processor = SimpleNamespace(thread_manager=None)
@@ -355,7 +355,7 @@ def test_supports_native_streaming_still_gates_on_flag(monkeypatch):
 # ---------------- native-stream placement (verdict-aware stamp) ----------------
 
 def _placement_msg(metadata, channel_id="C123CHAN", thread_id="111.0"):
-    from base_client import Message
+    from message_processor.client_contract import Message
     return Message(text="hi", user_id="U1", channel_id=channel_id,
                    thread_id=thread_id, metadata=metadata)
 

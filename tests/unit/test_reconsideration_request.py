@@ -18,12 +18,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import prompts
+import message_processor.prompts as prompts
 from config import config
 from message_processor import channel_request, channel_stream
 from openai_client import base as openai_base
 from openai_client.api import responses as responses_api
-from token_counter import admission_charge
+from message_processor.token_counter import admission_charge
 
 TEAM = "T1"
 CH = "C1"

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import pytest
 
-import prompts
+import message_processor.prompts as prompts
 from config import config
 
 from message_processor.destination_tools import destination_marker
@@ -32,7 +32,7 @@ from message_processor.turn_runtime import SELECTABLE_DESTINATIONS
 from message_processor.utilities import (SURFACE_CHANNEL,
                                         local_tools_guidance_for,
                                         reach_tools_for)
-from prompts import (CHANNEL_ACTIVITY_NO_REPLY_SUFFIX, CHANNEL_CROSS_THREAD_CONDUCT_SUFFIX,
+from message_processor.prompts import (CHANNEL_ACTIVITY_NO_REPLY_SUFFIX, CHANNEL_CROSS_THREAD_CONDUCT_SUFFIX,
                      CHANNEL_LOCAL_TOOLS_GUIDANCE, CHANNEL_POST_TO_THREAD_DESCRIPTION,
                      CHANNEL_POST_TO_THREAD_TARGET_DESCRIPTION, DESTINATION_CONTRACT_SUFFIX,
                      LOCAL_TOOLS_GUIDANCE, TAGGABLE_ROSTER_HEADING,
@@ -189,7 +189,7 @@ def test_no_prompt_or_tool_description_points_at_a_retired_block():
 
     root = pathlib.Path(__file__).resolve().parents[2]
     sources = {
-        "prompts.py": (root / "prompts.py").read_text(encoding="utf-8"),
+        "prompts.py": (root / "message_processor/prompts.py").read_text(encoding="utf-8"),
         "people_tools.py": (root / "message_processor/people_tools.py").read_text(
             encoding="utf-8"),
         "lookup_user schema": str(people_tools.get_lookup_user_schema()),
@@ -326,7 +326,7 @@ def test_a_closing_addressed_to_us_is_still_acknowledged():
 def test_the_two_paragraphs_cannot_say_it_differently():
     """One text, carried by both. Two copies of a principle this soft would diverge on the next
     edit and nothing would notice — the paragraphs read fine either way."""
-    from prompts import _LET_THE_EXCHANGE_END
+    from message_processor.prompts import _LET_THE_EXCHANGE_END
 
     for s in BOTH:
         assert _LET_THE_EXCHANGE_END in s
@@ -337,7 +337,7 @@ def test_letting_the_exchange_end_names_no_scenario():
     describe what a landed exchange looks like; it may not enumerate cases and prescribe a reply
     for each, and it may never say silence is compulsory — "if the conversation ended, great; if
     more needs to be said, great"."""
-    from prompts import _LET_THE_EXCHANGE_END
+    from message_processor.prompts import _LET_THE_EXCHANGE_END
 
     lowered = _LET_THE_EXCHANGE_END.lower()
     for banned in ("no_response_needed", "must not", "never reply", "always react",
@@ -353,7 +353,7 @@ def test_a_fulfilled_request_is_spent():
     "It's already pinned." — it learned the fulfillment from its own tool result, so the room
     could not teach it. Being the addressee keeps earning an answer only while an answer is left
     to give. The rule rides the shared constant because that turn was a thread reply."""
-    from prompts import _LET_THE_EXCHANGE_END
+    from message_processor.prompts import _LET_THE_EXCHANGE_END
 
     for fragment in ("turns out to be already delivered",
                      "your own tool comes back telling you it is already so",
@@ -811,7 +811,7 @@ def _materialize(surface, *, silence_capable=True, tools_disabled=False, registr
     from message_processor.destination_tools import register_destination_tools
     from message_processor.handlers.text import TextHandlerMixin
     from message_processor.turn_runtime import TurnRuntime
-    from tool_registry import SURFACE_CHANNEL, ToolRegistry
+    from message_processor.tool_registry import SURFACE_CHANNEL, ToolRegistry
 
     if registry is None:
         registry = ToolRegistry()
@@ -845,7 +845,7 @@ def test_the_conduct_paragraph_reaches_an_addressed_channel_turn():
     not, and an addressed turn gets NO restraint suffix (there is nothing to restrain). So the
     paragraph is keyed to the tool, not to a posture, and this is the half that would be lost if
     somebody moved it into the restraint suffixes where it looks like it belongs."""
-    from tool_registry import SURFACE_CHANNEL
+    from message_processor.tool_registry import SURFACE_CHANNEL
 
     contract = _materialize(SURFACE_CHANNEL, silence_capable=False)
     assert CONDUCT in contract
@@ -868,7 +868,7 @@ def test_the_conduct_paragraph_also_reaches_a_silence_capable_channel_turn():
     answer", and conduct says to post over there and write nothing here. Whichever is last is the
     one the model reads as the standing instruction, and the contract was answering a question
     conduct had already closed. Restraint keeps the closing position wherever it rides."""
-    from tool_registry import SURFACE_CHANNEL
+    from message_processor.tool_registry import SURFACE_CHANNEL
 
     contract = _materialize(SURFACE_CHANNEL, silence_capable=True)
     assert CHANNEL_ACTIVITY_NO_REPLY_SUFFIX in contract and CONDUCT in contract
@@ -885,7 +885,7 @@ def test_a_turn_that_cannot_post_cross_thread_is_never_told_how_to():
     etiquette cannot make this mistake at all: it no longer mentions the tool."""
     from unittest.mock import AsyncMock
 
-    from tool_registry import SURFACE_CHANNEL, ToolRegistry
+    from message_processor.tool_registry import SURFACE_CHANNEL, ToolRegistry
 
     empty = ToolRegistry()
     empty.register({"type": "function", "name": "react_to_message", "parameters": {}}, AsyncMock())
@@ -898,7 +898,7 @@ def test_the_conduct_paragraph_never_rides_a_dm_turn():
     """The tool IS in this registry's DM schema set, so what is under test is the SURFACE check and
     nothing else. A DM has no other thread of its own, and the channel-wide conduct paragraph has
     no business in its prompt."""
-    from tool_registry import SURFACE_DM
+    from message_processor.tool_registry import SURFACE_DM
 
     assert CONDUCT not in _materialize(SURFACE_DM)
 
@@ -967,7 +967,7 @@ def test_the_dm_system_prompt_carries_the_dm_etiquette_verbatim():
     from unittest.mock import MagicMock
 
     from message_processor.utilities import MessageUtilitiesMixin
-    from tool_registry import SURFACE_CHANNEL, SURFACE_DM
+    from message_processor.tool_registry import SURFACE_CHANNEL, SURFACE_DM
 
     proc = MessageUtilitiesMixin.__new__(type("P", (MessageUtilitiesMixin,), {}))
     client = MagicMock()
@@ -990,7 +990,7 @@ def test_the_gate_reads_exactly_what_it_read_before():
     `gate_text` drifting from the flattened text the responder gets. Both are asserted rather than
     assumed, because the gate is the one surface in this file nobody would think to re-record."""
     from message_processor.channel_steering import render_snapshot
-    from prompts import WAKE_CLASSIFIER_SYSTEM_PROMPT
+    from message_processor.prompts import WAKE_CLASSIFIER_SYSTEM_PROMPT
 
     for word in ("post_to_thread", "cross-thread", "thread=<ts>", "last word"):
         assert word not in WAKE_CLASSIFIER_SYSTEM_PROMPT

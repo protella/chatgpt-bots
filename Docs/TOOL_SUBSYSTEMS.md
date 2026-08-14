@@ -89,7 +89,7 @@ suppressed (`handlers/text.py`) — there is no surface left to report progress 
 the reply sat on screen reading "Yep" and the only signal was a 👀 on the user's message.
 
 So the routing decision — inline or background — is made by the model *before* the call, and the
-prompt is the only lever. `CODE_INTERPRETER_GUIDANCE` (prompts.py) tells it inline work is
+prompt is the only lever. `CODE_INTERPRETER_GUIDANCE` (`message_processor/prompts.py`) tells it inline work is
 measured in seconds and that a build, or a retry after a failed attempt, belongs in
 `start_background_job` mode `build`; the tool's own description says the same from the other side.
 `INLINE_SANDBOX_SLOW_SECONDS` (default 60) exists only to log when that steering fails — it
@@ -341,7 +341,7 @@ Consequences of that choice, each of which bites:
 **The tools were dead without a system prompt.** With all 23 tools on the table, "start a running
 agenda for our devops call" produced a *chat message*. A tool description is only read once the
 model has decided to reach for a tool; the reply-or-document choice happens before that. Hence
-`CANVAS_GUIDANCE` (`prompts.py`). On the retry it then read an **unrelated** canvas ("Q4 Launch —
+`CANVAS_GUIDANCE` (`message_processor/prompts.py`). On the retry it then read an **unrelated** canvas ("Q4 Launch —
 Hot Sauce") and tried to append the agenda to it — only Slack's ACL stopped a silent rewrite of
 someone else's document — so the guidance also says *never write what was asked for into an
 unrelated canvas just because it is the one that exists*.

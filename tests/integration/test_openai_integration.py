@@ -8,7 +8,7 @@ import time
 from unittest.mock import Mock, patch
 from openai_client import OpenAIClient, ImageData
 from message_processor.base import MessageProcessor
-from base_client import Message
+from message_processor.client_contract import Message
 
 
 class TestOpenAIRealAPI:

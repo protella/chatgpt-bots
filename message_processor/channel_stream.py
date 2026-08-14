@@ -41,11 +41,11 @@ from types import MappingProxyType
 from typing import (Any, Callable, Dict, FrozenSet, Iterable, List, Mapping,
                     NamedTuple, Optional, Sequence, Tuple)
 
-from base_client import ChannelStreamError, HistoryFetchError
+from message_processor.client_contract import ChannelStreamError, HistoryFetchError
 from config import config
 from database import is_unattended_summary
 from logger import setup_logger
-import prompts
+import message_processor.prompts as prompts
 from message_processor import dev_barriers
 from message_processor.turn_runtime import (AuthorizedEditTarget,
                                             RECEIPT_CLASS_ASSISTANT_REPLY)
@@ -198,7 +198,7 @@ RECEIPT_FINALIZED = "finalized"
 
 # ---------------------------------------------------------------- exceptions
 
-# ChannelStreamError is re-exported from base_client, where HistoryFetchError also lives —
+# ChannelStreamError is re-exported from client_contract, where HistoryFetchError also lives —
 # one hierarchy, rooted below this module so a channel turn can catch every fail-closed
 # context failure with one clause.
 

@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock
 import pytest
 from slack_sdk.errors import SlackApiError
 
-from base_client import Response
+from message_processor.client_contract import Response
 from config import config
 from slack_client.messaging import SlackMessagingMixin
 

@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from base_client import Message, Response
+from message_processor.client_contract import Message, Response
 from config import config
 from slack_client.formatting.text import SlackFormattingMixin
 from slack_client.messaging import SlackMessagingMixin

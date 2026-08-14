@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from base_client import HistoryFetchError
+from message_processor.client_contract import HistoryFetchError
 from slack_client import admission_watermark
 from slack_client.event_handlers import registration
 from slack_client.event_handlers.registration import _admit

@@ -44,7 +44,7 @@ from logger import setup_logger
 from message_processor.outbound_receipts import (CLASS_ASSISTANT_REPLY,
                                                  expect_scheduled_delivery,
                                                  forget_scheduled_delivery)
-from tool_registry import ToolContext, ToolRegistry
+from message_processor.tool_registry import ToolContext, ToolRegistry
 
 logger = setup_logger(name="slack_bot.ScheduleTools")
 

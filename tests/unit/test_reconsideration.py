@@ -28,7 +28,7 @@ import pytest
 
 import message_processor.dm_reconsideration as dm_reconsideration
 import message_processor.reconsideration as reconsideration
-from base_client import Message, Response
+from message_processor.client_contract import Message, Response
 from config import config
 from message_processor import participation_telemetry
 from message_processor.dm_reconsideration import (DMSnapshotItem, DMSurfaceSnapshot,
@@ -45,7 +45,7 @@ from message_processor.stale_send_guard import (COMMITTED, PENDING, Conversation
 from message_processor.turn_runtime import TurnRuntime
 from openai_client.api.responses import (ReconsiderationDecision,
                                          ReconsiderationDecisionError)
-from prompts import RECONSIDERATION_INSTRUCTION
+from message_processor.prompts import RECONSIDERATION_INSTRUCTION
 from tests.unit.channel_turn_harness import (build_stream, normalized, pin_channel_turn,
                                              thread_config)
 
@@ -1796,7 +1796,7 @@ async def test_correction_site_posts_asis_into_the_existing_surface(events, monk
 @pytest.mark.asyncio
 async def test_correction_site_revised_over_3900_reruns_the_cut_and_overflow(
         events, monkeypatch):
-    from message_markers import CONTINUATION_HEAD
+    from message_processor.message_markers import CONTINUATION_HEAD
 
     revised = "z" * 4500
     rig = SiteRig(monkeypatch, decisions=[_decision("post", revised)],

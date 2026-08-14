@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from slack_sdk.errors import SlackApiError
 
-from base_client import Message
+from message_processor.client_contract import Message
 from config import config
 from database import DatabaseManager
 from slack_client.event_handlers.message_events import SlackMessageEventsMixin

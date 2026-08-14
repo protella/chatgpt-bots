@@ -67,9 +67,9 @@ from message_processor.utilities import (StreamActor, TurnCoordinates, api_part,
                                         build_taggable_roster_evidence,
                                         effective_request_model)
 from slack_client.normalizer import FileRef, NormalizedMessage, TimestampError, ts_key
-from token_counter import (ITEM_STRUCTURAL_OVERHEAD, admission_charge,
-                           estimate_tokens_conservative)
-from tool_registry import SURFACE_CHANNEL
+from message_processor.token_counter import (ITEM_STRUCTURAL_OVERHEAD, admission_charge,
+                                             estimate_tokens_conservative)
+from message_processor.tool_registry import SURFACE_CHANNEL
 
 logger = setup_logger(name="slack_bot.ChannelRequest")
 

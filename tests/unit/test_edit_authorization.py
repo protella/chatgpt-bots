@@ -46,7 +46,7 @@ from slack_client.search_tool import (
     _ChannelScan,
     build_search_query,
 )
-from tool_registry import (
+from message_processor.tool_registry import (
     StagedEditTarget,
     ToolContext,
     ToolRegistry,

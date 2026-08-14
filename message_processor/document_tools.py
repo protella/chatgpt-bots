@@ -18,10 +18,10 @@ from __future__ import annotations
 from collections import OrderedDict
 from typing import Any, Awaitable, Callable, Dict, List, Optional, cast
 
-from canvas_content import CANVAS_MIMETYPE
+from message_processor.canvas_content import CANVAS_MIMETYPE
 from config import config
-from document_handler import DocumentHandler
-from tool_registry import ToolContext, ToolRegistry
+from message_processor.ingestion.document_handler import DocumentHandler
+from message_processor.tool_registry import ToolContext, ToolRegistry
 
 # One slice of document text per tool round — big enough to be useful,
 # bounded so a huge doc can't blow the tool-result cap.

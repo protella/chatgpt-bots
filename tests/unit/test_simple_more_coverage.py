@@ -74,7 +74,7 @@ class TestImageURLHandlerMethods:
     
     def test_extract_image_urls(self):
         """Test extracting image URLs from text"""
-        from image_url_handler import ImageURLHandler
+        from message_processor.ingestion.image_url_handler import ImageURLHandler
         
         handler = ImageURLHandler()
         
@@ -93,7 +93,7 @@ class TestImageURLHandlerMethods:
     
     def test_extract_image_urls_empty(self):
         """Test extracting from text with no URLs"""
-        from image_url_handler import ImageURLHandler
+        from message_processor.ingestion.image_url_handler import ImageURLHandler
         
         handler = ImageURLHandler()
         
@@ -106,7 +106,7 @@ class TestImageURLHandlerMethods:
         """validate_image_url is now a no-network shape check for every host (the guarded download
         is the real gate), so a well-formed URL passes without touching the session — and never
         sends an authenticated HEAD that a redirect could leak off-host."""
-        from image_url_handler import ImageURLHandler
+        from message_processor.ingestion.image_url_handler import ImageURLHandler
 
         handler = ImageURLHandler()
 
@@ -123,7 +123,7 @@ class TestImageURLHandlerMethods:
     @pytest.mark.asyncio
     async def test_validate_image_url_invalid(self):
         """Test validating an invalid URL"""
-        from image_url_handler import ImageURLHandler
+        from message_processor.ingestion.image_url_handler import ImageURLHandler
 
         handler = ImageURLHandler()
 
@@ -140,7 +140,7 @@ class TestThreadManagerMoreMethods:
     
     @pytest.fixture
     def manager(self):
-        from thread_manager import AsyncThreadStateManager
+        from message_processor.thread_manager import AsyncThreadStateManager
         return AsyncThreadStateManager()
     
     @pytest.mark.skip(reason="Stats structure differs")

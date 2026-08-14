@@ -3,11 +3,11 @@ from typing import Any, Optional, Callable, cast
 
 from slack_bolt.async_app import AsyncApp
 
-from base_client import BaseClient
+from message_processor.client_contract import BaseClient
 from config import config
-from markdown_converter import MarkdownConverter
+from slack_client.markdown_converter import MarkdownConverter
 from database import DatabaseManager
-from settings_modal import SettingsModal
+from slack_client.settings_modal import SettingsModal
 from .event_handlers import (
     SlackAssistantEventsMixin,
     SlackChannelJoinMixin,
@@ -22,7 +22,7 @@ from .history_tool import SlackHistoryToolMixin
 from .channel_lookup_tool import (SlackChannelLookupToolMixin,
                                   register_channel_lookup_tool)
 from .search_tool import SlackSearchToolMixin
-from tool_registry import Executor, ToolRegistry
+from message_processor.tool_registry import Executor, ToolRegistry
 from message_processor.bookmark_tools import register_bookmark_tools
 from message_processor.channel_admin_tools import register_channel_admin_tools
 from message_processor.destination_tools import register_destination_tools

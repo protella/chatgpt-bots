@@ -31,7 +31,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from logger import setup_logger
-from tool_registry import ToolContext, ToolRegistry
+from message_processor.tool_registry import ToolContext, ToolRegistry
 
 logger = setup_logger(name="slack_bot.BookmarkTools")
 

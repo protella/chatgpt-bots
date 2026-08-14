@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from base_client import BaseClient, Message
-from canvas_content import CANVAS_MIMETYPE
+from message_processor.client_contract import BaseClient, Message
+from message_processor.canvas_content import CANVAS_MIMETYPE
 from config import config, pipeline_status
-from message_markers import (
+from message_processor.message_markers import (
     ends_with_continuation,
     starts_as_continuation,
     strip_continuation_markers,
@@ -208,7 +208,7 @@ class ThreadManagementMixin(_Host):
             doc_text = doc_text_match.group(1).strip()
             
             # Import the summarization prompt
-            from prompts import DOCUMENT_SUMMARIZATION_PROMPT
+            from message_processor.prompts import DOCUMENT_SUMMARIZATION_PROMPT
             
             # Use proper role separation for document summarization
             # Developer message contains the instruction, user message contains the document
@@ -511,7 +511,7 @@ class ThreadManagementMixin(_Host):
 
         prior_text = (prior or {}).get("summary_text") or ""
         try:
-            from prompts import CONVERSATION_SUMMARIZATION_PROMPT
+            from message_processor.prompts import CONVERSATION_SUMMARIZATION_PROMPT
             user_block = (
                 (f"EXISTING SUMMARY OF OLDER MESSAGES:\n{prior_text}\n\n" if prior_text else "")
                 + f"NEW MESSAGES TO FOLD IN:\n{span_text}"

@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from message_processor import canvas_tools as ct
-from tool_registry import ToolContext, ToolRegistry
+from message_processor.tool_registry import ToolContext, ToolRegistry
 
 
 def _tabs(*canvas_ids):
@@ -55,7 +55,7 @@ def _delete_ctx(*, sender_type="human", authorized=True, with_message=True, **kw
     authorization: `canvas_delete_authorized` plus a human sender on ctx.message. Both fail
     closed, so every delete test has to say which one it is exercising.
     """
-    from base_client import Message
+    from message_processor.client_contract import Message
     ctx, web = _ctx(**kw)
     ctx.canvas_delete_authorized = authorized
     if with_message:
@@ -648,7 +648,7 @@ class TestCanvasesAreChannelContext:
         between "reply" and "document" happens before that, and only the system prompt shapes it.
         """
         import inspect
-        from prompts import CANVAS_GUIDANCE
+        from message_processor.prompts import CANVAS_GUIDANCE
         from message_processor.utilities import MessageUtilitiesMixin
 
         flat = " ".join(CANVAS_GUIDANCE.lower().split())
@@ -725,7 +725,7 @@ class TestDelete:
         """The tightening: a name-hit that carries NO real <@bot> mention (the vector where a
         message merely QUOTES the bot's name) must not put an irreversible delete on the table.
         Run the REAL signal derivation from a Message's metadata and confirm the gate stays shut."""
-        from base_client import Message
+        from message_processor.client_contract import Message
         from message_processor.handlers.text import TextHandlerMixin
 
         class _H(TextHandlerMixin):
@@ -1000,7 +1000,7 @@ class TestChecklists:
         assert "images are silently dropped" in help_text
 
     def test_the_prompt_biases_toward_checklists_and_tables(self):
-        from prompts import CANVAS_GUIDANCE
+        from message_processor.prompts import CANVAS_GUIDANCE
         flat = " ".join(CANVAS_GUIDANCE.lower().split())
         assert "is a checklist" in flat and "never plain bullets" in flat
         assert "is a table" in flat
@@ -1081,7 +1081,7 @@ class TestAddDontReplace:
     people scroll back through."""
 
     def test_the_prompt_says_add_dont_replace(self):
-        from prompts import CANVAS_GUIDANCE
+        from message_processor.prompts import CANVAS_GUIDANCE
         flat = " ".join(CANVAS_GUIDANCE.lower().split())
         assert "add, don't replace" in flat
         assert "rolling log" in flat and "prepended" in flat
@@ -1112,7 +1112,7 @@ class TestAddDontReplace:
         as literal text, and `document_content` accepts NO type but markdown (`html` and
         `rich_text` fail schema validation). Slack's interactive date chip can only be inserted by
         a person in the app — so the bot must not pretend otherwise."""
-        from prompts import CANVAS_GUIDANCE
+        from message_processor.prompts import CANVAS_GUIDANCE
         flat = " ".join(CANVAS_GUIDANCE.lower().split())
         assert "write the date as a plain heading" in flat
         assert "not through the api" in flat
@@ -1297,7 +1297,7 @@ class TestYouCannotInsertIntoAList:
         assert "delete_section" in desc
 
     def test_the_prompt_says_it_too(self):
-        from prompts import CANVAS_GUIDANCE
+        from message_processor.prompts import CANVAS_GUIDANCE
         flat = " ".join(CANVAS_GUIDANCE.lower().split())
         assert "a list is edited as a whole" in flat
         assert "you cannot insert an item into an existing list" in flat
@@ -1348,7 +1348,7 @@ class TestTheConfirmationLinksTheCanvas:
         assert "http" not in out["message"]
 
     def test_the_prompt_says_link_it(self):
-        from prompts import CANVAS_GUIDANCE
+        from message_processor.prompts import CANVAS_GUIDANCE
         flat = " ".join(CANVAS_GUIDANCE.lower().split())
         assert "link it" in flat
         assert "never invent or guess one" in flat

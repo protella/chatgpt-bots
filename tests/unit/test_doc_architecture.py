@@ -96,12 +96,12 @@ class TestContentDropMigration:
 
 class TestPromptsAndGuidance:
     def test_doc_summarization_prompt_is_gap_honest(self):
-        from prompts import DOCUMENT_SUMMARIZATION_PROMPT
+        from message_processor.prompts import DOCUMENT_SUMMARIZATION_PROMPT
         assert "GAP-HONEST" in DOCUMENT_SUMMARIZATION_PROMPT
         assert "not reproduce" in DOCUMENT_SUMMARIZATION_PROMPT
 
     def test_tools_guidance_anti_confabulation(self):
-        from prompts import LOCAL_TOOLS_GUIDANCE
+        from message_processor.prompts import LOCAL_TOOLS_GUIDANCE
         assert "read_document" in LOCAL_TOOLS_GUIDANCE
         assert "Never estimate" in LOCAL_TOOLS_GUIDANCE
 
@@ -199,7 +199,7 @@ class TestNativeFileInput:
         assert {"type", "filename", "file_data"} <= set(keys)
 
     def test_scanned_pdf_skips_ocr_conversion_when_native(self):
-        from document_handler import DocumentHandler
+        from message_processor.ingestion.document_handler import DocumentHandler
         h = DocumentHandler()
         fake_result = {"content": "", "total_pages": 2}
         with patch.object(h, "_parse_pdf_with_pdfplumber", return_value=fake_result), \
@@ -229,7 +229,7 @@ class TestScannedPdfOcr:
     the local attach path wants both. All degradations fall back, never raise."""
 
     def _image_based_handler(self, total_pages=2):
-        from document_handler import DocumentHandler
+        from message_processor.ingestion.document_handler import DocumentHandler
         h = DocumentHandler()
         base = {"content": "", "total_pages": total_pages, "pages": [], "format": "pdf"}
         return h, base
@@ -240,7 +240,7 @@ class TestScannedPdfOcr:
         monkeypatch.setattr(config, "ocr_max_pages", 20)
         with patch.object(h, "_parse_pdf_with_pdfplumber", return_value=dict(base)), \
              patch.object(h, "_is_image_based_pdf", return_value=True), \
-             patch("document_handler.convert_from_bytes",
+             patch("message_processor.ingestion.document_handler.convert_from_bytes",
                    return_value=[MagicMock(), MagicMock()]), \
              patch("pytesseract.image_to_string", side_effect=["HELLO WORLD", "SECOND PAGE"]):
             out = h.parse_pdf_structured(b"%PDF-fake", "scan.pdf",
@@ -257,7 +257,7 @@ class TestScannedPdfOcr:
         monkeypatch.setattr(config, "ocr_max_pages", 2)
         with patch.object(h, "_parse_pdf_with_pdfplumber", return_value=dict(base)), \
              patch.object(h, "_is_image_based_pdf", return_value=True), \
-             patch("document_handler.convert_from_bytes",
+             patch("message_processor.ingestion.document_handler.convert_from_bytes",
                    return_value=[MagicMock(), MagicMock()]), \
              patch("pytesseract.image_to_string", side_effect=["A", "B"]):
             out = h.parse_pdf_structured(b"%PDF-fake", "big-scan.pdf",
@@ -271,7 +271,7 @@ class TestScannedPdfOcr:
         monkeypatch.setattr(config, "enable_pdf_ocr", True)
         with patch.object(h, "_parse_pdf_with_pdfplumber", return_value=dict(base)), \
              patch.object(h, "_is_image_based_pdf", return_value=True), \
-             patch("document_handler.convert_from_bytes", return_value=[MagicMock()]), \
+             patch("message_processor.ingestion.document_handler.convert_from_bytes", return_value=[MagicMock()]), \
              patch("pytesseract.image_to_string",
                    side_effect=pytesseract.TesseractNotFoundError()):
             out = h.parse_pdf_structured(b"%PDF-fake", "scan.pdf",
@@ -298,7 +298,7 @@ class TestScannedPdfOcr:
              patch.object(h, "_is_image_based_pdf", return_value=True), \
              patch.object(h, "convert_pdf_to_images",
                           return_value=[{"page": 1, "base64_data": "x", "mimetype": "image/png"}]), \
-             patch("document_handler.convert_from_bytes", return_value=[MagicMock()]), \
+             patch("message_processor.ingestion.document_handler.convert_from_bytes", return_value=[MagicMock()]), \
              patch("pytesseract.image_to_string", return_value="INVOICE TOTAL 500"):
             out = h.parse_pdf_structured(b"%PDF-fake", "scan.pdf",
                                          ocr_images=True, ocr_text=True)
@@ -310,7 +310,7 @@ class TestScannedPdfOcr:
         # read_document may download + render + OCR a scan, so it must register with the
         # longer read_document_timeout, not the generic 20s tool_call_timeout.
         import message_processor.document_tools as dt
-        from tool_registry import ToolRegistry
+        from message_processor.tool_registry import ToolRegistry
         reg = ToolRegistry()
         dt.register_document_tools(reg)
         assert reg._tools["read_document"]["timeout"] == config.read_document_timeout
@@ -342,7 +342,7 @@ class TestScannedPdfOcr:
         # Build a genuine image-only PDF (no text layer) with PIL and OCR it for real.
         from io import BytesIO
         from PIL import Image, ImageDraw, ImageFont
-        from document_handler import DocumentHandler
+        from message_processor.ingestion.document_handler import DocumentHandler
 
         img = Image.new("RGB", (1240, 1754), "white")
         draw = ImageDraw.Draw(img)
@@ -420,7 +420,7 @@ class TestSpreadsheetSchema:
 # ---------------------------------------------------------------------------
 
 def _ctx(docs, download=b"%PDF", channel="C1", thread="111.0", channel_docs=None):
-    from tool_registry import ToolContext
+    from message_processor.tool_registry import ToolContext
     db = MagicMock()
     db.get_thread_documents_async = AsyncMock(return_value=docs)
     # F22: channel-wide fallback lookup. Defaults to the thread docs so tests that never
@@ -555,7 +555,7 @@ class TestReadDocumentTool:
         assert "open(" not in src.replace("pdfplumber.open(", "")
 
     def test_registered_when_enabled(self):
-        from tool_registry import ToolRegistry
+        from message_processor.tool_registry import ToolRegistry
         from message_processor.document_tools import register_document_tools
         reg = ToolRegistry()
         register_document_tools(reg)
@@ -643,7 +643,7 @@ class TestReadDocumentTool:
 
     def test_guidance_teaches_cross_thread_reads(self):
         # F25: LOCAL_TOOLS_GUIDANCE explicitly licenses cross-thread reads by filename.
-        from prompts import LOCAL_TOOLS_GUIDANCE
+        from message_processor.prompts import LOCAL_TOOLS_GUIDANCE
         assert "ANOTHER thread of this channel is readable too" in LOCAL_TOOLS_GUIDANCE
         assert "never declare a channel file unreachable without trying it" in LOCAL_TOOLS_GUIDANCE
 

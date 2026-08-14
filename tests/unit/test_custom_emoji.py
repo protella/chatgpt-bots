@@ -40,7 +40,7 @@ import pytest
 from config import config, valid_emoji_name
 from message_processor.participation import ParticipationEngine
 from slack_client.messaging import SlackMessagingMixin, WorkspaceEmojiCache
-from tool_registry import ToolContext
+from message_processor.tool_registry import ToolContext
 
 
 # =============================================================== WorkspaceEmojiCache
@@ -232,7 +232,7 @@ def test_nothing_builds_a_palette_for_the_gate_any_more(monkeypatch):
     for src in (inspect.getsource(main), inspect.getsource(responses.classify_wake)):
         assert "workspace_custom_emojis" not in src
         assert "participation_custom_emoji_cap" not in src
-    from prompts import WAKE_CLASSIFIER_SYSTEM_PROMPT as p
+    from message_processor.prompts import WAKE_CLASSIFIER_SYSTEM_PROMPT as p
     for retired in ("Allowed reaction emoji", "actually reacts with", "do not stretch one to fit",
                     "any standard Slack emoji name"):
         assert retired not in p, retired
@@ -351,7 +351,7 @@ def test_config_custom_emoji_defaults_and_documented():
 
 
 def test_local_tools_guidance_mentions_workspace_custom_emoji():
-    from prompts import LOCAL_TOOLS_GUIDANCE
+    from message_processor.prompts import LOCAL_TOOLS_GUIDANCE
     g = LOCAL_TOOLS_GUIDANCE.lower()
     assert "custom emoji" in g
     assert "standard slack emoji" in g

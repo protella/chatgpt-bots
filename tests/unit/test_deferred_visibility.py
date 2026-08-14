@@ -22,7 +22,7 @@ from message_processor.turn_runtime import TurnRuntime
 
 
 def _message(*, channel="C1", thread="10.0", ts="10.0", **meta):
-    from base_client import Message
+    from message_processor.client_contract import Message
     m = Message(text="hey has anyone looked at the Q3 numbers", user_id="U1",
                 channel_id=channel, thread_id=thread, metadata={"ts": ts, **meta})
     return m
@@ -72,7 +72,7 @@ async def test_a_silent_ambient_turn_posts_nothing_at_all(monkeypatch):
     Not a placeholder, not a composer status, not a status clear (which would itself
     auto-open the thread to say the bot is done doing nothing)."""
     from main import ChatBotV2
-    from base_client import Response
+    from message_processor.client_contract import Response
 
     monkeypatch.setattr(config, "enable_no_reply_tool", True, raising=False)
     handler = ChatBotV2.__new__(ChatBotV2)
@@ -104,7 +104,7 @@ async def test_a_silent_ambient_turn_posts_nothing_at_all(monkeypatch):
 async def test_an_addressed_turn_still_gets_its_indicator(monkeypatch):
     """The regression guard on the other side: don't defer what was never at risk."""
     from main import ChatBotV2
-    from base_client import Response
+    from message_processor.client_contract import Response
 
     monkeypatch.setattr(config, "enable_no_reply_tool", True, raising=False)
     handler = ChatBotV2.__new__(ChatBotV2)
@@ -159,7 +159,7 @@ def test_the_context_usage_box_is_gone():
     assert "Tips for optimal performance" not in src
     assert "of available context" not in src
 
-    from thread_manager import ThreadState
+    from message_processor.thread_manager import ThreadState
     assert not hasattr(ThreadState(thread_ts="1.0", channel_id="C1"),
                        "has_shown_80_percent_warning")
 
@@ -331,7 +331,7 @@ def test_the_model_is_still_told_about_compaction():
 async def _timeout_notice_shown_for(turn, monkeypatch):
     """Drive the real process_message with a thread that previously timed out; report whether
     the recovery notice was posted."""
-    from base_client import Response
+    from message_processor.client_contract import Response
     from message_processor.base import MessageProcessor
 
     with patch("message_processor.base.AsyncThreadStateManager"), \

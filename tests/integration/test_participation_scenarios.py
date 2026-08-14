@@ -1940,7 +1940,7 @@ async def test_the_buried_loop_rows_thread_is_reachable_by_its_own_search():
     """
     from message_processor.turn_runtime import TurnRuntime
     from tests.integration.scenario_harness import CHANNEL, _real_search_slack
-    from tool_registry import ToolContext
+    from message_processor.tool_registry import ToolContext
 
     scenario = next(s for s in RESPONDER_SCENARIOS if s.id == "news-settles-buried-loop")
     hit = scenario.search_hits[0]

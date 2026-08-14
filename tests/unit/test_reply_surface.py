@@ -740,7 +740,7 @@ class FakeToolLoopOpenAI:
         await stream_callback(None)                    # final round: the real completion signal
         # Honour aggregate_segments exactly like the real loop: chat opts in and gets the
         # seam-joined whole (matching what streamed to Slack); everything else gets last-round.
-        from message_markers import join_segments
+        from message_processor.message_markers import join_segments
         pre, post = "".join(self.preamble), "".join(self.post_tool)
         text = join_segments([pre, post]) if aggregate_segments else post
         return {"text": text,

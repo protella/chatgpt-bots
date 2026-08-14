@@ -20,10 +20,10 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, cas
 
 from config import config
 from logger import setup_logger
-from message_markers import join_segments
+from message_processor.message_markers import join_segments
 from openai_client.container_errors import (adoption_blocked, demote_container_tools,
                                             pin_container_tools)
-from tool_registry import ToolContext, ToolRegistry, serialize_tool_result
+from message_processor.tool_registry import ToolContext, ToolRegistry, serialize_tool_result
 
 from . import responses as responses_api
 

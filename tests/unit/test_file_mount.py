@@ -9,7 +9,7 @@ import pytest
 
 from message_processor import file_mount
 from message_processor.image_tools import CI_CONTAINER_KEY
-from tool_registry import ToolContext
+from message_processor.tool_registry import ToolContext
 
 
 class _BadRequest(Exception):
@@ -113,7 +113,7 @@ class TestSandboxSwitchGating:
     resolves it."""
 
     def _names(self, cfg, surface=None):
-        from tool_registry import ToolRegistry
+        from message_processor.tool_registry import ToolRegistry
         registry = ToolRegistry()
         file_mount.register_file_mount_tools(registry)
         kwargs = {"surface": surface} if surface else {}
@@ -186,7 +186,7 @@ class TestExecute:
         is precisely what happens BEFORE the model runs any code, so waiting for adoption would
         never resolve. The executor asks for a container, and the tool loop names it in the next
         round's declaration so the model can open the file."""
-        from tool_registry import SandboxHolder
+        from message_processor.tool_registry import SandboxHolder
 
         async def _fill(thread_key, h):
             h.container_id = "cntr_made"      # what ContainerManager.bridge_container does

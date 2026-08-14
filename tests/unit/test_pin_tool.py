@@ -29,7 +29,7 @@ from slack_sdk.errors import SlackApiError
 
 from slack_client import messaging
 from slack_client.messaging import SlackMessagingMixin
-from tool_registry import SURFACE_CHANNEL, ToolContext, ToolRegistry
+from message_processor.tool_registry import SURFACE_CHANNEL, ToolContext, ToolRegistry
 
 TEAM = "T1"
 CH = "C1"

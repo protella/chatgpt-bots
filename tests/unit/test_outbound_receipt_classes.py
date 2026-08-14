@@ -670,7 +670,7 @@ _FIXED_SURFACE_SENDERS = {"post_status_card", "send_image", "send_image_async",
 # §11.24: the producer sweep walks EVERY module under the production roots — no manual
 # whitelist a new posting site could dodge by living in a file nobody listed.
 _PRODUCER_ROOTS = ("message_processor", "slack_client", "streaming")
-_PRODUCER_TOP_LEVEL = ("main.py", "base_client.py")
+_PRODUCER_TOP_LEVEL = ("main.py",)
 
 
 def _producer_files() -> list:
@@ -732,12 +732,12 @@ def test_every_producer_call_site_stamps_a_class_explicitly():
 
     Static on purpose — the behavioral tests above prove the stamps LAND; this one proves no
     NEW producer can appear without saying what it posts. §11.24: the walk covers EVERY
-    module under message_processor/, slack_client/ and streaming/ plus main.py and
-    base_client.py — no manual whitelist. At runtime the ledger keywords and the §11.13
-    fixed-surface transports make the omission a TypeError (required, no default); the
-    variable-class transports have defaulted signatures, so their contract is the §11.9
-    ValueError on receipts-without-class — proved behaviorally below; this walk makes any of
-    it a test failure at review time.
+    module under message_processor/, slack_client/ and streaming/ plus main.py — no manual
+    whitelist (the client contract rides the message_processor/ root as client_contract.py).
+    At runtime the ledger keywords and the §11.13 fixed-surface transports make the omission a
+    TypeError (required, no default); the variable-class transports have defaulted signatures,
+    so their contract is the §11.9 ValueError on receipts-without-class — proved behaviorally
+    below; this walk makes any of it a test failure at review time.
     """
     files = _producer_files()
     assert len(files) > len(_PRODUCER_TOP_LEVEL) + len(_PRODUCER_ROOTS), \
@@ -757,7 +757,7 @@ def test_receipt_bearing_transport_signatures_carry_the_class_keyword():
     transport hardcodes nothing)."""
     import inspect
 
-    import base_client
+    import message_processor.client_contract as base_client
     from slack_client.messaging import SlackMessagingMixin
 
     for func in (SlackMessagingMixin.send_message,
@@ -800,7 +800,7 @@ async def test_transports_refuse_receipts_without_a_class():
     import io
     from unittest.mock import MagicMock
 
-    import base_client
+    import message_processor.client_contract as base_client
     from slack_client.messaging import SlackMessagingMixin
 
     host = MagicMock()

@@ -14,8 +14,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from PIL import Image
 
-import image_validation
-from image_validation import (ANIMATED_GIF, UNREADABLE, API_IMAGE_MIMETYPES,
+import message_processor.ingestion.image_validation as image_validation
+from message_processor.ingestion.image_validation import (ANIMATED_GIF, UNREADABLE, API_IMAGE_MIMETYPES,
                               IMAGE_EDIT_MIMETYPES, ensure_api_compatible,
                               ensure_compatible, sniff_image_mimetype,
                               validate_image_bytes)

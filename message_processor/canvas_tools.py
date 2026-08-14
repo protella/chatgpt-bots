@@ -48,10 +48,10 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Set, cast
 
-from canvas_content import CANVAS_MARKER, html_to_markdown
+from message_processor.canvas_content import CANVAS_MARKER, html_to_markdown
 from config import config
 from logger import setup_logger
-from tool_registry import ToolContext, ToolRegistry
+from message_processor.tool_registry import ToolContext, ToolRegistry
 
 logger = setup_logger(name="slack_bot.CanvasTools")
 

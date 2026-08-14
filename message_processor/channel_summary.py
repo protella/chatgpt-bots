@@ -287,7 +287,7 @@ class ChannelSummaryService:
         """Generate the narrative from an already-collected snapshot and persist it. RAISES on an
         empty generation; returns None when a mutation during the model call made the output stale,
         or when the save was refused. On success returns the saved narrative text."""
-        from prompts import CHANNEL_NARRATIVE_PROMPT  # lazy: avoid import cycle at module load
+        from message_processor.prompts import CHANNEL_NARRATIVE_PROMPT  # lazy: avoid import cycle at module load
         user_block = (
             "Recent channel messages (oldest to newest; some earlier ones may be omitted):\n\n"
             + "\n".join(lines)

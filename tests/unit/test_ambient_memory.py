@@ -8,7 +8,7 @@ import tempfile
 
 import pytest
 
-import ambient_fetch
+import message_processor.ingestion.ambient_fetch as ambient_fetch
 from database import DatabaseManager
 from message_processor import ambient_memory as am
 from message_processor.ambient_memory import AmbientArtifactService, _Job

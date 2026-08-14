@@ -195,7 +195,7 @@ async def catalog_uploads(processor, thread_key: str, image_inputs: List[Dict[st
     # so we key off that rather than a separately-built url list — the two can drift when an image
     # is skipped (oversized/undecodable) and is absent from image_inputs but present in the url
     # list, which would misattribute descriptions.
-    from prompts import IMAGE_ANALYSIS_PROMPT
+    from message_processor.prompts import IMAGE_ANALYSIS_PROMPT
 
     # Anything that ALREADY has a description does not need a second one.
     #

@@ -341,7 +341,7 @@ def _terminal_processor(loop_result, *, background=False, sandbox_assets=(), art
     The point is the metadata contract at the end of a silent turn: everything the turn
     PRODUCED still has to reach main.py, because silence was a decision about words.
     """
-    from base_client import Response  # noqa: F401 — the handler builds one
+    from message_processor.client_contract import Response  # noqa: F401 — the handler builds one
     from message_processor.handlers.text import TextHandlerMixin
 
     host = MagicMock()
@@ -392,7 +392,7 @@ def _terminal_processor(loop_result, *, background=False, sandbox_assets=(), art
 async def test_a_silent_turn_still_hands_over_everything_it_produced():
     """Files built in the sandbox, images made as ingredients, a job's card: silence ends the
     WORDS. A terminal response that dropped these swallowed the turn's own deliverables."""
-    from base_client import Message
+    from message_processor.client_contract import Message
     from config import config as cfg
 
     host = _terminal_processor(
@@ -428,7 +428,7 @@ async def test_a_silent_turn_still_hands_over_everything_it_produced():
 async def test_a_started_job_is_never_hidden_by_the_silence_that_accompanied_it():
     """Both facts ride the response. The job's card is what the room sees, so main.py must be
     able to see it too — and the model's own account of why it added no words survives."""
-    from base_client import Message
+    from message_processor.client_contract import Message
     from config import config as cfg
 
     host = _terminal_processor(
@@ -910,7 +910,7 @@ async def test_a_result_override_is_keyed_by_identity_not_call_id():
 # ------------------------------- the contract paragraphs (moved from test_no_reply_tool.py)
 
 def test_channel_activity_paragraph_wording():
-    from prompts import CHANNEL_ACTIVITY_NO_REPLY_SUFFIX as s
+    from message_processor.prompts import CHANNEL_ACTIVITY_NO_REPLY_SUFFIX as s
     assert "uninvited" not in s
     assert "Silence is the DEFAULT here" in s
     assert "could not easily get themselves" in s
@@ -924,7 +924,7 @@ def test_channel_activity_paragraph_wording():
 
 
 def test_thread_activity_paragraph_wording():
-    from prompts import (CHANNEL_ACTIVITY_NO_REPLY_SUFFIX,
+    from message_processor.prompts import (CHANNEL_ACTIVITY_NO_REPLY_SUFFIX,
                          THREAD_ACTIVITY_NO_REPLY_SUFFIX as s)
     assert "check its addressee yourself" in s
     assert "STICKS" in s
@@ -938,7 +938,7 @@ def test_thread_activity_paragraph_wording():
 
 def test_neither_paragraph_restates_the_silence_vocabulary():
     """The eight values live in the tool schema. Two copies of one vocabulary drift."""
-    from prompts import (CHANNEL_ACTIVITY_NO_REPLY_SUFFIX,
+    from message_processor.prompts import (CHANNEL_ACTIVITY_NO_REPLY_SUFFIX,
                          THREAD_ACTIVITY_NO_REPLY_SUFFIX)
     identifiers = [v for v in SILENCE_REASONS if "_" in v]
     for paragraph in (CHANNEL_ACTIVITY_NO_REPLY_SUFFIX, THREAD_ACTIVITY_NO_REPLY_SUFFIX):

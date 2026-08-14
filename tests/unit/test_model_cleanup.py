@@ -11,7 +11,7 @@ import pytest
 
 from config import BotConfig, MODEL_KNOWLEDGE_CUTOFFS, SUPPORTED_CHAT_MODELS
 from database import DatabaseManager
-from settings_modal import SettingsModal
+from slack_client.settings_modal import SettingsModal
 
 
 @pytest.fixture

@@ -438,7 +438,7 @@ async def test_the_richer_write_upgrades_the_channel_placeholder_in_place(temp_d
 
 async def test_the_ledger_writer_reaches_the_same_upgrade(temp_db):
     """The production phase-2 caller: utilities hands DocumentLedger.add_document the db."""
-    from thread_manager import DocumentLedger
+    from message_processor.thread_manager import DocumentLedger
 
     assert await temp_db.save_document_if_absent_async(
         THREAD, "q3.pdf", "application/pdf",

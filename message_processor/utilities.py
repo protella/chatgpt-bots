@@ -11,19 +11,19 @@ import os
 import re
 import pytz  # type: ignore[import-untyped]  # no stubs shipped; types-pytz isn't in the lockfile
 
-import prompts
-from base_client import BaseClient, Message
-from canvas_content import CANVAS_MIMETYPE
-from document_handler import container_magic_mismatch
+import message_processor.prompts as prompts
+from message_processor.client_contract import BaseClient, Message
+from message_processor.canvas_content import CANVAS_MIMETYPE
+from message_processor.ingestion.document_handler import container_magic_mismatch
 from config import config, pipeline_status
-from image_validation import ensure_api_compatible, TOO_LARGE_AFTER_CONVERSION
+from message_processor.ingestion.image_validation import ensure_api_compatible, TOO_LARGE_AFTER_CONVERSION
 from message_processor._host import _Host
 from message_processor.message_timestamps import stamp_content
 from message_processor.people_tools import format_people_summary
-from prompts import (SLACK_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT, LOCAL_TOOLS_GUIDANCE,
-                     CODE_INTERPRETER_GUIDANCE, CANVAS_GUIDANCE, TAGGABLE_ROSTER_HEADING,
-                     TURN_COORDINATES_HEADING)
-from tool_registry import SURFACE_CHANNEL, SURFACE_DM
+from message_processor.prompts import (SLACK_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT, LOCAL_TOOLS_GUIDANCE,
+                                       CODE_INTERPRETER_GUIDANCE, CANVAS_GUIDANCE, TAGGABLE_ROSTER_HEADING,
+                                       TURN_COORDINATES_HEADING)
+from message_processor.tool_registry import SURFACE_CHANNEL, SURFACE_DM
 
 
 REACH_TOOLS = prompts.REACH_TOOLS
@@ -379,7 +379,7 @@ class MessageUtilitiesMixin(_Host):
             except Exception as e:
                 self.log_warning(f"Schema block failed for {filename}: {e}")
         try:
-            from prompts import DOCUMENT_SUMMARIZATION_PROMPT
+            from message_processor.prompts import DOCUMENT_SUMMARIZATION_PROMPT
             # Bound the summarizer's input (utility window guard, chars/4 heuristic)
             summary = await self.openai_client.create_text_response(
                 messages=[

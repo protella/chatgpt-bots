@@ -13,11 +13,11 @@ import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from base_client import Message
+from message_processor.client_contract import Message
 from message_processor.ambient_memory import AmbientArtifactService, _Job
 from message_processor.thread_management import ThreadManagementMixin
 from message_processor.utilities import MessageUtilitiesMixin
-from thread_manager import AsyncThreadStateManager, ThreadState
+from message_processor.thread_manager import AsyncThreadStateManager, ThreadState
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 

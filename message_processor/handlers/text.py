@@ -5,7 +5,7 @@ import re
 import time
 from typing import Any, Dict, List, Mapping, Optional, cast
 
-from base_client import BaseClient, Message, Response
+from message_processor.client_contract import BaseClient, Message, Response
 from config import config, pipeline_status
 from message_processor import participation_telemetry
 from message_processor._host import _Host
@@ -22,10 +22,10 @@ from message_processor.turn_runtime import (DEST_KIND_CORRECTION_ANNOUNCEMENT,
                                             POST_TO_THREAD_TOOL, AuthorizedEditTarget,
                                             TurnEffectsUnsettled, await_turn_effects,
                                             revoke_turn_effects)
-import prompts
-from prompts import (CHANNEL_ACTIVITY_NO_REPLY_SUFFIX, DESTINATION_CONTRACT_SUFFIX,
-                     THREAD_ACTIVITY_NO_REPLY_SUFFIX)
-from message_markers import (
+import message_processor.prompts as prompts
+from message_processor.prompts import (CHANNEL_ACTIVITY_NO_REPLY_SUFFIX, DESTINATION_CONTRACT_SUFFIX,
+                                       THREAD_ACTIVITY_NO_REPLY_SUFFIX)
+from message_processor.message_markers import (
     CONTINUATION_HEAD,
     continuation_trailer,
     entity_safe_cut,
@@ -33,7 +33,7 @@ from message_markers import (
     segment_separator,
 )
 from streaming import FenceHandler, NativeStreamCoordinator, RateLimitManager, StreamingBuffer
-from tool_registry import SURFACE_CHANNEL, SURFACE_DM, SandboxHolder, ToolContext
+from message_processor.tool_registry import SURFACE_CHANNEL, SURFACE_DM, SandboxHolder, ToolContext
 from message_processor import (canvas_tools, file_mount, image_catalog, image_service,
                                image_tools, thread_files)
 from message_processor.artifacts import (collect_container_ids, stream_safe_text, strip_citation_markers,

@@ -36,7 +36,7 @@ from slack_client.history_tool import SlackHistoryToolMixin
 from slack_client.messaging import SlackMessagingMixin
 from slack_client.search_tool import SlackSearchToolMixin
 from tests.unit import channel_turn_harness as harness
-from tool_registry import ToolContext, serialize_tool_result
+from message_processor.tool_registry import ToolContext, serialize_tool_result
 
 CHANNEL = "C1"
 OTHER_CHANNEL = "C2"
@@ -249,7 +249,7 @@ def _ctx(turn, *, channel=CHANNEL, is_dm=False, thread="9000.0"):
 
 
 def _registry(name, executor, *, timeout=30.0):
-    from tool_registry import ToolRegistry
+    from message_processor.tool_registry import ToolRegistry
 
     registry = ToolRegistry()
     registry.register({"type": "function", "name": name, "parameters": {}}, executor,
@@ -870,7 +870,7 @@ def _handler_host(loop_result, db, *, streaming=True):
 async def _drive_handler(host, turn, *, streaming=True):
     from unittest.mock import patch
 
-    from base_client import Message
+    from message_processor.client_contract import Message
 
     message = Message(text="what was the cert blocker?", user_id="U1", channel_id=CHANNEL,
                       thread_id="9000.0", metadata={"ts": "9000.0"})
@@ -919,7 +919,7 @@ async def test_search_authorizes_a_post_to_an_old_root(temp_db, monkeypatch, str
     monkeypatch.setattr(config, "enable_tool_provenance", True)
     monkeypatch.setattr(config, "enable_tool_result_memory", False)
 
-    from tool_registry import ToolRegistry
+    from message_processor.tool_registry import ToolRegistry
 
     turn = _turn()
     search = _search_host([reply_hit()])
@@ -1008,7 +1008,7 @@ async def test_same_round_enrollment_does_not_authorize_the_same_round_post(monk
     reading the set the round resolved. Anyone re-verifying W3 should mutate that line.
     """
     monkeypatch.setattr(config, "enable_post_to_thread_tool", True)
-    from tool_registry import ToolRegistry
+    from message_processor.tool_registry import ToolRegistry
 
     turn = _turn()
     search = _search_host([reply_hit()])
@@ -1291,7 +1291,7 @@ async def test_a_post_that_landed_keeps_its_provenance_when_a_later_round_fails(
     from message_processor.handlers.text import TextHandlerMixin
     from openai_client.api import responses as responses_api
     from openai_client.api.tool_loop import create_text_response_with_tool_loop
-    from tool_registry import ToolRegistry
+    from message_processor.tool_registry import ToolRegistry
 
     poster = _post_host()
     search = _search_host([reply_hit()])
@@ -1411,7 +1411,7 @@ async def test_a_streamed_post_keeps_its_provenance_when_a_later_round_fails(
                                              create_text_response_with_tool_loop)
     from tests.unit.test_reply_surface import (FakeSlack, _message, _processor, _thread_state,
                                                _thread_turn)
-    from tool_registry import ToolRegistry
+    from message_processor.tool_registry import ToolRegistry
 
     poster = _post_host()
     search = _search_host([reply_hit()])

@@ -14,9 +14,9 @@ import pytest
 
 from config import config, _env_list
 from database import DatabaseManager
-from settings_modal import SettingsModal
+from slack_client.settings_modal import SettingsModal
 from slack_client.messaging import SlackMessagingMixin
-from base_client import Message, Response
+from message_processor.client_contract import Message, Response
 
 
 # --------------------------------------------------------------------------- env lists

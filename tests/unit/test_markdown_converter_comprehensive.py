@@ -3,7 +3,7 @@ Comprehensive unit tests for markdown_converter.py module
 Tests for improved coverage of markdown conversion functionality
 """
 import pytest
-from markdown_converter import MarkdownConverter
+from slack_client.markdown_converter import MarkdownConverter
 
 
 class TestMarkdownConverterComprehensive:

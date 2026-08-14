@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Optional
 
 from config import config
 from message_processor.channel_steering import is_ordinary_fact
-from tool_registry import ToolContext, ToolRegistry
+from message_processor.tool_registry import ToolContext, ToolRegistry
 
 # Keep stored facts to a concise sentence-or-two; hard cap guards the prompt.
 MAX_FACT_CHARS = 500

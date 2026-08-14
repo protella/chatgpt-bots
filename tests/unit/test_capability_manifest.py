@@ -88,7 +88,7 @@ class TestPromptRule:
         (which has the tools rather than a description of them) decides.
 
         Asserted as an absence so the floor cannot creep back in without its inputs."""
-        from prompts import WAKE_CLASSIFIER_SYSTEM_PROMPT as p
+        from message_processor.prompts import WAKE_CLASSIFIER_SYSTEM_PROMPT as p
         for retired in ("tools as they are described to it",
                         "genuinely open to the channel at large", "own tools/data sources"):
             assert retired not in p, retired

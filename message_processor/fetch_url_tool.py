@@ -13,9 +13,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
-import ambient_fetch
+import message_processor.ingestion.ambient_fetch as ambient_fetch
 from config import config
-from tool_registry import ToolContext, ToolRegistry
+from message_processor.tool_registry import ToolContext, ToolRegistry
 
 # Bounded slice returned to the model — big enough to answer from, small enough not to blow the
 # tool-result cap. Distinct from the (larger) extraction cap fed to the ambient summarizer.

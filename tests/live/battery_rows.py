@@ -500,7 +500,7 @@ async def search_coverage_probe(ctx: RowContext, query: str, *,
 
     from slack_client.history_tool import SlackHistoryToolMixin
     from slack_client.search_tool import SlackSearchToolMixin
-    from tool_registry import ToolContext
+    from message_processor.tool_registry import ToolContext
 
     class _Probe(SlackSearchToolMixin, SlackHistoryToolMixin):
         """The two mixins as production composes them, over the harness's own bot client."""

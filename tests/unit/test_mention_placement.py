@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from base_client import Message
+from message_processor.client_contract import Message
 from config import config
 from message_processor.participation import WakeDecision
 from slack_client.event_handlers.message_events import SlackMessageEventsMixin

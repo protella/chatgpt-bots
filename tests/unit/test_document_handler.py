@@ -4,7 +4,7 @@ import pytest
 from unittest.mock import Mock, patch
 
 # Import the document handler normally since pandas import was removed
-from document_handler import (
+from message_processor.ingestion.document_handler import (
     DocumentHandler, 
     SUPPORTED_DOCUMENT_MIMETYPES, 
     DOCUMENT_EXTENSIONS,
@@ -223,8 +223,8 @@ class TestDocumentHandlerPDFParsing:
         handler = DocumentHandler()
         return handler
     
-    @patch('document_handler.pypdf.PdfReader')
-    @patch('document_handler.pdfplumber.open')
+    @patch('message_processor.ingestion.document_handler.pypdf.PdfReader')
+    @patch('message_processor.ingestion.document_handler.pdfplumber.open')
     def test_parse_pdf_no_libraries(self, mock_pdfplumber_open, mock_pypdf2_reader, handler):
         """Test PDF parsing when no libraries are available"""
         # Make both libraries fail
@@ -235,7 +235,7 @@ class TestDocumentHandlerPDFParsing:
         with pytest.raises(Exception, match="pypdf parsing failed"):
             handler.parse_pdf_structured(b'pdf data', 'test.pdf')
     
-    @patch('document_handler.pdfplumber.open')
+    @patch('message_processor.ingestion.document_handler.pdfplumber.open')
     def test_parse_pdf_with_pdfplumber_success(self, mock_pdfplumber_open, handler_with_pdf):
         """Test successful PDF parsing with pdfplumber"""
         # Mock pdfplumber objects
@@ -261,8 +261,8 @@ class TestDocumentHandlerPDFParsing:
         assert 'Sample text from page 1' in result['content']
         assert '[Page 1]' in result['content']
     
-    @patch('document_handler.pypdf.PdfReader')
-    @patch('document_handler.pdfplumber.open')
+    @patch('message_processor.ingestion.document_handler.pypdf.PdfReader')
+    @patch('message_processor.ingestion.document_handler.pdfplumber.open')
     def test_parse_pdf_with_pypdf2_fallback(self, mock_pdfplumber_open, mock_pypdf2_reader, handler_with_pypdf2):
         """Test PDF parsing with pypdf fallback"""
         # Make pdfplumber fail
@@ -284,7 +284,7 @@ class TestDocumentHandlerPDFParsing:
         assert result['has_tables'] is False
         assert 'Page text' in result['content']
     
-    @patch('document_handler.pdfplumber.open')
+    @patch('message_processor.ingestion.document_handler.pdfplumber.open')
     def test_parse_pdf_large_document_limitation(self, mock_pdfplumber_open, handler_with_pdf):
         """Test PDF parsing with page count limitation"""
         # Create many mock pages
@@ -306,7 +306,7 @@ class TestDocumentHandlerPDFParsing:
         assert len(result['pages']) <= 1001  # 1000 + truncation notice
         assert 'pages omitted' in str(result['pages'][-1]['content'])
     
-    @patch('document_handler.pdfplumber.open')
+    @patch('message_processor.ingestion.document_handler.pdfplumber.open')
     def test_parse_pdf_page_extraction_error(self, mock_pdfplumber_open, handler_with_pdf):
         """Test handling of page extraction errors"""
         mock_page = Mock()
@@ -339,7 +339,7 @@ class TestDocumentHandlerWordProcessing:
         handler = DocumentHandler()
         return handler
     
-    @patch('document_handler.Document')
+    @patch('message_processor.ingestion.document_handler.Document')
     def test_parse_docx_no_library(self, mock_document_class, handler):
         """Test Word parsing when python-docx is not available"""
         # Make Document fail
@@ -350,7 +350,7 @@ class TestDocumentHandlerWordProcessing:
             result = handler.parse_docx_structured(b'docx data', 'test.docx')
             assert result['content'] == 'fallback'
     
-    @patch('document_handler.Document')
+    @patch('message_processor.ingestion.document_handler.Document')
     def test_parse_docx_success(self, mock_document_class, handler_with_docx):
         """Test successful Word document parsing"""
         # Mock document structure
@@ -437,7 +437,7 @@ class TestDocumentHandlerSpreadsheets:
         mock_pandas.DataFrame = Mock()
         return handler
     
-    @patch('document_handler.pd')
+    @patch('message_processor.ingestion.document_handler.pd')
     def test_parse_excel_no_pandas(self, mock_pd, handler):
         """Test Excel parsing when pandas is not available"""
         # Make pandas fail
@@ -490,7 +490,7 @@ class TestDocumentHandlerSpreadsheets:
                 assert result['format'] == 'csv'
                 mock_csv.assert_called_once()
     
-    @patch('document_handler.pd')
+    @patch('message_processor.ingestion.document_handler.pd')
     def test_parse_excel_with_pandas_multiple_sheets(self, mock_pd, handler_with_pandas):
         """Test Excel parsing with multiple sheets"""
         # Mock DataFrame
@@ -519,7 +519,7 @@ class TestDocumentHandlerSpreadsheets:
         assert result['sheets'][0]['name'] == 'Sheet1'
         assert result['sheets'][1]['name'] == 'Sheet2'
     
-    @patch('document_handler.pd')
+    @patch('message_processor.ingestion.document_handler.pd')
     def test_parse_csv_encoding_detection(self, mock_pd, handler_with_pandas):
         """Test CSV parsing with encoding detection"""
         # Test with different encodings

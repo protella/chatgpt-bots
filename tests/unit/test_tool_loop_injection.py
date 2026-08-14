@@ -22,7 +22,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from openai_client.api import tool_loop
-from tool_registry import ToolContext, ToolRegistry
+from message_processor.tool_registry import ToolContext, ToolRegistry
 
 
 # --------------------------------------------------------------------------- helpers
@@ -98,7 +98,7 @@ def _ci_container(tools):
 
 
 def _holder_ctx(container_id=None, gone_sink=None):
-    from tool_registry import SandboxHolder
+    from message_processor.tool_registry import SandboxHolder
     ctx = ToolContext(sandbox=SandboxHolder(
         container_id=container_id, manager=MagicMock(adopt=AsyncMock()), thread_key="C1:1.1"))
     ctx.container_gone_sink = gone_sink if gone_sink is not None else []

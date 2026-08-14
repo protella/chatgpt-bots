@@ -62,7 +62,7 @@ from message_processor.stale_send_guard import (Scope, StaleSendSuppressed, Turn
 from message_processor.turn_runtime import ReconsiderFacts
 from message_processor.utilities import effective_request_model
 from openai_client.api.responses import STALE_RECONSIDERATION_RESPONSE_FORMAT
-from prompts import RECONSIDERATION_INSTRUCTION
+from message_processor.prompts import RECONSIDERATION_INSTRUCTION
 
 logger = setup_logger(name="slack_bot.Reconsideration")
 

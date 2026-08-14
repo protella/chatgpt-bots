@@ -18,7 +18,7 @@ from pdf2image import convert_from_bytes
 from docx import Document
 from pptx import Presentation
 import pandas as pd
-from canvas_content import CANVAS_MARKER, CANVAS_MIMETYPE, html_to_markdown
+from message_processor.canvas_content import CANVAS_MARKER, CANVAS_MIMETYPE, html_to_markdown
 from config import config
 from logger import LoggerMixin
 

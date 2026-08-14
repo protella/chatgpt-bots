@@ -112,7 +112,7 @@ def test_get_thread_config_fetches_channel_row(cfg, db):
 # ---------------- modal ----------------
 
 def test_channel_modal_offers_shared_selects_and_personal_button():
-    from settings_modal import SettingsModal
+    from slack_client.settings_modal import SettingsModal
     modal = SettingsModal.__new__(SettingsModal)  # builder needs no db
     view = modal.build_channel_settings_modal(
         "C1", {"model": "gpt-5.5", "reasoning_effort": "high", "verbosity": None},
@@ -148,7 +148,7 @@ def test_channel_modal_full_ladder_on_56_and_inherit(monkeypatch):
     and fail on a workspace running gpt-5.5.
     """
     from config import config
-    from settings_modal import SettingsModal
+    from slack_client.settings_modal import SettingsModal
     monkeypatch.setattr(config, "gpt_model", "gpt-5.6-sol")
     modal = SettingsModal.__new__(SettingsModal)
     for cs in ({"model": "gpt-5.6-terra"}, {}, {"model": None}):
@@ -174,7 +174,7 @@ def test_channel_modal_full_ladder_on_56_and_inherit(monkeypatch):
 def test_channel_modal_stored_max_survives_model_swap_as_inherit():
     # Stored effort 'max' with the model switched to gpt-5.5: max isn't in the
     # 5.5 ladder, so the select falls back to inherit instead of crashing.
-    from settings_modal import SettingsModal
+    from slack_client.settings_modal import SettingsModal
     modal = SettingsModal.__new__(SettingsModal)
     view = modal.build_channel_settings_modal(
         "C1", {"model": "gpt-5.5", "reasoning_effort": "max"}, "tag_only")

@@ -40,16 +40,16 @@ import re
 from typing import Any, Dict, Optional, Tuple, cast
 from urllib.parse import urlsplit
 
-import ambient_fetch
+import message_processor.ingestion.ambient_fetch as ambient_fetch
 from config import clamp_effort, config
-from image_validation import (_MAX_TRANSCODE_PIXELS, _gif_is_animated,
-                              validate_image_bytes)
+from message_processor.ingestion.image_validation import (_MAX_TRANSCODE_PIXELS, _gif_is_animated,
+                                                          validate_image_bytes)
 from logger import setup_logger
 from message_processor.turn_runtime import (EffectRevoked, LaunchNotRecorded,
                                             mark_tool_launched as _mark_launched,
                                             run_effect as _run_effect)
 from openai_client.utilities import ImageData
-from tool_registry import ToolContext, ToolRegistry
+from message_processor.tool_registry import ToolContext, ToolRegistry
 
 logger = setup_logger(name="slack_bot.ImportImage")
 

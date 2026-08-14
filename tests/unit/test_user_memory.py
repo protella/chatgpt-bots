@@ -25,8 +25,8 @@ from message_processor.memory_tools import (
     get_remember_fact_schema,
     register_memory_tools,
 )
-from settings_modal import SettingsModal
-from tool_registry import SURFACE_CHANNEL, SURFACE_DM, ToolContext, ToolRegistry
+from slack_client.settings_modal import SettingsModal
+from message_processor.tool_registry import SURFACE_CHANNEL, SURFACE_DM, ToolContext, ToolRegistry
 
 DM = "D0BKX77NU66"
 CHANNEL = "C0BKX77NU66"

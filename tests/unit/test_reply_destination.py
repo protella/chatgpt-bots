@@ -84,8 +84,8 @@ def test_a_settled_route_is_never_offered_the_tool(mock_env, message, allowed):
 
 def test_an_open_turn_gets_the_flag_and_the_contract_paragraph(mock_env):
     from message_processor.handlers.text import TextHandlerMixin
-    from prompts import DESTINATION_CONTRACT_SUFFIX
-    from tool_registry import ToolRegistry
+    from message_processor.prompts import DESTINATION_CONTRACT_SUFFIX
+    from message_processor.tool_registry import ToolRegistry
 
     registry = ToolRegistry()
     registry.register(get_set_reply_destination_schema(), AsyncMock(return_value={"ok": True}),
@@ -132,7 +132,7 @@ def test_the_schema_offers_exactly_two_destinations():
 def test_the_contract_paragraph_defaults_to_thread_when_balanced():
     """The rubric is REVERSED from the utility classifier this replaces, which answered
     "channel" whenever it was unsure — so every ambiguous long answer landed in the room."""
-    from prompts import DESTINATION_CONTRACT_SUFFIX as s
+    from message_processor.prompts import DESTINATION_CONTRACT_SUFFIX as s
     assert "begin your reply with exactly" in s
     assert "If it is a close call, choose thread" in s
 
@@ -140,7 +140,7 @@ def test_the_contract_paragraph_defaults_to_thread_when_balanced():
 def test_the_contract_paragraph_spells_the_markers_the_parser_accepts():
     """The prompt and the parser have to agree on the literal, character for character — a
     paragraph teaching a grammar nothing accepts is a contract miss on every single turn."""
-    from prompts import DESTINATION_CONTRACT_SUFFIX as s
+    from message_processor.prompts import DESTINATION_CONTRACT_SUFFIX as s
     for destination in SELECTABLE_DESTINATIONS:
         marker = destination_marker(destination)
         assert marker in s
@@ -600,7 +600,7 @@ def test_the_channel_registry_does_not_carry_the_tool_and_the_dm_one_still_does(
     structurally ignored on the channel surface, so a per-turn gate there would have been a lie —
     and a schema set that varies within a channel is a cache fork."""
     from message_processor.destination_tools import register_destination_tools
-    from tool_registry import SURFACE_CHANNEL, SURFACE_DM, ToolRegistry
+    from message_processor.tool_registry import SURFACE_CHANNEL, SURFACE_DM, ToolRegistry
 
     registry = ToolRegistry()
     register_destination_tools(registry)
@@ -620,8 +620,8 @@ def test_the_marker_paragraph_rides_a_turn_with_no_tool_to_call(mock_env):
     channel surface — the only surface that ever has a destination to choose — has no tool."""
     from message_processor.destination_tools import register_destination_tools
     from message_processor.handlers.text import TextHandlerMixin
-    from prompts import DESTINATION_CONTRACT_SUFFIX
-    from tool_registry import SURFACE_CHANNEL, ToolRegistry
+    from message_processor.prompts import DESTINATION_CONTRACT_SUFFIX
+    from message_processor.tool_registry import SURFACE_CHANNEL, ToolRegistry
 
     registry = ToolRegistry()
     register_destination_tools(registry)
@@ -801,7 +801,7 @@ async def test_no_marker_reaches_a_non_streamed_reconsidered_reply(monkeypatch):
     goes to Slack, to F7 persistence, and into the history the next turn rebuilds. It is fresh
     model output and can mint a marker the original draft never had."""
     import main as main_module
-    from base_client import Message, Response
+    from message_processor.client_contract import Message, Response
     from main import ChatBotV2
     from message_processor.stale_send_guard import StaleSendSuppressed
 
@@ -1002,7 +1002,7 @@ async def test_a_held_tail_never_migrates_across_a_local_tool_seam(monkeypatch):
     them — so the room would read `A\\n\\n[B` while the history said `A[\\n\\nB`. The two must be
     the same bytes."""
     from config import config
-    from message_markers import join_segments
+    from message_processor.message_markers import join_segments
     monkeypatch.setattr(config, "enable_no_reply_tool", False, raising=False)
 
     segments = ["Checking that.[", "Here you go."]
@@ -1038,7 +1038,7 @@ def test_rounds_are_parsed_alone_so_a_marker_cannot_eat_a_seam():
     it. Handed the joined string, a marker that ended round one swallows the separator that was
     inserted after it — and the streaming reader, flushed at every round boundary, does not. On a
     native turn that disagreement is permanent: the buffer is what Slack keeps."""
-    from message_markers import join_segments
+    from message_processor.message_markers import join_segments
 
     segments = ["Checking that.[[reply:thread]]", "Here you go."]
     joined = join_segments(segments)
@@ -1055,7 +1055,7 @@ def test_rounds_are_parsed_alone_so_a_marker_cannot_eat_a_seam():
 def test_a_leading_markers_whitespace_still_vanishes_per_round():
     """The trailing-whitespace rule exists so a reply never opens with a blank line. Parsing per
     round must not cost that: within a round the marker still takes its own separator with it."""
-    from message_markers import join_segments
+    from message_processor.message_markers import join_segments
 
     segments = ["[[reply:channel]]\n\nThe short answer.", "And the follow-up."]
     assert consume_destination_marker(None, segments=segments) == join_segments(
@@ -1157,7 +1157,7 @@ def _non_streaming_loop(monkeypatch, rounds):
 async def test_the_non_streaming_loop_aggregates_only_for_the_caller_that_asks(monkeypatch):
     """Chat wants the whole turn; deep research wants the report and not the "I'll go look…"
     that preceded it. Same opt-in the streaming twin has, and the rounds come back either way."""
-    from message_markers import join_segments
+    from message_processor.message_markers import join_segments
 
     rounds = ["[[reply:channel]] Checking.", "Done."]
     run_loop = _non_streaming_loop(monkeypatch, rounds)
@@ -1177,7 +1177,7 @@ async def test_a_marker_written_before_a_tool_still_places_the_reply(monkeypatch
     """A marker belongs in the model's opening tokens, which on a tool turn is round ONE — not
     at the head of the joined whole. Parsing per round is what finds it, and the preamble it was
     attached to survives with its seam."""
-    from message_markers import join_segments
+    from message_processor.message_markers import join_segments
 
     rounds = ["[[reply:channel]] Checking.", "Done."]
     result = await _non_streaming_loop(monkeypatch, rounds)(aggregate_segments=True)
@@ -1203,7 +1203,7 @@ async def test_the_non_streamed_turn_keeps_its_preamble_and_its_marked_destinati
     and the marker it carried still places the reply. The canonicalization is byte-for-byte what
     the streaming path produces for the same rounds."""
     from config import config
-    from message_markers import join_segments
+    from message_processor.message_markers import join_segments
     monkeypatch.setattr(config, "enable_no_reply_tool", False, raising=False)
 
     rounds = ["[[reply:channel]] Checking that for you.", "Done — it shipped Tuesday."]
@@ -1252,7 +1252,7 @@ async def test_the_streaming_loop_hands_back_the_rounds_it_joined(monkeypatch):
     caller that has to transform the text can do it before the seams exist. Absent unless the
     caller asked for the aggregate — a final-round-only consumer must never be handed rounds its
     `text` does not describe."""
-    from message_markers import join_segments
+    from message_processor.message_markers import join_segments
     from openai_client.api import tool_loop
 
     rounds = [["Checking that.[[reply:thread]]"], ["Here you go."]]
@@ -1450,7 +1450,7 @@ async def test_a_non_streamed_reply_locks_its_destination_when_it_goes_out():
     """The streaming paths lock when they bind a surface; a non-streamed reply is posted by
     main.py, so that send is the same moment. Without it `destination_locked` would be false on
     a turn whose answer is already in the room."""
-    from base_client import Message, Response
+    from message_processor.client_contract import Message, Response
     from main import ChatBotV2
 
     app = ChatBotV2.__new__(ChatBotV2)
@@ -1494,7 +1494,7 @@ def _notice_processor():
         _post_prior_timeout_notice = MessageProcessor._post_prior_timeout_notice
 
         def __init__(self):
-            from thread_manager import AsyncThreadStateManager
+            from message_processor.thread_manager import AsyncThreadStateManager
             self.thread_manager = AsyncThreadStateManager(db=None)
             self.db = None
 
@@ -1523,7 +1523,7 @@ async def test_a_channel_prior_timeout_notice_settles_before_the_request_is_meas
     That is a reply in a slightly less convenient place; the alternative was an estimate that
     measured a request nobody sent."""
     import contextlib
-    from base_client import Message
+    from message_processor.client_contract import Message
 
     proc = _notice_processor()
     message = Message(text="q", user_id="U1", channel_id="C1", thread_id="10.0",
@@ -1566,7 +1566,7 @@ async def test_a_prior_timeout_notice_is_logged_as_what_it_did(notice_ts, expect
     """[r4-7] `send_message` swallows a SlackApiError and returns None, and the line said "Notified
     user" either way — so the one path where nobody is told anything read exactly like the one where
     they were."""
-    from base_client import Message
+    from message_processor.client_contract import Message
 
     proc = _notice_processor()
     logged = []

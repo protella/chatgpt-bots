@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 from io import BytesIO
 import zipfile
 
-from document_handler import DocumentHandler
+from message_processor.ingestion.document_handler import DocumentHandler
 
 
 class TestPDFToImageConversion:
@@ -16,7 +16,7 @@ class TestPDFToImageConversion:
         """Create a DocumentHandler instance"""
         return DocumentHandler()
     
-    @patch('document_handler.convert_from_bytes')
+    @patch('message_processor.ingestion.document_handler.convert_from_bytes')
     def test_convert_pdf_to_images_success(self, mock_convert, handler):
         """Test successful PDF to image conversion"""
         # Create mock PIL images
@@ -47,7 +47,7 @@ class TestPDFToImageConversion:
         # Verify convert_from_bytes was called correctly
         mock_convert.assert_called_once_with(b'pdf data', dpi=150, fmt='png')
     
-    @patch('document_handler.convert_from_bytes')
+    @patch('message_processor.ingestion.document_handler.convert_from_bytes')
     def test_convert_pdf_to_images_max_pages_limit(self, mock_convert, handler):
         """Test PDF conversion respects max_pages limit"""
         # Create 15 mock images
@@ -72,7 +72,7 @@ class TestPDFToImageConversion:
         assert result[0]['page'] == 1
         assert result[9]['page'] == 10
     
-    @patch('document_handler.convert_from_bytes')
+    @patch('message_processor.ingestion.document_handler.convert_from_bytes')
     def test_convert_pdf_to_images_failure(self, mock_convert, handler):
         """Test handling of PDF conversion failure"""
         mock_convert.side_effect = Exception("poppler-utils not installed")
@@ -81,7 +81,7 @@ class TestPDFToImageConversion:
         
         assert result == []
     
-    @patch('document_handler.convert_from_bytes')
+    @patch('message_processor.ingestion.document_handler.convert_from_bytes')
     def test_convert_pdf_to_images_partial_failure(self, mock_convert, handler):
         """Test handling when some pages fail to convert"""
         mock_image1 = Mock()

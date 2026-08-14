@@ -20,7 +20,7 @@ from message_processor.people_tools import (
     register_people_tools,
     MEMBERS_NAME_CAP,
 )
-from tool_registry import ToolContext, ToolRegistry
+from message_processor.tool_registry import ToolContext, ToolRegistry
 
 CHANNEL = "C0BKX77NU66"
 

@@ -1,8 +1,9 @@
 """slack_client.base.SlackBot.download_file_async must accept and forward `max_bytes`.
 
-The abstract (base_client.py) declares `max_bytes: Optional[int] = None`; the concrete override
-had dropped it, so a caller passing a streaming byte cap would hit a TypeError (or silently lose
-the cap on a looser call site). This pins the signature + pass-through.
+The abstract (message_processor/client_contract.py) declares `max_bytes: Optional[int] = None`;
+the concrete override had dropped it, so a caller passing a streaming byte cap would hit a
+TypeError (or silently lose the cap on a looser call site). This pins the signature +
+pass-through.
 
 `allow_html` (canvases) rides the same wrapper and is pinned the same way — see
 tests/unit/test_canvas_document.py for the canvas-side coverage.

@@ -6,7 +6,7 @@ import pytest
 from io import BytesIO
 from unittest.mock import MagicMock, patch, Mock
 from message_processor.base import MessageProcessor
-from base_client import Message, Response
+from message_processor.client_contract import Message, Response
 
 
 class TestMessageProcessor:

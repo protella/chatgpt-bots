@@ -25,7 +25,7 @@ from slack_client.messaging import SlackMessagingMixin
 
 
 def _msg(channel="C1", ts="100.0"):
-    from base_client import Message
+    from message_processor.client_contract import Message
     return Message(text="build me a deck", user_id="U1", channel_id=channel,
                    thread_id=ts, metadata={"ts": ts})
 
@@ -346,7 +346,7 @@ def test_an_interrupted_turn_retracts_its_claim():
     surface it has, so `posted` is True — but the turn claimed work and delivered none of it.
     Reading `posted` alone would keep the 👀 on a turn that visibly failed."""
     from main import ChatBotV2
-    from base_client import Response
+    from message_processor.client_contract import Response
 
     interrupted = Response(type="text", content="",
                            metadata={"streamed": True, "posted": True, "interrupted": True})

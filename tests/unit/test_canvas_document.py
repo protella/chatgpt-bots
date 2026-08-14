@@ -17,8 +17,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from canvas_content import CANVAS_MARKER, CANVAS_MIMETYPE, html_to_markdown
-from document_handler import (
+from message_processor.canvas_content import CANVAS_MARKER, CANVAS_MIMETYPE, html_to_markdown
+from message_processor.ingestion.document_handler import (
     MIME_TYPE_HANDLERS,
     SUPPORTED_DOCUMENT_MIMETYPES,
     DocumentHandler,
@@ -72,7 +72,7 @@ class TestParseCanvas:
         """The converter is third-party HTML parsing — if it ever throws, the failure must stay
         a failure rather than escaping into the raw-text fallback."""
         handler = DocumentHandler()
-        with patch("document_handler.html_to_markdown", side_effect=RuntimeError("bs4 blew up")):
+        with patch("message_processor.ingestion.document_handler.html_to_markdown", side_effect=RuntimeError("bs4 blew up")):
             result = handler.parse_canvas(CANVAS_HTML, "Launch checklist")
         assert result == {
             "content": "",
@@ -99,7 +99,7 @@ class TestParseCanvas:
 
     def test_a_converter_crash_never_reaches_force_text_extraction(self):
         handler = DocumentHandler()
-        with patch("document_handler.html_to_markdown", side_effect=RuntimeError("bs4 blew up")), \
+        with patch("message_processor.ingestion.document_handler.html_to_markdown", side_effect=RuntimeError("bs4 blew up")), \
                 patch.object(handler, "force_text_extraction",
                              side_effect=AssertionError("fallback must not run")) as fallback:
             result = handler.safe_extract_content(CANVAS_HTML, CANVAS_MIMETYPE, "Spec")
@@ -139,7 +139,7 @@ class TestCanvasRouting:
 
 class TestDownloadSignatures:
     def test_both_base_client_methods_declare_allow_html(self):
-        from base_client import BaseClient
+        from message_processor.client_contract import BaseClient
 
         for name in ("download_file", "download_file_async"):
             params = inspect.signature(getattr(BaseClient, name)).parameters
@@ -178,7 +178,7 @@ PDF_ROW = {"filename": "q3.pdf", "mime_type": "application/pdf",
 
 
 def _read_ctx(row, download):
-    from tool_registry import ToolContext
+    from message_processor.tool_registry import ToolContext
 
     db = MagicMock()
     db.get_thread_documents_async = AsyncMock(return_value=[dict(row)])
@@ -303,11 +303,11 @@ class TestColdRebuildPath:
     @pytest.mark.asyncio
     async def test_rebuild_asks_for_html_on_a_canvas(self, tmp_path, monkeypatch):
         monkeypatch.setenv("DATABASE_DIR", str(tmp_path))
-        from base_client import Message
+        from message_processor.client_contract import Message
         from database import DatabaseManager
         from message_processor.thread_management import ThreadManagementMixin
         from message_processor.utilities import MessageUtilitiesMixin
-        from thread_manager import AsyncThreadStateManager
+        from message_processor.thread_manager import AsyncThreadStateManager
 
         class _Proc(ThreadManagementMixin, MessageUtilitiesMixin):
             def __init__(self, db):

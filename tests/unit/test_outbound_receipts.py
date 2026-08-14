@@ -2007,7 +2007,7 @@ class _StopTurn(Exception):
 
 
 async def _run_pipeline(p, channel_id):
-    from base_client import Message
+    from message_processor.client_contract import Message
 
     msg = Message(text="hi", user_id="U1", channel_id=channel_id, thread_id="10.0",
                   metadata={"ts": "10.0"})

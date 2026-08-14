@@ -71,27 +71,6 @@ coverage.xml
 *.mo
 *.pot
 
-# Django stuff:
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
-
-# Flask stuff:
-instance/
-.webassets-cache
-
-# Scrapy stuff:
-.scrapy
-
-# Sphinx documentation
-docs/_build/
-
-# PyBuilder
-target/
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
 # IPython
 profile_default/
 ipython_config.py
@@ -99,22 +78,8 @@ ipython_config.py
 # pyenv
 .python-version
 
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-#Pipfile.lock
-
 # PEP 582; used by e.g. github.com/David-OConnor/pyflow
 __pypackages__/
-
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
-
-# SageMath parsed files
-*.sage.py
 
 # Environments (all .env* is ignored at the top of this file)
 .venv
@@ -124,16 +89,6 @@ ENV/
 env.bak/
 venv.bak/
 
-# Spyder project settings
-.spyderproject
-.spyproject
-
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
 # mypy
 .mypy_cache/
 .dmypy.json
@@ -141,9 +96,6 @@ dmypy.json
 
 # ruff
 .ruff_cache/
-
-# Pyre type checker
-.pyre/
 
 # Local logs — keep the directory, ignore everything written into it.
 # Must stay `logs/*`: a blanket `logs/` rule excludes the directory itself, and
@@ -153,11 +105,10 @@ logs/*
 !logs/.gitkeep
 *.log
 
-# BMAD Method folders (local only) — matches .bmad-core/, .bmad-infrastructure-devops/
+# Editor and scaffolding folders that exist only in a working copy. Both are still present in
+# clones that predate their removal from git, so the rules stay until those are cleaned up.
+.cursor/
 .bmad-*/
-
-# Ignore the OpenAI API reference PDF so it is not tracked by git
-API Reference - OpenAI API.pdf
 
 # SQLite databases
 data/*
@@ -185,7 +136,6 @@ mcp_config*.bak
 
 # Slack app manifest (environment-specific; use slack_app_manifest.example.yml as template)
 slack_app_manifest.yml
-slack_app_manifest.v3.yml
 
 # Company-branded loading messages stay local (like .env) — the generic set is the committed default
 status_messages/loading_messages.*.txt

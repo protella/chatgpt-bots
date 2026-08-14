@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, List, Optional, cast
 from dataclasses import dataclass, field
 from logger import LoggerMixin
 from config import config
-from token_counter import TokenCounter
+from message_processor.token_counter import TokenCounter
 
 # Shared stateless estimator for incremental context-size tracking
 _ESTIMATOR = TokenCounter()

@@ -18,7 +18,7 @@ import pytest
 
 from message_processor import file_mount
 from message_processor.containers import AUTO_CONTAINER
-from tool_registry import SURFACE_CHANNEL, SandboxHolder, ToolContext, ToolRegistry
+from message_processor.tool_registry import SURFACE_CHANNEL, SandboxHolder, ToolContext, ToolRegistry
 
 
 class _Pager:

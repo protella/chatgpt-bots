@@ -12,8 +12,8 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
-from base_client import Message, Response
-from thread_manager import AsyncThreadStateManager
+from message_processor.client_contract import Message, Response
+from message_processor.thread_manager import AsyncThreadStateManager
 from message_processor.base import MessageProcessor
 from message_processor.handlers.text import TextHandlerMixin, _legacy_fallback_target
 

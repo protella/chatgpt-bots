@@ -726,7 +726,7 @@ class TestSinkPlumbing:
 
     def test_base_client_send_file_declines_instead_of_raising(self):
         import inspect
-        from base_client import BaseClient
+        from message_processor.client_contract import BaseClient
         assert "send_file" not in getattr(BaseClient, "__abstractmethods__", set())
         assert inspect.iscoroutinefunction(BaseClient.send_file)
 

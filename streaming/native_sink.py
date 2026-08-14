@@ -10,9 +10,10 @@ coordinator owns the differences:
   no temporary fence closing);
 - when a part outgrows the per-message limit it "rolls": closes any open code fence,
   appends the continuation trailer, stops the stream, and starts a new native message
-  whose base is the part prefix (+ reopened fence). Markers come from message_markers
-  in their markdown-flavored forms, which Slack stores as the exact canonical mrkdwn
-  shapes the rebuild-side merger (_merge_continuation_history) strips — do NOT inline
+  whose base is the part prefix (+ reopened fence). Markers come from
+  message_processor.message_markers in their markdown-flavored forms, which Slack stores as
+  the exact canonical mrkdwn shapes the rebuild-side merger (_merge_continuation_history)
+  strips — do NOT inline
   marker strings here (R2 context-pollution bug);
 - any failure flips ``failed`` and the caller falls back to the legacy
   update_message_streaming edit loop on ``current_ts``.
@@ -23,7 +24,7 @@ from typing import Any, Optional, Tuple
 
 from message_processor.stale_send_guard import StaleSendSuppressed
 
-from message_markers import (
+from message_processor.message_markers import (
     _fence_state,
     entity_safe_cut,
     part_prefix_markdown,

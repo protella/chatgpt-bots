@@ -30,8 +30,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-import ambient_fetch
-from canvas_content import CANVAS_MIMETYPE
+import message_processor.ingestion.ambient_fetch as ambient_fetch
+from message_processor.canvas_content import CANVAS_MIMETYPE
 from config import clamp_effort, config
 from logger import setup_logger
 
@@ -637,7 +637,7 @@ class AmbientArtifactService:
         # sails past a prefix match and then 400s the vision call. ensure_api_compatible runs the
         # Pillow verify/load path, returns the canonical mimetype the API will accept, and
         # transcodes a decodable-but-unsupported format (BMP, TIFF, ...) to PNG in memory (F50b).
-        from image_validation import ensure_api_compatible
+        from message_processor.ingestion.image_validation import ensure_api_compatible
         raw, mime = ensure_api_compatible(raw)
         if not raw:
             await self._fail(job, kind, ambient_fetch.ERR_UNSUPPORTED_TYPE,
@@ -649,7 +649,7 @@ class AmbientArtifactService:
         try:
             import base64
             data_url = f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
-            from prompts import IMAGE_ANALYSIS_PROMPT
+            from message_processor.prompts import IMAGE_ANALYSIS_PROMPT
             description = await self.openai_client.analyze_images(
                 # Detail follows the configured default (HIGH) rather than a hardcoded `low`:
                 # this description IS the durable record of an image the bot never answered, so a
@@ -720,7 +720,7 @@ class AmbientArtifactService:
         handler = getattr(self, "_document_handler", None)
         if handler is None:
             try:
-                from document_handler import DocumentHandler
+                from message_processor.ingestion.document_handler import DocumentHandler
                 handler = self._document_handler = DocumentHandler()
             except Exception:  # noqa: BLE001
                 return None
@@ -766,7 +766,7 @@ class AmbientArtifactService:
         text = (text or "").strip()
         if not text:
             return None
-        from prompts import AMBIENT_FILE_SUMMARY_PROMPT, AMBIENT_LINK_SUMMARY_PROMPT
+        from message_processor.prompts import AMBIENT_FILE_SUMMARY_PROMPT, AMBIENT_LINK_SUMMARY_PROMPT
         prompt = AMBIENT_LINK_SUMMARY_PROMPT if link else AMBIENT_FILE_SUMMARY_PROMPT
         capped = text[:int(self.config.ambient_extract_max_chars)]
         try:

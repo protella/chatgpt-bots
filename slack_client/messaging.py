@@ -15,8 +15,8 @@ import aiohttp
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_sdk.errors import SlackApiError
 
-import prompts
-from base_client import HistoryFetchError, Message
+import message_processor.prompts as prompts
+from message_processor.client_contract import HistoryFetchError, Message
 from config import (SUPPORTED_CHAT_MODELS, config, dev_epoch_fence_requested,
                     pipeline_status_markers, valid_emoji_name)
 from message_processor import participation_telemetry
@@ -24,7 +24,7 @@ from message_processor.stale_send_guard import StaleSendSuppressed
 from message_processor.turn_runtime import (DEST_KIND_CORRECTION_ANNOUNCEMENT,
                                             EDIT_STATE_COMMITTED, EditRecord, EffectRevoked,
                                             LaunchNotRecorded, mark_tool_launched, run_effect)
-from message_markers import (
+from message_processor.message_markers import (
     CONTINUATION_HEAD,
     continuation_trailer,
     extract_continuation_markers,
@@ -1592,8 +1592,9 @@ class SlackMessagingMixin(_Host):
 
         `meta_out` (F7): optional dict the caller reads back — `meta_out["file_id"]` is the
         uploaded file's id, set only once Slack accepts the upload. The RETURN stays the bare
-        URL (base_client / slack_client.base declare that contract), so the file id rides a
-        side channel rather than breaking every existing caller. It exists because
+        URL (message_processor.client_contract / slack_client.base declare that contract), so
+        the file id rides a side channel rather than breaking every existing caller. It exists
+        because
         files_upload_v2 hands back no share ts: the file id is the only handle from which the
         image message's ts can later be resolved (see resolve_file_share_ts).
 
@@ -3205,7 +3206,8 @@ class SlackMessagingMixin(_Host):
 
     def get_post_to_thread_channel_schema(self, thread_config: Optional[dict] = None) -> dict:
         """The CHANNEL surface's variant: static (``thread_config`` is accepted and ignored, so
-        the registry can call it like any channel schema) and read from prompts constants.
+        the registry can call it like any channel schema) and read from message_processor.prompts
+        constants.
 
         Two things the channel wording has to say differently, which is why it is its own schema
         rather than a shared string. The origin-acknowledgment instruction cannot stand on a

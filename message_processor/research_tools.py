@@ -39,12 +39,12 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple, cast
 from uuid import uuid4
 
-from canvas_content import CANVAS_MIMETYPE
+from message_processor.canvas_content import CANVAS_MIMETYPE
 from config import clamp_effort, config
 from message_processor import document_tools, outbound_receipts
 from message_processor.artifacts import strip_citation_markers, strip_sandbox_links
 from message_processor.destination_tools import parse_destination_marker
-from tool_registry import ToolContext, ToolRegistry
+from message_processor.tool_registry import ToolContext, ToolRegistry
 
 # Process-lifetime flag: set once a labelled findings post fails (likely a missing
 # chat:write.customize scope) so we stop attempting the username override and post plainly

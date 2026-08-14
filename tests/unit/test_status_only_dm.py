@@ -195,7 +195,7 @@ def _text_handler_host():
 
 @pytest.mark.asyncio
 async def test_gate_none_ts_native_capable_streams(monkeypatch):
-    from base_client import Message
+    from message_processor.client_contract import Message
     host = _text_handler_host()
     client = MagicMock()
     client.supports_streaming = MagicMock(return_value=True)
@@ -223,7 +223,7 @@ async def test_gate_none_ts_without_native_still_streams(monkeypatch):
     (which is the shipped default). The legacy loop can seed its own message on the first
     chunk, so it streams; a turn that never speaks simply never seeds one.
     """
-    from base_client import Message
+    from message_processor.client_contract import Message
     from message_processor.handlers.text import TextHandlerMixin
     import types
 
@@ -252,7 +252,7 @@ async def test_gate_none_ts_without_native_still_streams(monkeypatch):
 async def test_gate_routed_turn_streams_after_f2_revision(monkeypatch):
     """F2 revision: a gate-routed turn now streams like any other —
     the old defer-to-non-streaming fork is gone."""
-    from base_client import Message
+    from message_processor.client_contract import Message
     monkeypatch.setattr(config, "enable_no_reply_tool", True)
     host = _text_handler_host()
     client = MagicMock()

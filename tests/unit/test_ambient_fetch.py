@@ -5,8 +5,8 @@ import socket
 
 import pytest
 
-import ambient_fetch
-from ambient_fetch import (
+import message_processor.ingestion.ambient_fetch as ambient_fetch
+from message_processor.ingestion.ambient_fetch import (
     ERR_BAD_URL,
     ERR_BLOCKED_SSRF,
     ERR_HTTP_STATUS,

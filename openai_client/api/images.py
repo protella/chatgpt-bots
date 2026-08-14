@@ -5,7 +5,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import aiohttp
 from config import config
-from prompts import IMAGE_EDIT_SYSTEM_PROMPT, IMAGE_GEN_SYSTEM_PROMPT
+from message_processor.prompts import IMAGE_EDIT_SYSTEM_PROMPT, IMAGE_GEN_SYSTEM_PROMPT
 
 from ..utilities import ImageData
 

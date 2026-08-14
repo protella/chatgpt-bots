@@ -22,7 +22,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from config import config
-from prompts import (
+from message_processor.prompts import (
     LOCAL_TOOLS_GUIDANCE,
     SLACK_SYSTEM_PROMPT,
     WAKE_CLASSIFIER_SYSTEM_PROMPT,
@@ -33,7 +33,7 @@ from slack_client.search_tool import SlackSearchToolMixin
 from slack_client.messaging import SlackMessagingMixin
 from slack_client.formatting.text import SlackFormattingMixin
 from slack_client.utilities import SlackUtilitiesMixin
-from tool_registry import ToolContext, ToolRegistry
+from message_processor.tool_registry import ToolContext, ToolRegistry
 
 
 # =========================================================== prompt wording (C1/C2)

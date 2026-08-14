@@ -246,7 +246,7 @@ async def test_the_prompt_carries_every_source_in_order_with_who_and_where():
     assert "posted to the channel" in prompt          # Peter, top-level
     assert "a reply inside a thread" in prompt        # Erin, in-thread
     # The developer prompt is the binary-gate prompt, and it is the only system input.
-    from prompts import WAKE_CLASSIFIER_SYSTEM_PROMPT
+    from message_processor.prompts import WAKE_CLASSIFIER_SYSTEM_PROMPT
     assert llm.captured_input[0] == {"role": "developer",
                                      "content": WAKE_CLASSIFIER_SYSTEM_PROMPT}
 
@@ -354,7 +354,7 @@ def test_the_rich_classifier_and_its_prompt_are_gone():
     without restoring the wiring fails here rather than in production."""
     from openai_client.api import responses
     assert not hasattr(responses, "classify_participation")
-    import prompts
+    import message_processor.prompts as prompts
     assert not hasattr(prompts, "PARTICIPATION_SYSTEM_PROMPT")
     import message_processor.participation as participation
     assert not hasattr(participation, "ParticipationVerdict")
@@ -367,7 +367,7 @@ def test_the_binary_prompt_asks_for_a_bit_and_nothing_else():
     It is ~10 lines now. The old one ran to staged addressee/exchange/answerability reasoning with
     per-bug regression clauses bolted on; those tests are gone with those clauses, because the
     judgments they guarded moved to the responder."""
-    from prompts import WAKE_CLASSIFIER_SYSTEM_PROMPT as p
+    from message_processor.prompts import WAKE_CLASSIFIER_SYSTEM_PROMPT as p
     # what it decides
     assert "whether to run the assistant" in p
     # what it must NOT do
@@ -389,7 +389,7 @@ def test_the_binary_prompt_asks_for_a_bit_and_nothing_else():
 def test_local_tools_guidance_carries_people_tools():
     # Unrelated to the gate (it teaches the RESPONDER), but it has always lived here and still
     # covers live behaviour: F29's two people tools plus the discoverability/freshness lessons.
-    from prompts import LOCAL_TOOLS_GUIDANCE
+    from message_processor.prompts import LOCAL_TOOLS_GUIDANCE
     for needle in ("lookup_user", "list_channel_members", "who is X",
                    "never need their Slack id", "THIS turn"):
         assert needle in LOCAL_TOOLS_GUIDANCE

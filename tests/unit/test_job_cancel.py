@@ -13,8 +13,8 @@ from types import SimpleNamespace
 import pytest
 
 from config import config
-from thread_manager import AsyncThreadStateManager
-from tool_registry import ToolContext, ToolRegistry
+from message_processor.thread_manager import AsyncThreadStateManager
+from message_processor.tool_registry import ToolContext, ToolRegistry
 import message_processor.research_tools as rt
 
 

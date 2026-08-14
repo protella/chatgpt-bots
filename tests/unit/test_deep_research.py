@@ -12,8 +12,8 @@ from types import SimpleNamespace
 import pytest
 
 from config import clamp_effort, config
-from thread_manager import AsyncThreadStateManager
-from tool_registry import ToolContext, ToolRegistry
+from message_processor.thread_manager import AsyncThreadStateManager
+from message_processor.tool_registry import ToolContext, ToolRegistry
 import message_processor.research_tools as rt
 
 
@@ -537,7 +537,7 @@ async def test_ack_suppression_flag_not_set_when_disabled(monkeypatch):
 
 
 def test_prompts_bullet_updated():
-    from prompts import LOCAL_TOOLS_GUIDANCE
+    from message_processor.prompts import LOCAL_TOOLS_GUIDANCE
     assert "will NOT be posted" in LOCAL_TOOLS_GUIDANCE
     assert "write NOTHING after the call" in LOCAL_TOOLS_GUIDANCE
     # Rejected work leaves the request open, and conceding is not a next step — so the bullet has
@@ -546,7 +546,7 @@ def test_prompts_bullet_updated():
     assert "start the corrected attempt right away, or say concretely what you will fix" in \
         LOCAL_TOOLS_GUIDANCE
     # ...and the general restraint principle must not license stopping at the concession.
-    from prompts import _LET_THE_EXCHANGE_END
+    from message_processor.prompts import _LET_THE_EXCHANGE_END
     assert "not for work you still owe" in _LET_THE_EXCHANGE_END
 
 

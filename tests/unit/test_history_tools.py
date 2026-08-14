@@ -6,7 +6,7 @@ from slack_sdk.errors import SlackApiError
 
 from slack_client.history_tool import SlackHistoryToolMixin
 from config import config
-from tool_registry import ToolContext
+from message_processor.tool_registry import ToolContext
 
 REQUESTER = "U_ASKER"
 OUTSIDER = "U_SOMEONE_ELSE"

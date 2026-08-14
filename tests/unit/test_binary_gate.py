@@ -25,7 +25,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from base_client import Message
+from message_processor.client_contract import Message
 from config import config
 from message_processor import participation_telemetry
 from message_processor.participation import (GateEvaluation, ParticipationEngine, SourceMessage,
@@ -801,7 +801,7 @@ def test_the_prompt_tells_the_gate_to_wake_on_participation_feedback():
     "is a reply wanted" would sleep through it — and only the responder can record the preference
     or change the setting, so sleeping DISCARDS the instruction. The prompt says so explicitly,
     because it is the one case where waking is right despite there being no question."""
-    from prompts import WAKE_CLASSIFIER_SYSTEM_PROMPT as p
+    from message_processor.prompts import WAKE_CLASSIFIER_SYSTEM_PROMPT as p
 
     assert "feedback about how it participates" in p
     assert "silently discards the instruction" in p
@@ -813,7 +813,7 @@ def test_the_prompt_tells_the_gate_to_wake_on_participation_feedback():
 
 
 def test_the_prompt_forbids_the_gate_from_doing_the_responders_job():
-    from prompts import WAKE_CLASSIFIER_SYSTEM_PROMPT as p
+    from message_processor.prompts import WAKE_CLASSIFIER_SYSTEM_PROMPT as p
 
     assert "You are not the assistant" in p
     assert "You only decide whether the assistant gets a turn" in p
@@ -831,7 +831,7 @@ def test_the_prompt_wakes_for_banter_that_is_unmistakably_about_this_assistant()
     other-bot talk with nothing asked stays asleep. The gate is never told the assistant's
     configured name, so "unmistakably, from what the messages themselves show" is the honest
     standard and the false-negative bias IS the narrowing."""
-    from prompts import WAKE_CLASSIFIER_SYSTEM_PROMPT as p
+    from message_processor.prompts import WAKE_CLASSIFIER_SYSTEM_PROMPT as p
 
     # (a) it wakes for banter that is unmistakably about this assistant
     assert "the room is talking about the assistant ITSELF" in p
@@ -1120,7 +1120,7 @@ class TestQueueDrainsSkipTheDebounce:
 
     @pytest.mark.parametrize("size", [1, 3])
     async def test_every_redispatch_is_stamped_whatever_the_batch_size(self, size):
-        from thread_manager import AsyncThreadStateManager
+        from message_processor.thread_manager import AsyncThreadStateManager
 
         manager = AsyncThreadStateManager(db=None)
         manager.get_thread_async = AsyncMock(return_value=MagicMock())
@@ -1149,7 +1149,7 @@ class TestQueueDrainsSkipTheDebounce:
         `carried_gate_sources`, the obvious home — a trigger arriving without metadata would need
         an isinstance check that silently skips it, and the drain would go back to paying the full
         debounce with nothing failing to say so."""
-        from thread_manager import AsyncThreadStateManager
+        from message_processor.thread_manager import AsyncThreadStateManager
 
         manager = AsyncThreadStateManager(db=None)
         manager.get_thread_async = AsyncMock(return_value=MagicMock())

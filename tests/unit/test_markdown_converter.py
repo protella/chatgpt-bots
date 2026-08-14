@@ -2,7 +2,7 @@
 Unit tests for markdown_converter.py module
 """
 import pytest
-from markdown_converter import MarkdownConverter
+from slack_client.markdown_converter import MarkdownConverter
 
 
 class TestMarkdownConverter:

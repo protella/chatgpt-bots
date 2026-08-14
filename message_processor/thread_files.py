@@ -22,7 +22,7 @@ import os
 from typing import Any, Dict, List, Optional
 from urllib.parse import unquote, urlparse
 
-from canvas_content import CANVAS_MIMETYPE
+from message_processor.canvas_content import CANVAS_MIMETYPE
 from database import UNATTENDED_SUMMARY_TEMPLATE
 from logger import setup_logger
 

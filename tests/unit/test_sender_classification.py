@@ -13,7 +13,7 @@ import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from markdown_converter import MarkdownConverter
+from slack_client.markdown_converter import MarkdownConverter
 from slack_client.utilities import BOT_USER_ID_CACHE_MAX, SlackUtilitiesMixin
 from slack_client.messaging import SlackMessagingMixin, rewrite_bot_object_mentions
 from slack_client.formatting.text import SlackFormattingMixin

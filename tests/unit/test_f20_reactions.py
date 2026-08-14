@@ -27,10 +27,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from config import config, valid_emoji_name
-from tool_registry import ToolContext
+from message_processor.tool_registry import ToolContext
 from slack_client.messaging import SlackMessagingMixin
 from message_processor.participation import ParticipationEngine
-import prompts
+import message_processor.prompts as prompts
 
 
 # --------------------------------------------------- point 1+4: the responder's etiquette

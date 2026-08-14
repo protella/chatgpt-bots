@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple, cast
 from uuid import uuid4
 
 from config import config, pipeline_status
-from image_validation import (
+from message_processor.ingestion.image_validation import (
     IMAGE_EDIT_MIMETYPES,
     TOO_LARGE_AFTER_CONVERSION,
     ensure_compatible,

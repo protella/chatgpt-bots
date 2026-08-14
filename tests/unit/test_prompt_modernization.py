@@ -10,7 +10,7 @@ import asyncio
 from unittest.mock import MagicMock
 
 from message_processor.utilities import MessageUtilitiesMixin
-from prompts import (
+from message_processor.prompts import (
     SLACK_SYSTEM_PROMPT,
     WAKE_CLASSIFIER_SYSTEM_PROMPT,
 )

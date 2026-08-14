@@ -28,10 +28,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 
-from base_client import Message
+from message_processor.client_contract import Message
 from message_processor import canvas_tools as ct
 from message_processor.handlers.text import TextHandlerMixin
-from tool_registry import ToolRegistry
+from message_processor.tool_registry import ToolRegistry
 
 CHANNEL = "C0BKX77NU66"
 DM = "D07PETERDM"
@@ -141,7 +141,7 @@ def _executor_verdict(meta, *, channel_id=CHANNEL):
     and report (result, was_slack_asked_to_delete)."""
     import asyncio
 
-    from tool_registry import ToolContext
+    from message_processor.tool_registry import ToolContext
 
     msg = Message(text="delete that canvas", user_id="U07PETER",
                   channel_id=channel_id, thread_id="100.0", metadata=dict(meta))
@@ -201,7 +201,7 @@ def test_a_context_that_never_derived_the_flag_cannot_delete():
     derive it — a background agent's own registry, an older call site — fails closed."""
     import asyncio
 
-    from tool_registry import ToolContext
+    from message_processor.tool_registry import ToolContext
 
     ctx = ToolContext(channel_id=CHANNEL, thread_ts="100.0", client=MagicMock())
     result = asyncio.run(ct.execute_delete_canvas(ctx, {"canvas_id": "F1"}))

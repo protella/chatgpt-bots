@@ -828,7 +828,7 @@ def _handler_host(streaming: bool) -> MagicMock:
 async def _drive_handler(host, *, streaming: bool):
     from unittest.mock import patch
 
-    from base_client import Message
+    from message_processor.client_contract import Message
 
     message = Message(text="what's the total?", user_id="U1", channel_id="C1",
                       thread_id="9000.0", metadata={"ts": "9000.0"})

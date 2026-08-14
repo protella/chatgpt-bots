@@ -22,7 +22,7 @@ import re
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from base_client import Message
+from message_processor.client_contract import Message
 from config import config
 from message_processor.message_timestamps import (
     render_message_timestamp,
@@ -31,7 +31,7 @@ from message_processor.message_timestamps import (
 )
 from message_processor.thread_management import ThreadManagementMixin
 from message_processor.utilities import MessageUtilitiesMixin
-from thread_manager import AsyncThreadStateManager
+from message_processor.thread_manager import AsyncThreadStateManager
 
 # A stamp is a leading "[Weekday YYYY-MM-DD H:MM AM/PM TZ]" bracket.
 _STAMP_RE = re.compile(r"^\[(Mon|Tue|Wed|Thu|Fri|Sat|Sun) \d{4}-\d{2}-\d{2} "

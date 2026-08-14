@@ -27,7 +27,7 @@ from message_processor.handlers import text as text_handler
 from message_processor.turn_runtime import TurnRuntime
 from openai_client.api import responses as R
 from openai_client.api import tool_loop
-from tool_registry import ToolContext, ToolRegistry
+from message_processor.tool_registry import ToolContext, ToolRegistry
 
 
 # --------------------------------------------------------------------------------- fixtures

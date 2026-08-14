@@ -33,8 +33,8 @@ from config import config
 from message_processor import image_delivery, image_tools as it
 from openai_client.container_errors import AUTO_CONTAINER
 from openai_client.utilities import ImageData
-from thread_manager import AsyncThreadStateManager
-from tool_registry import ToolContext, ToolRegistry
+from message_processor.thread_manager import AsyncThreadStateManager
+from message_processor.tool_registry import ToolContext, ToolRegistry
 
 
 # --------------------------------------------------------------------------------- fixtures
@@ -758,7 +758,7 @@ async def test_create_asset_on_an_auto_turn_mints_a_container():
     """W3's bridge. The asset is an INGREDIENT for code that has not run yet, so on an `auto`
     turn there is no id to wait for — the executor asks for one, and the tool loop names it in
     the next round's declaration."""
-    from tool_registry import SandboxHolder
+    from message_processor.tool_registry import SandboxHolder
 
     async def _fill(thread_key, holder):
         holder.container_id = "cntr_made"     # what ContainerManager.bridge_container does

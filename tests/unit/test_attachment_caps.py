@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from PIL import Image
 
-from image_validation import TOO_LARGE_AFTER_CONVERSION
+from message_processor.ingestion.image_validation import TOO_LARGE_AFTER_CONVERSION
 from message_processor.utilities import MessageUtilitiesMixin
 
 pytestmark = pytest.mark.asyncio

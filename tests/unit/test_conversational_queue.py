@@ -10,9 +10,9 @@ from unittest.mock import Mock, AsyncMock, patch
 
 import pytest
 
-from base_client import Message
+from message_processor.client_contract import Message
 from config import config
-from thread_manager import AsyncThreadStateManager
+from message_processor.thread_manager import AsyncThreadStateManager
 from message_processor.base import MessageProcessor
 
 
@@ -438,7 +438,8 @@ class TestGateOrder:
 class TestBusyRetirement:
     def _runtime_sources(self):
         for rel in ("main.py", "message_processor/base.py", "slack_client/messaging.py",
-                    "base_client.py", "thread_manager.py"):
+                    "message_processor/client_contract.py",
+                    "message_processor/thread_manager.py"):
             yield rel, (REPO / rel).read_text()
 
     def test_no_busy_response_constructed_or_handled(self):
@@ -779,7 +780,7 @@ async def test_the_admitted_catch_up_turn_catalogues_the_carried_images():
     from types import SimpleNamespace
     from unittest.mock import MagicMock
 
-    from base_client import Response
+    from message_processor.client_contract import Response
     from message_processor.base import MessageProcessor
     from message_processor.turn_runtime import TurnRuntime
 

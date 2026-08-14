@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from message_processor import knowledge_tools
-from tool_registry import ToolContext, ToolRegistry
+from message_processor.tool_registry import ToolContext, ToolRegistry
 
 CHANNEL = "C0KNOW123"
 DM = "D0KNOW456"

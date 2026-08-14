@@ -22,7 +22,7 @@ import pytest
 from slack_sdk.errors import SlackApiError
 
 from message_processor import channel_admin_tools as cat
-from tool_registry import SURFACE_CHANNEL, ToolContext, ToolRegistry
+from message_processor.tool_registry import SURFACE_CHANNEL, ToolContext, ToolRegistry
 
 CH = "C1000000000"
 DM = "D1000000000"

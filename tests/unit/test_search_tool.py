@@ -20,7 +20,7 @@ from slack_client.history_tool import SlackHistoryToolMixin
 from slack_client.search_tool import (SearchBackend, SlackSearchToolMixin, build_search_query,
                                       normalize_search_text, score_search_text,
                                       search_backend_for)
-from tool_registry import ToolContext, ToolRegistry
+from message_processor.tool_registry import ToolContext, ToolRegistry
 
 
 class _Bot(SlackSearchToolMixin, SlackHistoryToolMixin):
@@ -340,7 +340,7 @@ def test_limit_clamping():
 
 
 def test_guidance_mentions_search():
-    from prompts import LOCAL_TOOLS_GUIDANCE
+    from message_processor.prompts import LOCAL_TOOLS_GUIDANCE
     assert "search_slack" in LOCAL_TOOLS_GUIDANCE
     # BF1: the guidance is availability-conditional now — when search_slack is not among the
     # available tools (no action_token), fall to the fetch tools without comment.
@@ -353,7 +353,7 @@ def test_guidance_mentions_search():
 # =====================================================================================
 
 from slack_client import search_tool as search_mod  # noqa: E402
-from tool_registry import serialize_tool_result  # noqa: E402
+from message_processor.tool_registry import serialize_tool_result  # noqa: E402
 
 CH = "C0BKX77NU66"
 

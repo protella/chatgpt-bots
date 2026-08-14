@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 
-from base_client import Message
+from message_processor.client_contract import Message
 from main import ChatBotV2
 from message_processor.base import MessageProcessor
 from message_processor.utilities import MessageUtilitiesMixin

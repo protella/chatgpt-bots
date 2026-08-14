@@ -14,7 +14,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from settings_modal import SettingsModal
+from slack_client.settings_modal import SettingsModal
 from slack_client.event_handlers.settings import SlackSettingsHandlersMixin
 
 

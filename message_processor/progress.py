@@ -5,7 +5,7 @@ import logging
 from typing import Callable, List, Optional
 
 from config import config
-from message_markers import CHECKLIST_STATUS_MARKER
+from message_processor.message_markers import CHECKLIST_STATUS_MARKER
 
 logger = logging.getLogger(__name__)
 

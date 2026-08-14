@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from base_client import Message
+from message_processor.client_contract import Message
 from config import config
 from message_processor import channel_request
 from message_processor.channel_request import (BATCHED_IMAGE_CAP, IMAGE_TOKEN_BOUND,
@@ -423,7 +423,7 @@ async def test_read_document_resolves_a_file_only_the_stream_knew_about():
     """The point of the catalog: a document dropped in ANOTHER thread of this channel is readable
     on the turn it is asked about, not one turn later once a `documents` row exists."""
     from message_processor.document_tools import execute_read_document
-    from tool_registry import ToolContext
+    from message_processor.tool_registry import ToolContext
 
     db = MagicMock()
     db.get_thread_documents_async = AsyncMock(return_value=[])
@@ -449,7 +449,7 @@ async def test_read_document_refuses_an_image_from_the_catalog():
     """`read_document` extracts text; an image has none. `view_image` is the tool for those, and
     silently returning an extraction failure for a PNG would look like a broken file."""
     from message_processor.document_tools import execute_read_document
-    from tool_registry import ToolContext
+    from message_processor.tool_registry import ToolContext
 
     db = MagicMock()
     db.get_thread_documents_async = AsyncMock(return_value=[])
@@ -572,7 +572,7 @@ def counted_admission():
     and no egress the estimator answers from its byte-ratio fallback, which is correct behaviour and
     a different set of figures.
     """
-    import token_counter
+    import message_processor.token_counter as token_counter
     if token_counter.wait_for_admission_encoder() is None:
         pytest.skip("o200k vocabulary unavailable — the fallback path is covered separately")
 
@@ -634,7 +634,7 @@ def test_every_item_pays_for_framing_its_text_cannot_show():
     """[r2-4] Role wrappers and message delimiters are tokens the API adds around content we never
     see, so a request assembled from forty items is not the sum of forty strings. Forty EMPTY items
     used to cost zero, which is a bound that does not bound anything."""
-    from token_counter import ITEM_STRUCTURAL_OVERHEAD
+    from message_processor.token_counter import ITEM_STRUCTURAL_OVERHEAD
 
     empty = [{"role": "user", "content": ""} for _ in range(40)]
     estimate = estimate_admission(instructions="", input_items=empty, tools=None,
@@ -668,7 +668,7 @@ def test_the_admission_charge_is_never_below_the_real_token_count():
 
     Not gated on the tokenizer loading: the charge does not use one.
     """
-    from token_counter import admission_charge, estimate_tokens
+    from message_processor.token_counter import admission_charge, estimate_tokens
 
     for text, measured in _MEASURED_O200K_TOKENS:
         assert admission_charge(text) >= measured, text[:20]
@@ -686,7 +686,7 @@ def test_the_admission_charge_needs_no_tokenizer_at_all(monkeypatch):
     — a number the module's own comment admitted was below the worst case. The charge has no
     tokenizer to lose now, so the fallback question does not arise for admission.
     """
-    import token_counter
+    import message_processor.token_counter as token_counter
 
     monkeypatch.setattr(token_counter, "_admission_encoder", lambda: None)
     for text, measured in _MEASURED_O200K_TOKENS:
@@ -702,7 +702,7 @@ def test_the_reserve_estimator_covers_the_measured_token_count(counted_admission
     """The counted estimator no longer decides whether a turn may be sent, but it does decide how
     much of a summary survives, so it still has to be at least the real count of what it measures.
     """
-    from token_counter import estimate_tokens_conservative
+    from message_processor.token_counter import estimate_tokens_conservative
 
     for text, measured in _MEASURED_O200K_TOKENS:
         assert estimate_tokens_conservative(text) >= measured, text[:20]
@@ -717,7 +717,7 @@ class TestTheReserveTokenizerLoadsWithoutWedgingATurn:
 
     @pytest.fixture(autouse=True)
     def _fresh_loader(self, monkeypatch):
-        import token_counter
+        import message_processor.token_counter as token_counter
         monkeypatch.setattr(token_counter, "_ENCODER_SLOT", {})
         monkeypatch.setattr(token_counter, "_ENCODER_THREAD", None)
         monkeypatch.setattr(token_counter, "_ENCODER_ATTEMPTS", 0)
@@ -728,7 +728,7 @@ class TestTheReserveTokenizerLoadsWithoutWedgingATurn:
         perfectly good vocabulary arriving milliseconds later."""
         import threading
 
-        import token_counter
+        import message_processor.token_counter as token_counter
 
         release = threading.Event()
 
@@ -755,7 +755,7 @@ class TestTheReserveTokenizerLoadsWithoutWedgingATurn:
     def test_a_failed_load_is_retried_by_a_later_caller(self, monkeypatch):
         """A cold cache with momentarily no network is not a permanent verdict. Storing None as the
         answer meant one unlucky boot cost the whole process its exact counts."""
-        import token_counter
+        import message_processor.token_counter as token_counter
 
         attempts = []
 
@@ -776,7 +776,7 @@ class TestTheReserveTokenizerLoadsWithoutWedgingATurn:
 
     def test_retries_are_bounded_so_a_dead_box_stops_paying_the_grace(self, monkeypatch):
         """A permanently offline box must not spend the grace on every request forever."""
-        import token_counter
+        import message_processor.token_counter as token_counter
 
         attempts = []
 
@@ -796,7 +796,7 @@ class TestTheReserveTokenizerLoadsWithoutWedgingATurn:
 def test_a_special_token_literal_in_a_message_does_not_break_admission():
     """tiktoken's `encode` REFUSES text containing a special-token literal, and a user is entirely
     capable of typing one into a channel. `encode_ordinary` treats it as the text it is."""
-    from token_counter import admission_charge, estimate_tokens_conservative
+    from message_processor.token_counter import admission_charge, estimate_tokens_conservative
 
     typed = "what happens if I say <|endoftext|> out loud?"
     assert estimate_tokens_conservative(typed) > 0
@@ -1274,7 +1274,7 @@ async def test_a_channel_turn_never_mutates_thread_state_messages():
     """THE tripwire. A channel turn's transcript is Slack. Anything appended here is invisible to
     the request and would be replayed as history the next time a DM-shaped code path read it."""
     from message_processor.base import MessageProcessor
-    from base_client import Response
+    from message_processor.client_contract import Response
 
     with patch("message_processor.base.AsyncThreadStateManager"), \
          patch("message_processor.base.OpenAIClient"):

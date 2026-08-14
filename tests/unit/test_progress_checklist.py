@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from config import config
-from message_markers import CHECKLIST_STATUS_MARKER
+from message_processor.message_markers import CHECKLIST_STATUS_MARKER
 from message_processor.progress import ProgressChecklist
 
 LOADER = config.circle_loader_emoji

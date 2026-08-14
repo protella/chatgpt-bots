@@ -26,10 +26,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiosqlite
 import pytest
 
-from base_client import Message
+from message_processor.client_contract import Message
 from config import config
 from database import DatabaseManager, memory_content_hash
-from settings_modal import SettingsModal
+from slack_client.settings_modal import SettingsModal
 from message_processor import channel_steering
 from message_processor.channel_steering import (
     CHANNEL_FACT_HEADING, EMPTY_SNAPSHOT, POLICY_HEADING, POLICY_MAX_CHARS,
@@ -1316,7 +1316,7 @@ def test_the_two_allowed_directives_mentions_are_still_what_the_guard_thinks_the
 def test_the_responder_is_told_to_consider_a_durable_write_at_the_end_of_the_turn():
     """A prompt STEP, not a mandatory call: the default is to write nothing, and the two kinds of
     write are pointed at different tools so a behavioural rule never lands as a fact."""
-    from prompts import LOCAL_TOOLS_GUIDANCE
+    from message_processor.prompts import LOCAL_TOOLS_GUIDANCE
 
     assert ("Consider whether there is anything durable to write. The default is nothing. "
             "Store only stable facts or explicitly stated preferences, never a transcript. "

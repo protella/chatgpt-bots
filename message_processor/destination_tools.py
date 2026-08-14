@@ -47,9 +47,9 @@ import re
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 from logger import setup_logger
-from message_markers import join_segments
+from message_processor.message_markers import join_segments
 from message_processor.turn_runtime import SELECTABLE_DESTINATIONS
-from tool_registry import ToolContext, ToolRegistry
+from message_processor.tool_registry import ToolContext, ToolRegistry
 
 logger = setup_logger(name="slack_bot.DestinationTools")
 

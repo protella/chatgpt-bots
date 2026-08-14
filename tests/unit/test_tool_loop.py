@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from config import config
-from tool_registry import ToolContext, ToolRegistry, serialize_tool_result
+from message_processor.tool_registry import ToolContext, ToolRegistry, serialize_tool_result
 from openai_client.api import tool_loop
 from openai_client.api import responses as responses_api
 from slack_client.messaging import SlackMessagingMixin
@@ -1015,7 +1015,7 @@ def test_an_explicit_reaction_request_can_no_longer_die_at_the_gate():
     is placed by the responder through react_to_message (which the cap test above exercises). There
     is no clause to assert, so this asserts the absence of the mechanism — a react action back in
     the gate's vocabulary is the regression."""
-    from prompts import WAKE_CLASSIFIER_SYSTEM_PROMPT
+    from message_processor.prompts import WAKE_CLASSIFIER_SYSTEM_PROMPT
     for retired in ('choose "respond"', "react_and_respond", '"react"'):
         assert retired not in WAKE_CLASSIFIER_SYSTEM_PROMPT, retired
     # The gate's only output is a bool, so it cannot name an emoji even if it wanted to.
@@ -1162,18 +1162,18 @@ class TestSegmentJoin:
     a paragraph break between round-segments, but only where the model didn't already leave one."""
 
     def test_jams_get_a_paragraph_break(self):
-        from message_markers import segment_separator, join_segments
+        from message_processor.message_markers import segment_separator, join_segments
         assert segment_separator("under Super Heavy.", "Fixed.") == "\n\n"
         assert join_segments(["under Super Heavy.", "Fixed."]) == "under Super Heavy.\n\nFixed."
 
     def test_existing_whitespace_is_not_doubled(self):
-        from message_markers import segment_separator
+        from message_processor.message_markers import segment_separator
         assert segment_separator("done.\n", "next") == ""          # prior segment ends in space
         assert segment_separator("done.", "\nnext") == ""          # next begins with space
         assert segment_separator("done. ", "next") == ""
 
     def test_empty_segments_contribute_nothing(self):
-        from message_markers import segment_separator, join_segments
+        from message_processor.message_markers import segment_separator, join_segments
         assert segment_separator("", "x") == "" and segment_separator("x", "") == ""
         assert join_segments(["only"]) == "only"
         assert join_segments(["a", "", "b"]) == "a\n\nb"           # the empty middle round vanishes
@@ -1285,7 +1285,7 @@ def _ci_container(tools):
 
 
 def _holder_ctx(manager=None, thread_key="C1:1.1", container_id=None):
-    from tool_registry import SandboxHolder
+    from message_processor.tool_registry import SandboxHolder
     return ToolContext(sandbox=SandboxHolder(
         container_id=container_id, manager=manager, thread_key=thread_key))
 

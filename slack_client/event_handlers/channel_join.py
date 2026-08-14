@@ -317,7 +317,7 @@ class SlackChannelJoinMixin(_Host):
         openai_client = self._intro_openai_client()
         if openai_client is None:
             return ""
-        from prompts import CHANNEL_INTRO_PROMPT
+        from message_processor.prompts import CHANNEL_INTRO_PROMPT
         # Hand the composer the WHOLE narrative (it is already capped at channel_summary_max_chars),
         # and tell it explicitly to mine the specifics — the depth of the read depends on it seeing
         # the concrete particulars (people, projects, open items), not a thin slice.

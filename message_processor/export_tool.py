@@ -29,13 +29,13 @@ import json
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
-from base_client import HistoryFetchError
+from message_processor.client_contract import HistoryFetchError
 from config import config
 from logger import setup_logger
 from message_processor import file_mount
 from slack_client.history_fetch import iter_pages
 from slack_client.utilities import ACTOR_REMOTE_LOOKUP_DEFAULT
-from tool_registry import ToolContext, ToolRegistry
+from message_processor.tool_registry import ToolContext, ToolRegistry
 
 logger = setup_logger(name="slack_bot.ExportTool")
 

@@ -22,7 +22,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from database import DatabaseManager
-from settings_modal import SettingsModal
+from slack_client.settings_modal import SettingsModal
 
 
 # --------------------------------------------------------------------------- fakes / builders

@@ -21,9 +21,7 @@ from message_processor.utilities import MessageUtilitiesMixin
 REPO = Path(__file__).resolve().parents[2]
 
 RUNTIME_FILES = [
-    "main.py", "base_client.py", "config.py", "database.py", "thread_manager.py",
-    "token_counter.py", "document_handler.py", "image_url_handler.py",
-    "markdown_converter.py",
+    "main.py", "config.py", "database.py",
 ] + [str(p.relative_to(REPO)) for p in (REPO / "message_processor").rglob("*.py")] \
   + [str(p.relative_to(REPO)) for p in (REPO / "slack_client").rglob("*.py")] \
   + [str(p.relative_to(REPO)) for p in (REPO / "openai_client").rglob("*.py")]

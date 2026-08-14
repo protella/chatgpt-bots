@@ -38,8 +38,8 @@ from message_processor import image_tools as it
 from message_processor import outbound_receipts
 from message_processor.turn_runtime import EffectRevoked, TurnRuntime
 from openai_client.utilities import ImageData
-from thread_manager import AsyncThreadStateManager
-from tool_registry import ToolContext, ToolRegistry
+from message_processor.thread_manager import AsyncThreadStateManager
+from message_processor.tool_registry import ToolContext, ToolRegistry
 
 pytestmark = pytest.mark.asyncio
 
@@ -1342,7 +1342,7 @@ async def test_a_call_that_cannot_be_stamped_with_its_identity_is_refused_not_ru
         runs.append(1)
         return {"ok": True}
 
-    import tool_registry as tr
+    import message_processor.tool_registry as tr
     monkeypatch.setattr(tr.copy, "copy", MagicMock(side_effect=RuntimeError("no copy")))
     turn = TurnRuntime()
     reg = _registry(_executor)

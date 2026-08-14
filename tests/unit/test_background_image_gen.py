@@ -14,7 +14,7 @@ import pytest
 from config import config
 from message_processor.image_delivery import publish_image
 from message_processor.progress import ProgressChecklist
-from thread_manager import AsyncThreadStateManager
+from message_processor.thread_manager import AsyncThreadStateManager
 
 
 # --------------------------------------------------------------------------- registry
@@ -254,7 +254,7 @@ async def test_merge_preserving_upsert(tmp_path):
 # --------------------------------------------------------------------------- history marker
 
 def test_checklist_marker_recognized():
-    from message_markers import CHECKLIST_STATUS_MARKER, is_checklist_status_text
+    from message_processor.message_markers import CHECKLIST_STATUS_MARKER, is_checklist_status_text
     assert is_checklist_status_text(f"✓ Generated image{CHECKLIST_STATUS_MARKER}")
     assert not is_checklist_status_text("✓ Generated image")
     assert not is_checklist_status_text("")
@@ -262,7 +262,7 @@ def test_checklist_marker_recognized():
 
 @pytest.mark.asyncio
 async def test_checklist_message_carries_marker():
-    from message_markers import CHECKLIST_STATUS_MARKER
+    from message_processor.message_markers import CHECKLIST_STATUS_MARKER
     client = _delivery_client()
     c = ProgressChecklist(client, "C1", "T1", message_id="m1", min_edit_interval=0)
     await c.step("Generating image…", done_text="Generated image")

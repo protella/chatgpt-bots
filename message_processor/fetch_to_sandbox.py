@@ -23,11 +23,11 @@ import posixpath
 from typing import Any, Dict, Optional
 from urllib.parse import urlsplit
 
-import ambient_fetch
+import message_processor.ingestion.ambient_fetch as ambient_fetch
 from config import config
 from logger import setup_logger
 from message_processor import file_mount
-from tool_registry import ToolContext, ToolRegistry
+from message_processor.tool_registry import ToolContext, ToolRegistry
 
 logger = setup_logger(name="slack_bot.FetchToSandbox")
 

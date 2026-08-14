@@ -92,7 +92,7 @@ class TestChatBotV2Initialization:
             self, mock_processor_class, mock_slackbot_class, mock_config):
         """The cold-cache fetch belongs to boot, not to the first channel turn — but boot must not
         WAIT for a network round trip either, or a blackholed egress holds the process down."""
-        import token_counter
+        import message_processor.token_counter as token_counter
 
         mock_config.validate.return_value = None
         mock_client = Mock()
@@ -2114,7 +2114,7 @@ class TestTurnLedgerWiring:
 
     @staticmethod
     def _message(channel_id="C123", **meta):
-        from base_client import Message
+        from message_processor.client_contract import Message
         payload = {"ts": "10.0", "wake_source": "mention"}
         payload.update(meta)
         return Message(text="ping", user_id="U1", channel_id=channel_id,
@@ -2325,9 +2325,9 @@ class TestTurnSettlementOrdering:
 
     @pytest.mark.asyncio
     async def test_a_straggling_flight_is_cancelled_before_the_ledger_settles(self, bot):
-        from base_client import Message, Response
+        from message_processor.client_contract import Message, Response
         from message_processor import outbound_receipts
-        from tool_registry import ToolContext, ToolRegistry
+        from message_processor.tool_registry import ToolContext, ToolRegistry
 
         order = []
         captured = {}
@@ -2372,10 +2372,10 @@ class TestTurnSettlementOrdering:
         flights used to be caught and stepped over, so revocation never happened and the ledger
         settled anyway — leaving a shielded straggler free to take a lease and post AFTER
         settlement. The sequence is now one shielded unit that owns itself."""
-        from base_client import Message, Response
+        from message_processor.client_contract import Message, Response
         from message_processor import outbound_receipts
         from message_processor.turn_runtime import TurnRuntime
-        from tool_registry import ToolContext, ToolRegistry
+        from message_processor.tool_registry import ToolContext, ToolRegistry
 
         order, captured = [], {}
         entered, hold, stuck = asyncio.Event(), asyncio.Event(), asyncio.Event()
@@ -2440,7 +2440,7 @@ class TestTurnSettlementOrdering:
         removing the turn — while the finalizer was still revoking and settling behind it. That
         state is the whole thing the shielded unit exists to prevent, so the wait is now bound by
         the unit FINISHING and by nothing else. Cancelled here far more times than any cap was."""
-        from base_client import Message, Response
+        from message_processor.client_contract import Message, Response
         from message_processor import outbound_receipts
         from message_processor.turn_runtime import TurnRuntime
 
@@ -2483,7 +2483,7 @@ class TestTurnSettlementOrdering:
         can no longer say what is still running, and settling receipts around unknown state is how
         a post ends up outside every account of the turn. It settles anyway (the alternative is
         stranding rows nothing will ever revisit), but only after nothing can act any more."""
-        from base_client import Message, Response
+        from message_processor.client_contract import Message, Response
         from message_processor import outbound_receipts
         from message_processor.turn_runtime import TurnRuntime
 
@@ -2526,7 +2526,7 @@ class TestTurnSettlementOrdering:
         reconcile, which is the only mechanism that can still tell the truth about them."""
         import logging
 
-        from base_client import Message, Response
+        from message_processor.client_contract import Message, Response
         from message_processor import outbound_receipts
         from message_processor.turn_runtime import TurnRuntime
 

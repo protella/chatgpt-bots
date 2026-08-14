@@ -29,7 +29,7 @@ from slack_sdk.errors import SlackApiError
 from database import DatabaseManager
 from message_processor import outbound_receipts as orx
 from message_processor import schedule_tools as st
-from tool_registry import SURFACE_CHANNEL, SURFACE_DM, ToolContext, ToolRegistry
+from message_processor.tool_registry import SURFACE_CHANNEL, SURFACE_DM, ToolContext, ToolRegistry
 
 TEAM = "T1"
 CH = "C0BKX77NU66"

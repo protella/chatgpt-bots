@@ -20,7 +20,7 @@ import logging
 # the attachment path validated nothing at all and the gate kept a third, narrower list. One
 # definition now, in image_validation. (Extensions are matched lower-cased at every call site
 # below, so the old upper-case duplicates were never load-bearing.)
-from image_validation import (
+from message_processor.ingestion.image_validation import (
     ensure_api_compatible,
     API_IMAGE_EXTENSIONS as IMAGE_EXTENSIONS,
 )

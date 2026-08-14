@@ -18,7 +18,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional
 
-from tool_registry import ToolContext, ToolRegistry
+from message_processor.tool_registry import ToolContext, ToolRegistry
 
 # list_channel_members: resolve at most this many names; the rest are a LOUD note.
 MEMBERS_NAME_CAP = 50

@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from base_client import Message
+from message_processor.client_contract import Message
 from config import config
 from message_processor import routing_facts
 from message_processor.turn_runtime import TurnRuntime
@@ -454,7 +454,7 @@ class _MatHost:
 
 
 def _registry():
-    from tool_registry import ToolRegistry
+    from message_processor.tool_registry import ToolRegistry
     reg = ToolRegistry()
     reg.register(
         {"type": "function", "name": "no_response_needed",
@@ -495,7 +495,7 @@ def test_the_suffix_wording_follows_posture_not_the_gate(mock_env, monkeypatch):
     """The paragraphs describe why the message is in front of the model, so posture picks them.
     A thread message the gate judged and an ungated thread continuation raise the same question —
     is this still mine? — and now read the same instruction."""
-    from prompts import (CHANNEL_ACTIVITY_NO_REPLY_SUFFIX,
+    from message_processor.prompts import (CHANNEL_ACTIVITY_NO_REPLY_SUFFIX,
                          THREAD_ACTIVITY_NO_REPLY_SUFFIX)
     monkeypatch.setattr(config, "enable_no_reply_tool", True, raising=False)
     host = _MatHost(_registry())

@@ -6,7 +6,7 @@ column-aligned code blocks with links moved out to a footnote line.
 """
 import re
 
-from markdown_converter import MarkdownConverter
+from slack_client.markdown_converter import MarkdownConverter
 
 
 def code_block_lines(text: str) -> list:

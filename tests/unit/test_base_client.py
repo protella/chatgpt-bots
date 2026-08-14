@@ -1,11 +1,11 @@
 """
-Unit tests for base_client.py module
+Unit tests for message_processor/client_contract.py module
 Tests the abstract base client for platform implementations
 """
 import pytest
 from typing import Optional, Dict, Any, List
 from unittest.mock import patch, AsyncMock
-from base_client import BaseClient, Message, Response
+from message_processor.client_contract import BaseClient, Message, Response
 
 
 class TestMessage:

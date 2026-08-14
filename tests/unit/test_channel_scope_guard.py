@@ -27,7 +27,7 @@ from slack_client.channel_lookup_tool import SlackChannelLookupToolMixin
 from slack_client.history_tool import (ACCESS_DENIED_MESSAGE, CHANNEL_READ_TOOLS,
                                        SlackHistoryToolMixin)
 from slack_client.search_tool import SlackSearchToolMixin
-from tool_registry import ToolContext
+from message_processor.tool_registry import ToolContext
 
 REQUESTER = "U_ASKER"
 OUTSIDER = "U_SOMEONE_ELSE"
@@ -397,7 +397,7 @@ async def test_synthetic_context_gets_full_check(bot):
 
 def test_attest_message_origin_requires_live_human_event():
     """The stamp itself: only a human event whose channel AND user match the message."""
-    from base_client import Message
+    from message_processor.client_contract import Message
     from slack_client.event_handlers.message_events import attest_message_origin
 
     def _msg():

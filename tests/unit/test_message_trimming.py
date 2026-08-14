@@ -4,7 +4,7 @@ Tests for message trimming, preservation, and document summarization functionali
 import pytest
 from unittest.mock import patch
 from message_processor.base import MessageProcessor
-from thread_manager import ThreadState
+from message_processor.thread_manager import ThreadState
 
 
 class TestMessageTrimming:

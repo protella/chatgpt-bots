@@ -20,7 +20,7 @@ async def _describe_produced_image(processor, db, thread_key: str, file_url: str
     not a turn, and the image is already posted by the time this runs.
     """
     try:
-        from prompts import IMAGE_ANALYSIS_PROMPT
+        from message_processor.prompts import IMAGE_ANALYSIS_PROMPT
         fmt = (getattr(image_data, "format", None) or "png").lower()
         mimetype = "image/jpeg" if fmt in ("jpg", "jpeg") else f"image/{fmt}"
         model = config.utility_model

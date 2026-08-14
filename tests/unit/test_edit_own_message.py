@@ -32,8 +32,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from config import config
-from markdown_converter import MarkdownConverter
-from message_markers import extract_continuation_markers
+from slack_client.markdown_converter import MarkdownConverter
+from message_processor.message_markers import extract_continuation_markers
 from message_processor.stale_send_guard import StaleSendSuppressed
 from message_processor.turn_runtime import (DEST_KIND_CORRECTION_ANNOUNCEMENT,
                                             EDIT_STATE_ANNOUNCEMENT_ONLY, EDIT_STATE_COMMITTED,
@@ -43,7 +43,7 @@ from slack_client.formatting.text import SlackFormattingMixin
 from slack_client.messaging import Delivery, SlackMessagingMixin
 from slack_client.utilities import strip_citations
 from slack_sdk.errors import SlackApiError
-from tool_registry import SURFACE_CHANNEL, ToolContext, ToolRegistry
+from message_processor.tool_registry import SURFACE_CHANNEL, ToolContext, ToolRegistry
 
 TEAM = "T1"
 CH = "C1"

@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, cast
 
 from slack_sdk.errors import SlackApiError
 
-from base_client import Message
+from message_processor.client_contract import Message
 from config import config
 from message_processor.routing_facts import stamp_routing_facts
 from slack_client import actor_tail

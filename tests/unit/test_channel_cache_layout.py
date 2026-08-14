@@ -28,7 +28,7 @@ from message_processor.handlers.text import (TOOL_EVIDENCE_HEADER,
                                              TOOL_EVIDENCE_TRUNCATED,
                                              TextHandlerMixin,
                                              build_tool_evidence_block)
-from tool_registry import SURFACE_CHANNEL, SURFACE_DM, ToolContext, ToolRegistry
+from message_processor.tool_registry import SURFACE_CHANNEL, SURFACE_DM, ToolContext, ToolRegistry
 
 
 # --------------------------------------------------------------------------- fixtures
@@ -322,7 +322,7 @@ def test_a_factory_that_raises_omits_its_tool_and_logs():
 
     reg.register(boom, AsyncMock(), name="broken", dynamic=True)
     reg.register({"type": "function", "name": "fine", "parameters": {}}, AsyncMock())
-    with patch("tool_registry.logger") as log:
+    with patch("message_processor.tool_registry.logger") as log:
         assert _names(reg.schemas({})) == ["fine"]
     assert log.error.called
     message = log.error.call_args[0][0]
@@ -463,7 +463,7 @@ def _has_breakpoint(item):
 
 @pytest.mark.asyncio
 async def test_a_dm_turn_builds_no_evidence_block_and_resolves_per_user():
-    from base_client import Message
+    from message_processor.client_contract import Message
     from message_processor.handlers.text import TextHandlerMixin
 
     seen = {}
@@ -622,7 +622,7 @@ def test_the_channel_surface_is_static_about_the_terminal_tool_and_the_destinati
 def test_the_contract_paragraph_still_follows_the_route_not_the_schema(mock_env):
     """The tool is statically present on every channel turn now, so schema presence can no
     longer decide who is told they may stay quiet — the routing fact does."""
-    from prompts import CHANNEL_ACTIVITY_NO_REPLY_SUFFIX
+    from message_processor.prompts import CHANNEL_ACTIVITY_NO_REPLY_SUFFIX
     host = _materialize_host(_registry())
     _, _, available, suffix = host._materialize_request_tools(
         host._client, {"model": "gpt-5.6-sol"}, _message(silence_capable=True),

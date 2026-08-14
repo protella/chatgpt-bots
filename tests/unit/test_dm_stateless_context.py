@@ -21,11 +21,11 @@ import os
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from base_client import Message
+from message_processor.client_contract import Message
 from config import config
 from message_processor.thread_management import ThreadManagementMixin
 from message_processor.utilities import MessageUtilitiesMixin
-from thread_manager import AsyncThreadStateManager, ThreadState
+from message_processor.thread_manager import AsyncThreadStateManager, ThreadState
 
 
 # --------------------------------------------------------------------------- harness
@@ -364,7 +364,7 @@ async def test_rebuild_includes_reactions_annotation(temp_db):
 # --------------------------------------------- usage-driven token budgeting
 
 def test_estimator_is_chars_over_four_no_tiktoken():
-    import token_counter as tc
+    import message_processor.token_counter as tc
     assert not hasattr(tc, "tiktoken")
     counter = tc.TokenCounter("gpt-5.5")
     assert counter.count_tokens("x" * 400) == 100

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import pytest
 
-from base_client import HistoryFetchError
+from message_processor.client_contract import HistoryFetchError
 from config import config
 from slack_client.history_fetch import (HistoryPageInvalid, FetchBudget, _USE_CONFIG_CEILING,
                                         iter_pages, page_messages)

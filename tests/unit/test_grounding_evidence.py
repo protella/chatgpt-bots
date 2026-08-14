@@ -244,6 +244,6 @@ def test_own_tool_provenance_is_still_allowed_to_be_authoritative():
     """The audit above must not have swept this away with the rest. A "[used tools: …]" line is a
     system-generated record of what the bot itself did — the one thing in its context that IS
     ground truth, and the reason it can answer "how did you get that?" instead of guessing."""
-    from prompts import SLACK_SYSTEM_PROMPT
+    from message_processor.prompts import SLACK_SYSTEM_PROMPT
 
     assert "authoritative record of the tools you actually invoked" in SLACK_SYSTEM_PROMPT

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 
-from mcp_manager import MCPManager
+from openai_client.mcp_manager import MCPManager
 from openai_client.api.responses import _collect_mcp_list_tools
 
 
