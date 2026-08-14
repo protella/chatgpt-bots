@@ -238,7 +238,7 @@ class ChatBotV2:
         
     async def initialize(self):
         """Initialize the bot components"""
-        main_logger.info(f"Initializing Chat Bot V2 for {self.platform}...")
+        main_logger.info(f"Initializing Chat Bot v3 for {self.platform}...")
 
         # Open the participation ledger HERE, before any Slack traffic. Built lazily it would
         # have put a mkdir and a file open inside the first gate call — on the hot path of the
