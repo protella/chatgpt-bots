@@ -183,6 +183,18 @@ class TestPrompts:
         assert "minutes rather than seconds" in desc
         assert "frozen half-sentence" in desc
 
+    def test_background_job_tool_excludes_slack_history_work(self):
+        """Live: asked to summarize a channel's last month, the model dispatched a research job.
+        Research jobs have no Slack access, so the job could only work from the snapshot it was
+        handed and honestly declined. The exclusion has to be at the point of choice."""
+        from message_processor.research_tools import get_start_background_job_schema
+        desc = get_start_background_job_schema()["description"]
+        assert "cannot fetch or search Slack history or the workspace" in desc
+        assert "conversation snapshot captured at dispatch" in desc
+        assert "use `export_conversation` and compute over the export instead" in desc
+        # An export made in THIS turn lives in a different container than the job's sandbox.
+        assert "do not pass it an export path from this turn" in desc
+
     def test_guidance_tells_the_model_a_job_can_be_stopped(self):
         """Live 2026-08-09: the bot agreed to stand down on a doc job and the job ran on for
         eight more minutes, then delivered the doc. The tool now exists; the guidance has to

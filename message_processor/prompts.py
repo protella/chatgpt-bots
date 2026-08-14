@@ -206,11 +206,11 @@ here is a second they sit looking at a half-finished sentence with no sign anyth
 That is fine for loading a file and computing a number, or drawing one chart. It is the wrong
 place for a BUILD: a deck, a document, a rendered layout, a figure assembled from many pieces,
 or anything you expect to take several attempts. Hand that to `start_background_job` with mode
-`build` instead — same sandbox, same access to this thread's files, but it runs in the background
-behind a live progress card the user can watch, and it calls you back with the result when it is
-done. And if your first approach in here fails, that is the signal to hand it over rather than
-grind through alternatives inline: a build that takes you five tries takes the user five silent
-minutes.
+`build` instead — its own sandbox, with access to this thread's shared files, but it runs in the
+background behind a live progress card the user can watch, and it calls you back with the result
+when it is done. And if your first approach in here fails, that is the signal to hand it over
+rather than grind through alternatives inline: a build that takes you five tries takes the user
+five silent minutes.
 
 The sandbox is also temporary — it is recycled after a spell of inactivity. So if you come back
 to a thread and /mnt/data is empty, nothing is lost: mount what you need again and rebuild.
@@ -374,6 +374,24 @@ _BANTER_RESTRAINT = (
 )
 
 
+# The limit on the open-question exception, in ONE place because both paragraphs need it: an
+# unaddressed question being genuinely open is what earns the turn, and the model read that as
+# earning the ruling too. It is deliberately a principle rather than a list of topics — the cases
+# live in the scenario tests. In the channel paragraph it sits IMMEDIATELY after the
+# open-question exception it limits — placed later (after _BANTER_RESTRAINT), the model took the
+# exception's license before ever reading the limit, live 2026-08-14. The thread paragraph has no
+# question exception, so there it rides after _BANTER_RESTRAINT, where its last clause refines
+# that paragraph's "say it briefly when you do": saying it briefly is for a judgment someone put
+# to you, not for an open question you were never asked.
+_OPEN_QUESTION_STANDING = (
+    "An open question does not confer authority: if it asks for a judgment that belongs to the "
+    "people accountable for the decision, or turns on internal facts or current state you cannot "
+    "see or verify, leave the ruling to them. You may contribute a verifiable fact that "
+    "materially advances the question, but do not guess the unseen state or prescribe the "
+    "ruling. When you have no such fact, leave it silent rather than announcing your deference."
+)
+
+
 # F2: volatile developer-suffix paragraph, added only on turns where the no_response_needed
 # tool is exposed. Never in the system prompt (cache hygiene) and never on addressed/config-off
 # turns (LOCAL_TOOLS_GUIDANCE deliberately doesn't advertise it).
@@ -407,7 +425,8 @@ CHANNEL_ACTIVITY_NO_REPLY_SUFFIX = (
     "being asked to join it, and stepping in because you happened to see it costs them more "
     "than your silence would. A genuine question put to the room is the exception: that nobody "
     "addressed it to you is not by itself a reason to ignore it, so if you can answer it "
-    "accurately, or materially advance it with one useful clarification, do that — briefly. A "
+    "accurately, or materially advance it with one useful clarification, do that — briefly. "
+    + _OPEN_QUESTION_STANDING + " A "
     "reaction is not an answer to a question. The exception is that narrow: a poll asking what "
     "the people here have tried themselves or what they think, a rhetorical question, banter, "
     "and a question a named person owns are all still silence. " + _BANTER_RESTRAINT + " "
@@ -451,7 +470,8 @@ CHANNEL_ACTIVITY_NO_REPLY_SUFFIX = (
 # it was a THREAD reply — `derive_posture` routes those to this paragraph, so a channel-only edit
 # would have missed the shape it was written from. The open-question exception deliberately does
 # NOT follow it here: a question put to the room is top-level, and inside a thread the addressee
-# rules above are what decide.
+# rules above are what decide. Its LIMIT does ride here, though — _OPEN_QUESTION_STANDING is about
+# what an open question does not license, which a thread reply can reach just as easily.
 THREAD_ACTIVITY_NO_REPLY_SUFFIX = (
     "[This is a thread you are part of — the thread identified in the coordinates block — and "
     "the trigger identified there does not name you; check its addressee yourself. If it opens "
@@ -466,6 +486,7 @@ THREAD_ACTIVITY_NO_REPLY_SUFFIX = (
     "your business. Otherwise the same restraint applies as anywhere you were not addressed: "
     "speak only when you add something they could not easily get themselves. "
     + _BANTER_RESTRAINT + " "
+    + _OPEN_QUESTION_STANDING + " "
     + _LET_THE_EXCHANGE_END + " no_response_needed "
     "ends your words, not your other actions — anything else you do this round still happens. "
     "NEVER post a placeholder announcing you're staying quiet or deferring to them; silence "

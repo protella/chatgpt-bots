@@ -74,11 +74,13 @@ Two traps that already shipped bugs once each:
 - **A reused container's listing is CUMULATIVE** — turn 2 sees turn 1's files. Published file ids
   are persisted (`published_files_json`) because the in-memory dedupe dies with the process.
 
-### Inline sandbox vs a background build job — same sandbox, different waiting room
+### Inline sandbox vs a background build job — same kind of sandbox, different waiting room
 
 `code_interpreter` is a **hosted** tool: it sits in the tools array and the model runs it *inside*
 the reply. `start_background_job` is a local function tool that detaches the work. Same container
-image, same access to the thread's files — the difference is entirely who waits and what they see.
+image and the same access to the thread's shared files, but a build job gets its **own** container
+(keyed `thread#job:id` — an export staged inline is NOT reachable from it) — beyond that, the
+difference is entirely who waits and what they see.
 
 **There is no point at which we can intervene in an inline run.** All of a round's sandbox calls
 happen server-side within ONE streaming API call: no round boundary, no chance to inject a

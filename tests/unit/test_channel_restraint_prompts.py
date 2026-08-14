@@ -109,6 +109,24 @@ def test_the_reaction_endorsement_rule_reaches_both_paragraphs():
         assert prompts._BANTER_RESTRAINT in s
 
 
+def test_the_open_question_standing_limit_reaches_both_paragraphs():
+    """An open question earns the turn, not the ruling. One constant, both suffixes — a thread
+    reply can walk into the same judgment the channel variant's exception invited."""
+    for s in BOTH:
+        assert prompts._OPEN_QUESTION_STANDING in s
+
+
+def test_the_open_question_standing_limit_states_the_principle():
+    """Pinned as a principle, not a topic list: the judgment belongs to whoever is accountable,
+    unseen state is not to be guessed, and deferring out loud is still speaking."""
+    s = prompts._OPEN_QUESTION_STANDING
+    assert "An open question does not confer authority" in s
+    assert "belongs to the people accountable for the decision" in s
+    assert "current state you cannot see or verify" in s
+    assert "do not guess the unseen state or prescribe the ruling" in s
+    assert "rather than announcing your deference" in s
+
+
 def test_the_reaction_endorsement_rule_states_the_mechanism_and_its_limbs():
     """The incident: an agreement emoji on a config tip framed as an opinion about a product.
     Both limbs are pinned — factual business in the same message launders nothing, and a

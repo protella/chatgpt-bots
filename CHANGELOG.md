@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.1.2] - 2026-08-14
+
+### 🔧 Changed
+
+- **The bot no longer rules on decisions that belong to people.** When an open question in a
+  channel asks for a judgment owned by the people accountable for it, or turns on internal
+  facts the bot can't verify, it now stays out of it — it can still contribute a verifiable
+  fact, but it won't prescribe the call. Ordinary factual questions to the room are unaffected.
+- **"Summarize this channel's last month" now actually covers the month.** Requests to analyze
+  or summarize Slack conversation history are routed to the full-history export instead of a
+  background research job (which can't read Slack and could only see a recent snapshot). The
+  bot computes over the complete record and states the coverage window honestly.
+
 ## [3.1.1] - 2026-08-13
 
 ### 🔧 Changed
