@@ -737,7 +737,7 @@ async def run_responder_trial(openai_client: Any, *, room: Room, trigger: Say,
 # --------------------------------------------------------------------------- running trials
 
 _TRANSPORT_ERRORS = (TimeoutError, asyncio.TimeoutError, ConnectionError, OSError)
-_TRANSPORT_MODULES = ("openai", "httpx", "httpcore")
+_TRANSPORT_MODULES = ("openai", "httpx", "httpcore", "httpx2", "httpcore2")
 
 
 def is_transport_error(exc: BaseException) -> bool:
