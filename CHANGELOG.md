@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.1.3] - 2026-08-18
+
+### 🔧 Changed
+
+- **Dependency refresh.** OpenAI SDK 2.53.0 → 3.1.0 and pypdf 6.15.0 → 6.16.1. The SDK's
+  new major swaps its internal HTTP client (httpx → httpx2); the bot doesn't touch that layer,
+  so no code, config, or `.env` changes are involved. Verified live on both the DM and channel
+  paths, including PDF extraction.
+
 ## [3.1.2] - 2026-08-14
 
 ### 🔧 Changed
