@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.1.4] - 2026-08-20
+
+### 🔧 Changed
+
+- **Knowing a product is not knowing our setup.** The bot no longer presents guesses about how
+  this workspace has configured, licensed, or administered a tool — including the AI tools it
+  knows best — as fact. What someone shows in the conversation or a tool actually returns still
+  counts as evidence, and general product questions are still answered; only confident
+  reconstruction of unseen internal state is off the table.
+
 ## [3.1.3] - 2026-08-18
 
 ### 🔧 Changed

@@ -127,6 +127,16 @@ def test_the_open_question_standing_limit_states_the_principle():
     assert "rather than announcing your deference" in s
 
 
+def test_the_open_question_standing_limit_separates_product_knowledge_from_deployment_state():
+    """Knowing a product well is not seeing how this workplace runs it: configuration, licensing
+    and administration are unseen state, and the carve-out keeps what the conversation shows or a
+    tool returned usable as evidence."""
+    s = prompts._OPEN_QUESTION_STANDING
+    assert "General product knowledge is not evidence" in s
+    assert "do not state unseen workplace state as fact" in s
+    assert "your familiarity is not" in s
+
+
 def test_the_reaction_endorsement_rule_states_the_mechanism_and_its_limbs():
     """The incident: an agreement emoji on a config tip framed as an opinion about a product.
     Both limbs are pinned — factual business in the same message launders nothing, and a
