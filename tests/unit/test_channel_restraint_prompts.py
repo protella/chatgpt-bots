@@ -214,6 +214,35 @@ def test_the_reaction_endorsement_rule_states_the_mechanism_and_its_limbs():
     assert "agreeing with the insult" in s
 
 
+def test_a_message_to_someones_team_is_not_the_bots_to_answer():
+    """2026-08-21 ruling. The old clause read any room-wide invitation as addressed to the bot
+    too — a team reflection poll came back with a first-person persona answer, and a "react to
+    confirm you've read this" reminder came back with a ✅. What decides is whose the message
+    is: a team's is the team's, and the bot is on nobody's team."""
+    s = prompts._BANTER_RESTRAINT
+    # the old license is gone
+    assert "an open invitation to the room to answer by reacting" not in s
+    assert "staying silent through it is not restraint" not in s
+    assert "having no body to have preferences with is not a reason to sit out" not in s
+    # ...and the ownership principle stands in its place
+    assert "A message someone puts to THEIR TEAM" in s
+    assert "is the team's, and you are not on anyone's team" in s
+    assert "no reply and no reaction" in s
+    assert "unless someone names you" in s
+    # casual chatter thrown open to whoever is around keeps the play-along license
+    assert "A casual question thrown open to whoever is around is a different thing" in s
+    assert "no body to have preferences with" in s
+
+
+def test_the_reaction_guidance_excludes_a_reaction_asked_of_a_team():
+    """Same ruling on the reaction surface, and it has to survive the channel line filter."""
+    clause = "A reaction someone asks of THEIR TEAM"
+    for g in (LOCAL_TOOLS_GUIDANCE, CHANNEL_LOCAL_TOOLS_GUIDANCE):
+        assert clause in g
+        assert "you are not on anyone's team" in g
+        assert "the room already reacting to it is not a reason to join" in g
+
+
 def test_the_voice_paragraph_carries_the_standing_rule():
     """It rides the system prompt rather than the restraint paragraph because standing governs
     every surface and every turn, addressed or not."""

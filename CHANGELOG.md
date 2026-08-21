@@ -15,6 +15,13 @@ All notable changes to this project will be documented in this file.
   anyone in the thread could draw is not new information, public documentation it just looked
   up is not evidence of how this workplace is set up, and it no longer @-mentions people or
   hands out next steps unasked. DMs and @mentions are unchanged.
+- **A message to someone's team is the team's.** A manager's mandate or reminder, a team
+  check-in or Friday ritual, a "react so I know you've read this", an @here meant for the people
+  who work with the sender — the bot is not on anyone's team, so it neither answers nor reacts
+  unless someone names it. Casual questions and for-fun polls thrown open to whoever is around
+  are still fair game to play along with briefly. (Replaces the earlier "an open invitation to
+  the room is addressed to you too" rule, which produced a first-person answer to a team
+  reflection poll and a ✅ on a compliance reminder.)
 - **It remembers its corrections.** When the bot corrects a factual claim it made, it stores
   the corrected fact in memory (channel memory in a channel, personal memory in a DM) as one
   concise line, without announcing it — so the same mistake is not repeated next week.
