@@ -177,22 +177,27 @@ async def test_dm_remember_writes_the_user_store(db):
 
 
 @pytest.mark.asyncio
-async def test_dm_remember_cap_counts_user_rows_and_lists_the_stalest(db):
+async def test_dm_remember_budget_counts_user_rows_and_returns_the_whole_store(db):
+    """The personal store gets the same character budget as a channel's, and the same refusal:
+    the model is handed everything it holds, so it can consolidate and retry."""
     for i in range(1, 4):
         await db.add_user_memory_async(USER, f"fact {i}", author=USER)
-    with patch.object(config, "memory_max_rows", 3):
+    with patch.object(config, "memory_store_max_chars", 20):
         result = await execute_remember_fact(_ctx(db), {"content": "one more"})
     assert result["ok"] is False and result["error"] == "memory_full"
-    assert [r["content"] for r in result["oldest"]] == ["fact 1", "fact 2", "fact 3"]
+    assert [r["content"] for r in result["facts"]] == ["fact 1", "fact 2", "fact 3"]
+    assert result["budget_chars"] == 20
+    assert "consolidate" in result["hint"]
     assert len(await db.get_user_memory_async(USER)) == 3
 
 
 @pytest.mark.asyncio
 async def test_dm_remember_truncates_at_the_shared_limit(db):
-    from message_processor.memory_tools import MAX_FACT_CHARS
-
-    await execute_remember_fact(_ctx(db), {"content": "x" * (MAX_FACT_CHARS + 50)})
-    assert len((await db.get_user_memory_async(USER))[0]["content"]) == MAX_FACT_CHARS
+    """The limit is config.memory_fact_max_chars (MEMORY_FACT_MAX_CHARS), not a module constant —
+    both stores read the same operator setting, live."""
+    with patch.object(config, "memory_fact_max_chars", 120):
+        await execute_remember_fact(_ctx(db), {"content": "x" * 170})
+    assert len((await db.get_user_memory_async(USER))[0]["content"]) == 120
 
 
 @pytest.mark.asyncio
@@ -577,7 +582,7 @@ async def test_a_modal_without_the_section_leaves_memory_alone(db):
 @pytest.mark.asyncio
 async def test_list_facts_returns_the_whole_store():
     """No result cap: `list_facts` is the full-view surface the modal's '+N more' points at, and
-    memory_max_rows is the only thing that bounds a store."""
+    the store's character budget is the only thing that bounds a store."""
     import message_processor.memory_tools as memory_tools
 
     assert not hasattr(memory_tools, "LIST_FACTS_MAX")
@@ -700,3 +705,21 @@ async def test_a_dropped_stash_warns_instead_of_vanishing(db):
         )
 
     assert "was NOT saved" in client.chat_postMessage.await_args.kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_editing_one_note_in_a_store_past_the_old_row_cap_keeps_it(db):
+    """2026-08-20: stores are bounded by characters, so the modal passes no row cap. With one,
+    editing a note in a 26-row store deleted the original and refused its replacement."""
+    ids = [await db.add_user_memory_async(USER, f"note {i}", author=USER) for i in range(26)]
+    seed = [[i, memory_content_hash(f"note {n}")] for n, i in enumerate(ids)]
+    lines = [f"note {n}" for n in range(26)]
+    lines[0] = "note 0 edited"
+
+    result = await db.reconcile_user_memory_from_textarea_async(
+        USER, seed, lines, author=USER, max_rows=None)
+
+    assert result["deleted"] == [ids[0]] and result["added"] == ["note 0 edited"]
+    assert result["over_cap"] == 0
+    contents = {r["content"] for r in await db.get_user_memory_async(USER)}
+    assert "note 0 edited" in contents and len(contents) == 26

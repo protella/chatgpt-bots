@@ -222,6 +222,20 @@ class TestPrompts:
         assert '"passed along", not applied' in LOCAL_TOOLS_GUIDANCE
         assert "a later cancel supersedes it" in LOCAL_TOOLS_GUIDANCE
 
+    def test_guidance_makes_a_self_correction_leave_a_memory_note(self):
+        """A correction that is only posted lives exactly as long as the context window: next
+        week the same wrong claim comes back. Correcting a factual claim of its own is the one
+        case where the standing bias against saving is explicitly overridden."""
+        from message_processor.prompts import LOCAL_TOOLS_GUIDANCE
+        assert "Whenever you correct a factual claim you made" in LOCAL_TOOLS_GUIDANCE
+        assert "also store the corrected fact with remember_fact" in LOCAL_TOOLS_GUIDANCE
+        # both surfaces named, so a DM correction does not go looking for channel memory
+        assert "channel memory in a channel, personal memory in a DM" in LOCAL_TOOLS_GUIDANCE
+        assert "explicit exception to the bias against saving" in LOCAL_TOOLS_GUIDANCE
+        # and the two habits that would make it worse than nothing
+        assert "Update the near-duplicate instead of adding a second note" in LOCAL_TOOLS_GUIDANCE
+        assert "never announce the save" in LOCAL_TOOLS_GUIDANCE
+
     @pytest.mark.critical
     def test_critical_prompts_structure(self):
         """Critical: the pieces production behavior depends on"""

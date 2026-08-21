@@ -913,7 +913,7 @@ def test_channel_activity_paragraph_wording():
     from message_processor.prompts import CHANNEL_ACTIVITY_NO_REPLY_SUFFIX as s
     assert "uninvited" not in s
     assert "Silence is the DEFAULT here" in s
-    assert "could not easily get themselves" in s
+    assert "Speak only when you are offering something the room does not already have" in s
     assert "no_response_needed" in s
     assert 'consist only of "I haven\'t tried it,"' in s
     assert "do not suppress a substantive answer merely because it includes a limitation" in s

@@ -5109,7 +5109,7 @@ class DatabaseManager(LoggerMixin):
                 raise
 
     async def reconcile_channel_memory_from_textarea_async(
-        self, channel_id: str, seed: list, lines: list, author: str, max_rows: int
+        self, channel_id: str, seed: list, lines: list, author: str, max_rows: Optional[int]
     ) -> dict:
         """Reconcile channel-scope memory against an edited textarea in ONE atomic transaction.
 
@@ -5345,7 +5345,7 @@ class DatabaseManager(LoggerMixin):
             return cursor.rowcount or 0
 
     async def reconcile_user_memory_from_textarea_async(
-        self, user_id: str, seed: list, lines: list, author: str, max_rows: int
+        self, user_id: str, seed: list, lines: list, author: str, max_rows: Optional[int]
     ) -> dict:
         """The user-store twin of ``reconcile_channel_memory_from_textarea_async``.
 

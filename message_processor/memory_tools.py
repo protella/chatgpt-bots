@@ -21,8 +21,15 @@ told the bot alone. The store split is what makes that structural — the channe
 Rules enforced here, not by prompt:
 - Writes are attributed to the triggering user, and channel writes are always channel-scope.
 - Workspace-scope rows are visible in context but read-only from a channel.
-- The row cap (MEMORY_MAX_ROWS) is enforced on insert for BOTH stores; at cap the model is told
-  the oldest entries so it can update/forget instead.
+- A fact longer than MEMORY_FACT_MAX_CHARS is trimmed to it on write.
+- Each store — one channel's facts, or one person's personal facts — is bounded by CHARACTERS,
+  not rows (MEMORY_STORE_MAX_CHARS, 2026-08-20; MEMORY_MAX_ROWS no longer gates these tools).
+  The measure is the SERIALIZED store, ``len("\\n".join(contents))``, because that is exactly what
+  the settings modal puts in its one textarea — and Slack caps that element at 3000 characters.
+  A store that fits the budget is a store a person can open and see ALL of. A write that would
+  exceed it is refused with the store's full current contents, for the model to consolidate
+  (update/forget) and retry: nothing is truncated to fit and nothing is evicted for it.
+  Both limits are operator settings read from config, never literals here.
 
 Executors never raise: every failure is an ``{"ok": False, "error": ...}`` result (the registry
 would wrap an exception anyway, but clean errors give the model something actionable).
@@ -35,8 +42,77 @@ from config import config
 from message_processor.channel_steering import is_ordinary_fact
 from message_processor.tool_registry import ToolContext, ToolRegistry
 
-# Keep stored facts to a concise sentence-or-two; hard cap guards the prompt.
-MAX_FACT_CHARS = 500
+
+def _fact_max_chars() -> int:
+    """Per-fact character cap (MEMORY_FACT_MAX_CHARS), read live rather than frozen at import.
+
+    It was a module constant until 2026-08-20; the owner's ruling is that a store's limits are
+    operator settings, not literals in the code, so this and the store budget come from .env.
+    """
+    return max(1, config.memory_fact_max_chars)
+
+
+def _store_max_chars() -> int:
+    """The whole store's character budget (MEMORY_STORE_MAX_CHARS), read live for the same reason.
+
+    It is the settings modal's textarea budget under another name — see the module docstring.
+    """
+    return max(1, config.memory_store_max_chars)
+
+
+def _serialized_len(contents: List[str]) -> int:
+    """Length of the store as the settings modal serializes it: one fact per line.
+
+    The joining newlines count, and each line is normalized exactly as
+    ``SettingsModal._compute_memory_seed`` normalizes it, so the two measurements cannot disagree
+    about whether a store fits the box. Blank lines are dropped there and dropped here.
+    """
+    from database import normalize_memory_line
+
+    lines = [line for line in (normalize_memory_line(c or "") for c in contents) if line]
+    return len("\n".join(lines))
+
+
+async def _store_rows(ctx: ToolContext) -> List[Dict[str, Any]]:
+    """The rows this store's budget is measured over — and that a refusal hands back.
+
+    Channel: the channel's OWN ordinary facts. Workspace-scope rows are read-only from here and
+    steering rows are not facts, so neither spends a budget the model has no way to free.
+    """
+    if ctx.is_dm:
+        return list(await ctx.db.get_user_memory_async(ctx.user_id) or [])
+    rows = await ctx.db.get_channel_memory_async(ctx.channel_id) or []
+    return [r for r in rows if r.get("scope") == "channel" and is_ordinary_fact(r)]
+
+
+def _over_budget(rows: List[Dict[str, Any]], new_content: str,
+                 replacing_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    """None when the write fits the store's budget; otherwise the refusal result.
+
+    The refusal carries the WHOLE store — ids, contents, and the numbers — because consolidating
+    is the only way forward and the model cannot merge notes it was not shown. It deliberately
+    does not truncate the new fact (a mutilated fact is a wrong fact, kept forever) and does not
+    evict an old one (which of its own notes is spent is the model's call, not an ordering rule's).
+    """
+    kept = [(row.get("content") or "") for row in rows if row.get("id") != replacing_id]
+    budget = _store_max_chars()
+    total = _serialized_len(kept + [new_content])
+    if total <= budget:
+        return None
+    listed = sorted(rows, key=lambda r: r.get("id") or 0)
+    return {
+        "ok": False,
+        "error": "memory_full",
+        "hint": "consolidate: update or forget something, then write again",
+        "message": (f"This store holds {budget} characters and that write would take it to "
+                    f"{total}. NOTHING WAS SAVED. Consolidate what is already here — merge the "
+                    "overlapping notes with update_fact, drop what is spent with forget_fact — "
+                    "and then retry the write."),
+        "used_chars": _serialized_len(kept),
+        "would_be_chars": total,
+        "budget_chars": budget,
+        "facts": [{"id": r.get("id"), "content": r.get("content") or ""} for r in listed],
+    }
 
 
 def _text_arg(value: Any) -> Optional[str]:
@@ -61,6 +137,10 @@ def get_remember_fact_schema() -> Dict[str, Any]:
             "memory (decisions, conventions, recurring events, who owns what). "
             "Bias strongly against saving; most exchanges contain nothing durable. "
             "Update an existing [#id] fact instead of adding a near-duplicate. "
+            f"This channel's facts share a {_store_max_chars()}-character store, so keep each one "
+            "to a concise sentence or two. A write that would overflow the store is refused with "
+            "everything currently in it and saves nothing — consolidate what is there (merge "
+            "with update_fact, drop what is spent with forget_fact) and write again. "
             "NOT for rules about your own behavior here — 'stay quiet unless tagged', 'keep "
             "answers short in this channel' and the like are the channel's standing policy: "
             "write those with set_channel_participation(standing_policy=...)."
@@ -89,7 +169,8 @@ def get_update_fact_schema() -> Dict[str, Any]:
         "name": "update_fact",
         "description": (
             "Revise an existing channel-memory fact (shown in context as [#id]) when it "
-            "changed or needs refinement. Prefer this over remember_fact for near-duplicates. "
+            "changed or needs refinement. Prefer this over remember_fact for near-duplicates, "
+            "and use it to MERGE two overlapping notes into one when the store is full. "
             "It edits background facts only; to change a rule about how you behave here, "
             "replace the standing policy with set_channel_participation(standing_policy=...)."
         ),
@@ -168,7 +249,11 @@ def get_remember_fact_dm_schema() -> Dict[str, Any]:
             "DM: it is never shown in channels. "
             "Bias strongly against saving; most exchanges contain nothing durable, and a "
             "passing detail saved forever is worse than one forgotten. "
-            "Update an existing [#id] fact instead of adding a near-duplicate."
+            "Update an existing [#id] fact instead of adding a near-duplicate. "
+            f"What you remember about this person shares a {_store_max_chars()}-character store, "
+            "so keep each fact to a concise sentence or two. A write that would overflow it is "
+            "refused with everything currently stored and saves nothing — consolidate what is "
+            "there (merge with update_fact, drop what is spent with forget_fact) and write again."
         ),
         "parameters": {
             "type": "object",
@@ -189,7 +274,8 @@ def get_update_fact_dm_schema() -> Dict[str, Any]:
         "name": "update_fact",
         "description": (
             "Revise something you remember about this person (shown in context as [#id]) when "
-            "it changed or needs refinement. Prefer this over remember_fact for near-duplicates."
+            "it changed or needs refinement. Prefer this over remember_fact for near-duplicates, "
+            "and use it to MERGE two overlapping notes into one when the store is full."
         ),
         "parameters": {
             "type": "object",
@@ -337,29 +423,16 @@ async def execute_remember_fact(ctx: ToolContext, args: Dict[str, Any]) -> Dict[
     if not content:
         return {"ok": False, "error": "bad_arguments",
                 "message": "content is required, as a string."}
-    content = content[:MAX_FACT_CHARS]
-    cap = max(1, config.memory_max_rows)
+    content = content[:_fact_max_chars()]
+    # How many rows a store has stopped mattering on 2026-08-20: a hundred short notes that fit
+    # the modal's box are fine, and three long ones that don't are not. Only the characters count.
+    refusal = _over_budget(await _store_rows(ctx), content)
+    if refusal:
+        return refusal
 
     if ctx.is_dm:
-        rows = await ctx.db.get_user_memory_async(ctx.user_id) or []
-        if len(rows) >= cap:
-            # rows arrive ordered updated_ts ASC, so the head is the stalest.
-            oldest = [{"id": r["id"], "content": r["content"]} for r in rows[:3]]
-            return {"ok": False, "error": "memory_full",
-                    "hint": "forget or update something",
-                    "oldest": oldest}
         new_id = await ctx.db.add_user_memory_async(ctx.user_id, content, author=ctx.user_id)
         return {"ok": True, "id": new_id, "content": content}
-
-    rows = await ctx.db.get_channel_memory_async(ctx.channel_id)
-    # Steering rows never consume fact capacity: the cap exists to keep remembered facts from
-    # crowding the prompt, and a channel whose preferences filled it could store nothing at all.
-    chan_rows = [r for r in rows if r.get("scope") == "channel" and is_ordinary_fact(r)]
-    if len(chan_rows) >= cap:
-        oldest = [{"id": r["id"], "content": r["content"]} for r in chan_rows[:3]]
-        return {"ok": False, "error": "memory_full",
-                "hint": "forget or update something",
-                "oldest": oldest}
 
     new_id = await ctx.db.add_channel_memory_async(
         ctx.channel_id, content, scope="channel", author=ctx.user_id
@@ -379,7 +452,13 @@ async def execute_update_fact(ctx: ToolContext, args: Dict[str, Any]) -> Dict[st
     if "row" not in resolved:
         return resolved
     row = resolved["row"]
-    content = content[:MAX_FACT_CHARS]
+    content = content[:_fact_max_chars()]
+    # A revision spends the budget too — but it REPLACES this row, so this row's current content
+    # is not part of what the new text has to fit beside. Without that, consolidating a store that
+    # is already full would be impossible: every merge would be refused by the notes it merges.
+    refusal = _over_budget(await _store_rows(ctx), content, replacing_id=row["id"])
+    if refusal:
+        return refusal
     # The store-constrained update, even though _visible_row already resolved the row against
     # exactly what this surface may reach: this is a model-driven write, and the storage should be
     # the last word on what it can touch rather than a check three frames up.

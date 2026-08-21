@@ -421,8 +421,16 @@ class SettingsModal(LoggerMixin):
     # textarea now, so it needs no per-item cap — only the 2900-char textarea budget below.
     _MODAL_LIST_CAP = 10
 
-    # Slack plain_text_input's max we build the channel-memory textarea against (value + budget guard).
-    _MEMORY_TEXTAREA_MAX = 2900
+    # Slack plain_text_input's max we build the channel-memory textarea against (value + budget
+    # guard). It IS the memory store's budget (config.memory_store_max_chars) — the tools refuse a
+    # write that would not fit this box, so the two must be one number — clamped to 2900 because
+    # Slack hard-caps the element at 3000 and a bigger MEMORY_STORE_MAX_CHARS must not silently
+    # start hiding notes again.
+    _SLACK_TEXTAREA_CEILING = 2900
+
+    @property
+    def _MEMORY_TEXTAREA_MAX(self) -> int:
+        return min(config.memory_store_max_chars, self._SLACK_TEXTAREA_CEILING)
 
     @staticmethod
     def _truncate(text: str, limit: int) -> str:
@@ -443,6 +451,12 @@ class SettingsModal(LoggerMixin):
         stop and the rest become the "+N more not shown" remainder. The seed lists EXACTLY the
         included rows — never seed a row that isn't in the box, or submit could "delete" a row the
         user never saw. Returns ``(initial_value, mem_seed, hidden_count)``.
+
+        The overflow path is the LEGACY path now: the memory tools refuse any write that would put
+        a store past this same budget, so a store written since 2026-08-20 fits the box whole and
+        `hidden_count` is normally zero. It stays for stores that filled up under the old row cap,
+        until their owners consolidate them. (The read-only workspace-shared list is unaffected —
+        it has its own `_MODAL_LIST_CAP` and is not part of any store's budget.)
         """
         from database import normalize_memory_line, memory_content_hash
 

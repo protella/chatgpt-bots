@@ -75,7 +75,20 @@ def test_neither_paragraph_apologizes_for_being_there():
 def test_the_value_floor_survives_in_both_paragraphs():
     assert "Silence is the DEFAULT here" in CHANNEL_ACTIVITY_NO_REPLY_SUFFIX
     for s in BOTH:
-        assert "could not easily get themselves" in s
+        assert "Speak only when you are offering something the room does not already have" in s
+
+
+def test_the_value_floor_is_retrieved_facts_not_capability_in_both_paragraphs():
+    """Quiet-by-default, 2026-08-20: the old floor asked only for something the people here
+    "could not easily get themselves", which being able to answer already satisfies — so the bot
+    raced the room to general questions. The floor is now what it actually holds that they don't."""
+    for s in BOTH:
+        assert "a fact you actually retrieved or verified with your tools this turn" in s
+        assert "an established fact about your own prior words, actions, or tool use" in s
+        assert "Being able to answer is never by itself a reason to answer" in s
+        assert "an informed colleague could supply is the room's to give, not yours" in s
+        # the capability license it replaces is gone from both
+        assert "could not easily get" not in s
 
 
 def test_the_honesty_escape_survives_in_the_channel_paragraph():
@@ -95,7 +108,14 @@ def test_the_value_floor_is_earned_by_new_grounded_information():
     s = CHANNEL_ACTIVITY_NO_REPLY_SUFFIX
     assert "a non-answer dressed as advice is still that answer" in s
     assert "new grounded information" in s
-    assert "knowledge you actually hold with confidence" in s
+    # 2026-08-20: "knowledge you actually hold with confidence" was the same license in the list —
+    # a model always holds its general knowledge with confidence. Grounding has to be an act.
+    assert "a fact you actually retrieved or verified" in s
+    assert "knowledge you actually hold with confidence" not in s
+    # 2026-08-20 (again): the clarification route went with it — an inference any informed
+    # colleague could draw from the stream is not new grounded information.
+    assert "a clarifying connection supported by the stream in front of you" not in s
+    assert "a check you made this turn, or a fact you actually retrieved or verified" in s
     # The live loophole the first §7 probe found: an empty search reported as if it were a fact.
     assert "reporting that you searched and found nothing" in s
 
@@ -127,14 +147,60 @@ def test_the_open_question_standing_limit_states_the_principle():
     assert "rather than announcing your deference" in s
 
 
+def test_the_open_question_exception_is_not_a_capability_license():
+    """The exception survives — an unaddressed question is still answerable — but "if you can
+    answer it accurately" made capability the bar, which is the whole failure mode. What earns the
+    turn is the same retrieved-or-verified fact the value floor asks for."""
+    s = CHANNEL_ACTIVITY_NO_REPLY_SUFFIX
+    assert "A genuine question put to the room is the exception" in s
+    assert "if you can answer it accurately" not in s
+    assert "Settle it with a fact you actually retrieved or verified this turn" in s
+    assert "what any informed colleague here could say, the answer is theirs to give" in s
+    assert "being first with it adds nothing" in s
+    # the retrieved-or-verified fact is the ONLY route now — the clarification license is gone
+    assert "materially advance it with one useful clarification" not in s
+    assert "do that — briefly" in s
+
+
+def test_the_open_question_standing_limit_wants_a_fact_that_was_actually_retrieved():
+    """"A verifiable fact" reads as "a fact I could verify" — general knowledge passes it. The
+    contribution clause now names the act, matching the floor in both paragraphs."""
+    s = prompts._OPEN_QUESTION_STANDING
+    assert "You may contribute a fact you actually retrieved or verified" in s
+    assert "verifiable fact" not in s
+
+
+def test_the_thread_bar_never_overrides_the_addressee_rules_or_an_answer_owed():
+    """The mirrored floor sits in a paragraph whose whole first half is about being the one asked.
+    Read flat it would silence an addressed follow-up, so it says what it is for."""
+    s = THREAD_ACTIVITY_NO_REPLY_SUFFIX
+    assert "That bar is for what is genuinely the room's" in s
+    assert "never overrides the addressee rules above" in s
+    assert "never cuts short an answer or a correction you already owe" in s
+    # and the rules it must not outrank are still there, on both sides of it
+    assert "check its addressee yourself" in s
+    assert "Keep answering while you are the one being asked" in s
+
+
 def test_the_open_question_standing_limit_separates_product_knowledge_from_deployment_state():
     """Knowing a product well is not seeing how this workplace runs it: configuration, licensing
     and administration are unseen state, and the carve-out keeps what the conversation shows or a
     tool returned usable as evidence."""
     s = prompts._OPEN_QUESTION_STANDING
     assert "General product knowledge is not evidence" in s
-    assert "do not state unseen workplace state as fact" in s
+    assert "do not state unseen workplace state as fact" not in s
+    assert "Do not state unseen workplace state as fact" in s
     assert "your familiarity is not" in s
+    # retrieving it this turn does not convert it into evidence about this workplace
+    assert "whether you remember it or just retrieved it this turn from public documentation" in s
+    assert "CAN be configured is not a fact about how it IS configured here" in s
+    assert "a tool actually returned about this workplace" in s
+    # the contribution has to advance the question, not the product
+    assert "materially advances the question itself" in s
+    assert "a fact about the product in general is not that" in s
+    # and an unaddressed turn does not get to summon anyone or assign homework
+    assert "never the place to @-mention a person into the thread" in s
+    assert "hand someone a next step to go check" in s
 
 
 def test_the_reaction_endorsement_rule_states_the_mechanism_and_its_limbs():

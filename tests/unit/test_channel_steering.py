@@ -1199,14 +1199,17 @@ class TestGenericToolsCannotTouchSteering:
 
     async def test_remember_fact_capacity_ignores_steering_rows(self, temp_db, monkeypatch):
         from message_processor.memory_tools import execute_remember_fact
-        monkeypatch.setattr(config, "memory_max_rows", 2, raising=False)
+        # A store is bounded by characters now; "react less here" is steering, so its characters
+        # are not the facts' to spend — a channel whose preferences filled the budget could
+        # remember nothing at all.
+        monkeypatch.setattr(config, "memory_store_max_chars", 33, raising=False)
         await temp_db.set_channel_policy_async("C1", "only deploys")
         temp_db.add_channel_memory("C1", "react less here", author=MARK)
-        temp_db.add_channel_memory("C1", "one real fact")
-        res = await execute_remember_fact(_memory_ctx(temp_db), {"content": "a second real fact"})
-        assert res["ok"], "steering rows must not consume the fact cap"
+        temp_db.add_channel_memory("C1", "one real fact")            # 13 chars
+        res = await execute_remember_fact(_memory_ctx(temp_db), {"content": "second real fact"})
+        assert res["ok"], "steering rows must not consume the fact budget"
         res = await execute_remember_fact(_memory_ctx(temp_db), {"content": "a third real fact"})
-        assert res["error"] == "memory_full"        # the cap still applies to FACTS
+        assert res["error"] == "memory_full"        # the budget still applies to FACTS
 
     async def test_the_fallback_extractor_cannot_evict_or_revise_steering(self, temp_db,
                                                                          monkeypatch):

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 from typing import Optional
 
+from config import config
 from database import memory_content_hash, normalize_memory_line
 from slack_client.settings_modal import SettingsModal
 
@@ -59,7 +60,9 @@ class TestMemoryTextarea:
         assert el["type"] == "plain_text_input"
         assert el["action_id"] == "channel_memory"
         assert el["multiline"] is True
-        assert el["max_length"] == 2900
+        # The box IS the memory store's budget: the tools refuse a write that would not fit it,
+        # so the person always sees 100% of what is stored (clamped to Slack's 3000 element limit).
+        assert el["max_length"] == min(config.memory_store_max_chars, 2900)
         # both channel-scope notes seed the textarea, one per line
         assert el["initial_value"] == "deploys break on fridays\nprefer bullet points"
         assert "*What I remember about this channel*" in _all_text(view)

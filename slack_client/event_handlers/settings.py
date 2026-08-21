@@ -142,7 +142,7 @@ class SlackSettingsHandlersMixin(_Host):
                 return "\n🧹 Personal memory cleared."
             result = await self.db.reconcile_user_memory_from_textarea_async(
                 user_id, seed or [], submitted.get('lines') or [], author=user_id,
-                max_rows=config.memory_max_rows)
+                max_rows=None)  # the box is bounded by characters, never by rows (2026-08-20)
             over_cap = result.get('over_cap', 0)
             conflicts = result.get('conflicts', 0)
             warning = ""
@@ -658,7 +658,8 @@ class SlackSettingsHandlersMixin(_Host):
                             seen.add(norm)
                             lines.append(norm)
                     result = await self.db.reconcile_channel_memory_from_textarea_async(
-                        channel_id, seed, lines, author=user_id, max_rows=config.memory_max_rows)
+                        channel_id, seed, lines, author=user_id,
+                        max_rows=None)  # the box is bounded by characters, never by rows (2026-08-20)
                     over_cap = result.get('over_cap', 0)
                     conflicts = result.get('conflicts', 0)
                     if over_cap:

@@ -9,6 +9,8 @@ The DM surface — where the same tool names reach the per-user store instead �
 lives in tests/unit/test_user_memory.py, including the DM behaviour that used to
 be a flat refusal here.
 """
+import os
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -80,26 +82,119 @@ async def test_remember_happy_path_attributes_author():
 
 
 @pytest.mark.asyncio
-async def test_remember_cap_hit_lists_oldest_three():
-    rows = [_row(i, f"fact {i}", updated_ts=f"2026-06-{i:02d}") for i in range(1, 6)]
+async def test_over_budget_write_is_refused_with_the_whole_store_and_how_to_fix_it():
+    """A store is bounded by CHARACTERS as of 2026-08-20, and a refusal has to be actionable:
+    consolidating is the only way forward, and the model cannot merge notes it was not shown."""
+    rows = [_row(i, f"fact {i} " + "z" * 20, updated_ts=f"2026-06-{i:02d}") for i in range(1, 6)]
     db = _db(rows=rows)
-    with patch.object(config, "memory_max_rows", 5):
+    with patch.object(config, "memory_store_max_chars", 140):
         result = await execute_remember_fact(_ctx(db), {"content": "one more"})
-    assert result["ok"] is False
-    assert result["error"] == "memory_full"
-    assert result["hint"] == "forget or update something"
-    assert [r["id"] for r in result["oldest"]] == [1, 2, 3]
+    assert result["ok"] is False and result["error"] == "memory_full"
+    # the FULL store comes back, ids included, not a sample of the oldest
+    assert [f["id"] for f in result["facts"]] == [1, 2, 3, 4, 5]
+    assert [f["content"] for f in result["facts"]] == [r["content"] for r in rows]
+    assert result["budget_chars"] == 140 and result["would_be_chars"] > 140
+    assert "consolidate" in result["hint"]
+    assert "NOTHING WAS SAVED" in result["message"]
+    assert "update_fact" in result["message"] and "forget_fact" in result["message"]
     db.add_channel_memory_async.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_remember_cap_counts_only_channel_scope():
-    """Workspace-scope rows are visible but must not consume the channel's cap."""
-    rows = [_row(1, "chan fact"), _row(2, "shared fact", scope="workspace")]
+async def test_the_budget_is_the_serialized_store_newlines_included():
+    """The budget measures what the settings modal puts in its one textarea — one fact per line —
+    so the joining newlines count. Contents that sum to exactly the budget do not fit."""
+    rows = [_row(1, "a" * 40), _row(2, "b" * 39)]
+    db = _db(rows=rows, new_id=3)
+    # 40 + 39 + 20 = 99 characters of content, but 101 as two newline-joined lines plus a third.
+    with patch.object(config, "memory_store_max_chars", 100):
+        refused = await execute_remember_fact(_ctx(db), {"content": "c" * 20})
+    assert refused["ok"] is False and refused["error"] == "memory_full"
+    assert refused["would_be_chars"] == 101
+    with patch.object(config, "memory_store_max_chars", 101):
+        fits = await execute_remember_fact(_ctx(db), {"content": "c" * 20})
+    assert fits["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_row_count_alone_never_blocks_a_write():
+    """The row cap is gone from this path: many short notes that fit the modal's box are fine.
+    MEMORY_MAX_ROWS is left parsed for .env compatibility and must gate nothing here."""
+    rows = [_row(i, f"note {i}") for i in range(1, 61)]
+    db = _db(rows=rows, new_id=61)
+    with patch.object(config, "memory_max_rows", 5):
+        result = await execute_remember_fact(_ctx(db), {"content": "note 61"})
+    assert result["ok"] is True
+    db.add_channel_memory_async.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_budget_counts_only_this_channels_own_facts():
+    """Workspace-scope rows are visible but read-only from here, so they cannot spend a budget the
+    model has no way to free."""
+    rows = [_row(1, "chan fact"), _row(2, "x" * 400, scope="workspace")]
     db = _db(rows=rows, new_id=9)
-    with patch.object(config, "memory_max_rows", 2):
+    with patch.object(config, "memory_store_max_chars", 100):
         result = await execute_remember_fact(_ctx(db), {"content": "fits"})
     assert result["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_an_update_does_not_have_to_fit_beside_the_row_it_replaces():
+    """Otherwise a full store could never be consolidated: every merge would be refused by the
+    very note it is merging."""
+    rows = [_row(1, "a" * 45), _row(2, "b" * 45)]
+    db = _db(rows=rows)
+    with patch.object(config, "memory_store_max_chars", 95):
+        result = await execute_update_fact(_ctx(db), {"id": 2, "content": "c" * 49})
+    assert result["ok"] is True
+    db.update_channel_fact_async.assert_awaited_once_with(2, "c" * 49)
+
+
+@pytest.mark.asyncio
+async def test_remember_truncates_at_the_configured_fact_cap():
+    """Owner's ruling 2026-08-20: a fact's length limit is an operator setting, not a literal in
+    memory_tools. Truncation itself is unchanged — it just reads the cap from config now."""
+    db = _db(rows=[], new_id=11)
+    with patch.object(config, "memory_fact_max_chars", 20):
+        result = await execute_remember_fact(_ctx(db), {"content": "y" * 90})
+    assert result["content"] == "y" * 20
+    db.add_channel_memory_async.assert_awaited_once_with(
+        CHANNEL, "y" * 20, scope="channel", author="U07PETER"
+    )
+
+
+def test_both_memory_limits_come_from_the_environment():
+    """Neither limit may be hardcoded: MEMORY_FACT_MAX_CHARS defaults to 500 and
+    MEMORY_STORE_MAX_CHARS to 2900 (the modal's textarea budget), and both follow the env."""
+    from config import BotConfig
+
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("MEMORY_FACT_MAX_CHARS", None)
+        os.environ.pop("MEMORY_STORE_MAX_CHARS", None)
+        defaults = BotConfig()
+        assert defaults.memory_fact_max_chars == 500
+        assert defaults.memory_store_max_chars == 2900
+
+        os.environ["MEMORY_FACT_MAX_CHARS"] = "42"
+        os.environ["MEMORY_STORE_MAX_CHARS"] = "1200"
+        tuned = BotConfig()
+        assert tuned.memory_fact_max_chars == 42
+        assert tuned.memory_store_max_chars == 1200
+
+
+def test_the_store_budget_and_the_modal_textarea_are_one_number():
+    """Drift guard. The tools refuse a write that would not fit the modal's box, so if these two
+    ever disagree the store either hides notes from the person or refuses writes that would fit.
+    The modal clamps at Slack's element limit, which is the one direction they may differ."""
+    from slack_client.settings_modal import SettingsModal
+
+    modal = SettingsModal(db=None)
+    assert modal._MEMORY_TEXTAREA_MAX == min(config.memory_store_max_chars, 2900)
+    with patch.object(config, "memory_store_max_chars", 1500):
+        assert modal._MEMORY_TEXTAREA_MAX == 1500
+    with patch.object(config, "memory_store_max_chars", 99999):
+        assert modal._MEMORY_TEXTAREA_MAX == 2900   # Slack caps the element at 3000
 
 
 @pytest.mark.asyncio

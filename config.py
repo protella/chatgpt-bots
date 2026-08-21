@@ -1063,9 +1063,23 @@ class BotConfig:
     # Write = model-invoked remember/update/forget tools during the response (Phase C).
     # Off → no injection, no tools, no extraction (unchanged behavior).
     enable_channel_memory: bool = field(default_factory=lambda: os.getenv("ENABLE_CHANNEL_MEMORY", "true").lower() == "true")
-    # Hard cap on channel-scope memory rows per channel — keeps the injected block small and
-    # bounded; at the cap the remember tool refuses and points at the oldest rows instead.
+    # Row cap for the legacy post-response extraction fallback and the engine's preference
+    # markers only. As of 2026-08-20 it gates NEITHER the model's memory tools NOR the settings
+    # modal: a store is bounded by characters (memory_store_max_chars below), not by rows — a
+    # row cap on the modal would delete an edited note and refuse its replacement once a store
+    # held more short notes than the cap. Kept parsed for .env compatibility.
     memory_max_rows: int = field(default_factory=lambda: int(os.getenv("MEMORY_MAX_ROWS", "25")))
+    # Per-fact character cap, applied on write by the memory tools (longer content is trimmed to
+    # it). Was hardcoded in message_processor/memory_tools.py; it is a tuning number, so it lives
+    # here with the rest of them.
+    memory_fact_max_chars: int = field(default_factory=lambda: int(os.getenv("MEMORY_FACT_MAX_CHARS", "500")))
+    # What one store may hold in total — a channel's facts, or a person's personal facts — measured
+    # the way the settings modal measures its textarea: len("\n".join(contents)).
+    # WHY 2900: the modal shows the whole store in ONE Slack plain_text_input, and Slack hard-caps
+    # that element at 3000 characters; the modal clamps to 2900 for headroom. Raising this above
+    # 2900 therefore only loosens the tool side — the box stays at 2900 and the overflow goes back
+    # to being facts nobody can see or edit. Don't.
+    memory_store_max_chars: int = field(default_factory=lambda: int(os.getenv("MEMORY_STORE_MAX_CHARS", "2900")))
     # --- Per-user memory (toolbelt round T2) ---
     # The DM twin of enable_channel_memory: read = inject the requester's own durable facts into
     # the DM prompt, write = the same remember/update/forget/list tools, routed to the user store.

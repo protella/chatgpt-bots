@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.1.5] - 2026-08-21
+
+### 🔧 Changed
+
+- **Quiet by default when nobody asked.** In a channel or thread where it was not addressed,
+  the bot now speaks only when it has something the room does not already have: a fact it
+  actually retrieved or verified this turn, or a fact about its own prior words and actions.
+  Being able to answer a general question is no longer a reason to answer it, an inference
+  anyone in the thread could draw is not new information, public documentation it just looked
+  up is not evidence of how this workplace is set up, and it no longer @-mentions people or
+  hands out next steps unasked. DMs and @mentions are unchanged.
+- **It remembers its corrections.** When the bot corrects a factual claim it made, it stores
+  the corrected fact in memory (channel memory in a channel, personal memory in a DM) as one
+  concise line, without announcing it — so the same mistake is not repeated next week.
+- **Memory limits are settings, not code.** `MEMORY_FACT_MAX_CHARS` (default 500) caps one
+  note; `MEMORY_STORE_MAX_CHARS` (default 2900) caps a whole channel or personal store,
+  measured exactly as the settings modal shows it, so everything stored is always visible and
+  editable there. A write that would overflow the store is refused with its full contents so
+  the model consolidates instead; the old 25-row cap no longer gates the memory tools or the
+  settings modal.
+
+### 🐛 Fixed
+
+- **Editing a note in a large memory store could lose it.** The settings modal still applied
+  the old 25-row cap, so editing one note in a store of more than 25 would delete the original
+  and refuse the replacement. The modal is now bounded by characters only.
+
 ## [3.1.4] - 2026-08-20
 
 ### 🔧 Changed
