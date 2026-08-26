@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.1.6] - 2026-08-25
+
+### 🔧 Changed
+
+- **Dependency refresh.** OpenAI SDK 3.1.0 → 3.3.1, tiktoken 0.13.0 → 0.14.0, lxml 6.1.1 →
+  6.1.2, python-dotenv 1.2.2 → 1.2.3, striprtf 0.0.32 → 0.0.33. No code, config, or `.env`
+  changes; verified on prod for a full day of traffic (DMs, channels, streaming, background
+  builds, document extraction).
+
 ## [3.1.5] - 2026-08-21
 
 ### 🔧 Changed
