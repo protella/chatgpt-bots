@@ -4,6 +4,36 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.1.7] - 2026-08-26
+
+### ✨ Added
+
+- **Background builds retry transient failures.** A deep-research build that dies on a
+  transient API error (connection drop, timeout, 5xx) now retries up to
+  `DEEP_RESEARCH_BUILD_RETRIES` times (default 2) within the same overall build deadline,
+  instead of failing the whole job on the first hiccup. The status card says so while it
+  happens ("retrying after a connection error…"), steering sent mid-build is carried into the
+  retry, and work already staged out of the container is not redone blindly — the retry is told
+  what was already applied. Errors that can't succeed on retry (a dead container, an explicit
+  do-not-retry from the API, a spent time budget) still fail immediately and honestly.
+
+### 🔧 Changed
+
+- **PDF admission cost comes from real page counts.** A PDF sent to the model natively is now
+  budgeted at its actual page count (plus its extracted text) instead of a bytes-based guess
+  that overpriced text-heavy PDFs by ~40× — a 16-page PDF was being priced at 1.17M tokens and
+  refused. Normal documents now pass admission with room to spare; genuinely oversized batches
+  are still refused.
+
+### 🐛 Fixed
+
+- **No more error cards nobody asked for.** When the bot wakes on its own in a channel (ambient
+  gate, membership wake) and then can't build the request — over budget, history fetch failed —
+  it now stays silent and records the outcome, instead of posting a "Too Much For One Request"
+  card into a conversation where nobody addressed it. Anyone who actually asked (@mention, DM,
+  name, strict 1:1 continuation, or an absorbed question the bot owed an answer to) still gets
+  the honest error card.
+
 ## [3.1.6] - 2026-08-25
 
 ### 🔧 Changed

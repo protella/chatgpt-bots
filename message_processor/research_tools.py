@@ -33,11 +33,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import importlib
 import time
 import unicodedata
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple, cast
 from uuid import uuid4
+
+import openai
 
 from message_processor.canvas_content import CANVAS_MIMETYPE
 from config import clamp_effort, config
@@ -163,6 +166,33 @@ _SteeringCallback = Callable[[], Awaitable[List[Dict[str, Any]]]]
 _BUILD_APPLIED_UPDATES_MESSAGE = (
     "[Updates already applied during the research phase — keep them applied:\n{notes}]"
 )
+
+# --- Build-phase retry: what the model is told when its stream was cut off -------------------
+#
+# The stream is the only thing that died; the CONTAINER is untouched, and the container is where
+# the work is. So the resume note's whole job is to stop the model starting over: point it at
+# what already exists and tell it to look before it acts. Side effects (mounted files, staged
+# images, an export already pulled down) are NOT deduplicated anywhere — this note is the only
+# thing standing between a retry and a second copy of everything.
+_BUILD_RESUME_NOTE = (
+    "[Your previous stream was cut off by a provider error partway through the work. Nothing "
+    "you produced was lost: this is the SAME container, and everything you already did is still "
+    "in it — files you mounted, files you staged, images you created, scripts you wrote.\n\n"
+    "Before doing anything else, INSPECT it: list the working directory and read back your own "
+    "build script. Then CONTINUE from where that leaves off. Do not redo completed steps, do "
+    "not rebuild a file that is already there, and do not re-run export_conversation or "
+    "fetch_url_to_sandbox for content that is already present in the container. Keep the todo "
+    "card true with update_todos as you go.]"
+)
+# R1: the drain that fed these notes to earlier rounds was DESTRUCTIVE, and those rounds died
+# with the stream. Replaying an instruction the model already honoured is harmless; losing one
+# silently reinstates whatever the user asked to have dropped.
+_BUILD_RESUME_STEERING = (
+    "\n\nMid-run updates you already received and must still honor:\n{notes}"
+)
+# No attempt is worth starting on the fag end of the budget: a build that gets seconds to
+# re-orient in its own container produces nothing and burns the tokens anyway.
+_BUILD_RETRY_MIN_REMAINING_S = 30.0
 
 # --- Revision grounding: the file a revision job starts FROM -------------------------------
 #
@@ -1128,6 +1158,11 @@ class _ResearchCard:
         # Mid-run updates handed to the job (update_background_job). A COUNT, never the text —
         # the note was typed into the thread one message ago and the card is a glance.
         self._steering_notes = 0
+        # A transient out-of-band condition the user deserves to see NOW ("provider hiccup —
+        # retrying"). Deliberately NOT the phase: `set_phase` is invisible while any todo is
+        # in_progress (see _visible_lines), which is exactly the state a mid-build retry happens
+        # in. The alert rides the context line instead, which renders unconditionally.
+        self._alert: Optional[str] = None
         self._steering_flush_tasks: set = set()
         self._terminal: Optional[str] = None
         self._dirty = False
@@ -1187,9 +1222,14 @@ class _ResearchCard:
         return lines[-_CARD_MAX_LINES:]
 
     def _context_line(self) -> str:
-        """'todos as of H:MM' + live activity counters — the mechanical tool events live
-        here as counts, not as body lines."""
-        parts = [f"todos as of {self._now_label()}"]
+        """Optional alert + 'todos as of H:MM' + live activity counters — the mechanical tool
+        events live here as counts, not as body lines. This block renders on EVERY card state,
+        which is why the alert lives here rather than on the phase tail."""
+        parts: List[str] = []
+        if self._alert:
+            # First, because it is the one part of this line that is news.
+            parts.append(self._alert)
+        parts.append(f"todos as of {self._now_label()}")
         if self._web_searches:
             n = self._web_searches
             parts.append(f"{n} web search{'es' if n != 1 else ''}")
@@ -1248,6 +1288,8 @@ class _ResearchCard:
         error = self.todos.set(todos)
         if error:
             return error
+        # The model is driving the card again, so whatever the alert was warning about is over.
+        self._alert = None
         await self._request_update()
         return None
 
@@ -1263,13 +1305,31 @@ class _ResearchCard:
         self._phase = _gist(phase, _PHASE_GIST_CHARS)
         await self._request_update()
 
+    async def set_alert(self, alert: Optional[str]) -> None:
+        """Raise (or clear) the context-line alert — an out-of-band condition the card must show
+        even while a todo is spinning, e.g. "Provider hiccup — retrying (2/3)…".
+
+        It is NOT sticky by design: the next model-driven card activity — an update_todos apply
+        or an activity counter bump — clears it, because that activity IS the "moving again"
+        signal. Nothing has to remember to take it down.
+
+        Which is also why it renders IMMEDIATELY instead of through the throttle. An alert is
+        raised and cleared by two events that can land inside the same one-second window, and a
+        coalesced update renders only the final state — the user would be told nothing at all
+        about the very thing the alert exists to tell them."""
+        text = " ".join((alert or "").split())
+        self._alert = _gist(text, _PHASE_GIST_CHARS) if text else None
+        await self._force_flush()
+
     async def note_web_search(self) -> None:
         self._web_searches += 1
+        self._alert = None
         await self._request_update()
 
     async def note_mcp(self, label: Optional[str]) -> None:
         key = label or "MCP"
         self._mcp_calls[key] = self._mcp_calls.get(key, 0) + 1
+        self._alert = None
         await self._request_update()
 
     def bump_steering(self, n: int) -> None:
@@ -1285,6 +1345,10 @@ class _ResearchCard:
         one there was anything to say."""
         if n > 0:
             self._steering_notes += n
+            # An activity counter moving IS the job showing signs of life (R2) — and inside a
+            # build phase, steering is the only counter there is: no web_search or MCP event
+            # ever reaches this card.
+            self._alert = None
             self._dirty = True
 
     def request_steering_flush(self) -> None:
@@ -1351,6 +1415,22 @@ class _ResearchCard:
             delay = throttle - (now - self._last_update)
             self._flush_task = asyncio.ensure_future(self._delayed_flush(delay))
 
+    async def _force_flush(self) -> None:
+        """Render the current state NOW, ignoring the throttle window.
+
+        For state whose whole value is being seen at the moment it happens, so being coalesced
+        into a later render loses it entirely. Unlike `_finalize` this leaves the card OPEN and
+        cancels nothing: a trailing flush already scheduled is still wanted, and re-rendering
+        current state is harmless. Best-effort — `_safe_update` swallows its own failures."""
+        if self.ts is None or self._closed:
+            return
+        async with self._lock:
+            if self.ts is None or self._closed:
+                return
+            self._dirty = False
+            self._last_update = self._clock()
+            await self._safe_update(self._blocks())
+
     async def _delayed_flush(self, delay: float) -> None:
         try:
             await self._sleep(delay)
@@ -1388,6 +1468,8 @@ class _ResearchCard:
         self._terminal = terminal_line
         self._status_emoji = status_emoji
         self._failed = failed
+        # A retry alert is a promise of more work; the terminal line supersedes it either way.
+        self._alert = None
         if self._flush_task is not None and not self._flush_task.done():
             self._flush_task.cancel()
         async with self._lock:
@@ -1999,6 +2081,96 @@ def _revision_master_items(master: Optional[Dict[str, str]]) -> List[Dict[str, A
                  reason=master.get("reason") or _REVISION_REASON_FALLBACK)}]
 
 
+def _build_resume_text(applied_notes: Optional[List[str]]) -> str:
+    """The body of the ONE user-role message a retried build attempt gets on top of its input.
+
+    Rebuilt before EVERY retry, not frozen at the first one: `applied_notes` keeps growing while
+    the job runs (the pre-round drain appends to it), so a note the SECOND attempt drained and
+    then lost with its own stream would never reach the third. One item, current contents."""
+    text = _BUILD_RESUME_NOTE
+    if applied_notes:
+        text += _BUILD_RESUME_STEERING.format(
+            notes="\n".join(f"{i}. {n}" for i, n in enumerate(applied_notes, 1)))
+    return text
+
+
+def _load_transport_errors() -> Tuple[type, ...]:
+    """Raw transport exception classes, from whichever HTTP stack is actually installed.
+
+    The SDK normally wraps these in APIConnectionError, but a socket that dies while the SSE
+    iterator is being consumed can surface the underlying error un-remapped. openai v3 rides
+    httpx2/httpcore2 and v2 rides httpx/httpcore, so all four are PROBED and none is required —
+    an absent module simply contributes nothing."""
+    found: List[type] = []
+    for module_name, attrs in (("httpx2", ("TransportError",)),
+                               ("httpx", ("TransportError",)),
+                               ("httpcore2", ("ProtocolError", "NetworkError", "ReadError")),
+                               ("httpcore", ("ProtocolError", "NetworkError", "ReadError"))):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:  # noqa: BLE001 — a stack we don't have is not an error
+            continue
+        for attr in attrs:
+            candidate = getattr(module, attr, None)
+            if isinstance(candidate, type) and issubclass(candidate, BaseException):
+                found.append(candidate)
+    return tuple(found)
+
+
+_TRANSPORT_ERRORS: Tuple[type, ...] = _load_transport_errors()
+
+
+def _is_retryable_build_error(e: BaseException) -> bool:
+    """Is this build-stream failure worth another attempt against the same container?
+
+    Retryable ⇔ a TRANSPORT or SERVER-side failure: APIConnectionError/APITimeoutError, a 5xx,
+    or the shape that prompted this — a bare `openai.APIError` carrying no status at all, which
+    is how a Responses SSE stream reports that it died partway through.
+
+    Everything else is terminal ON PURPOSE, 429 and 408/409 included. The app runs the SDK with
+    `max_retries=0` (openai_client/base.py) by design and this path adds no backoff: an immediate
+    same-load re-attempt of a rate-limited build that already ran for minutes would simply fail
+    again, having spent the remaining budget getting there. 4xx is the model's or our own
+    request's problem and re-sending it byte-for-byte cannot fix it.
+
+    A dead CONTAINER is not retryable either (R4): the retry would name the corpse in its tools
+    array. That case has its own honest messaging already.
+
+    Note what does NOT reach here: an SDK timeout. `_safe_api_call` re-raises every timeout —
+    `openai.APITimeoutError` included — as a BUILTIN TimeoutError, so it is indistinguishable
+    from our own `wait_for` firing and the caller has to separate the two by the clock."""
+    from openai_client.container_errors import is_container_gone
+
+    if isinstance(e, Exception) and is_container_gone(e):
+        return False
+    if isinstance(e, (openai.APIConnectionError, openai.APITimeoutError)):
+        return True
+    if _TRANSPORT_ERRORS and isinstance(e, _TRANSPORT_ERRORS):
+        # A socket that died under the SSE iterator, reaching us without the SDK's wrapper.
+        return True
+    if not isinstance(e, openai.APIError):
+        return False
+    response = getattr(e, "response", None)
+    # The provider's own verdict, when it bothered to give one, outranks the status heuristic.
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        should_retry = None
+        with contextlib.suppress(Exception):
+            should_retry = headers.get("x-should-retry")
+        if isinstance(should_retry, str) and should_retry.strip().lower() == "false":
+            return False
+    status = getattr(e, "status_code", None)
+    if status is None:
+        status = getattr(response, "status_code", None)
+    if status is None:
+        return True
+    try:
+        return int(status) >= 500
+    except (TypeError, ValueError):
+        # A status we cannot read is not a status that says "server fault".
+        return False
+
+
 def _native_file_bounds(items: List[Dict[str, Any]]) -> List[int]:
     """Worst-case token bound per native file part actually present in the candidate input.
 
@@ -2043,6 +2215,9 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
     job were building in the thread's container, any chat message the user sent while it worked
     would baseline the half-written deck as published, and the job's own publisher would then
     skip it. The deck would vanish, silently, and the more the user chatted the likelier it got.
+
+    A stream cut off by a TRANSIENT provider error is retried (DEEP_RESEARCH_BUILD_RETRIES)
+    against that same container, under the one shared deadline — see the loop below.
 
     Never raises: a build failure costs the file, not the research report.
     """
@@ -2210,29 +2385,83 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
     # partial build is still the only account there is.
     notes = ""
 
-    try:
-        result = await asyncio.wait_for(
-            _consume_research_stream(
-                processor, messages=build_input, tools=tools, registry=registry,
-                tool_context=build_ctx, model=model, system_prompt=system_prompt,
-                effort=clamp_effort(model, getattr(config, "deep_research_reasoning_effort",
-                                                   "high") or "high"),
-                verbosity=getattr(config, "deep_research_verbosity", "medium") or "medium",
-                card=None, artifacts_sink=artifacts, container_gone_sink=containers_gone,
-                pre_round_input_callback=steering_callback,
-                # A build needs more rounds than a search: mount, write code, read the
-                # traceback, fix it, re-run, verify. Running out of rounds mid-build is the
-                # difference between a deck and an apology.
-                max_rounds=int(getattr(config, "deep_research_max_build_rounds", 16) or 16),
-                job_id=job_id),
-            timeout=timeout_s)
-        notes = (result or {}).get("text") or ""
-    except asyncio.CancelledError:
-        raise
-    except asyncio.TimeoutError:
-        processor.log_warning(f"Build phase {job_id} timed out after {timeout_s:.0f}s")
-    except Exception as e:  # noqa: BLE001 — the report still ships without the file
-        processor.log_error(f"Build phase {job_id} failed: {e}", exc_info=True)
+    # A transient provider error kills the STREAM, not the container — and the container is where
+    # the build lives. So a cut-off attempt is resumable: re-enter the loop against the same
+    # container with a note telling the model to look at what it already produced. ONE overall
+    # deadline, shared by every attempt: a retry must not double the wall clock the job was
+    # budgeted, and DEEP_RESEARCH_BUILD_TIMEOUT is still what bounds a hung build.
+    total_attempts = 1 + max(0, int(getattr(config, "deep_research_build_retries", 0) or 0))
+    deadline = time.monotonic() + timeout_s
+    # ONE item, however many retries happen: a second copy of the same instruction is not a
+    # stronger instruction. Its TEXT is rewritten before each retry, though — see below.
+    resume_item: Optional[Dict[str, Any]] = None
+    attempt_input = build_input
+
+    for attempt in range(1, total_attempts + 1):
+        remaining = deadline - time.monotonic()
+        try:
+            result = await asyncio.wait_for(
+                _consume_research_stream(
+                    processor, messages=attempt_input, tools=tools, registry=registry,
+                    tool_context=build_ctx, model=model, system_prompt=system_prompt,
+                    effort=clamp_effort(model, getattr(config, "deep_research_reasoning_effort",
+                                                       "high") or "high"),
+                    verbosity=getattr(config, "deep_research_verbosity", "medium") or "medium",
+                    card=None, artifacts_sink=artifacts, container_gone_sink=containers_gone,
+                    pre_round_input_callback=steering_callback,
+                    # A build needs more rounds than a search: mount, write code, read the
+                    # traceback, fix it, re-run, verify. Running out of rounds mid-build is the
+                    # difference between a deck and an apology. A retry gets a FRESH budget —
+                    # it is re-doing the orientation the dead attempt already paid for.
+                    max_rounds=int(getattr(config, "deep_research_max_build_rounds", 16) or 16),
+                    job_id=job_id),
+                timeout=remaining)
+            # Only the LAST attempt's text survives; the earlier streams took theirs with them.
+            # Acceptable: the container listing, not the model's account, is what the publisher
+            # actually ships from.
+            notes = (result or {}).get("text") or ""
+            break
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — the report still ships without the file
+            left = deadline - time.monotonic()
+            spent = left <= _BUILD_RETRY_MIN_REMAINING_S
+            # A TimeoutError here is AMBIGUOUS: it is either our own `wait_for` firing, or an
+            # SDK timeout from below — `_safe_api_call` re-raises `openai.APITimeoutError` as a
+            # builtin TimeoutError, so the exception itself cannot say which. The CLOCK can. With
+            # real budget still on it, this deadline did not expire, so the timeout came from a
+            # single call underneath and is exactly as transient as a dropped stream.
+            timed_out = isinstance(e, asyncio.TimeoutError)
+            if timed_out and spent:
+                processor.log_warning(f"Build phase {job_id} timed out after {timeout_s:.0f}s")
+                break
+            # R4 leak: the recovery layer underneath may have DEMOTED this call to a throwaway
+            # `auto` container. Retrying then resumes somewhere the work never happened, under a
+            # note promising the model everything is still there. Terminal instead.
+            retryable = (not containers_gone
+                         and (timed_out or _is_retryable_build_error(e)))
+            if retryable and not spent and attempt < total_attempts:
+                processor.log_warning(
+                    f"Build phase {job_id} attempt {attempt}/{total_attempts} failed "
+                    f"(retrying): {e}")
+                # Best-effort like every card op, and deliberately an ALERT rather than a phase:
+                # a mid-build retry happens with a todo in_progress, where the phase line is not
+                # rendered at all. Cleared by the next attempt's first sign of life.
+                with contextlib.suppress(Exception):
+                    await card.set_alert(
+                        f"Provider hiccup — retrying ({attempt + 1}/{total_attempts})…")
+                if resume_item is None:
+                    resume_item = {"role": "user", "content": ""}
+                    attempt_input = build_input + [resume_item]
+                # Rewritten, not re-appended: steering the DYING attempt drained is in
+                # `applied_notes` now and would otherwise be lost with its stream.
+                resume_item["content"] = _build_resume_text(applied_notes)
+                continue
+            if timed_out:
+                processor.log_warning(f"Build phase {job_id} timed out after {timeout_s:.0f}s")
+                break
+            processor.log_error(f"Build phase {job_id} failed: {e}", exc_info=True)
+            break
 
     # Hand back what the publisher needs, even after a timeout: a deck finished at second 599
     # is still a deck. The container LISTING is the only source of truth about what exists —

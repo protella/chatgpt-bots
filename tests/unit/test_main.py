@@ -283,7 +283,26 @@ class TestChatBotV2MessageHandling:
         assert client.handle_error.await_args.args == (
             "C123", "thread_123", "Something went wrong")
         assert "lease" in client.handle_error.await_args.kwargs
-    
+
+    @pytest.mark.asyncio
+    async def test_a_fail_closed_error_nobody_asked_for_is_not_posted(self, bot):
+        """The processor stamps a fail-closed turn that was never addressed to us; the post site
+        honours it and says nothing. The turn is still classified `error` for the ledger — only
+        the words are withheld."""
+        message = Mock(channel_id="C123", thread_id="thread_123")
+        client = Mock()
+        client.send_thinking_indicator = AsyncMock(return_value="thinking_123")
+        client.delete_message = AsyncMock()
+        client.handle_error = AsyncMock()
+
+        response = Mock(type="error", content="⚠️ **Too Much For One Request**",
+                        metadata={"suppress_error_post": True})
+        bot.processor.process_message = AsyncMock(return_value=response)
+
+        await bot.handle_message(message, client)
+
+        client.handle_error.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_handle_message_exception(self, bot):
         """Test exception handling during message processing"""

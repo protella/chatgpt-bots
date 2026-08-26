@@ -71,6 +71,24 @@ POSTURE_CHANNEL = "channel_activity"
 
 POSTURES = frozenset({POSTURE_ADDRESSED, POSTURE_THREAD, POSTURE_CHANNEL})
 
+# --- wake_source values that mean a PERSON put this turn to us ---
+# The F3 provenance stamped at dispatch (slack_client/event_handlers/message_events.py). The two
+# absentees are the point: `ambient` (a gate woke us on traffic that never named us) and
+# `thread_continuation` (which splits — see STRICT_CONTINUATION) are not addressing by themselves.
+ADDRESSED_WAKE_SOURCES = frozenset({"app_mention", "dm", "name_mention"})
+
+# Stamped beside `membership_wake` on the channel-listen dispatch, true or false, on every message
+# it sends. It is the OTHER half of that flag: a thread continuation skipped the gate under the
+# STRICT rule (a human, us, at most one other human, no other bots) rather than under the widened
+# membership rule. Strict is a person talking TO us in a thread that is effectively a private
+# conversation with us — addressed in every sense except the @ — while a membership wake is us
+# overhearing a room we happen to be in.
+STRICT_CONTINUATION = "strict_continuation"
+
+# Non-human authorship, from whichever key the dispatch path stamped it under. `sender_type` rides
+# every message built by `_event_to_message`; `participation_sender_bot` is the gate's own copy.
+_BOT_SENDER_TYPES = frozenset({"other_bot", "self"})
+
 
 def derive_posture(*, addressed: bool, ts: Optional[str],
                    thread_ts: Optional[str]) -> str:
@@ -140,6 +158,59 @@ def owes_words(message: Any) -> bool:
     if not isinstance(meta, dict):
         return False
     return meta.get(GATE_REQUIRED) is False and meta.get(SILENCE_CAPABLE) is False
+
+
+def sender_is_bot(message: Any) -> bool:
+    """True when this message was written by a bot — ours or somebody else's.
+
+    Reads the stamped provenance only, and answers FALSE when nothing was stamped: an unstamped
+    message is an unknown author, and treating an unknown as a bot would silence notices owed to
+    real people.
+    """
+    meta = getattr(message, "metadata", None)
+    if not isinstance(meta, dict):
+        return False
+    return (meta.get("participation_sender_bot") is True
+            or meta.get("sender_type") in _BOT_SENDER_TYPES)
+
+
+def addressed_wake(message: Any) -> bool:
+    """True when somebody put this turn to us: an @mention, a DM, our name, or a direct thread.
+
+    Reads facts STAMPED AT DISPATCH and derives nothing of its own — the routing posture for the
+    two explicit-addressing routes, `wake_source` for the name hit (a name in text is a signal,
+    not explicit addressing, so it deliberately never earns POSTURE_ADDRESSED),
+    `participation_name_hit` for the gated name route which carries that fact under its own key,
+    and STRICT_CONTINUATION for the thread that is effectively a private conversation with us.
+
+    `owes_words` is included whole rather than restated, which is what carries an ABSORBED
+    obligation: when a Phase-Q batch folds a real @mention into an ambient trigger,
+    `absorb_owed_answer` writes exactly that pair of facts onto the trigger, and the turn that
+    answers for the mention must be able to tell the mentioner it could not.
+
+    Weaker than `owes_words` alone, and the difference is the name hit and the strict thread: both
+    are owed nothing — the gate may well find that people were discussing us, and a thread turn
+    may have nothing worth adding — but in both a person is talking to us and a turn that fails
+    closed has somebody to say so to. An ambient wake and a membership-widened continuation have
+    nobody: an error card there is the bot interrupting a conversation it was never asked into to
+    announce its own plumbing.
+
+    Says nothing about WHO wrote it. A bot can @mention us; see `sender_is_bot`, which the notice
+    sites pair with this rather than folding into it, because "were we addressed" and "is there a
+    person to answer" are two questions and only the first one belongs here.
+    """
+    meta = getattr(message, "metadata", None)
+    if not isinstance(meta, dict):
+        return False
+    if meta.get(ROUTING_POSTURE) == POSTURE_ADDRESSED:
+        return True
+    if meta.get("wake_source") in ADDRESSED_WAKE_SOURCES:
+        return True
+    if meta.get(STRICT_CONTINUATION) is True:
+        return True
+    if meta.get("participation_name_hit") is True:
+        return True
+    return owes_words(message)
 
 
 def absorb_owed_answer(trigger: Any, absorbed: Any) -> bool:

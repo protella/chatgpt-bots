@@ -284,6 +284,7 @@ async def test_mentions_only_still_honours_a_strict_one_to_one_continuation(list
     assert md["silence_capable"] is True
     assert md["wake_source"] == "thread_continuation"
     assert md["membership_wake"] is False               # strict, so authority is not withheld
+    assert md["strict_continuation"] is True            # …and so is a fail-closed explanation
 
 
 @pytest.mark.asyncio
@@ -327,6 +328,7 @@ async def test_another_bots_reply_in_our_thread_is_ungated_in_an_on_channel(list
     assert md["silence_capable"] is True                 # the only brake there is
     assert md["wake_source"] == "thread_continuation"
     assert md["membership_wake"] is True                 # never strict, so never authoritative
+    assert md["strict_continuation"] is False            # overheard, so owed no error card
 
 
 @pytest.mark.asyncio

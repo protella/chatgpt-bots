@@ -1390,13 +1390,25 @@ class ChatBotV2:
                         # it is the room's only word from us — so it is guarded like any first
                         # surface. Refusal raises, and the handler below records the
                         # suppression instead of the error.
-                        await client.handle_error(
-                            message.channel_id,
-                            message.thread_id,
-                            response.content,
-                            lease=lease,
-                            receipts=turn.receipt_ledger,
-                        )
+                        #
+                        # UNLESS the turn was never addressed to us: a fail-closed channel turn
+                        # nobody asked for is stamped by the processor and says nothing at all.
+                        # The ledger still gets its `error` kind and its fail-closed code from
+                        # the lines below — the outcome is recorded, only the words are withheld.
+                        # `is True`, not truthiness: a stand-in Mock metadata must never be able
+                        # to swallow a real notice.
+                        if (response.metadata or {}).get("suppress_error_post") is True:
+                            main_logger.info(
+                                "Fail-closed turn nobody addressed — recorded, nothing posted "
+                                f"for {message.channel_id}:{message.thread_id}")
+                        else:
+                            await client.handle_error(
+                                message.channel_id,
+                                message.thread_id,
+                                response.content,
+                                lease=lease,
+                                receipts=turn.receipt_ledger,
+                            )
 
                 # Close the attempt with what the room actually SAW. Deliberately not folded into
                 # the contract check below, which asks a narrower question — is this channel one we

@@ -10,8 +10,11 @@ sink and its own delivery path". This is that sink. The properties worth defendi
 * files publish AFTER the report, so the thread reads card → report → deck;
 * the card's terminal state reflects what SHIPPED, never what the model claimed.
 """
+import asyncio
+import itertools
 from unittest.mock import AsyncMock, MagicMock
 
+import openai
 import pytest
 
 from message_processor import research_tools as rt
@@ -66,6 +69,7 @@ def _card(plan=("Research the thing", "Build the deck")):
     # F37: "Building the deck…" is a PHASE (the replaceable status line), not a todo — it must
     # not permanently spend one of the card's four lines.
     card.set_phase = AsyncMock()
+    card.set_alert = AsyncMock()
     # The build phase is a FRESH model loop: it must be handed the live list, or it restarts the
     # plan from scratch instead of revising it. Real _TodoState, so as_prompt_block() is real.
     card.todos = rt._TodoState(list(plan))
@@ -249,6 +253,367 @@ class TestBuildPhase:
             card=_card())
 
         assert build["notes"] == ""
+
+
+def _transient_stream_error(message="An error occurred while processing your request."):
+    """The live failure (job 5e58a49b615f): a Responses SSE stream that died 281s into a build
+    and surfaced as a BARE openai.APIError — no status code, no response object at all."""
+    return openai.APIError(message, request=None, body=None)
+
+
+def _status_error(cls, status):
+    response = MagicMock()
+    response.status_code = status
+    response.headers = {}
+    return cls("the provider said no", response=response, body=None)
+
+
+async def _build(processor, card, **kw):
+    return await rt._run_build_phase(
+        processor=processor, client=MagicMock(), channel_id="C1", thread_root="1.0",
+        thread_key="C1:1.0", job_id="j", task="t", findings="f",
+        deliverables=[{"type": "pdf", "description": "d", "filename": "d.pdf"}],
+        snapshot=[], thread_config={}, system_prompt=None, model="gpt-5.6-sol",
+        card=card, **kw)
+
+
+@pytest.mark.unit
+class TestBuildPhaseRetry:
+    """A transient provider error kills the STREAM, not the container — and the container is
+    where the build actually lives. Starting over would throw away minutes of real work; the
+    retry re-enters the same container and tells the model to look before it acts."""
+
+    async def test_a_cut_off_stream_resumes_against_the_same_container(self, monkeypatch):
+        processor = _processor()
+        card = _card()
+        monkeypatch.setattr(rt.config, "deep_research_build_retries", 2)
+        calls = []
+
+        async def flaky(_proc, **kw):
+            calls.append(kw["messages"])
+            if len(calls) == 1:
+                raise _transient_stream_error()
+            return {"text": "deck built", "tools_used": []}
+
+        monkeypatch.setattr(rt, "_consume_research_stream", flaky)
+
+        build = await _build(processor, card)
+
+        assert build["notes"] == "deck built"
+        assert len(calls) == 2
+        # The resume note is APPENDED — the original brief is not replaced or rebuilt.
+        assert calls[1][:len(calls[0])] == calls[0]
+        resume = [i for i in calls[1] if rt._BUILD_RESUME_NOTE in str(i.get("content"))]
+        assert len(resume) == 1 and resume[0]["role"] == "user"
+        # The user hears about it on the ONE block that renders in every card state.
+        assert [c.args[0] for c in card.set_alert.await_args_list] == [
+            "Provider hiccup — retrying (2/3)…"]
+
+    async def test_one_resume_note_total_however_many_retries(self, monkeypatch):
+        # Re-appending it is not a stronger instruction, just a duplicate one.
+        processor = _processor()
+        monkeypatch.setattr(rt.config, "deep_research_build_retries", 2)
+        calls = []
+
+        async def flaky(_proc, **kw):
+            calls.append(kw["messages"])
+            if len(calls) < 3:
+                raise _transient_stream_error()
+            return {"text": "deck built", "tools_used": []}
+
+        monkeypatch.setattr(rt, "_consume_research_stream", flaky)
+
+        await _build(processor, _card())
+
+        assert len(calls) == 3
+        assert sum(1 for i in calls[2] if rt._BUILD_RESUME_NOTE in str(i.get("content"))) == 1
+
+    async def test_the_resume_note_replays_steering_the_dead_attempt_had_drained(self,
+                                                                                 monkeypatch):
+        # The drain is DESTRUCTIVE and those rounds died with the stream. Replaying an
+        # instruction the model already honoured is harmless; losing one silently reinstates
+        # whatever the user asked to have dropped.
+        processor = _processor()
+        monkeypatch.setattr(rt.config, "deep_research_build_retries", 2)
+        calls = []
+
+        async def flaky(_proc, **kw):
+            calls.append(kw["messages"])
+            if len(calls) == 1:
+                raise _transient_stream_error()
+            return {"text": "ok", "tools_used": []}
+
+        monkeypatch.setattr(rt, "_consume_research_stream", flaky)
+
+        await _build(processor, _card(), applied_notes=["drop the competitor section"])
+
+        resume = [i for i in calls[1] if rt._BUILD_RESUME_NOTE in str(i.get("content"))][0]
+        assert "drop the competitor section" in resume["content"]
+        assert "must still honor" in resume["content"]
+
+    async def test_a_4xx_is_terminal(self, monkeypatch):
+        # The SDK runs with max_retries=0 here by design, and this path adds no backoff: a 4xx
+        # means the request itself is wrong, and re-sending it byte-for-byte cannot fix it.
+        processor = _processor()
+        card = _card()
+        monkeypatch.setattr(rt.config, "deep_research_build_retries", 2)
+        calls = []
+
+        async def bad_request(_proc, **kw):
+            calls.append(kw["messages"])
+            raise _status_error(openai.BadRequestError, 400)
+
+        monkeypatch.setattr(rt, "_consume_research_stream", bad_request)
+
+        build = await _build(processor, card)
+
+        assert len(calls) == 1
+        card.set_alert.assert_not_awaited()
+        assert build["notes"] == ""
+        assert processor.log_error.called
+
+    async def test_a_dead_container_is_not_retried(self, monkeypatch):
+        # R4: the retry would name the corpse in its own tools array. That case already has its
+        # own honest messaging.
+        processor = _processor()
+        card = _card()
+        monkeypatch.setattr(rt.config, "deep_research_build_retries", 2)
+        calls = []
+
+        async def gone(_proc, **kw):
+            calls.append(kw["messages"])
+            raise _transient_stream_error("Container with id 'cntr_job1' not found.")
+
+        monkeypatch.setattr(rt, "_consume_research_stream", gone)
+
+        await _build(processor, card)
+
+        assert len(calls) == 1
+        card.set_alert.assert_not_awaited()
+
+    async def test_exhausted_retries_still_hand_the_publisher_the_container(self, monkeypatch):
+        # Whatever the dead attempts DID write is still in there, and the container listing is
+        # what the publisher ships from — so the phase must still return, not vanish.
+        processor = _processor()
+        card = _card()
+        monkeypatch.setattr(rt.config, "deep_research_build_retries", 2)
+        calls = []
+
+        async def always_flaky(_proc, **kw):
+            calls.append(kw["messages"])
+            raise _transient_stream_error()
+
+        monkeypatch.setattr(rt, "_consume_research_stream", always_flaky)
+
+        build = await _build(processor, card)
+
+        assert len(calls) == 3
+        assert build is not None and build["notes"] == ""
+        assert build["container_ids"] == ["cntr_job1"]
+        # One announcement per retry, and none after the last attempt.
+        assert len(card.set_alert.await_args_list) == 2
+        # The existing final-failure line survives, so log greps keep working.
+        assert any("failed" in str(c.args[0]) for c in processor.log_error.call_args_list)
+
+    async def test_the_resume_note_is_rewritten_before_every_retry(self, monkeypatch):
+        # `applied_notes` keeps growing while the job runs. Freezing the note at the first retry
+        # would lose whatever the SECOND attempt drained and then died holding.
+        processor = _processor()
+        monkeypatch.setattr(rt.config, "deep_research_build_retries", 2)
+        applied = []
+        calls = []
+
+        async def flaky(_proc, **kw):
+            calls.append(kw["messages"])
+            if len(calls) < 3:
+                applied.append(f"note {len(calls)}")
+                raise _transient_stream_error()
+            return {"text": "ok", "tools_used": []}
+
+        monkeypatch.setattr(rt, "_consume_research_stream", flaky)
+
+        await _build(processor, _card(), applied_notes=applied)
+
+        assert len(calls) == 3
+        resume = [i for i in calls[2] if rt._BUILD_RESUME_NOTE in str(i.get("content"))]
+        assert len(resume) == 1
+        assert "note 1" in resume[0]["content"] and "note 2" in resume[0]["content"]
+
+    async def test_a_timeout_with_budget_left_came_from_below_and_is_retried(self, monkeypatch):
+        # `_safe_api_call` re-raises openai.APITimeoutError as a BUILTIN TimeoutError, which is
+        # the same type our own wait_for raises. Only the clock can tell them apart: with most
+        # of the budget still on it, this one came from a single call underneath.
+        processor = _processor()
+        card = _card()
+        monkeypatch.setattr(rt.config, "deep_research_build_retries", 2)
+        calls = []
+
+        async def flaky(_proc, **kw):
+            calls.append(kw["messages"])
+            if len(calls) == 1:
+                raise TimeoutError("OpenAI API call timed out after 300 seconds")
+            return {"text": "deck built", "tools_used": []}
+
+        monkeypatch.setattr(rt, "_consume_research_stream", flaky)
+
+        build = await _build(processor, card)
+
+        assert len(calls) == 2 and build["notes"] == "deck built"
+        assert card.set_alert.await_count == 1
+
+    async def test_a_spent_budget_is_still_the_terminal_timeout_path(self, monkeypatch):
+        # The other half of that split: when the deadline really is gone, ship what exists —
+        # unchanged behavior, and the "timed out after Ns" line log greps rely on.
+        processor = _processor()
+        card = _card()
+        monkeypatch.setattr(rt.config, "deep_research_build_retries", 2)
+        monkeypatch.setattr(rt.config, "deep_research_build_timeout", 10.0)
+        calls = []
+
+        async def timing_out(_proc, **kw):
+            calls.append(kw["messages"])
+            raise TimeoutError()
+
+        monkeypatch.setattr(rt, "_consume_research_stream", timing_out)
+
+        build = await _build(processor, card)
+
+        assert len(calls) == 1 and build["notes"] == ""
+        card.set_alert.assert_not_awaited()
+        assert any("timed out" in str(c.args[0])
+                   for c in processor.log_warning.call_args_list)
+
+    async def test_no_retry_is_announced_that_cannot_actually_start(self, monkeypatch):
+        # Retries SHARE the one wall clock; they do not extend it. A build handed seconds to
+        # re-orient in its own container produces nothing and bills for it anyway — and telling
+        # the user "retrying" and then not retrying is worse than saying nothing.
+        processor = _processor()
+        card = _card()
+        monkeypatch.setattr(rt.config, "deep_research_build_retries", 2)
+        monkeypatch.setattr(rt.config, "deep_research_build_timeout", 10.0)
+        calls = []
+
+        async def always_flaky(_proc, **kw):
+            calls.append(kw["messages"])
+            raise _transient_stream_error()
+
+        monkeypatch.setattr(rt, "_consume_research_stream", always_flaky)
+
+        await _build(processor, card)
+
+        assert len(calls) == 1
+        card.set_alert.assert_not_awaited()
+        warnings = " ".join(str(c.args[0]) for c in processor.log_warning.call_args_list)
+        assert "retrying" not in warnings
+        assert any("failed" in str(c.args[0]) for c in processor.log_error.call_args_list)
+
+    async def test_a_demoted_container_makes_the_failure_terminal(self, monkeypatch):
+        # R4 leak: if the recovery layer underneath swapped this call onto a throwaway `auto`
+        # container, the work is not where the resume note swears it is.
+        processor = _processor()
+        card = _card()
+        monkeypatch.setattr(rt.config, "deep_research_build_retries", 2)
+        calls = []
+
+        async def demoted(_proc, **kw):
+            calls.append(kw["messages"])
+            kw["container_gone_sink"].append({"container_id": "cntr_job1"})
+            raise _transient_stream_error()
+
+        monkeypatch.setattr(rt, "_consume_research_stream", demoted)
+
+        await _build(processor, card)
+
+        assert len(calls) == 1
+        card.set_alert.assert_not_awaited()
+
+
+class _FakeCardClient:
+    """Records what the card actually rendered. No sleeping, no network."""
+
+    def __init__(self):
+        self.blocks = []
+
+    async def post_status_card(self, *_a, **_kw):
+        return "111.0"
+
+    async def update_status_card(self, _channel, _ts, _text, blocks):
+        self.blocks.append(blocks)
+
+
+def _context_text(blocks):
+    return blocks[1]["elements"][0]["text"]
+
+
+@pytest.mark.unit
+class TestCardAlert:
+    async def test_the_alert_is_visible_where_a_phase_is_not_and_clears_when_work_resumes(self):
+        # set_phase is deliberately NOT rendered while a todo is in_progress (the spinning item
+        # IS "what I'm doing now") — which is exactly the state a mid-build retry happens in.
+        # The alert rides the context block instead, which renders unconditionally.
+        client = _FakeCardClient()
+        clock = itertools.count(0, 10).__next__       # every op past the throttle window
+        card = rt._ResearchCard(processor=MagicMock(), client=client, channel_id="C1",
+                                thread_root="1.0", task="t", label=None,
+                                todos=rt._TodoState(["Build the deck"]), clock=clock)
+        await card.start()
+        await card.set_todos([{"text": "Build the deck", "status": "in_progress"}])
+        await card.set_phase("Building the deck…")
+        assert not any("Building the deck" in line for line in card._visible_lines())
+
+        await card.set_alert("Provider hiccup — retrying (2/3)…")
+        assert "Provider hiccup — retrying (2/3)…" in _context_text(client.blocks[-1])
+
+        # The model driving the card again IS the "moving again" signal — nothing has to
+        # remember to take the alert down.
+        await card.set_todos([{"text": "Build the deck", "status": "done"}])
+        assert "retrying" not in _context_text(client.blocks[-1])
+
+    async def test_the_alert_reaches_slack_even_when_the_clear_lands_inside_the_throttle_window(
+            self):
+        # The failure this guards: raise and clear are barely a second apart, the throttle
+        # coalesces them into ONE render, and that render shows the state AFTER the clear — so
+        # the user is never told the thing the alert exists to tell them.
+        client = _FakeCardClient()
+        card = rt._ResearchCard(processor=MagicMock(), client=client, channel_id="C1",
+                                thread_root="1.0", task="t", label=None,
+                                todos=rt._TodoState(["Build the deck"]),
+                                clock=lambda: 0.0, sleep=AsyncMock())
+        await card.start()
+        await card.set_alert("Provider hiccup — retrying (2/3)…")
+        await card.set_todos([{"text": "Build the deck", "status": "in_progress"}])
+        for _ in range(3):
+            await asyncio.sleep(0)      # let the trailing flush run
+
+        rendered = [_context_text(b) for b in client.blocks]
+        assert any("retrying" in text for text in rendered)
+        assert "retrying" not in rendered[-1]
+
+    async def test_a_steering_bump_also_clears_it(self):
+        # Inside a build phase, steering is the ONLY activity counter — no web_search or MCP
+        # event ever reaches this card.
+        client = _FakeCardClient()
+        clock = itertools.count(0, 10).__next__
+        card = rt._ResearchCard(processor=MagicMock(), client=client, channel_id="C1",
+                                thread_root="1.0", task="t", label=None,
+                                todos=rt._TodoState(["Build the deck"]), clock=clock)
+        await card.start()
+        await card.set_alert("Provider hiccup — retrying (2/3)…")
+        await card.note_steering(1)
+        assert "retrying" not in _context_text(client.blocks[-1])
+        assert "1 update passed along" in _context_text(client.blocks[-1])
+
+    async def test_an_activity_counter_bump_also_clears_it(self):
+        client = _FakeCardClient()
+        clock = itertools.count(0, 10).__next__
+        card = rt._ResearchCard(processor=MagicMock(), client=client, channel_id="C1",
+                                thread_root="1.0", task="t", label=None,
+                                todos=rt._TodoState(["Dig"]), clock=clock)
+        await card.start()
+        await card.set_alert("Provider hiccup — retrying (2/3)…")
+        await card.note_web_search()
+        assert "retrying" not in _context_text(client.blocks[-1])
+        assert "1 web search" in _context_text(client.blocks[-1])
 
 
 @pytest.mark.unit

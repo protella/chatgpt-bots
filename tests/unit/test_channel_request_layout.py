@@ -27,6 +27,7 @@ from message_processor.channel_request import (BATCHED_IMAGE_CAP, IMAGE_TOKEN_BO
                                                estimate_admission, native_file_token_bound,
                                                prompt_cache_key, to_input_items)
 from message_processor.channel_stream import END_MARKER_TEXT, StreamOverBudgetError
+from message_processor.token_counter import estimate_tokens_conservative
 from message_processor.turn_runtime import TurnRuntime
 from tests.unit.channel_turn_harness import (build_stream, file_ref, item_texts,
                                              no_tools_prepared, normalized,
@@ -592,9 +593,43 @@ def test_an_image_is_charged_its_ceiling_not_its_base64():
     assert estimate.fits
 
 
-def test_a_native_file_is_charged_the_worse_of_bytes_and_pages():
+def test_a_paged_native_file_is_charged_its_pages_plus_the_text_it_yields(monkeypatch):
+    """The API does BOTH things to a native PDF — renders every page AND reads the text out of
+    them — so a bound that stopped at the pages would stop being a ceiling exactly where it
+    matters, on a text-dense document. `document_reserves` does not already cover that leg: it
+    reserves room for the SUMMARY we generate locally, which is a different payload from the raw
+    text the API tokenizes out of the native part.
+
+    What is gone is the CONTAINER BYTES. A 1.1MB, 16-page image-heavy PDF was priced at
+    1,169,733 tokens and refused at the door; pages plus text puts it near 50k.
+    """
+    # The text leg is MEASURED, not ratio'd — the real o200k instrument, stubbed only so the
+    # arithmetic below is exact.
+    assert channel_request.estimate_tokens_conservative is estimate_tokens_conservative
+    monkeypatch.setattr(channel_request, "estimate_tokens_conservative",
+                        lambda text: len(text or "") // 4)
+
+    # Text-light: the live case. Pages dominate; the megabyte of compressed images never appears.
+    light = "Fig. 1\n" * 40
+    assert (channel_request.native_file_token_bound(1_100_000, 16, extracted_text=light)
+            == 16 * PDF_PAGE_TOKEN_BOUND + len(light) // 4)
+
+    # Text-dense: same pages, and the text leg is now the larger half of the ceiling.
+    dense = "x" * 200_000
+    dense_bound = channel_request.native_file_token_bound(60_000, 16, extracted_text=dense)
+    assert dense_bound == 16 * PDF_PAGE_TOKEN_BOUND + 50_000
+    assert dense_bound > 16 * PDF_PAGE_TOKEN_BOUND, "the text leg has to actually bite"
+
+    # No text in hand: the pages alone, and the container bytes never re-enter.
+    assert channel_request.native_file_token_bound(50_000_000, 2) == 2 * PDF_PAGE_TOKEN_BOUND
+
+
+def test_a_native_file_with_no_page_count_is_still_charged_by_its_bytes():
+    """An unparseable PDF, or a native part that has no pages at all (a spreadsheet mount): the
+    bytes are the only thing known locally, and one token per byte is the worst case for text —
+    a proxy for what the API will charge, not a guarantee. Pre-existing, unchanged."""
     assert native_file_token_bound(5000, None) == 5000
-    assert native_file_token_bound(5000, 4) == 4 * PDF_PAGE_TOKEN_BOUND
+    assert native_file_token_bound(5000, 0) == 5000
     assert native_file_token_bound(None, None) == 0
     # Uncapped on purpose: a file whose worst case cannot fit genuinely cannot be guaranteed to.
     assert native_file_token_bound(50_000_000, None) == 50_000_000
@@ -1370,6 +1405,87 @@ async def test_a_malformed_trigger_timestamp_fails_closed_and_releases_the_lock(
     response = await processor.process_message(message, MagicMock(), None, turn=TurnRuntime())
     assert response.type == "error"
     processor.thread_manager.release_thread_lock.assert_awaited()
+
+
+def _absorbed_mention_meta():
+    """What the Phase-Q drain actually leaves on a trigger that absorbed an earlier @mention —
+    built by the real `absorb_owed_answer` rather than transcribed, so the two cannot drift."""
+    from message_processor import routing_facts
+
+    trigger = _message(ts="10.0")
+    trigger.metadata.update({"wake_source": "ambient", "gate_required": True, "gate_woke": True,
+                             "silence_capable": True, "sender_type": "human",
+                             "routing_posture": "channel_activity"})
+    mention = _message(ts="9.0")
+    mention.metadata.update({"wake_source": "app_mention", "gate_required": False,
+                             "silence_capable": False, "sender_type": "human",
+                             "routing_posture": "addressed_to_assistant"})
+    assert routing_facts.absorb_owed_answer(trigger, [mention]) is True
+    return dict(trigger.metadata)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wake,meta,posts", [
+    ("ambient", {"wake_source": "ambient", "gate_required": True, "gate_woke": True,
+                 "silence_capable": True, "sender_type": "human",
+                 "routing_posture": "channel_activity"}, False),
+    ("membership continuation", {"wake_source": "thread_continuation", "gate_required": False,
+                                 "silence_capable": True, "membership_wake": True,
+                                 "strict_continuation": False, "sender_type": "human",
+                                 "routing_posture": "thread_activity"}, False),
+    ("strict 1:1 continuation", {"wake_source": "thread_continuation", "gate_required": False,
+                                 "silence_capable": True, "membership_wake": False,
+                                 "strict_continuation": True, "sender_type": "human",
+                                 "routing_posture": "thread_activity"}, True),
+    ("@mention", {"wake_source": "app_mention", "gate_required": False,
+                  "silence_capable": False, "sender_type": "human",
+                  "routing_posture": "addressed_to_assistant"}, True),
+    ("name hit", {"wake_source": "name_mention", "gate_required": True, "gate_woke": True,
+                  "silence_capable": True, "participation_name_hit": True,
+                  "sender_type": "human", "routing_posture": "channel_activity"}, True),
+    ("name hit from a peer bot", {"wake_source": "name_mention", "gate_required": True,
+                                  "gate_woke": True, "silence_capable": True,
+                                  "participation_name_hit": True, "sender_type": "other_bot",
+                                  "participation_sender_bot": True,
+                                  "routing_posture": "channel_activity"}, False),
+    ("absorbed @mention", _absorbed_mention_meta(), True),
+])
+async def test_a_fail_closed_turn_speaks_only_where_somebody_asked(wake, meta, posts):
+    """Nobody asked. A channel turn that fails closed on an AMBIENT wake — a gate wake, or a
+    thread we are merely a member of — records its outcome and posts nothing: the card would
+    interrupt a conversation we were never asked into to announce our own plumbing.
+
+    Four things do have somebody to tell. An @mention and a name in the text are people talking
+    to us; a STRICT 1:1 continuation is a person carrying on what is effectively a private
+    thread with us; and a catch-up turn that absorbed an owed @mention answers for that mention,
+    so it owes the mentioner the reason it could not. A peer bot that said our name has nobody:
+    it cannot act on "try a smaller attachment", and a card posted at a bot is a loop seed.
+
+    The OUTCOME is identical in every case — `turn.turn_error` is what the ledger's fail-closed
+    code is read from, and it is written before this decision is made.
+    """
+    from message_processor.base import MessageProcessor
+
+    with patch("message_processor.base.AsyncThreadStateManager"), \
+         patch("message_processor.base.OpenAIClient"):
+        processor = MessageProcessor()
+    processor.db = None
+    processor.thread_manager.acquire_thread_lock = AsyncMock(return_value=True)
+    processor.thread_manager.release_thread_lock = AsyncMock()
+    # The live shape: a 16-page image-heavy PDF whose admission put the turn over the limit.
+    processor.get_or_create_channel_thread_state = AsyncMock(
+        side_effect=StreamOverBudgetError("C1: 1169733 tokens over the limit"))
+
+    message = _message(ts="10.0")
+    message.metadata.update(meta)
+    turn = TurnRuntime()
+    with patch.object(config, "enable_channel_memory", False):
+        response = await processor.process_message(message, MagicMock(), None, turn=turn)
+
+    assert turn.turn_error == "stream_over_budget", wake
+    assert response.type == "error", wake
+    assert "Too Much For One Request" in response.content, wake
+    assert (response.metadata.get("suppress_error_post") is not True) is posts, wake
 
 
 @pytest.mark.parametrize("error_name,code,needle", [

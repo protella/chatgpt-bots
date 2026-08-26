@@ -898,6 +898,21 @@ class MessageProcessor(ThreadManagementMixin,
             if turn is not None:
                 turn.turn_error = "history_fetch_failed"
 
+            history_notice = (
+                f"{config.error_emoji} **Couldn't Load Conversation History**\n\n"
+                "Slack didn't return this conversation's history (it may be busy or "
+                "rate-limiting). Your message wasn't processed — please try again in a moment."
+            )
+
+            # The fourth fail-closed code, and the same rule as its three siblings below: with
+            # nobody for the card to be for, the outcome is recorded and nothing is said.
+            if not self._fail_closed_notice_warranted(message, channel_turn):
+                self.log_info(
+                    "Fail-closed (history_fetch_failed) on an unaddressed channel turn in "
+                    f"{thread_key} — outcome recorded, nothing posted")
+                return Response(type="error", content=history_notice,
+                                metadata={"suppress_error_post": True})
+
             if thinking_id and hasattr(client, 'update_message'):
                 try:
                     await cast(Any, client).update_message(
@@ -914,14 +929,7 @@ class MessageProcessor(ThreadManagementMixin,
                 except Exception:
                     pass
 
-            return Response(
-                type="error",
-                content=(
-                    f"{config.error_emoji} **Couldn't Load Conversation History**\n\n"
-                    "Slack didn't return this conversation's history (it may be busy or "
-                    "rate-limiting). Your message wasn't processed — please try again in a moment."
-                )
-            )
+            return Response(type="error", content=history_notice)
         except ChannelStreamError as e:
             # The channel window could not be built, or could not be sent. Every branch here is
             # FAIL-CLOSED by design: the alternative is answering a room we cannot see, which
@@ -943,6 +951,23 @@ class MessageProcessor(ThreadManagementMixin,
                           f"Time: {elapsed:.2f}s")
             self.log_info("=" * 100)
             self.log_info("")
+
+            # NOBODY ASKED. On a channel turn nobody put to us — a gate wake on ambient traffic,
+            # a thread we are merely a member of, or a peer bot that said our name — the card has
+            # no audience: it interrupts a conversation we were not asked into to announce our own
+            # plumbing, which is the exact interruption the participation model exists to prevent.
+            # The OUTCOME is unchanged and still recorded — `turn.turn_error` above is what the
+            # ledger's fail-closed code is read from, and the terminal is classified `error`
+            # exactly as before; only the words are withheld. Returning here also skips the
+            # status rewrite below, which is right for the same reason: main.py DELETES the
+            # chrome of an error turn, so nothing is left standing (and these turns are
+            # silence-capable, so they have no thinking surface to begin with).
+            if not self._fail_closed_notice_warranted(message, channel_turn):
+                self.log_info(
+                    f"Fail-closed ({code}) on an unaddressed channel turn in {thread_key} — "
+                    "outcome recorded, nothing posted")
+                return Response(type="error", content=notice["message"],
+                                metadata={"suppress_error_post": True})
 
             if thinking_id and hasattr(client, 'update_message'):
                 try:
@@ -1086,6 +1111,24 @@ class MessageProcessor(ThreadManagementMixin,
             except Exception as lock_error:
                 # Even if release fails, log it but don't crash
                 self.log_error(f"Error releasing thread lock for {thread_key}: {lock_error}", exc_info=True)
+
+    @staticmethod
+    def _fail_closed_notice_warranted(message: Message, channel_turn: bool) -> bool:
+        """Is there anybody a fail-closed card would be FOR?
+
+        Two questions, both answered from facts stamped at dispatch. Were we addressed — an
+        @mention, a DM, our name in the text, a strict thread continuation, or a batch carrying a
+        mention that already owed words? And is the author a person? A peer bot that says our name
+        gets nothing: it cannot act on "try a smaller attachment", and a card posted at a bot is
+        the first half of a loop.
+
+        A DM never reaches the false branch (`channel_turn` is False there), so the notices a DM
+        has always had are untouched by this.
+        """
+        if not channel_turn:
+            return True
+        return (routing_facts.addressed_wake(message)
+                and not routing_facts.sender_is_bot(message))
 
     @staticmethod
     def _channel_stream_failure(error: ChannelStreamError):

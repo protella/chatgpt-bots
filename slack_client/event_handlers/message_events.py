@@ -9,7 +9,7 @@ from slack_sdk.errors import SlackApiError
 
 from message_processor.client_contract import Message
 from config import config
-from message_processor.routing_facts import stamp_routing_facts
+from message_processor.routing_facts import STRICT_CONTINUATION, stamp_routing_facts
 from slack_client import actor_tail
 from slack_client._host import _Host
 from slack_client.formatting.blocks import extract_supplementary_text
@@ -1176,6 +1176,12 @@ class SlackMessageEventsMixin(_Host):
         # never have to tell "not a membership wake" from "never stamped". Read only by the
         # structural-authorization predicate (ruling 2A).
         message.metadata["membership_wake"] = membership_wake
+        # The other half of the same split, stamped on EVERY dispatch out of this path for the
+        # same reason. A STRICT continuation is a human carrying on a thread that is effectively a
+        # private conversation with us — they are talking TO us, and a turn that cannot answer
+        # owes them the reason. The widened membership route is us overhearing a room, and owes
+        # nobody an explanation of our own plumbing. Read by routing_facts.addressed_wake.
+        message.metadata[STRICT_CONTINUATION] = direct_continuation and not membership_wake
         # The routing facts, stamped on EVERY dispatch out of this path — including the two
         # routes that need no gate. A turn may end in silence when the gate judged it (the
         # model that woke it can also decide there is nothing to add) or when it is a thread

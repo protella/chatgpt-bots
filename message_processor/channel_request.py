@@ -267,25 +267,51 @@ class ChannelTurnContext:
         for doc in self.document_inputs:
             if not (doc.get("native") and doc.get("file_data_b64")):
                 continue
-            bounds.append(native_file_token_bound(doc.get("size_bytes"), doc.get("total_pages")))
+            bounds.append(native_file_token_bound(
+                doc.get("size_bytes"), doc.get("total_pages"),
+                extracted_text=doc.get("content")))
         return tuple(bounds)
 
 
-def native_file_token_bound(size_bytes: Optional[int], page_count: Optional[int]) -> int:
+def native_file_token_bound(size_bytes: Optional[int], page_count: Optional[int],
+                            extracted_text: Optional[str] = None) -> int:
     """The most a native input_file part can cost, and deliberately not an average.
 
-    One token per byte is the true worst case for high-entropy text: no tokenizer emits more than
-    one token per byte, so a file of N bytes can never cost more than N tokens as text. When we
-    also know the page count locally, the rendered-pages cost may exceed that (a scanned PDF is
-    large in pages and small in extractable bytes), so the bound is the larger of the two.
+    A PAGED file — a PDF whose page count we parsed locally — is charged BOTH of the two things
+    the API does with it: it renders every page (which is what PDF_PAGE_TOKEN_BOUND prices) AND it
+    reads the text out of them. So the bound is `pages * PDF_PAGE_TOKEN_BOUND` plus the measured
+    cost of the text we extracted from the same file. `document_reserves` does NOT already cover
+    that: it reserves room for the SUMMARY we generate locally and send in the document block,
+    which is a different payload from the raw text the API tokenizes out of the native part.
+    Dropping the text leg would stop being a ceiling exactly where it matters most — a text-dense
+    PDF, where the text can cost more than the pages do.
+
+    What is gone is the BYTE leg: the API never tokenizes a PDF's container bytes, which are mostly
+    compressed images, fonts and object tables. Charging them made the container's compression
+    ratio the price of the document. The live case was a 1.1MB, 16-page image-heavy PDF priced at
+    1,169,733 tokens and refused at the door; under this bound it is 16*2500 = 40k for the pages
+    plus roughly 10k for its extracted text — about 50k, some 23x under the old estimate and
+    comfortably inside the window it was refused from.
+
+    The text is MEASURED, never ratio'd: `estimate_tokens_conservative` is the o200k count plus
+    headroom, the same instrument the admission diagnostic uses, so a page of dense CSV and a page
+    of English prose are not priced as if they were the same text.
+
+    With NO page count — an unparseable PDF, or a native part that has no pages at all, such as a
+    CSV/XLSX mounted for the sandbox — the bytes are the only thing we know. One token per byte is
+    the true worst case for high-entropy TEXT (no byte-level BPE tokenizer emits more than one
+    token per byte), which makes the byte count a reasonable proxy for a file the API will read as
+    text — a proxy, not a guarantee, since a paged or rendered part can cost more than its bytes.
+    Pre-existing behaviour on that leg, unchanged here.
 
     UNCAPPED on purpose. A file whose worst case will not fit genuinely cannot be guaranteed to
     fit, and admitting it on an optimistic average is how a turn dies inside the API instead of
     at the door.
     """
-    by_bytes = int(size_bytes or 0)
-    by_pages = int(page_count or 0) * PDF_PAGE_TOKEN_BOUND
-    return max(by_bytes, by_pages)
+    pages = int(page_count or 0)
+    if pages > 0:
+        return pages * PDF_PAGE_TOKEN_BOUND + estimate_tokens_conservative(extracted_text or "")
+    return int(size_bytes or 0)
 
 
 def fresh_turn_context(ctx: ChannelTurnContext, fresh_stream: ChannelStream

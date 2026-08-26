@@ -974,6 +974,11 @@ class BotConfig:
     # traceback, fix, re-run, verify. Running out of rounds mid-build is the difference between
     # a deck and an apology.
     deep_research_build_timeout: float = field(default_factory=lambda: float(os.getenv("DEEP_RESEARCH_BUILD_TIMEOUT", "1800")))
+    # Extra build-stream attempts after a TRANSIENT provider error (a dropped SSE stream, a 5xx,
+    # a bare APIError with no status). The container is the persistence, so a retry resumes
+    # against work already done rather than starting over. The overall wall clock is still
+    # DEEP_RESEARCH_BUILD_TIMEOUT — retries share that one budget, they do not extend it.
+    deep_research_build_retries: int = field(default_factory=lambda: max(0, int(os.getenv("DEEP_RESEARCH_BUILD_RETRIES", "2"))))
     deep_research_max_build_rounds: int = field(default_factory=lambda: max(1, int(os.getenv("DEEP_RESEARCH_MAX_BUILD_ROUNDS", "16"))))
     # Label the findings post with a chat.postMessage username override ("<bot> [research: …]").
     # Needs the chat:write.customize scope, which the app may not have — on the first failure the
