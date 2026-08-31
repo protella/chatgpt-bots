@@ -1191,9 +1191,9 @@ numpy==2.5.1 \
     # via
     #   pandas
     #   pandas-stubs
-openai==3.3.1 \
-    --hash=sha256:6f22807de1a976c932cecda620e8172a8c3fdbaeed29c7f21564e0c2410edf56 \
-    --hash=sha256:9652df7fdf8ee6f5bd58e0a12f2b1d414a18e0f06bb7a9a57c8643a5f5469bd3
+openai==3.6.0 \
+    --hash=sha256:18fe3f6e96390ef41ee27b152fc9effefca321c33673bd9b956a572493d3ab9b \
+    --hash=sha256:508e2158bf971687f953b62e44b02f207792c815aac306816386d7ba34d37f5f
     # via -r requirements.in
 openpyxl==3.1.5 \
     --hash=sha256:5282c12b107bffeef825f4617dc029afaf41d0ea60823bbb665ef3079dc79de2 \
@@ -1628,9 +1628,9 @@ pygments==2.20.0 \
     --hash=sha256:6757cd03768053ff99f3039c1a36d6c0aa0b263438fcab17520b30a303a82b5f \
     --hash=sha256:81a9e26dd42fd28a23a2d169d86d7ac03b46e2f8b59ed4698fb4785f946d0176
     # via pytest
-pypdf==6.16.1 \
-    --hash=sha256:63fec31c4092ae50b6729beedcb469055b60d20c834bde1c402df241f371f644 \
-    --hash=sha256:c4d1b43ddae921387321cf63936cd16a7743b91d2da92f165c149a195c972ba9
+pypdf==6.16.2 \
+    --hash=sha256:595647f6191de6f402cfde1d0c455d6cbccbd509aac32b34783009c032de5d6e \
+    --hash=sha256:c8b09a59399062fb45a1b8156c18a787a10a3dae03ac9674397a226712c94604
     # via -r requirements.in
 pypdfium2==5.12.1 \
     --hash=sha256:05bab9b1ba2de7fc299ae2af25cb9c8a0543bc8bb893e879fe8c9ba8310e9ce4 \
@@ -1839,9 +1839,9 @@ slack-bolt==1.30.0 \
     --hash=sha256:81f5bc46e79516d23d5e2a31dded6304dd1b8b6b72c0083f2f31d5d801e262c4 \
     --hash=sha256:af38258d41f801ad9c74503090e0f39accd66c49f667f7e55c97fcdb0e51b886
     # via -r requirements.in
-slack-sdk==3.43.0 \
-    --hash=sha256:0553152e46c4259eb69f7464cdadc35ba4802ca10f9f5a849c92cf03d6c2ba07 \
-    --hash=sha256:4b6557c65577fc172f685af218b811f9f3b4909e24cddd839ada09565f10c585
+slack-sdk==3.44.0 \
+    --hash=sha256:3d0b5997acafacece907299fb387852233c3c0635762de1c2343ad6ebff2f911 \
+    --hash=sha256:e872acaf4e76ef22e9544af390b6e3896ce7198ad6bb26b3ce2630f3422f2ca3
     # via
     #   -r requirements.in
     #   slack-bolt
