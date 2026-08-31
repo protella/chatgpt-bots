@@ -26,6 +26,7 @@ All notable changes to this project will be documented in this file.
 - **Channel memory saves rules, not incidents.** A note is written only when someone actually
   stated a rule, and it is stored as stated — one rule per note, at their level of generality —
   rather than as the single case that prompted it.
+- **Dependency refresh.** openai 3.6.0, pypdf 6.16.2, slack-sdk 3.44.0.
 
 ### 🐛 Fixed
 
