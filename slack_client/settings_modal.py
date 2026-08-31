@@ -1231,10 +1231,18 @@ class SettingsModal(LoggerMixin):
                 # No selection - might happen during modal updates
                 self.log_debug("No reasoning_level_gpt54 selected_option found")
 
-        # Fallback if no reasoning selection due to Slack modal update bug
+        # Fallback if no reasoning selection due to Slack modal update bug. This forced 'none'
+        # for years, which silently overwrote a stored effort with the weakest setting the
+        # moment Slack failed to report the selection — and it is the ONLY seam that runs, so a
+        # configured default further downstream never got a say. The workspace default is the
+        # honest stand-in for "we could not read what they picked".
         if not reasoning_found:
-            extracted['reasoning_effort'] = 'none'
-            self.log_debug("No reasoning selection found - using default: none")
+            from config import clamp_effort
+            model_for_clamp = extracted.get('model') or config.gpt_model
+            extracted['reasoning_effort'] = clamp_effort(model_for_clamp,
+                                                         config.default_reasoning_effort)
+            self.log_debug("No reasoning selection found - using workspace default: "
+                           f"{extracted['reasoning_effort']}")
         
         verbosity_block = values.get('verbosity_block', {})
         if 'verbosity' in verbosity_block:

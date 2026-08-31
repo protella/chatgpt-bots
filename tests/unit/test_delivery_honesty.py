@@ -482,9 +482,15 @@ async def _channel_turn_with_a_prior_timeout(*, admission_fails: bool, had_timeo
                                             unsupported=(), open_top_level: bool = False,
                                             trigger_text: str = "what happened to the Q3 numbers",
                                             gate_sources=(), reply=None,
-                                            reply_destination=None):
+                                            reply_destination=None, addressed: bool = True,
+                                            dm: bool = False):
     """Drive the real process_message for a CHANNEL turn that owes prose, and report
-    (the order of the steps that matter, the response, what admission saw)."""
+    (the order of the steps that matter, the response, what admission saw).
+
+    `addressed` stamps the routing facts of a real @mention — the default, because every card
+    these tests are about is a card SOMEBODY is owed. `addressed=False` is the ambient shape:
+    the gate woke on traffic that never named us. `dm=True` moves the whole turn to a DM
+    surface, where the notices are unconditional."""
     from unittest.mock import patch
 
     from message_processor.base import MessageProcessor
@@ -496,9 +502,16 @@ async def _channel_turn_with_a_prior_timeout(*, admission_fails: bool, had_timeo
 
     order = []
     seen = {}
+    channel_id = "D1" if dm else "C1"
+
+    def _add_message(role: str = "", content: str = "", **_kw) -> None:
+        """A DM writes its breadcrumb into ThreadState; the channel path never does."""
+        state.messages.append({"role": role, "content": content})
+
     state = SimpleNamespace(had_timeout=had_timeout, messages=[], thread_ts="10.0",
-                            channel_id="C1", root_author=("U1", "human"), config_overrides={},
-                            participants={}, current_model=None, has_trimmed_messages=False)
+                            channel_id=channel_id, root_author=("U1", "human"),
+                            config_overrides={}, participants={}, current_model=None,
+                            has_trimmed_messages=False, add_message=_add_message)
 
     async def _state(*a, **k):
         return state
@@ -548,10 +561,20 @@ async def _channel_turn_with_a_prior_timeout(*, admission_fails: bool, had_timeo
     client.send_message = AsyncMock(side_effect=_send)
     client.update_message = AsyncMock()
     ts = "10.0"
-    meta: Dict[str, Any] = {"ts": ts}
+    meta: Dict[str, Any] = {"ts": ts, "sender_type": "human"}
+    if dm:
+        meta.update({"wake_source": "dm", "gate_required": False, "silence_capable": False,
+                     "routing_posture": "addressed_to_assistant"})
+    elif addressed:
+        meta.update({"wake_source": "app_mention", "gate_required": False,
+                     "silence_capable": False, "routing_posture": "addressed_to_assistant"})
+    else:
+        # The live shape of the incident: a gate wake on channel traffic nobody put to us.
+        meta.update({"wake_source": "ambient", "gate_required": True, "gate_woke": True,
+                     "silence_capable": True, "routing_posture": "channel_activity"})
     if gate_sources:
         meta["gate_sources"] = list(gate_sources)
-    message = Message(text=trigger_text, user_id="U1", channel_id="C1",
+    message = Message(text=trigger_text, user_id="U1", channel_id=channel_id,
                       thread_id=ts, metadata=meta)
     if open_top_level:
         # A top-level trigger in a channel that allows top-level replies: both destinations are
@@ -733,6 +756,60 @@ async def test_a_failed_file_only_trigger_with_nothing_behind_it_still_shortcuts
     assert "admission" not in order, order
     assert any(o.startswith("card:") and "Unsupported File Type" in o for o in order), order
     assert response.content == "" and response.metadata.get("posted") is True
+
+
+# ------------------- the card is for somebody: an unaddressed channel turn is told nothing
+
+@pytest.mark.asyncio
+async def test_an_unaddressed_channel_turn_posts_no_unsupported_file_card():
+    """LIVE (2026-08-27): an audio file dropped into a busy channel with a one-character
+    comment. Nobody addressed us, no model call could be made — and a static "Unsupported File
+    Type" card announced our own plumbing to a room that had not asked us anything.
+
+    Same rule as the fail-closed notices: with nobody for the card to be for, the outcome is
+    recorded and nothing is said."""
+    order, response, _ = await _channel_turn_with_a_prior_timeout(
+        admission_fails=False, had_timeout=False, trigger_text="", addressed=False,
+        unsupported=[{"name": "voice-note.mp3", "mimetype": "audio/mpeg"}])
+    assert not any(o.startswith("card:") for o in order), order
+    # The turn still ENDS: the outcome rides the Response, and main.py is told to say none of it.
+    assert response.type == "error"
+    assert response.metadata.get("suppress_error_post") is True
+
+
+@pytest.mark.asyncio
+async def test_an_unaddressed_channel_turn_that_chose_silence_gets_no_fallback_card():
+    """The other site, and the one that actually fired: the model was called (there was other
+    content to answer), chose no_response_needed, and the acknowledgment-of-last-resort seam
+    posted the card behind its silence."""
+    order, _, _ = await _channel_turn_with_a_prior_timeout(
+        admission_fails=False, had_timeout=False, addressed=False,
+        unsupported=[{"name": "voice-note.mp3", "mimetype": "audio/mpeg"}],
+        reply=Response(type="text", content="",
+                       metadata={"terminal_action": "no_reply", "posted": False}))
+    assert order == ["stream", "admission"], order
+
+
+@pytest.mark.asyncio
+async def test_an_addressed_channel_turn_still_gets_the_unsupported_file_card():
+    """The counterpart. Somebody @mentioned us and handed us a file we cannot read: they are
+    waiting on it, and silence there is the bot ignoring a direct request."""
+    order, response, _ = await _channel_turn_with_a_prior_timeout(
+        admission_fails=False, had_timeout=False, trigger_text="", addressed=True,
+        unsupported=[{"name": "voice-note.mp3", "mimetype": "audio/mpeg"}])
+    assert any(o.startswith("card:") and "Unsupported File Type" in o for o in order), order
+    assert response.type == "text" and response.metadata.get("posted") is True
+
+
+@pytest.mark.asyncio
+async def test_a_dm_always_gets_the_unsupported_file_card():
+    """Regression guard: every message in a DM is addressed to us, so the notices a DM has
+    always had must not be touched by the channel rule."""
+    order, response, _ = await _channel_turn_with_a_prior_timeout(
+        admission_fails=False, had_timeout=False, trigger_text="", dm=True,
+        unsupported=[{"name": "voice-note.mp3", "mimetype": "audio/mpeg"}])
+    assert any(o.startswith("card:") and "Unsupported File Type" in o for o in order), order
+    assert response.type == "text" and response.metadata.get("posted") is True
 
 
 # ------------------------------------------------- a FOREIGN post is not this exchange (§2c)

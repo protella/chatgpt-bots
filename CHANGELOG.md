@@ -4,6 +4,45 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.1.8] - 2026-08-30
+
+### ✨ Added
+
+- **Workspace context file.** An optional, admin-authored file of durable background about your
+  organization — what the company does, product names, an acronym glossary, team conventions —
+  injected into every system prompt so the bot stops guessing at in-house shorthand. Point
+  `WORKSPACE_CONTEXT_FILE` at a markdown or plain-text file; `workspace_context.example.md` is a
+  commented template. Read once per process, so edits apply on restart; a missing file logs a
+  warning and changes nothing. Optional but recommended.
+
+### 🔧 Changed
+
+- **Default reasoning effort is `medium`.** `DEFAULT_REASONING_EFFORT` moves from `low`, and the
+  settings modal no longer falls back to `none` when Slack fails to report which effort was
+  selected — it uses the workspace default instead of silently downgrading a stored setting.
+- **The bot answers fewer questions that were not for it.** An unaddressed question in a room of
+  colleagues usually has a person in mind — whoever owns that system, budget, or call — and the
+  bot now leaves it to them unless nobody else is the obvious addressee.
+- **Channel memory saves rules, not incidents.** A note is written only when someone actually
+  stated a rule, and it is stored as stated — one rule per note, at their level of generality —
+  rather than as the single case that prompted it.
+
+### 🐛 Fixed
+
+- **No "Unsupported File Type" card when nobody asked.** Dropping a file the bot cannot read into
+  a channel — a song, a video, a design file — no longer produces an error card from a bot nobody
+  addressed. It stays silent and records the outcome. Anyone who actually asked still gets told,
+  and if that notice fails to post the bot now retries it rather than leaving the asker in
+  silence.
+- **No invented workarounds for files the bot can't read.** Told a file type was unsupported, the
+  bot would sometimes send the person off to convert or re-upload it as something it also cannot
+  read (a `.mp3` "re-upload it as WAV"). It now only suggests a fix it can actually carry out.
+
+### ⬆️ Upgrade note
+
+- Optional: create a `workspace_context.md` on each deployment (copy `workspace_context.example.md`)
+  and set `WORKSPACE_CONTEXT_FILE` in that environment's `.env`. Without it, nothing changes.
+
 ## [3.1.7] - 2026-08-26
 
 ### ✨ Added

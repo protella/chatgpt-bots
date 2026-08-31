@@ -154,3 +154,6 @@ Docs/internal/
 
 # Prod deployment checklist — internal implementation notes, never published
 Docs/V3_PROD_DEPLOYMENT_CHECKLIST.md
+
+# Admin-authored workspace context (real content stays out of the public repo)
+workspace_context.md

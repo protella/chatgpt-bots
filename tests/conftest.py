@@ -39,6 +39,13 @@ os.environ['DATABASE_DIR'] = tempfile.mkdtemp(prefix='pytest-bot-db-')
 for _dev_barrier_var in ('DEV_TURN_BARRIERS', 'DEV_TURN_BARRIERS_DIR', 'DEV_TURN_BARRIERS_TIMEOUT'):
     os.environ[_dev_barrier_var] = ''
 
+# THE WORKSPACE CONTEXT FILE IS OFF FOR THE SUITE. A dev machine that points
+# WORKSPACE_CONTEXT_FILE at a real file would otherwise inject that admin-authored text into
+# every system prompt a test builds, so prompt assertions would pass or fail on what happens to
+# be on THIS disk. Empty-string, never pop(), for the same reason as the barriers above: an
+# absent variable is one load_dotenv() will happily supply from .env.
+os.environ['WORKSPACE_CONTEXT_FILE'] = ''
+
 @pytest.fixture
 def mock_env(monkeypatch):
     """Mock environment variables for testing"""
@@ -178,6 +185,21 @@ def _isolated_participation_ledger(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "log_directory", str(tmp_path / "ledger"), raising=False)
     yield
     participation_telemetry.shutdown()
+
+
+# The env var above only settles what the config singleton read at IMPORT time. This pins the
+# attribute itself for every test, and empties the loader's process-wide `lru_cache` around each
+# one — a test that legitimately points the setting at a fixture file (test_workspace_context.py)
+# would otherwise leave its content cached for every prompt test that ran after it.
+@pytest.fixture(autouse=True)
+def _workspace_context_off(monkeypatch):
+    from config import config
+    from message_processor.utilities import _load_workspace_context
+
+    monkeypatch.setattr(config, "workspace_context_file", "", raising=False)
+    _load_workspace_context.cache_clear()
+    yield
+    _load_workspace_context.cache_clear()
 
 
 @pytest.fixture(autouse=True)

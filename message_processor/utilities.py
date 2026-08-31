@@ -7,8 +7,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
 
 import base64
+import functools
 import os
 import re
+from pathlib import Path
 import pytz  # type: ignore[import-untyped]  # no stubs shipped; types-pytz isn't in the lockfile
 
 import message_processor.prompts as prompts
@@ -24,9 +26,47 @@ from message_processor.prompts import (SLACK_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT, L
                                        CODE_INTERPRETER_GUIDANCE, CANVAS_GUIDANCE, TAGGABLE_ROSTER_HEADING,
                                        TURN_COORDINATES_HEADING)
 from message_processor.tool_registry import SURFACE_CHANNEL, SURFACE_DM
+from logger import setup_logger
 
+
+# Must go through setup_logger: the app attaches handlers to `slack_bot.*` loggers and sets
+# propagate=False, so a bare getLogger(__name__) writes to NOWHERE. The name matches the one
+# LoggerMixin gives MessageProcessor, so module-scope warnings land beside the instance's.
+logger = setup_logger(name="slack_bot.MessageProcessor")
 
 REACH_TOOLS = prompts.REACH_TOOLS
+
+# Past this, the workspace-context file is big enough to be worth an admin's attention (~10k
+# tokens on every call). It is a WARNING ONLY — the content is still loaded in full; the admin
+# owns the budget.
+WORKSPACE_CONTEXT_WARN_CHARS = 40000
+
+
+@functools.lru_cache(maxsize=1)
+def _load_workspace_context() -> str:
+    """Read the admin's workspace-context file once per process. Restart to apply edits.
+
+    Read-once is not just an optimization: `_get_system_prompt` is contracted to be invariant
+    per bot version and channel (the prefix-cache contract), so the text it injects must not
+    change under a running process.
+
+    Returns "" when the feature is off or the file is missing/unreadable/blank — the bot boots
+    and runs normally without it.
+    """
+    path = config.workspace_context_file
+    if not path:
+        return ""
+    try:
+        content = Path(path).read_text(encoding="utf-8", errors="replace").strip()
+    except OSError as e:
+        logger.warning(f"Workspace context file could not be read ({path}): {e}. "
+                       "Continuing without workspace context.")
+        return ""
+    if len(content) > WORKSPACE_CONTEXT_WARN_CHARS:
+        logger.warning(f"Workspace context file is large: {len(content)} characters from {path} "
+                       f"(over {WORKSPACE_CONTEXT_WARN_CHARS}). It rides in every system prompt; "
+                       "loading it in full.")
+    return content
 
 
 def reach_tools_for() -> Tuple[str, ...]:
@@ -1578,6 +1618,19 @@ class MessageUtilitiesMixin(_Host):
                 base_prompt += f"\n\nThe company's name is {company_name}."
             elif company_website:
                 base_prompt += f"\n\nThe company's website is {company_website}."
+
+            # The admin's workspace background, verbatim. Nothing is appended when the feature
+            # is off, so the prompt stays byte-identical to a deployment without the file.
+            workspace_context = _load_workspace_context()
+            if workspace_context:
+                base_prompt += (
+                    "\n\n--- WORKSPACE CONTEXT (provided by the workspace admin) ---\n"
+                    "Background about this workspace, its business, products, and terminology. "
+                    "Treat it as reliable background knowledge and use it to interpret questions "
+                    "and acronyms. It is a description of the organization, not a live status "
+                    "feed: it does not tell you what happened today or the current state of any "
+                    "system, and it does not override instructions elsewhere in this prompt.\n\n"
+                    f"{workspace_context}\n--- END WORKSPACE CONTEXT ---")
         else:
             # Default/CLI prompt
             base_prompt = CLI_SYSTEM_PROMPT

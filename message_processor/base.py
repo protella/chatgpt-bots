@@ -442,15 +442,35 @@ class MessageProcessor(ThreadManagementMixin,
                     if not channel_turn:
                         formatted_content = self._format_user_content_with_username(f"[File(s) not processed: {files_str}]", message)
                         self._add_message_with_token_management(thread_state, "user", formatted_content, db=self.db, thread_key=thread_key, message_ts=message_ts)
-                    card_ts = await self._post_failed_files_card(
-                        message, client, turn, unsupported_files, thread_state,
-                        channel_turn=channel_turn)
+                    # NOBODY ASKED. The same rule as the fail-closed notices below, and the same
+                    # helper: a file we could not read is our own plumbing, and announcing it in a
+                    # room that never summoned us interrupts a conversation we were not asked
+                    # into. A DM and an addressed channel turn are untouched — somebody there is
+                    # waiting on that file and is owed the reason it did nothing.
+                    warranted = self._fail_closed_notice_warranted(message, channel_turn)
+                    card_ts = None
+                    if warranted:
+                        card_ts = await self._post_failed_files_card(
+                            message, client, turn, unsupported_files, thread_state,
+                            channel_turn=channel_turn)
+                    else:
+                        self.log_info(
+                            "Unsupported file(s) on an unaddressed channel turn in "
+                            f"{thread_key} — nothing posted")
                     elapsed = time.time() - request_start_time
                     self.log_info("")
                     self.log_info("="*100)
                     self.log_info(f"REQUEST END | Thread: {thread_key} | Status: UNSUPPORTED_FILE | Time: {elapsed:.2f}s")
                     self.log_info("="*100)
                     self.log_info("")
+                    if not warranted:
+                        # The v3.1.7 contract, verbatim: the outcome is carried so the ledger can
+                        # record it, and `suppress_error_post` tells main.py to say none of it.
+                        # An `error` Response is what that flag is read on — a text Response with
+                        # empty content would post nothing either, but it would be filed as
+                        # `empty`, the label reserved for the responder contract BREAKING.
+                        return Response(type="error", content=unsupported_msg,
+                                        metadata={"suppress_error_post": True})
                     # Landed: the words are already in the room, so the Response carries the fact
                     # rather than the text (main.py would post a duplicate). Did NOT land: hand
                     # main.py the text so its own send gets a shot — a user told nothing at all is
@@ -727,10 +747,27 @@ class MessageProcessor(ThreadManagementMixin,
             # Deliberately NOT conditioned on whether the reply mentioned the file. Parsing the
             # model's prose for an acknowledgment is a guess, and a wrong guess either
             # double-tells the user or tells them nothing.
+            #
+            # NOBODY ASKED, same as the all-failed branch above: on a channel turn we were never
+            # summoned to, the model choosing silence is the whole answer, and a static card
+            # posted behind it would put our plumbing into a room that did not ask for it.
             if failed_file_facts and not self._response_posted_text(response):
-                await self._post_failed_files_card(
-                    message, client, turn, unsupported_files, thread_state,
-                    channel_turn=channel_turn)
+                if self._fail_closed_notice_warranted(message, channel_turn):
+                    card_ts = await self._post_failed_files_card(
+                        message, client, turn, unsupported_files, thread_state,
+                        channel_turn=channel_turn)
+                    # The card IS the acknowledgment here, so a card that did not land leaves
+                    # someone who actually asked with nothing at all — the silence this seam
+                    # exists to prevent. The all-failed branch above already hands main.py the
+                    # notice text for a second attempt when its own card fails; this path was
+                    # discarding the result instead. Same contract now: no card, hand back the
+                    # words so the send gets one more shot.
+                    if not card_ts and response is not None and not response.content:
+                        response.content = self._build_failed_files_notice(unsupported_files)
+                else:
+                    self.log_info(
+                        "Unsupported file(s) on an unaddressed channel turn in "
+                        f"{thread_key} — nothing posted")
 
             # DEBUG: log conversation history after processing (with truncated content).
             # log_debug, not print — conversation content must not leak to stdout

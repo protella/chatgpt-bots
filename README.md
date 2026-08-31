@@ -174,6 +174,24 @@ Also worth a decision on day one: `BOT_NAME_ALIASES` (names the bot answers to w
 and the status-emoji names near the top of `.env.example` - they must exist in your
 workspace or the corresponding indicators silently fail.
 
+### Workspace context (optional, recommended)
+
+Durable background about your organization - what the company does, product names, the acronym
+glossary, team conventions - written once by an admin and injected into every system prompt. It
+saves the bot from guessing at in-house shorthand. To enable it:
+
+1. Copy [workspace_context.example.md](workspace_context.example.md) to `workspace_context.md`
+   and fill it in (markdown or plain text; it is passed through verbatim).
+2. Point `WORKSPACE_CONTEXT_FILE` at it in `.env`. A relative path resolves against the
+   directory the bot is started from, not the repo root - use an absolute path if your process
+   manager starts it from somewhere else.
+3. Restart the bot.
+
+The file is read once, on the first message the bot handles, and cached for the life of the
+process - so later edits apply on the next restart. If the file is missing or unreadable the bot
+logs a warning and runs normally without it. Keep it out of version control if your repo is
+public - `workspace_context.md` is already gitignored.
+
 ### Models
 
 All chat models share a 1.05M-token context window and prompt caching. Users pick theirs in

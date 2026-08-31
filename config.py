@@ -408,6 +408,12 @@ class BotConfig:
     # Slack settings configuration
     settings_slash_command: str = field(default_factory=lambda: os.getenv("SETTINGS_SLASH_COMMAND", "/chatgpt-settings"))
     
+    # Workspace context file — path to an admin-authored markdown/plain-text file of durable
+    # background about this workspace (company, products, acronym glossary), injected into every
+    # Slack system prompt. Empty (the default) means the feature is off. Read once per process,
+    # so edits apply on restart.
+    workspace_context_file: str = field(default_factory=lambda: os.getenv("WORKSPACE_CONTEXT_FILE", "").strip())
+
     # Database configuration
     database_dir: str = field(default_factory=lambda: os.getenv("DATABASE_DIR", "data"))
 

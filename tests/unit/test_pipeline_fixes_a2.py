@@ -295,6 +295,10 @@ class _MergeHarness:
     # fires is exactly what several of these tests are about.
     _response_posted_text = staticmethod(MessageProcessor._response_posted_text)
     _post_failed_files_card = MessageProcessor._post_failed_files_card
+    # The real "is anybody owed this card" predicate, which now guards both card sites. These
+    # turns are DMs, where it is unconditionally true — binding the stub would hide that.
+    _fail_closed_notice_warranted = staticmethod(
+        MessageProcessor._fail_closed_notice_warranted)
 
     def __init__(self, manager, thread_state, attach_result, reply=None):
         self.thread_manager = manager

@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from slack_sdk.errors import SlackApiError
 
-from config import config
+from config import clamp_effort, config
 from message_processor.outbound_receipts import channel_post_admission
 from slack_client._host import _Host
 # Every callback below is ingress-tracked: they do substantial DB work, and shutdown's claim to
@@ -1294,16 +1294,19 @@ class SlackSettingsHandlersMixin(_Host):
                         # Web search is on and wasn't minimal - keep the stored value
                         merged_settings['reasoning_effort'] = reasoning_from_stored
                 else:
-                    # No stored value either - use a safe default
+                    # No stored value either — fall back to the CONFIGURED default rather than a
+                    # hardcoded pair. `low` is not a default any more (the global default is
+                    # `medium`), and a fallback that invents its own value drifts from the one
+                    # the owner set. Clamped like every other effort this codebase stores.
                     model = merged_settings.get('model', config.gpt_model)
-                    merged_settings['reasoning_effort'] = 'low' if web_search_enabled else 'none'
+                    merged_settings['reasoning_effort'] = clamp_effort(
+                        model, config.default_reasoning_effort)
                     self.log_debug(f"No reasoning in form or stored, defaulting to {merged_settings['reasoning_effort']} for model {model}")
 
             # Final guard: the 5.6 family never accepts `minimal` (and 5.5 has no
             # `max`) — clamp whatever the merge/restore produced so a stale stored
             # value can never be re-stored or reach the API. With web search on,
             # `minimal` upgrades to `low` (handled above) before this maps it to `none`.
-            from config import clamp_effort
             _model = merged_settings.get('model', config.gpt_model)
             _effort = merged_settings.get('reasoning_effort')
             if _effort:
