@@ -1036,6 +1036,10 @@ class BotConfig:
     # Per-file size ceiling for an outbound artifact. Slack's own limit is far higher; this is
     # our guard against uploading something absurd. Oversized artifacts are dropped with a note.
     artifact_max_mb: int = field(default_factory=lambda: max(1, int(os.getenv("ARTIFACT_MAX_MB", "25"))))
+    # Ceiling for an INBOUND mount into the sandbox. It matches the document pipeline's own
+    # admission limit (DocumentHandler.max_document_size, 50MB) — anything we already read we
+    # must also be able to mount — and is unrelated to the outbound artifact cap above.
+    mount_max_mb: int = field(default_factory=lambda: max(1, int(os.getenv("MOUNT_MAX_MB", "50"))))
     # Outbound allowlist by extension. Deliberately excludes executables and macro-enabled Office
     # formats (.xlsm/.docm) — the bot must not hand anyone active content. `zip` IS allowed: a
     # background build can declare an "archive" deliverable, and the size caps above bound it.

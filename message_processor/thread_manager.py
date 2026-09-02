@@ -5,7 +5,7 @@ Manages conversation state, locks, and memory for each Slack thread
 import time
 import asyncio
 from collections import deque
-from typing import Any, Callable, Dict, List, Optional, cast
+from typing import Any, Callable, Dict, List, Optional, Set, cast
 from dataclasses import dataclass, field
 from logger import LoggerMixin
 from config import config
@@ -841,37 +841,53 @@ class AsyncThreadStateManager(LoggerMixin):
                 self.log_warning("Timed out awaiting research jobs during shutdown")
         self._active_research.clear()
 
+    @staticmethod
+    def _watchdog_max_lock_duration() -> int:
+        """Longest a lock can be held by a turn that is still alive.
+
+        Every tool round is bounded by the API timeouts, and a turn runs at most
+        `max_tool_rounds` of them, so anything under this bound is a live turn by
+        construction — a three-image turn legitimately runs for minutes.
+        """
+        per_round = max(float(config.api_timeout_read), float(config.api_timeout_image))
+        return int(int(config.max_tool_rounds) * per_round + 10)
+
+    async def _check_stuck_locks(self, max_lock_duration: int, reported: Set[str]) -> None:
+        """One watchdog tick: log newly-stuck threads once, forget the ones that cleared.
+
+        Detection only. The watchdog never mutates thread state — a lock held past the
+        bound is still held by a running turn, and `had_timeout` belongs to the real
+        timeout handlers, which set it when a request actually times out.
+        """
+        stuck_threads = await self._lock_manager.get_stuck_threads(max_duration=max_lock_duration)
+        stuck_set = set(stuck_threads)
+        for thread_key in stuck_threads:
+            if thread_key in reported:
+                continue
+            reported.add(thread_key)
+            self.log_error(
+                f"Detected stuck async thread: {thread_key} - lock held over "
+                f"{max_lock_duration}s; not force-released (it will timeout naturally "
+                f"with asyncio.wait_for)"
+            )
+        reported.intersection_update(stuck_set)
+
     def _start_async_watchdog(self):
         """Start the background task that monitors for stuck locks"""
         async def async_watchdog():
-            api_timeout = int(config.api_timeout_read)
+            max_lock_duration = self._watchdog_max_lock_duration()
+            reported: Set[str] = set()
 
-            # Calculate maximum possible timeout (for image operations which can take 5 minutes)
-            max_possible_timeout = 300  # 5 minutes for image operations
-            # Use a buffer after the longest possible operation
-            max_lock_duration = max_possible_timeout + 10  # 10s buffer after longest operation
-
-            self.log_info(f"Async thread lock watchdog started with {max_lock_duration}s timeout (base API timeout: {api_timeout}s, max operation timeout: {max_possible_timeout}s)")
+            self.log_info(
+                f"Async thread lock watchdog started with {max_lock_duration}s threshold "
+                f"({config.max_tool_rounds} tool rounds x max(read {config.api_timeout_read}s, "
+                f"image {config.api_timeout_image}s) + 10s)"
+            )
 
             while True:
                 try:
                     await asyncio.sleep(10)  # Check every 10 seconds
-
-                    # Get stuck threads (locked for more than API timeout duration)
-                    stuck_threads = await self._lock_manager.get_stuck_threads(max_duration=max_lock_duration)
-
-                    for thread_key in stuck_threads:
-                        self.log_error(f"Detected stuck async thread: {thread_key} - after {max_lock_duration}s")
-
-                        # Mark thread as no longer processing
-                        if thread_key in self._threads:
-                            self._threads[thread_key].is_processing = False
-                            # Store that this thread had a timeout for notification
-                            self._threads[thread_key].had_timeout = True
-
-                        # With async locks, we don't force-release - they timeout naturally
-                        self.log_warning(f"Async thread {thread_key} will timeout naturally with asyncio.wait_for")
-
+                    await self._check_stuck_locks(max_lock_duration, reported)
                 except Exception as e:
                     self.log_error(f"Async watchdog error: {e}", exc_info=True)
 

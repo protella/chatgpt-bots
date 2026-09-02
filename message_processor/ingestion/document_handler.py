@@ -32,9 +32,15 @@ from logger import LoggerMixin
 # Per-file extraction timeout. Module constant for now; can move to env config
 # once config.py is available to this layer's changes.
 EXTRACTION_TIMEOUT_SECONDS = 30
-# Office XML formats are ZIP archives; refuse anything that would decompress
-# past this (zip-bomb guard).
-MAX_OFFICE_DECOMPRESSED_BYTES = 200 * 1024 * 1024
+# Office XML formats are ZIP archives; the honest zip-bomb signal is the compression
+# RATIO, not the decompressed size. Real Office files deflate at roughly 10-30:1, while a
+# bomb runs ~1000:1 — so a large legitimate workbook passes and a tiny bomb does not.
+MAX_OFFICE_COMPRESSION_RATIO = 100
+# Row ceiling for spreadsheet extraction. It bounds memory on the read (pandas streams the
+# sheet and stops once it has enough rows) and it is the same cap the renderer already used,
+# so what we read is what we can show. The readers ask for ONE row past the cap: that extra
+# row is the only honest way to tell "exactly this many rows" from "cut short here".
+SPREADSHEET_MAX_ROWS = 1000
 # force_text_extraction has no failure channel of its own: it returns a bracketed
 # placeholder when there is nothing decodable. The placeholder is truthy, and every
 # caller reads truthy content as success, so the prefix is what tells "recovered some
@@ -393,14 +399,14 @@ class DocumentHandler(LoggerMixin):
             # Zip-bomb guard for office-XML formats (they are ZIP archives)
             if handler_name in ('parse_docx_structured', 'parse_pptx_structured', 'parse_excel_adaptive') \
                     and file_data[:2] == b'PK' and not self._office_zip_within_limits(file_data):
-                self.log_error(f"Refusing {filename}: decompressed size exceeds "
-                               f"{MAX_OFFICE_DECOMPRESSED_BYTES // (1024 * 1024)}MB (zip-bomb guard)")
+                self.log_error(f"Refusing {filename}: compression ratio exceeds "
+                               f"{MAX_OFFICE_COMPRESSION_RATIO}:1 (zip-bomb guard)")
                 return {
                     'content': f'[Unable to parse {filename} - archive decompresses beyond safe limits]',
                     'filename': filename,
                     'mime_type': mime_type,
                     'size_bytes': len(file_data),
-                    'error': 'Decompressed size exceeds safety limit',
+                    'error': 'Compression ratio exceeds safety limit',
                     'format': 'error',
                 }
             # Get the parser method (PDF takes the OCR-images toggle; the native
@@ -741,11 +747,11 @@ class DocumentHandler(LoggerMixin):
         except Exception as e:
             raise Exception(f"pypdf parsing failed: {e}")
     def _office_zip_within_limits(self, file_data: bytes) -> bool:
-        """Probe an office-XML ZIP's declared decompressed size without extracting."""
+        """Probe an office-XML ZIP's declared compression ratio without extracting."""
         try:
             with zipfile.ZipFile(BytesIO(file_data)) as zf:
                 total = sum(info.file_size for info in zf.infolist())
-            return total <= MAX_OFFICE_DECOMPRESSED_BYTES
+            return total <= MAX_OFFICE_COMPRESSION_RATIO * len(file_data)
         except zipfile.BadZipFile:
             # Not actually a ZIP despite the PK prefix — let the parser's own
             # error recovery handle it.
@@ -1004,11 +1010,13 @@ class DocumentHandler(LoggerMixin):
         """
         if file_data[:2] == b'PK':
             try:
-                all_sheets = pd.read_excel(BytesIO(file_data), sheet_name=None, engine='openpyxl')
+                all_sheets = pd.read_excel(BytesIO(file_data), sheet_name=None,
+                                           engine='openpyxl', nrows=SPREADSHEET_MAX_ROWS + 1)
             except Exception as e:
                 try:
                     # Try without specifying engine
-                    all_sheets = pd.read_excel(BytesIO(file_data), sheet_name=None)
+                    all_sheets = pd.read_excel(BytesIO(file_data), sheet_name=None,
+                                               nrows=SPREADSHEET_MAX_ROWS + 1)
                 except Exception:
                     # The magic bytes named the container and its readers still failed, so
                     # there is nothing left to guess at — a CSV re-read of ZIP bytes is noise.
@@ -1016,7 +1024,8 @@ class DocumentHandler(LoggerMixin):
                         f"{filename} is a ZIP archive but not a readable workbook: {e}") from e
         elif file_data[:4] == b'\xd0\xcf\x11\xe0':
             try:
-                all_sheets = pd.read_excel(BytesIO(file_data), sheet_name=None, engine='xlrd')
+                all_sheets = pd.read_excel(BytesIO(file_data), sheet_name=None, engine='xlrd',
+                                           nrows=SPREADSHEET_MAX_ROWS + 1)
             except Exception as e:
                 raise SpreadsheetFormatMismatch(
                     f"{filename} is an OLE2 file but not a readable .xls workbook: {e}") from e
@@ -1049,6 +1058,11 @@ class DocumentHandler(LoggerMixin):
         # Limit number of sheets
         sheet_items = list(all_sheets.items())[:20]
         for sheet_name, df in sheet_items:
+            # The readers fetch one row past the cap purely as a truncation signal; it is
+            # never rendered, and the reported row count is what we actually show.
+            truncated = len(df) > SPREADSHEET_MAX_ROWS
+            if truncated:
+                df = df.iloc[:SPREADSHEET_MAX_ROWS]
             sheet_data = {
                 'name': str(sheet_name)[:50],  # Limit sheet name length
                 'rows': len(df),
@@ -1068,8 +1082,14 @@ class DocumentHandler(LoggerMixin):
                 sheet_data['format'] = 'list'
             else:
                 # Fallback: structured text
-                sheet_content = df.to_string(max_rows=1000, max_cols=50)
+                sheet_content = df.to_string(max_rows=SPREADSHEET_MAX_ROWS, max_cols=50)
                 sheet_data['format'] = 'raw'
+            # Say a cut-short sheet is cut short in the content itself, or the model reports
+            # the capped count as the total.
+            if truncated:
+                sheet_data['truncated'] = True
+                sheet_content = (f"{sheet_content}\n[first {SPREADSHEET_MAX_ROWS} rows shown — "
+                                 "mount_file it for the full sheet]")
             sheet_data['content'] = sheet_content
             # Add to overall content
             content_parts.append(f"[Sheet: {sheet_name}]")

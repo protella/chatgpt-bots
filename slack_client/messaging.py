@@ -3414,9 +3414,13 @@ class SlackMessagingMixin(_Host):
                     },
                     "new_text": {
                         "type": "string",
-                        "description": ("Complete corrected replacement body in normal "
-                                        "markdown. Omit continuation markers and footer "
-                                        "chrome; the tool preserves those."),
+                        "description": ("Complete replacement body in normal markdown that "
+                                        "keeps the correction visible: strike the wrong "
+                                        "words (~~like this~~) and put the corrected text "
+                                        "right after them, so a later reader sees both what "
+                                        "was said and what is true. Never silently rewrite. "
+                                        "Omit continuation markers and footer chrome; the "
+                                        "tool preserves those."),
                     },
                     "correction_note": {
                         "type": "string",

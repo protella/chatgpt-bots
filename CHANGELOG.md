@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.1.9] - 2026-09-01
+
+### 🔧 Changed
+
+- **Corrections stay legible.** When the bot edits one of its own messages to fix a mistake, it
+  now strikes the wrong words and puts the correction right after them instead of rewriting the
+  message clean, so anyone reading the thread later can see both what was said and what is true.
+  The public correction notice is unchanged.
+
+### 🐛 Fixed
+
+- **Large spreadsheets are no longer refused as "zip bombs".** The guard that protects against
+  malicious Office archives keyed on decompressed size and turned away real 20–50 MB workbooks.
+  It now keys on compression ratio, which real files never approach. Spreadsheet extraction
+  reads at most the first 1,000 rows per sheet (what it could ever show anyway) and says so when
+  a sheet was cut short, so the model does not report a capped count as the total.
+- **Big files can be mounted into the sandbox.** `mount_file` was capped by the 25 MB outbound
+  artifact limit, so a file the bot had already read could still not be analyzed in code. Mounts
+  now allow the same 50 MB the document pipeline admits (`MOUNT_MAX_MB`, default 50).
+- **No false "my last answer never finished" after a long turn.** The stuck-thread watchdog
+  flagged any turn over 310 seconds — a multi-image edit legitimately runs longer — logged an
+  error every 10 seconds, and marked the turn as timed out, which could post a bogus recovery
+  notice on the next message. The threshold is now derived from the configured tool-round and
+  API timeouts, it logs once per incident, and it no longer touches turn state.
+
 ## [3.1.8] - 2026-08-30
 
 ### ✨ Added

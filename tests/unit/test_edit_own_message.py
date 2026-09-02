@@ -214,9 +214,13 @@ def test_schema_is_exactly_the_spec_json():
                                            "in this channel stream or returned by a read tool "
                                            "this turn.")},
             "new_text": {"type": "string",
-                         "description": ("Complete corrected replacement body in normal "
-                                         "markdown. Omit continuation markers and footer "
-                                         "chrome; the tool preserves those.")},
+                         "description": ("Complete replacement body in normal markdown that "
+                                         "keeps the correction visible: strike the wrong "
+                                         "words (~~like this~~) and put the corrected text "
+                                         "right after them, so a later reader sees both what "
+                                         "was said and what is true. Never silently rewrite. "
+                                         "Omit continuation markers and footer chrome; the "
+                                         "tool preserves those.")},
             "correction_note": {"type": "string",
                                 "description": ("A concise public description of the specific "
                                                 "fact or detail being corrected.")},

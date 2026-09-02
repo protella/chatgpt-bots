@@ -58,10 +58,10 @@ FILES_KEY = "_thread_files"
 _MOUNTS: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 _MOUNTS_MAX = 256
 
-# Reuse the artifact ceiling: it is the same question in the other direction — how large a
-# file are we willing to move between Slack and a container in one hop.
+# The inbound document ceiling, NOT the outbound artifact cap: if the pipeline admitted the
+# file and showed the model its text, the model must be able to mount the same bytes.
 def _max_bytes() -> int:
-    return config.artifact_max_mb * 1024 * 1024
+    return config.mount_max_mb * 1024 * 1024
 
 
 def _err(code: str, message: str, **extra: Any) -> Dict[str, Any]:
@@ -262,7 +262,7 @@ async def execute_mount_file(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str
     if len(data) > _max_bytes():
         return _err("file_too_large",
                     f"{entry['filename']} is {len(data) / (1024 * 1024):.1f} MB, over the "
-                    f"{config.artifact_max_mb} MB mount limit.")
+                    f"{config.mount_max_mb} MB mount limit.")
 
     # The upload itself is `stage_bytes` — one place where bytes enter a container, so a user's
     # own SVG gets the same gzip transport a fetched one does instead of the raw 400. The

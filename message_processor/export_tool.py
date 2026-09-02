@@ -51,8 +51,8 @@ _PAGE_LIMIT = 200
 # ladder in `fetch_page` honors Retry-After when one arrives anyway.
 _PAGE_PAUSE_S = 1.2
 
-# One transfer's ceiling is `artifact_max_mb` (the same bound `mount_file` moves bytes under),
-# so a bigger export becomes several parts.
+# One transfer's ceiling is `artifact_max_mb` (an export part is a deliverable, so it takes the
+# outbound cap), so a bigger export becomes several parts.
 _PART_TEMPLATE = "export-part-{:03d}.jsonl"
 
 

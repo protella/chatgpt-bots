@@ -1,6 +1,7 @@
 """D1 document-handler fixes: pptx support, router unification, timeout,
 zip-bomb guard, no-disk rule, and the generated supported-types message."""
 import io
+import os
 import zipfile
 
 import pytest
@@ -181,6 +182,40 @@ def test_zip_bomb_refused(handler):
 
 def test_normal_office_zip_passes_guard(handler):
     assert handler._office_zip_within_limits(_make_pptx()) is True
+
+
+def test_large_low_ratio_zip_passes_guard(handler):
+    """A big real workbook is big on the wire too — only the RATIO condemns it."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("xl/worksheets/sheet1.xml", os.urandom(2 * 1024 * 1024))
+    data = buf.getvalue()
+    assert len(data) > 1024 * 1024  # incompressible, so it stays large
+    assert handler._office_zip_within_limits(data) is True
+
+
+def test_oversized_sheet_is_capped_and_says_so(handler):
+    """A workbook past the row cap extracts to the cap, flagged and annotated."""
+    import pandas as pd
+
+    def _workbook(rows: int) -> bytes:
+        frame = pd.DataFrame({"id": range(rows), "value": [f"row-{i}" for i in range(rows)]})
+        buf = io.BytesIO()
+        frame.to_excel(buf, index=False, engine="openpyxl")
+        return buf.getvalue()
+
+    sheet = handler.parse_excel_adaptive(_workbook(1500), "big.xlsx")["sheets"][0]
+    assert sheet["rows"] == dh.SPREADSHEET_MAX_ROWS
+    assert sheet["truncated"] is True
+    assert f"[first {dh.SPREADSHEET_MAX_ROWS} rows shown" in sheet["content"]
+    assert "mount_file" in sheet["content"]
+
+    # A sheet that ENDS at the cap is complete — flagging it would be a false note.
+    exact = handler.parse_excel_adaptive(
+        _workbook(dh.SPREADSHEET_MAX_ROWS), "exact.xlsx")["sheets"][0]
+    assert exact["rows"] == dh.SPREADSHEET_MAX_ROWS
+    assert "truncated" not in exact
+    assert "rows shown" not in exact["content"]
 
 
 # --- no-disk rule ---

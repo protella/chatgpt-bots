@@ -266,7 +266,7 @@ class TestExecute:
         assert result["error"] == "file_unavailable"
 
     async def test_oversize_file_refused(self, monkeypatch):
-        monkeypatch.setattr(file_mount.config, "artifact_max_mb", 1)
+        monkeypatch.setattr(file_mount.config, "mount_max_mb", 1)
         ctx, raw = _ctx(data=b"x" * (2 * 1024 * 1024))
         result = await file_mount.execute_mount_file(ctx, {"file_id": "file_doc_1"})
 
