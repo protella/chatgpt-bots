@@ -672,6 +672,11 @@ def get_edit_canvas_schema(thread_config: Optional[Dict[str, Any]] = None
             "- `delete_section` — remove the ONE BLOCK `find_text` matches. Use it to take out a "
             "line the user asked you to drop, or to clean up something you yourself put in the "
             "wrong place. It needs no markdown. Never delete anything else.\n\n"
+            "TABLES: a section is ONE CELL, never a row or the whole table. To change a cell, "
+            "replace_section with that cell's own text as find_text (a repo name, a status) and "
+            "the new cell content as markdown; quoting a row with | pipes matches nothing. Cells "
+            "can be edited and cleared, but rows cannot be added or removed through this tool — "
+            "say so instead of trying.\n\n"
             "READ THE CANVAS FIRST. `find_text` must be text you have actually seen in it. If it "
             "matches more than one block you will be told how many; pass `occurrence` to say which "
             "one you mean, counting from the top.\n\n"
@@ -838,6 +843,11 @@ def get_edit_canvas_schema_static(thread_config: Optional[Dict[str, Any]] = None
             "- `delete_section` — remove the ONE BLOCK `find_text` matches. Use it to take out a "
             "line the user asked you to drop, or to clean up something you yourself put in the "
             "wrong place. It needs no markdown. Never delete anything else.\n\n"
+            "TABLES: a section is ONE CELL, never a row or the whole table. To change a cell, "
+            "replace_section with that cell's own text as find_text (a repo name, a status) and "
+            "the new cell content as markdown; quoting a row with | pipes matches nothing. Cells "
+            "can be edited and cleared, but rows cannot be added or removed through this tool — "
+            "say so instead of trying.\n\n"
             "READ THE CANVAS FIRST. `find_text` must be text you have actually seen in it. If it "
             "matches more than one block you will be told how many; pass `occurrence` to say which "
             "one you mean, counting from the top.\n\n"
@@ -1314,6 +1324,19 @@ async def execute_edit_canvas(ctx: ToolContext, args: Dict[str, Any]) -> Dict[st
             "find_text must name one line, not a region. To rewrite a whole list, use "
             "operation='replace_list' with any single line of it as find_text; to change several "
             "unrelated lines, call edit_canvas once per line.")
+    # Slack keys every table CELL as its own section — there is no row section and no table
+    # section — so a quoted row (`| Golden pipeline | Platform | ... |`) can never match. Seen
+    # live: the model quoted a header row six times in one thread, each a section_not_found that
+    # spent a tool call and a Slack round-trip, and the turn hit the tool cap twice. Match the
+    # row SHAPE `read_canvas` emits — a leading pipe — not any pipe: `- Build | deploy pipeline`
+    # is a legitimate anchor, and cell text never starts with one. Settled from the arguments
+    # alone, which saves the claim and the round-trip.
+    if find_text and find_text.strip().startswith("|"):
+        return _err(
+            "find_text_is_table_row",
+            "In a table, a canvas section is ONE CELL, not a row. Pass the text of the single "
+            "cell you want to change as find_text (no | pipes) and the new cell content as "
+            "markdown. Rows cannot be added or removed through this tool.")
     # Ticking a box is NOT an in-place edit. A replacement carrying `- [x]` makes Slack build a
     # NEW list: the item leaves its place in the document and reappears at the bottom. And
     # stripping the box (which `_replacement_for_section` does, correctly, for a plain bullet)

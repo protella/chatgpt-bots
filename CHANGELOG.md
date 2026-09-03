@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.1.10] - 2026-09-03
+
+### 🔧 Changed
+
+- **Canvas tables can be edited cell by cell.** In a Slack canvas every table cell is its own
+  editable block; there is no row or table block. The bot now knows that: to change a cell it
+  anchors on that cell's text, and it says plainly when asked to add or remove rows, which the
+  canvas API does not support. Quoting a whole row as the anchor is refused up front with the
+  cell rule instead of burning a Slack round-trip on a lookup that can never match.
+- **Larger per-turn tool budget.** `MAX_TOOL_ROUNDS` and `MAX_TOOL_CALLS_PER_TURN` default to 20
+  (were 10). A column update across a table costs one call per cell, and the old budget ran out
+  around nine cells.
+
 ## [3.1.9] - 2026-09-01
 
 ### 🔧 Changed

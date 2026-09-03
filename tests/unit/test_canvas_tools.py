@@ -1616,6 +1616,10 @@ class TestTheWorkClaim:
               "markdown": "- [x] beta"}, "missing_find_text"),
             ({"canvas_id": "F123", "operation": "replace_section", "find_text": "- ",
               "markdown": "beta"}, "missing_find_text"),
+            # A quoted table row. Slack keys every cell as its own section, so this matches
+            # nothing — and the pipes say so without a claim or a round-trip.
+            ({"canvas_id": "F123", "operation": "replace_section", "markdown": "x",
+              "find_text": "| Golden pipeline | Platform |"}, "find_text_is_table_row"),
         )
         for args, expected in refusals:
             ctx, web = _ctx()
@@ -1624,6 +1628,14 @@ class TestTheWorkClaim:
 
             assert out["error"] == expected
             assert calls == [], f"{expected} claimed or called Slack: {calls}"
+
+        # The row refusal keys on the row SHAPE, not on the character: a heading or list item
+        # that merely contains a pipe is a legitimate anchor and must reach the real work.
+        ctx, _web = _ctx()
+        out = await ct.execute_edit_canvas(ctx, {
+            "canvas_id": "F123", "operation": "replace_section", "markdown": "x",
+            "find_text": "CI | CD"})
+        assert out.get("error") != "find_text_is_table_row"
 
     async def test_a_refusal_only_slack_could_reveal_keeps_its_claim(self):
         # The 2026-08-11 ruling, stated as a test. By the time _rewrite_list finds the list item

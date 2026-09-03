@@ -782,8 +782,8 @@ class BotConfig:
     # one final round runs with tool_choice="none" so the model answers with what it has.
     # The rounds default matches the calls default: a round spends at least one call, so the
     # calls cap is the binding budget and the rounds cap is a runaway backstop only.
-    max_tool_rounds: int = field(default_factory=lambda: int(os.getenv("MAX_TOOL_ROUNDS", "10")))
-    max_tool_calls_per_turn: int = field(default_factory=lambda: int(os.getenv("MAX_TOOL_CALLS_PER_TURN", "10")))
+    max_tool_rounds: int = field(default_factory=lambda: int(os.getenv("MAX_TOOL_ROUNDS", "20")))
+    max_tool_calls_per_turn: int = field(default_factory=lambda: int(os.getenv("MAX_TOOL_CALLS_PER_TURN", "20")))
     # Per-executor timeout (seconds); a timed-out tool returns an error result to the model.
     tool_call_timeout: float = field(default_factory=lambda: float(os.getenv("TOOL_CALL_TIMEOUT", "20")))
     # Truncation cap on a single tool result fed back to the model (characters).
