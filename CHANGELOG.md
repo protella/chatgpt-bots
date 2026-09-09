@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.2.1] - 2026-09-09
+
+### 🐛 Fixed
+
+- **Builds in a DM can use files from earlier in the same conversation.** Slack splits a DM
+  into a new thread per top-level message, so a deck requested one message after the images it
+  needed could not reach them and the build gave up. The sandbox's file list now covers the
+  whole DM for the last week, and the image tools' reach widens from a day to a week too.
+
 ## [3.2.0] - 2026-09-09
 
 ### ✨ Added

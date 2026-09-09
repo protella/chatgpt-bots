@@ -153,3 +153,147 @@ class TestDuplicateRowsCollapse:
                           _doc(2, filename="b.csv", file_id="F2")])
         entries = await thread_files.build_catalog(db, "C1:1")
         assert len(entries) == 2
+
+
+class WideningDB(FakeDB):
+    """A FakeDB that also answers the two CHANNEL-wide lookups.
+
+    `find_channel_images_async` honours `within_hours` the way the real SQL does, so the
+    lookback bound is exercised through the same contract production relies on rather than
+    asserted against a stub that ignores it.
+    """
+
+    def __init__(self, channel_images=None, channel_docs=None, **kw):
+        super().__init__(**kw)
+        self._channel_images = channel_images or []
+        self._channel_docs = channel_docs or []
+        self.channel_calls = []
+
+    async def find_channel_images_async(self, channel_id, within_hours=None, limit=50):
+        self.channel_calls.append({"channel_id": channel_id, "within_hours": within_hours,
+                                   "limit": limit})
+        rows = self._channel_images
+        if within_hours is not None:
+            cutoff = _ago(hours=within_hours)
+            rows = [r for r in rows if str(r.get("created_at") or "") >= cutoff]
+        # The real lookup is NEWEST first.
+        return sorted(rows, key=lambda r: str(r.get("created_at") or ""), reverse=True)[:limit]
+
+    async def get_channel_documents_async(self, channel_id):
+        # The real lookup is oldest-first and carries no time bound.
+        return sorted(self._channel_docs, key=lambda r: str(r.get("created_at") or ""))
+
+
+def _ago(*, hours=0, minutes=0):
+    """A timestamp shaped like SQLite's CURRENT_TIMESTAMP, that far in the past."""
+    from datetime import datetime, timedelta, timezone
+    stamp = datetime.now(timezone.utc) - timedelta(hours=hours, minutes=minutes)
+    return stamp.strftime("%Y-%m-%d %H:%M:%S")
+
+
+@pytest.mark.unit
+class TestDMWidening:
+    """A DM is one conversation; Slack just splits it into roots.
+
+    Live 2026-09-09: four images generated minutes earlier in the same DM sat under a different
+    root than "now build me a deck from those", so the catalog was empty, `mount_file` had
+    nothing to offer, and the build job saw an empty /mnt/data. Channels stay strict — there a
+    thread is a real conversation boundary, not an accident of the surface.
+    """
+
+    async def test_an_image_from_another_root_of_this_dm_is_mountable(self):
+        db = WideningDB(channel_images=[_img(7, url="https://files.slack.com/x/deck1.png",
+                                             created_at=_ago(minutes=5))])
+        entries = await thread_files.build_catalog(db, "D0BKX77NU66:1784925818.611379")
+
+        assert thread_files.valid_ids(entries) == ["file_img_7"]
+        assert entries[0]["scope"] == "earlier in this DM"
+        assert "[earlier in this DM]" in thread_files.catalog_lines(entries)
+        # The whole point: mount_file's executor resolves the id against this snapshot.
+        assert thread_files.resolve(entries, "file_img_7") is not None
+        # One DM, and only this one.
+        assert db.channel_calls == [{"channel_id": "D0BKX77NU66",
+                                     "within_hours": thread_files.DM_LOOKBACK_HOURS,
+                                     "limit": thread_files.MAX_CATALOG * 2}]
+
+    async def test_a_document_from_another_root_of_this_dm_is_mountable(self):
+        db = WideningDB(channel_docs=[_doc(4, filename="q3.csv", file_id="F4",
+                                           created_at=_ago(hours=2))])
+        entries = await thread_files.build_catalog(db, "D0BKX77NU66:1784925818.611379")
+
+        assert thread_files.valid_ids(entries) == ["file_doc_4"]
+        assert entries[0]["scope"] == "earlier in this DM"
+
+    async def test_a_channel_gets_nothing_extra(self):
+        db = WideningDB(channel_images=[_img(7, url="https://files.slack.com/x/deck1.png",
+                                             created_at=_ago(minutes=5))],
+                        channel_docs=[_doc(4, file_id="F4", created_at=_ago(hours=2))])
+        entries = await thread_files.build_catalog(db, "C0BKX77NU66:1784925818.611379")
+
+        assert entries == []
+        assert db.channel_calls == []
+
+    async def test_anything_older_than_the_lookback_is_left_alone(self):
+        db = WideningDB(
+            channel_images=[_img(7, url="https://files.slack.com/x/old.png",
+                                 created_at=_ago(hours=thread_files.DM_LOOKBACK_HOURS + 6))],
+            channel_docs=[_doc(4, file_id="F4", created_at=_ago(hours=thread_files.DM_LOOKBACK_HOURS + 6))],
+        )
+        entries = await thread_files.build_catalog(db, "D0BKX77NU66:1")
+        assert entries == []
+
+    async def test_a_file_already_in_the_strict_catalog_is_not_offered_twice(self):
+        url = "https://files.slack.com/x/deck1.png"
+        db = WideningDB(images=[_img(7, url=url)],
+                        channel_images=[_img(7, url=url, created_at=_ago(minutes=5))])
+        entries = await thread_files.build_catalog(db, "D0BKX77NU66:1")
+
+        assert thread_files.valid_ids(entries) == ["file_img_7"]
+        # The STRICT entry survives, unmarked: it is this thread's own file.
+        assert "scope" not in entries[0]
+
+    async def test_strict_entries_win_the_cap_and_are_unchanged(self):
+        strict = [_doc(i, filename=f"s{i}.csv", file_id=f"F{i}",
+                       created_at=f"2026-09-09T{i:02d}:00:00")
+                  for i in range(1, thread_files.MAX_CATALOG + 1)]
+        db = WideningDB(docs=strict,
+                        channel_images=[_img(99, url="https://files.slack.com/x/late.png",
+                                             created_at=_ago(minutes=1))])
+        entries = await thread_files.build_catalog(db, "D0BKX77NU66:1")
+
+        assert len(entries) == thread_files.MAX_CATALOG
+        assert "file_img_99" not in thread_files.valid_ids(entries)
+        assert all("scope" not in e for e in entries)
+
+    async def test_a_broken_widening_still_yields_the_strict_catalog(self):
+        db = WideningDB(docs=[_doc(1)])
+
+        async def boom(*a, **kw):
+            raise RuntimeError("channel store is down")
+
+        db.find_channel_images_async = boom
+        db.get_channel_documents_async = boom
+        entries = await thread_files.build_catalog(db, "D0BKX77NU66:1")
+        assert thread_files.valid_ids(entries) == ["file_doc_1"]
+
+    async def test_a_recent_document_outranks_a_wall_of_images(self):
+        """The room is shared, and recency decides who gets it.
+
+        Filling from images first and asking documents for the leftovers meant a DM holding a
+        screenshot-per-message could never offer the CSV uploaded a minute ago: the cap was
+        spent before the document query ran.
+        """
+        db = WideningDB(
+            channel_images=[_img(i, url=f"https://files.slack.com/x/shot{i}.png",
+                                 created_at=_ago(hours=2))
+                            for i in range(1, 21)],
+            channel_docs=[_doc(4, filename="q3.csv", file_id="F4",
+                               created_at=_ago(hours=1))],
+        )
+        entries = await thread_files.build_catalog(db, "D0BKX77NU66:1")
+
+        assert len(entries) == thread_files.MAX_CATALOG
+        ids = thread_files.valid_ids(entries)
+        assert "file_doc_4" in ids, "the newest file must not be crowded out by older images"
+        # Newest first, and the document IS the newest.
+        assert ids[0] == "file_doc_4"

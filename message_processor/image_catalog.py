@@ -46,7 +46,7 @@ def _describe(entry: Dict[str, Any]) -> str:
 # How far back the DM widening below reaches. A DM has no thread structure to bound "this
 # conversation", so time is the only honest boundary — a picture from last week is not what
 # "edit that image" means.
-DM_LOOKBACK_HOURS = 24
+DM_LOOKBACK_HOURS = 24 * 7  # one week [OWNER 2026-09-09]; was 24h, which cut off a same-day build's inputs
 
 
 def _entry(row: Dict[str, Any], origin: Optional[str] = None) -> Optional[Dict[str, Any]]:
