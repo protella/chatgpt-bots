@@ -1551,9 +1551,10 @@ class TestOnlyTheDocumentShipsNotItsIngredients:
 
         assert [p["filename"] for p in out] == ["revenue.png"]
 
-    async def test_a_declared_manifest_beats_every_heuristic(self):
-        # A background build KNOWS what was asked for. Everything else in the container is
-        # working material, whatever it happens to be named.
+    async def test_a_declared_manifest_leads_and_the_rest_follow_as_extras(self):
+        # A background build KNOWS what was asked for, so the declared file leads. What else the
+        # build made is offered behind it (flagged as an extra) rather than dropped — the
+        # delivery model decides, and a deck built beside the photos is usually the whole point.
         files = [_cfile("f1", "/mnt/data/deck.pdf"),
                  _cfile("f2", "/mnt/data/notes.csv"),
                  _cfile("f3", "/mnt/data/scratch.txt")]
@@ -1566,7 +1567,7 @@ class TestOnlyTheDocumentShipsNotItsIngredients:
             thread_key="C1:1.0", container_ids=["c1"], db=None,
             expect_filenames=["deck.pdf"])
 
-        assert [p["filename"] for p in out] == ["deck.pdf"]
+        assert [p["filename"] for p in out] == ["deck.pdf", "notes.csv", "scratch.txt"]
 
     async def test_a_misnamed_deliverable_still_reaches_the_user(self):
         # The model does not always honour the filename it was handed. Matching the EXTENSION
@@ -1581,6 +1582,85 @@ class TestOnlyTheDocumentShipsNotItsIngredients:
             expect_filenames=["rise_of_ai.pdf"])
 
         assert [p["filename"] for p in out] == ["ai_report_final.pdf"]
+
+
+class TestUndeclaredExtrasAreStagedNotDropped:
+    """Live 2026-09-09: a build declared three photos, then produced a fourth photo AND the
+    five-slide deck the user actually wanted. The declared manifest was treated as absolute, so
+    both were dropped before the delivery model ever saw them — the user got photos, no deck,
+    and no explanation. Extras are staged and FLAGGED now; the model decides what ships
+    (delivery policy lives in the model, not the tool)."""
+
+    @staticmethod
+    def _deck_with(*blobs):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("[Content_Types].xml", "<Types/>")
+            for i, blob in enumerate(blobs):
+                zf.writestr(f"ppt/media/image{i}.png", blob)
+        return buf.getvalue()
+
+    @staticmethod
+    def _cand(filename, data):
+        import hashlib
+        return {"ref": MagicMock(), "filename": filename,
+                "ext": filename.rpartition(".")[2].lower(), "data": data,
+                "digest": hashlib.sha256(data).hexdigest()}
+
+    def test_an_undeclared_deck_and_photo_are_staged_after_the_declared_ones(self):
+        from message_processor.artifacts import _select_candidates
+        bite = PNG + b"-fourth-photo"
+        # Deliberately listed extras-first: the accepted order must still be declared-then-extras.
+        cands = [self._cand("menu.pptx", self._deck_with(b"something-else")),
+                 self._cand("bite.png", bite),
+                 self._cand("hero.png", PNG + b"-1"),
+                 self._cand("plate.png", PNG + b"-2")]
+
+        accepted = _select_candidates(cands, suppress_digests=set(),
+                                      expect_filenames=["hero.png", "plate.png"])
+
+        assert [c["filename"] for c in accepted] == [
+            "hero.png", "plate.png", "menu.pptx", "bite.png"]
+        assert [c["declared"] for c in accepted] == [True, True, False, False]
+
+    def test_an_extra_photo_embedded_in_the_extra_deck_is_still_an_ingredient(self):
+        # Being staged as an extra is not a licence to ship ingredients: the deck's own bytes
+        # say this photo went INTO it, so it is working material and the deck is the extra.
+        # It is REPORTED, though — a silent hole in the manifest is what made the delivery model
+        # tell the user a photo "didn't make it" when it was sitting inside the deck.
+        from message_processor.artifacts import _select_candidates
+        bite = PNG + b"-went-into-the-deck"
+        cands = [self._cand("menu.pptx", self._deck_with(bite)),
+                 self._cand("bite.png", bite),
+                 self._cand("hero.png", PNG + b"-1"),
+                 self._cand("plate.png", PNG + b"-2")]
+
+        folded = []
+        accepted = _select_candidates(cands, suppress_digests=set(),
+                                      expect_filenames=["hero.png", "plate.png"],
+                                      embedded_out=folded)
+
+        assert [c["filename"] for c in accepted] == ["hero.png", "plate.png", "menu.pptx"]
+        assert [c["declared"] for c in accepted] == [True, True, False]
+        assert folded == [("bite.png", "menu.pptx")]
+
+    def test_the_photo_is_credited_to_the_deck_that_actually_ships(self):
+        # Both versions of the deck contain the photo, and the superseded draft is dropped. If
+        # ownership were resolved before that prune it would name the draft — a document that
+        # never posts — and the completion card would call a delivered file missing.
+        from message_processor.artifacts import _select_candidates
+        bite = PNG + b"-went-into-both-decks"
+        cands = [self._cand("menu_v1.pptx", self._deck_with(bite, b"draft-marker")),
+                 self._cand("menu_v2.pptx", self._deck_with(bite)),
+                 self._cand("bite.png", bite)]
+
+        folded = []
+        accepted = _select_candidates(cands, suppress_digests=set(),
+                                      expect_filenames=["menu.pptx", "bite.png"],
+                                      embedded_out=folded)
+
+        assert [c["filename"] for c in accepted] == ["menu_v2.pptx"]
+        assert folded == [("bite.png", "menu_v2.pptx")]
 
 
 class TestCitationMarkersNeverReachTheUser:
@@ -1661,7 +1741,7 @@ class TestStaging:
         # Nothing was posted: staging takes no Slack client at all.
         assert staged[0].manifest_entry() == {
             "artifact_id": "art_1", "filename": "report.pdf", "kind": "pdf",
-            "size_bytes": len(PDF)}
+            "size_bytes": len(PDF), "declared": True}
 
     @pytest.mark.asyncio
     async def test_staging_applies_the_declared_manifest(self):
@@ -1691,6 +1771,27 @@ class TestStaging:
             thread_key="C1:1.3", ledger_key="C1:1.3")
         assert [p["filename"] for p in published] == ["b.csv"]
         assert client.send_file.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_publish_staged_ships_every_id_the_model_named(self, monkeypatch):
+        """The config cap bounds GUESSED publication. A delivery plan is not a guess — the model
+        named these file by file — and with extras staged a real plan runs past four. Dropping
+        the fifth with a log line loses a deliverable the user asked for."""
+        monkeypatch.setattr(artifacts_mod.config, "artifact_max_files", 4)
+        files = [MagicMock(id=f"f{i}", source="assistant", path=f"/mnt/data/part_{i}.csv")
+                 for i in range(5)]
+        oc = _openai_payloads(files, {f"f{i}": CSV + f"South,{i}\n".encode() for i in range(5)})
+        staged = await artifacts_mod.stage_artifacts(openai_client=oc, container_ids=["c1"],
+                                                     ledger_key="C1:1.9")
+        assert len(staged) == 5
+
+        client = _client()
+        published = await artifacts_mod.publish_staged(
+            staged, [s.artifact_id for s in staged], client=client, channel_id="C1",
+            thread_id="1.9", thread_key="C1:1.9", ledger_key="C1:1.9")
+
+        assert len(published) == 5
+        assert client.send_file.await_count == 5
 
     @pytest.mark.asyncio
     async def test_publish_staged_drops_an_unknown_id_instead_of_guessing(self):

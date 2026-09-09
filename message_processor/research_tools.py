@@ -487,7 +487,10 @@ def get_start_background_job_schema() -> dict:
                         "this entirely when they just want an answer (the common case). "
                         "Declaring a deliverable gives the job a code sandbox and image tools, "
                         "so it can actually BUILD the file. Declare it only if the user asked "
-                        "for a file; do not volunteer one."
+                        "for a file; do not volunteer one. Declare what the user will OPEN, not "
+                        "the pieces that go into it — photos or charts that end up inside a deck "
+                        "or a document are the build's ingredients, and declaring them makes the "
+                        "job post them loose beside the thing they belong to."
                     ),
                     "items": {
                         "type": "object",
@@ -788,7 +791,9 @@ _DELIVERY_INSTRUCTION = (
     "{manifest_block}"
     "Call `deliver` exactly once. Decide, in this order:\n"
     "1. WHICH FILES SHIP. Post the deliverables they asked for. Do not post the working "
-    "material that went into them.\n"
+    "material that went into them. A file marked EXTRA was built beyond the declared list — "
+    "post it when it is part of what the user asked for (a deck built alongside its photos), "
+    "skip it when it is working material.\n"
     "2. WHETHER THE FULL REPORT GETS POSTED AS TEXT. If a file you are publishing already "
     "contains the findings, posting the report as well says the same thing twice, badly — Slack "
     "cannot render a markdown table and the report is full of them. But if NO file carries the "
@@ -828,6 +833,17 @@ _DELIVERY_SUPPRESSED_INPUTS_BLOCK = (
     "resized, composited, assembled into a document) to be publishable. If the user's ask really "
     "is one of these files exactly as it was, say so plainly and name the route: an image from "
     "the web can be posted directly with import_web_image.\n\n"
+)
+
+# The other silent suppression, and the same failure mode. Live 2026-09-09: the build embedded a
+# declared photo into the declared deck, the publisher correctly kept the loose copy out — and the
+# delivery model, seeing a one-file manifest, told the user the photo "didn't make it".
+_DELIVERY_EMBEDDED_BLOCK = (
+    "FOLDED INTO A DOCUMENT, NOT AVAILABLE SEPARATELY: {names}. Each of these is INSIDE the "
+    "document named beside it and cannot be posted on its own. Publish that document and the "
+    "file reaches the user with it; leave the document out and the file does not reach them at "
+    "all — so if it is part of the ask, that document has to ship. Either way it was built: "
+    "never report one of these as missing, or as something that could not be produced.\n\n"
 )
 
 # Corrections the run actually APPLIED, repeated for the model that decides what ships.
@@ -999,20 +1015,33 @@ def _deliverables_gist(deliverables: List[Dict[str, str]]) -> str:
 
 
 def _undelivered_deliverables(deliverables: List[Dict[str, str]],
-                              published: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+                              published: List[Dict[str, Any]],
+                              embedded_ingredients: Optional[List[Tuple[str, str]]] = None
+                              ) -> List[Dict[str, str]]:
     """Which DECLARED deliverables never reached the thread. A declared file is covered when a
     published upload carries its exact name or, failing that, its extension — the same forgiving
     match the manifest keep uses, because the model does not always honour the filename it was
     handed. Each published upload is consumed ONCE, so a single shipped PDF can't mark two
     declared PDFs delivered. A green card must never hide a file the user asked for and did not
-    get."""
+    get.
+
+    It must not invent a loss either. ``embedded_ingredients`` — ``(filename, containing
+    document)`` pairs from staging — covers a declared file that went out INSIDE a document that
+    actually published: live 2026-09-09 the card went amber over a photo the user was looking at,
+    folded into the deck beside it. Such a file consumes no upload, because the document it rides
+    in is still the deliverable that upload answers."""
     remaining = list(published)
+    published_names = {(p.get("filename") or "").lower() for p in published}
+    folded = {(name or "").lower() for name, owner in (embedded_ingredients or ())
+              if (owner or "").lower() in published_names}
 
     # Pass 1 — exact names claim their file first, so an extension match for one deliverable
     # can't swallow the upload another deliverable needs by name.
     unmatched: List[Dict[str, str]] = []
     for d in deliverables:
         name = (d.get("filename") or "").lower()
+        if name and name in folded:
+            continue    # delivered, inside a document that did post
         match = next((p for p in remaining
                       if name and (p.get("filename") or "").lower() == name), None)
         if match is not None:
@@ -2496,7 +2525,8 @@ async def _stage_build(processor, *, job_id: str, build: Dict[str, Any]) -> List
     deliverable to it.
 
     Whatever the publisher held back as an unchanged INPUT is written back onto ``build`` under
-    ``suppressed_inputs`` — the same way ``notes`` rides that dict to the delivery phase. The
+    ``suppressed_inputs``, and whatever it folded into a document under
+    ``embedded_ingredients`` — the same way ``notes`` rides that dict to the delivery phase. The
     delivery model has to be told WHY its manifest is short: left to infer it, it reads an empty
     manifest as a build that lost its output, which is exactly what happened live.
 
@@ -2506,6 +2536,7 @@ async def _stage_build(processor, *, job_id: str, build: Dict[str, Any]) -> List
 
     manager = getattr(processor, "container_manager", None)
     suppressed_inputs: List[str] = []
+    embedded: List[Tuple[str, str]] = []
     try:
         # The time budget lives INSIDE stage_artifacts (per-file, deadline-bounded) rather than
         # as an outer wait_for: a wrap-and-cancel discarded a deck that had already been staged
@@ -2520,7 +2551,8 @@ async def _stage_build(processor, *, job_id: str, build: Dict[str, Any]) -> List
             suppress_digests=build["suppress_digests"],
             expect_filenames=build["expect_filenames"],
             time_budget=config.artifact_publish_timeout,
-            suppressed_inputs_out=suppressed_inputs)
+            suppressed_inputs_out=suppressed_inputs,
+            embedded_out=embedded)
     except Exception as e:  # noqa: BLE001
         processor.log_error(f"Build phase {job_id} staging failed: {e}", exc_info=True)
         staged = []
@@ -2529,6 +2561,13 @@ async def _stage_build(processor, *, job_id: str, build: Dict[str, Any]) -> List
         build["suppressed_inputs"] = list(dict.fromkeys(suppressed_inputs))
         processor.log_info(f"Build phase {job_id} held back {len(suppressed_inputs)} unchanged "
                            f"input(s): {build['suppressed_inputs']}")
+    if embedded:
+        # Deduped on the pair: the same photo can legitimately sit in two documents.
+        build["embedded_ingredients"] = list(dict.fromkeys(embedded))
+        processor.log_info(
+            f"Build phase {job_id} folded {len(build['embedded_ingredients'])} file(s) into a "
+            f"document instead of posting them loose: "
+            f"{[f'{n} (inside {o})' for n, o in build['embedded_ingredients']]}")
     processor.log_info(f"Build phase {job_id} staged {len(staged)} file(s)")
     return staged
 
@@ -2778,7 +2817,8 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
             channel_id=channel_id, thread_root=thread_root,
             build_notes=(build or {}).get("notes") or "", late_notes=late_notes,
             applied_notes=applied_notes,
-            suppressed_inputs=(build or {}).get("suppressed_inputs"))
+            suppressed_inputs=(build or {}).get("suppressed_inputs"),
+            embedded_ingredients=(build or {}).get("embedded_ingredients"))
 
         _mark_delivering()
         ack: Dict[str, bool] = {}
@@ -2788,7 +2828,8 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
             label_source=label_source, deliverables=deliverables, card=card,
             ledger_key=(build or {}).get("ledger_key") or thread_key,
             elapsed=elapsed, effort=effort, tools_used=tools_used, receipts=receipts,
-            late_notes=late_notes, ack_out=ack)
+            late_notes=late_notes,
+            embedded_ingredients=(build or {}).get("embedded_ingredients"), ack_out=ack)
         # "Surfaced" means the REPLY landed, not that the delivery succeeded. A failed reply is
         # forgiven by the delivery itself once the report posts — rightly, the findings are what
         # must not be lost — but the reply is the only post carrying the not-applied
@@ -2917,6 +2958,7 @@ async def _plan_delivery(processor, *, job_id: str, task: str, report: str, stag
                          late_notes: Optional[List[str]] = None,
                          applied_notes: Optional[List[str]] = None,
                          suppressed_inputs: Optional[List[str]] = None,
+                         embedded_ingredients: Optional[List[Tuple[str, str]]] = None,
                          ) -> Optional[Dict[str, Any]]:
     """F37 — the POKE. Hand the finished job's output back to the model and let IT decide what
     the user sees: which files ship, whether the full report is posted, and what the message says.
@@ -2936,8 +2978,11 @@ async def _plan_delivery(processor, *, job_id: str, task: str, report: str, stag
     artifact_ids = [s.artifact_id for s in staged]
     has_report = bool((report or "").strip())
     if staged:
-        manifest = "\n".join(f"- {s.artifact_id}: {s.filename} "
-                             f"({s.ext}, {s.size_bytes:,} bytes)" for s in staged)
+        manifest = "\n".join(
+            f"- {s.artifact_id}: {s.filename} ({s.ext}, {s.size_bytes:,} bytes)"
+            + ("" if s.declared else
+               " — EXTRA: not in the declared deliverables, the build made it on its own")
+            for s in staged)
         manifest_block = _DELIVERY_MANIFEST_BLOCK.format(manifest=manifest)
     else:
         manifest_block = _DELIVERY_NO_FILES_BLOCK
@@ -2946,6 +2991,10 @@ async def _plan_delivery(processor, *, job_id: str, task: str, report: str, stag
         # needed most in the "none" case — that is the one the model misread live.
         manifest_block += _DELIVERY_SUPPRESSED_INPUTS_BLOCK.format(
             names=", ".join(dict.fromkeys(suppressed_inputs)))
+    if embedded_ingredients:
+        manifest_block += _DELIVERY_EMBEDDED_BLOCK.format(
+            names=", ".join(dict.fromkeys(
+                f"{name} (inside {owner})" for name, owner in embedded_ingredients)))
 
     plan: Dict[str, Any] = {}
 
@@ -3044,12 +3093,20 @@ async def _plan_delivery(processor, *, job_id: str, task: str, report: str, stag
                 return None
             await asyncio.sleep(2.0)
 
-    if not plan.get("reply"):
+    # Keyed on the SENTINEL, not on the reply text. Live: the model called `deliver` with a
+    # valid publish list and an empty reply; keying on `reply` threw that decision away and fell
+    # through to the no-plan fallback, which posts everything. An empty reply is schema-valid —
+    # the files are the answer — and `_transact_delivery` already skips a reply it does not have.
+    if not plan.get("_delivered"):
         processor.log_warning(f"Background job {job_id}: model returned no delivery plan")
         return None
+    if not plan.get("reply"):
+        processor.log_info(
+            f"Background job {job_id}: delivery plan carries no reply text — publishing per plan")
     processor.log_info(
         f"Background job {job_id} delivery plan: publish={plan.get('publish') or []}, "
-        f"post_report={plan.get('post_report')}, reply={len(plan['reply'])} chars")
+        f"post_report={plan.get('post_report')}, "
+        f"reply={len(plan.get('reply') or '')} chars")
     return plan
 
 
@@ -3060,6 +3117,7 @@ async def _transact_delivery(processor, client, *, channel_id: str, thread_root:
                              ledger_key: str, elapsed: float, effort: str,
                              tools_used: List[str], receipts=None,
                              late_notes: Optional[List[str]] = None,
+                             embedded_ingredients: Optional[List[Tuple[str, str]]] = None,
                              ack_out: Optional[Dict[str, bool]] = None) -> bool:
     """Execute the delivery plan in reading order — the model's message, then the report if it
     asked for one, then the files — and finalize the card from what actually landed.
@@ -3086,9 +3144,14 @@ async def _transact_delivery(processor, client, *, channel_id: str, thread_root:
         # No model in the loop means nobody is going to acknowledge the late updates, and
         # posting the findings under a silence that implies they were honoured is exactly the
         # false claim this round exists to stop. The application says it itself.
+        # Nobody is judging the EXTRAS, so fall back to what was actually asked for: the declared
+        # deliverables. Only when nothing was declared (or nothing matched) does everything go —
+        # that is still the old lossless behaviour, just not applied to files whose whole point
+        # was that a model would look at them first.
+        fallback_declared = [s.artifact_id for s in staged if s.declared]
         plan = {"reply": _LATE_NOTES_FALLBACK_LINE if late_notes else "",
                 "post_report": has_report,
-                "publish": [s.artifact_id for s in staged]}
+                "publish": fallback_declared or [s.artifact_id for s in staged]}
 
     reply = (plan.get("reply") or "").strip()
     publish_ids = list(plan.get("publish") or [])
@@ -3187,7 +3250,7 @@ async def _transact_delivery(processor, client, *, channel_id: str, thread_root:
         names = ", ".join(p["filename"] for p in published)
         # A declared deliverable that never staged (or the model withheld) is a real loss even
         # though something shipped — a green card naming only the survivors would hide it.
-        missing = _undelivered_deliverables(deliverables, published)
+        missing = _undelivered_deliverables(deliverables, published, embedded_ingredients)
         if missing:
             await card.finalize_partial(
                 f"Delivered {names} below — but couldn't deliver "

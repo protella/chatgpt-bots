@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.2.3] - 2026-09-09
+
+### 🐛 Fixed
+
+- **A build job no longer throws away files it made beyond its declared list.** A job asked
+  for a deck but dispatched with only its photos declared used to deliver the photos and drop
+  the deck it had built. Undeclared outputs are now staged as extras and the delivery step
+  decides whether they ship, so the file you actually wanted reaches you.
+- **A photo folded into a delivered deck is no longer reported as missing.** The delivery
+  message and the status card both said "couldn't deliver" a photo that was sitting on a slide
+  of the deck they had just posted. Both now know which files went out inside which document.
+- **Delivery honors the plan even when the model sends no message with it,** instead of
+  falling back to posting everything.
+- **Delivery uploads every file the plan names.** A cap meant for guessed publication was
+  silently dropping the fifth file of an explicit plan.
+
+### 🔧 Changed
+
+- Build jobs may create up to ten sandbox images per run, up from four.
+- The dispatcher is told to declare what the user will open, not the pieces that go into it.
+
 ## [3.2.2] - 2026-09-09
 
 ### 🐛 Fixed

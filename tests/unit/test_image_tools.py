@@ -940,7 +940,8 @@ async def test_create_asset_moderation_block_is_a_result_not_an_exception():
 async def test_create_asset_is_capped_per_turn():
     oc = _openai()
     ctx = _ctx(_FakeProcessor(openai_client=oc), container_id="cntr_abc123")
-    ctx.sandbox_image_assets = [{"path": f"/mnt/data/{i}.png"} for i in range(4)]
+    ctx.sandbox_image_assets = [{"path": f"/mnt/data/{i}.png"}
+                                for i in range(it._MAX_ASSETS_PER_TURN)]
 
     res = await it.execute_create_image_asset(
         ctx, {"prompt": "one more", "filename": "extra.png"})

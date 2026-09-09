@@ -250,6 +250,18 @@ class TestUndeliveredDeliverables:
         published = [{"filename": "report.pdf"}, {"filename": "social-card.png"}]
         assert _undelivered_deliverables(deliverables, published) == []
 
+    def test_a_photo_folded_into_a_published_deck_counts_as_delivered(self):
+        # Live 2026-09-09: the build embedded the declared photo into the declared deck, the
+        # publisher correctly kept the loose copy back — and the card went amber over a file the
+        # user was looking at. The deck it rides in is the upload, so it consumes none itself.
+        from message_processor.research_tools import _undelivered_deliverables
+        deliverables = [{"type": "powerpoint", "filename": "menu.pptx", "description": "x"},
+                        {"type": "image", "filename": "bite.png", "description": "y"}]
+        missing = _undelivered_deliverables(
+            deliverables, [{"filename": "menu.pptx"}],
+            embedded_ingredients=[("bite.png", "menu.pptx")])
+        assert missing == []
+
     def test_extension_fallback_covers_a_renamed_deliverable(self):
         from message_processor.research_tools import _undelivered_deliverables
         deliverables = [{"type": "pdf", "filename": "report.pdf", "description": "x"}]

@@ -60,7 +60,7 @@ CATALOG_KEY = "_image_catalog"
 
 # A filename the model picks lands in a shell-adjacent sandbox path. Keep it boring.
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
-_MAX_ASSETS_PER_TURN = 4
+_MAX_ASSETS_PER_TURN = 10
 # Ceiling on the transcoded edit-source bytes we base64 into the Images request. A highly
 # compressed TIFF/GIF under 50M pixels can expand into a very large PNG; without this a single
 # source could exhaust process memory or blow the API request limit. Matches ImageURLHandler's

@@ -1161,8 +1161,10 @@ class _Staged(SimpleNamespace):
     """Stand-in for artifacts.StagedArtifact — only the manifest fields matter here."""
 
 
-def _staged(artifact_id="art_1", filename="report.pdf", ext="pdf", size_bytes=1234):
-    return _Staged(artifact_id=artifact_id, filename=filename, ext=ext, size_bytes=size_bytes)
+def _staged(artifact_id="art_1", filename="report.pdf", ext="pdf", size_bytes=1234,
+            declared=True):
+    return _Staged(artifact_id=artifact_id, filename=filename, ext=ext,
+                   size_bytes=size_bytes, declared=declared)
 
 
 class _PlanStub(_StreamStub):
@@ -1258,6 +1260,32 @@ async def test_the_report_is_not_posted_as_text_when_a_file_carries_it(monkeypat
     assert not any("| Date | Model |" in b for b in bodies)
     assert not any("# Findings" in b for b in bodies)
     assert seen["ids"] == ["art_1"]          # and the PDF did ship
+
+
+@pytest.mark.asyncio
+async def test_an_empty_reply_does_not_throw_away_the_plan(monkeypatch):
+    """Live: the model called `deliver` with a valid publish list and no reply text — the files
+    were the answer. Keying acceptance on the reply threw the whole decision away and fell
+    through to the no-plan fallback, which posts everything."""
+    monkeypatch.setattr(config, "enable_deep_research", True)
+    monkeypatch.setattr(config, "enable_research_label", False)
+    _wire_build(monkeypatch, [_staged()])
+    seen = _capture_publish(monkeypatch)
+    stub = _PlanStub(text=REPORT, plan={"reply": "", "publish": ["art_1"],
+                                        "post_report": False})
+    client = _CardClient()
+    proc = _FakeProcessor(openai_client=SimpleNamespace(
+        create_streaming_response_with_tool_loop=stub), tm=AsyncThreadStateManager())
+
+    await rt._run_background_job(
+        processor=proc, client=client, channel_id="C1", thread_root="100.0",
+        thread_key="C1:100.0", job_id="j1", task="build the deck", mode="build",
+        snapshot=[], system_prompt="DEV", model="gpt-5.6-sol",
+        deliverables=[{"type": "pdf", "description": "the report", "filename": "report.pdf"}])
+
+    assert seen["ids"] == ["art_1"]     # the model's plan stood
+    bodies = [t for (_c, _t, t, _u) in client.sent]
+    assert not any("# Findings" in b for b in bodies)   # not the post-everything fallback
 
 
 @pytest.mark.asyncio

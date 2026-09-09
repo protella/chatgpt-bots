@@ -33,7 +33,7 @@ import time
 import zipfile
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from config import config
 from logger import setup_logger
@@ -496,10 +496,12 @@ async def publish_artifacts(
     it also catches a model that copies the user's spreadsheet to a new name and thereby makes
     an assistant-owned, byte-identical twin of a file they already have.
 
-    `expect_filenames` is the DECLARED deliverable manifest, and when it is present it is the
-    whole answer: the user asked for a PDF, so they get the PDF and nothing else. Everything
-    else in the container is working material by definition. Only a background build knows this
-    up front — a chat turn has no manifest and must fall back to the heuristics below.
+    `expect_filenames` is the DECLARED deliverable manifest. It names what was definitely asked
+    for — those files lead, and they are exempt from the intent heuristics below — but it is not
+    a closed list: a build that also produced the deck the user actually wanted must not have it
+    dropped for going undeclared, so everything else that survives the heuristics follows as an
+    EXTRA, flagged as one. Only a background build has a manifest at all; a chat turn has none
+    and rides the heuristics alone.
     """
     ledger = ledger_key or thread_key
     lock = publication_lock(ledger)
@@ -529,15 +531,18 @@ _OPAQUE_COMPOSITE_EXTS = {"pdf"}
 _DOCUMENT_EXTS = _COMPOSITE_EXTS | _OPAQUE_COMPOSITE_EXTS
 
 
-def _embedded_member_hashes(candidates: List[Dict[str, Any]]) -> set:
-    """sha256 of every file embedded inside the composite documents we're about to publish.
+def _embedded_member_owners(candidates: List[Dict[str, Any]]) -> Dict[str, str]:
+    """digest -> the filename of the composite document that CONTAINS those bytes.
 
     Used to tell a deliverable apart from an ingredient. python-pptx/docx store an added
     picture as an unmodified zip entry, so the hash matches the loose file exactly. If the
     model re-encodes an image on the way in, the hashes won't match and the loose copy still
     goes out — this is a precise suppression, never a guess at what looks like a leftover.
+
+    Keeping the OWNER, not just the hash, is what lets a caller say "it went out inside the
+    deck" instead of leaving the file's absence to be read as a failed build.
     """
-    hashes: set = set()
+    owners: Dict[str, str] = {}
     for candidate in candidates:
         if candidate["ext"] not in _COMPOSITE_EXTS:
             continue
@@ -546,10 +551,16 @@ def _embedded_member_hashes(candidates: List[Dict[str, Any]]) -> set:
                 for info in zf.infolist():
                     if info.is_dir() or info.file_size == 0:
                         continue
-                    hashes.add(hashlib.sha256(zf.read(info)).hexdigest())
+                    owners.setdefault(hashlib.sha256(zf.read(info)).hexdigest(),
+                                      candidate["filename"])
         except Exception as e:  # noqa: BLE001 — a corrupt zip must not stop publication
             logger.debug(f"Could not inspect {candidate['filename']} for embedded files: {e}")
-    return hashes
+    return owners
+
+
+def _embedded_member_hashes(candidates: List[Dict[str, Any]]) -> set:
+    """The digests of `_embedded_member_owners`, for callers that only need membership."""
+    return set(_embedded_member_owners(candidates))
 
 
 def _base_name(ref: ArtifactRef) -> str:
@@ -753,7 +764,8 @@ def _declared_candidate_ids(candidates: List[Dict[str, Any]],
 
 def _select_candidates(candidates: List[Dict[str, Any]], *, suppress_digests: set,
                        expect_filenames: List[str],
-                       suppressed_inputs_out: Optional[List[str]] = None
+                       suppressed_inputs_out: Optional[List[str]] = None,
+                       embedded_out: Optional[List[Tuple[str, str]]] = None
                        ) -> List[Dict[str, Any]]:
     """Phase 2: decide which downloaded candidates are DELIVERABLES rather than working
     material. Pure selection, no I/O — which is what lets a background job run it, show the
@@ -768,33 +780,37 @@ def _select_candidates(candidates: List[Dict[str, Any]], *, suppress_digests: se
     copied a fetched PNG to a new name (byte-identical, correctly refused) and the delivery model,
     seeing an empty manifest and no reason for it, told the user the file "didn't make it back
     from the build". Silence read as breakage.
-    """
-    # A .pptx/.docx/.xlsx is a zip, and an image embedded into one is stored as a verbatim zip
-    # entry — so the deck itself tells us which of the other files were merely its ingredients.
-    # Ask for a deck and you should get a deck, not a deck plus the loose charts that went into
-    # it. (The prompt also tells the model to embed from memory; this is the part that does not
-    # depend on the model complying.)
-    embedded = _embedded_member_hashes(candidates)
 
-    # A DECLARED manifest beats every heuristic below: the caller knows exactly which files were
-    # asked for, so anything else in the container is working material. Matched on name, and on
-    # extension too — the model does not always honour the filename it was given, and delivering
-    # the right document under a slightly wrong name beats delivering nothing.
+    ``embedded_out`` is the same idea for the other silent suppression: it is filled with
+    ``(filename, containing document)`` pairs for every candidate held back because its bytes are
+    already INSIDE a document going out. Live 2026-09-09 that gap cost twice — the delivery model
+    told the user the photo "didn't make it", and the status card went amber over a file that had
+    actually shipped, folded into the deck.
+    """
+    # A DECLARED manifest tells us which files were definitely asked for — it does not tell us
+    # that everything else is working material. Live 2026-09-09: a build declared three photos,
+    # then also produced a fourth photo and the .pptx deck the user actually wanted; treating the
+    # manifest as absolute dropped both before the delivery model ever saw them, and the user got
+    # photos and no deck with no explanation. Delivery policy lives in the model (CLAUDE.md), so
+    # undeclared files are STAGED AS EXTRAS and flagged, not discarded here.
     #
     # A matched candidate is a DECLARED deliverable, and the heuristics below (superseded-draft
     # pruning, document-image suppression) exist to guess a chat turn's intent — they must never
     # fire on a file the caller explicitly asked for. A job declaring report.pdf AND
     # social-card.png would otherwise lose the PNG the moment the PDF made it a "document turn".
+    # Extras get no such exemption: they still run the full gauntlet below.
     declared_ids: set = set()
+    for candidate in candidates:
+        candidate["declared"] = True
     if expect_filenames:
         declared_ids = _declared_candidate_ids(candidates, expect_filenames)
-        keep = [c for c in candidates if id(c) in declared_ids]
-        if keep:
-            dropped = [c["filename"] for c in candidates if id(c) not in declared_ids]
-            if dropped:
-                # Never silently truncate — say what was held back and why.
-                logger.info(f"Artifacts held back (not a declared deliverable): {dropped}")
-            candidates = keep
+        if declared_ids:
+            for candidate in candidates:
+                candidate["declared"] = id(candidate) in declared_ids
+            extras = [c["filename"] for c in candidates if id(c) not in declared_ids]
+            if extras:
+                logger.info("Artifacts staged as extras beyond the declared manifest "
+                            f"(the model decides whether they ship): {extras}")
         else:
             # Nothing matched. Publishing the intermediates would be worse than useless — it
             # would look like the deliverable. Say so loudly and hand back the raw candidates,
@@ -811,17 +827,41 @@ def _select_candidates(candidates: List[Dict[str, Any]], *, suppress_digests: se
     # Scoped to DOCUMENT types on purpose. "Give me a chart and a cleaned CSV" is a normal ask
     # and must keep working; "give me two different PDFs in one turn" is not, and the log says
     # plainly what was held back if it ever happens.
-    by_ext: Dict[str, List[Dict[str, Any]]] = {}
-    for candidate in candidates:
+    #
+    # "Last" is resolved from the stamped LISTING order, not from this list's position: the
+    # download pass sorts the declared manifest to the front, so position stopped meaning
+    # creation order the moment prioritization existed. That was invisible while a declared
+    # manifest truncated the list to itself; now that undeclared extras survive, a draft could
+    # otherwise be crowned "finished" purely because the reshuffle left it last.
+    by_ext: Dict[str, List[Tuple[int, Dict[str, Any]]]] = {}
+    for position, candidate in enumerate(candidates):
         if candidate["ext"] in _DOCUMENT_EXTS:
-            by_ext.setdefault(candidate["ext"], []).append(candidate)
-    superseded = {id(c) for group in by_ext.values() if len(group) > 1 for c in group[:-1]
-                  if id(c) not in declared_ids}
+            by_ext.setdefault(candidate["ext"], []).append(
+                (candidate.get("order", position), candidate))
+    superseded: set = set()
+    for group in by_ext.values():
+        if len(group) < 2:
+            continue
+        newest = max(group, key=lambda pc: pc[0])[1]
+        superseded.update(id(c) for _pos, c in group
+                          if c is not newest and id(c) not in declared_ids)
     if superseded:
         logger.info(
             "Artifacts held back (superseded drafts of the same document type): "
             f"{[c['filename'] for c in candidates if id(c) in superseded]}")
         candidates = [c for c in candidates if id(c) not in superseded]
+
+    # A .pptx/.docx/.xlsx is a zip, and an image embedded into one is stored as a verbatim zip
+    # entry — so the deck itself tells us which of the other files were merely its ingredients.
+    # Ask for a deck and you should get a deck, not a deck plus the loose charts that went into
+    # it. (The prompt also tells the model to embed from memory; this is the part that does not
+    # depend on the model complying.)
+    #
+    # Deliberately AFTER the superseded prune: only a document that is actually going out may
+    # claim a digest. Two versions of one deck both contain the photo, and ownership goes to the
+    # first one seen — so computing this earlier attributed the photo to the draft that is about
+    # to be dropped, and the completion card then called a delivered file missing.
+    embedded = _embedded_member_owners(candidates)
 
     # Is a DOCUMENT going out this turn? Then the loose images beside it are the pictures that
     # went into it, and the user asked for the document.
@@ -834,7 +874,13 @@ def _select_candidates(candidates: List[Dict[str, Any]], *, suppress_digests: se
     # Note this stays scoped to turns that produce a document. A turn that just draws a chart
     # publishes it, exactly as before — being asked for a picture and being asked for a report
     # that contains pictures are different requests.
-    publishing_document = any(c["ext"] in _DOCUMENT_EXTS for c in candidates)
+    #
+    # Scoped to the DECLARED set when there is one, which is what it always saw before extras
+    # were staged: "is the thing the caller asked for a document?". An extra deck built beside
+    # three declared photos must not retroactively turn a fourth photo into an ingredient — if it
+    # really is one, the embedded-hash check above catches it on the bytes.
+    doc_scope = [c for c in candidates if id(c) in declared_ids] if declared_ids else candidates
+    publishing_document = any(c["ext"] in _DOCUMENT_EXTS for c in doc_scope)
 
     accepted: List[Dict[str, Any]] = []
     seen_hashes: set = set()
@@ -851,8 +897,11 @@ def _select_candidates(candidates: List[Dict[str, Any]], *, suppress_digests: se
             continue
 
         if digest in embedded:
-            logger.info(
-                f"Artifact suppressed (embedded in a document we're publishing): {filename}")
+            owner = embedded[digest]
+            logger.info(f"Artifact suppressed (embedded in {owner}, which we're publishing): "
+                        f"{filename}")
+            if embedded_out is not None and (filename, owner) not in embedded_out:
+                embedded_out.append((filename, owner))
             continue
 
         if publishing_document and ext in _IMAGE_EXTS and id(candidate) not in declared_ids:
@@ -867,6 +916,13 @@ def _select_candidates(candidates: List[Dict[str, Any]], *, suppress_digests: se
         seen_hashes.add(digest)
 
         accepted.append(candidate)
+
+    # Declared deliverables lead, extras follow. _gather_candidates already prioritizes the
+    # manifest by NAME/EXTENSION before downloading, but that is a listing-order heuristic, not
+    # the entry-by-entry match — so make the guarantee here. sort() is stable, so relative order
+    # within each group (and therefore the creation order the rules above rely on) survives.
+    if declared_ids:
+        accepted.sort(key=lambda c: 0 if id(c) in declared_ids else 1)
 
     return accepted
 
@@ -884,13 +940,19 @@ async def _upload_candidates(
     ledger_key: str,
     receipts: Any = None,
     skipped: int = 0,
+    cap: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Phase 3: upload the selected files to Slack and persist their refs.
 
     The cap counts ACCEPTED uploads, not candidates: an intermediate file the model happened to
-    write must not consume the budget the real deliverable needed.
+    write must not consume the budget the real deliverable needed. It defaults to
+    ``config.artifact_max_files`` — a guard against a runaway turn GUESSING at what to publish.
+    A caller that already knows exactly what is going out (``publish_staged``, executing a plan
+    the model named file by file) passes its own: the guess is gone, and silently dropping the
+    fifth file a model deliberately chose is a lost deliverable, not restraint.
     """
-    cap = config.artifact_max_files
+    if cap is None:
+        cap = config.artifact_max_files
     published: List[Dict[str, Any]] = []
     published_ids: Dict[str, List[str]] = {}
 
@@ -995,17 +1057,24 @@ class StagedArtifact:
     publish BY ID, never by filename: filenames are model-authored and therefore hallucinable,
     and a selection contract that silently matched the wrong file — or nothing — would ship the
     wrong deliverable with total confidence.
+
+    ``declared`` says whether this file answered the caller's declared manifest. False means the
+    build produced it on its own — it is still staged and still offered, because a deck built
+    beside the photos that were asked for is usually the thing the user actually wanted; the
+    delivery model gets to tell that apart from working material.
     """
     artifact_id: str
     filename: str
     ext: str
     size_bytes: int
     candidate: Dict[str, Any]   # the internal candidate dict (carries the bytes + ref)
+    declared: bool = True
 
     def manifest_entry(self) -> Dict[str, Any]:
         """What the model is shown. The bytes never go anywhere near the prompt."""
         return {"artifact_id": self.artifact_id, "filename": self.filename,
-                "kind": self.ext, "size_bytes": self.size_bytes}
+                "kind": self.ext, "size_bytes": self.size_bytes,
+                "declared": self.declared}
 
 
 async def stage_artifacts(
@@ -1018,6 +1087,7 @@ async def stage_artifacts(
     expect_filenames: Optional[Iterable[str]] = None,
     time_budget: Optional[float] = None,
     suppressed_inputs_out: Optional[List[str]] = None,
+    embedded_out: Optional[List[Tuple[str, str]]] = None,
 ) -> List[StagedArtifact]:
     """Gather + select + hold in memory. Publishes NOTHING. Never raises.
 
@@ -1026,8 +1096,9 @@ async def stage_artifacts(
     cancelled the whole coroutine and lost every file a slow container had already produced.
 
     ``suppressed_inputs_out`` is filled in place with the names held back as unchanged mounted
-    inputs, so a caller whose next step is a MODEL can explain an empty manifest instead of
-    letting it read as a failed build (see ``_select_candidates``).
+    inputs, and ``embedded_out`` with ``(filename, containing document)`` for the ones folded
+    into a document that IS going out — so a caller whose next step is a MODEL can explain a
+    short manifest instead of letting it read as a failed build (see ``_select_candidates``).
     """
     lock = publication_lock(ledger_key)
     try:
@@ -1050,7 +1121,8 @@ async def stage_artifacts(
             accepted = _select_candidates(
                 candidates, suppress_digests=set(suppress_digests or ()),
                 expect_filenames=[f.lower() for f in (expect_filenames or ())],
-                suppressed_inputs_out=suppressed_inputs_out)
+                suppressed_inputs_out=suppressed_inputs_out,
+                embedded_out=embedded_out)
     except Exception as e:  # noqa: BLE001 — a staging failure costs the files, not the job
         logger.error(f"Artifact staging failed for {ledger_key}: {e}", exc_info=True)
         return []
@@ -1059,7 +1131,8 @@ async def stage_artifacts(
 
     staged = [
         StagedArtifact(artifact_id=f"art_{i}", filename=c["filename"], ext=c["ext"],
-                       size_bytes=len(c["data"]), candidate=c)
+                       size_bytes=len(c["data"]), candidate=c,
+                       declared=bool(c.get("declared", True)))
         for i, c in enumerate(accepted, start=1)
     ]
     if staged:
@@ -1110,11 +1183,14 @@ async def publish_staged(
     lock = publication_lock(ledger_key)
     try:
         async with lock:
+            # Every file here was named explicitly by the model, so the config cap (a bound on
+            # GUESSED publication) has nothing left to protect against — and with extras staged
+            # a legitimate plan runs past four.
             return await _upload_candidates(
                 chosen, client=client, channel_id=channel_id, thread_id=thread_id,
                 thread_key=thread_key, db=db, message_ts=message_ts,
                 container_manager=container_manager, ledger_key=ledger_key,
-                receipts=receipts)
+                receipts=receipts, cap=len(chosen))
     except Exception as e:  # noqa: BLE001
         logger.error(f"Staged publication failed for {ledger_key}: {e}", exc_info=True)
         return []
