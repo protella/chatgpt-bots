@@ -964,10 +964,16 @@ class DatabaseManager(LoggerMixin):
                 enable_mcp BOOLEAN DEFAULT 1,
                 enable_streaming BOOLEAN DEFAULT 1,
 
-                -- Image settings
-                image_model TEXT DEFAULT 'gpt-image-2',
-                image_size TEXT DEFAULT '1024x1024',
-                image_quality TEXT DEFAULT 'auto',
+                -- Fast service tier opt-in: NULL or 'standard' = off, 'fast' = on.
+                -- Personal/global only — never thread- or channel-scoped.
+                service_tier TEXT DEFAULT NULL,
+
+                -- Image settings. `image_size` 'auto' means the SHAPE is chosen per
+                -- request (the model's `aspect` argument) and rendered at `image_tier`.
+                image_model TEXT DEFAULT 'gpt-image-2.5-sunburst',
+                image_size TEXT DEFAULT 'auto',
+                image_tier TEXT DEFAULT 'large',
+                image_quality TEXT DEFAULT 'high',
                 image_background TEXT DEFAULT 'auto',
                 input_fidelity TEXT DEFAULT 'high',
                 vision_detail TEXT DEFAULT 'auto',
@@ -1442,10 +1448,12 @@ class DatabaseManager(LoggerMixin):
                         enable_web_search BOOLEAN DEFAULT 1,
                         enable_streaming BOOLEAN DEFAULT 1,
 
-                        -- Image settings
-                        image_model TEXT DEFAULT 'gpt-image-2',
-                        image_size TEXT DEFAULT '1024x1024',
-                        image_quality TEXT DEFAULT 'auto',
+                        -- Image settings. 'auto' size = shape chosen per request
+                        -- (the model's `aspect` argument), rendered at `image_tier`.
+                        image_model TEXT DEFAULT 'gpt-image-2.5-sunburst',
+                        image_size TEXT DEFAULT 'auto',
+                        image_tier TEXT DEFAULT 'large',
+                        image_quality TEXT DEFAULT 'high',
                         image_background TEXT DEFAULT 'auto',
                         input_fidelity TEXT DEFAULT 'high',
                         vision_detail TEXT DEFAULT 'auto',
@@ -1474,7 +1482,7 @@ class DatabaseManager(LoggerMixin):
                 self.log_info("DB: Adding image_quality column to user_preferences table")
                 self.conn.execute("""
                     ALTER TABLE user_preferences
-                    ADD COLUMN image_quality TEXT DEFAULT 'auto'
+                    ADD COLUMN image_quality TEXT DEFAULT 'high'
                 """)
                 self.conn.commit()
                 self.log_info("DB: Successfully added image_quality column")
@@ -1492,6 +1500,42 @@ class DatabaseManager(LoggerMixin):
                 """)
                 self.conn.commit()
                 self.log_info("DB: Successfully added image_background column")
+
+        # STRICTLY BEFORE `_migrate_gpt6()` below, which WRITES image_tier='large' on every
+        # user row. Ordering is the guard here rather than a PRAGMA check inside the swap:
+        # the column is unconditional (unlike channel_settings.image_model, which is added by
+        # a later step and has to be probed), so putting it first makes the swap's UPDATE a
+        # plain write with nothing to test.
+        with self._migration_step("user_preferences.image_tier"):
+            # The size TIER a model-chosen shape renders at (standard/large/max). Only
+            # consulted while image_size is 'auto'; a row with a saved WxH ignores it.
+            cursor = self.conn.execute("PRAGMA table_info(user_preferences)")
+            columns = [col[1] for col in cursor.fetchall()]
+
+            if 'image_tier' not in columns:
+                self.log_info("DB: Adding image_tier column to user_preferences table")
+                self.conn.execute("""
+                    ALTER TABLE user_preferences
+                    ADD COLUMN image_tier TEXT DEFAULT 'large'
+                """)
+                self.conn.commit()
+                self.log_info("DB: Successfully added image_tier column")
+
+        with self._migration_step("user_preferences.service_tier"):
+            # Fast service tier opt-in. NULL (every pre-existing row) or 'standard' means off,
+            # 'fast' means on — so the additive column is inert until a user opts in, and the
+            # admin gate (OPENAI_SERVICE_TIER) still has the final say.
+            cursor = self.conn.execute("PRAGMA table_info(user_preferences)")
+            columns = [col[1] for col in cursor.fetchall()]
+
+            if 'service_tier' not in columns:
+                self.log_info("DB: Adding service_tier column to user_preferences table")
+                self.conn.execute("""
+                    ALTER TABLE user_preferences
+                    ADD COLUMN service_tier TEXT DEFAULT NULL
+                """)
+                self.conn.commit()
+                self.log_info("DB: Successfully added service_tier column")
 
         with self._migration_step("user_preferences.enable_mcp"):
             # Check if enable_mcp column exists in user_preferences table
@@ -1516,20 +1560,22 @@ class DatabaseManager(LoggerMixin):
                 self.log_info("DB: Adding image_model column to user_preferences table")
                 self.conn.execute("""
                     ALTER TABLE user_preferences
-                    ADD COLUMN image_model TEXT DEFAULT 'gpt-image-2'
+                    ADD COLUMN image_model TEXT DEFAULT 'gpt-image-2.5-sunburst'
                 """)
-                # Explicitly set all existing rows to gpt-image-2. The DEFAULT clause
-                # above already does this on SQLite, but make the one-time bulk swap
-                # explicit so the intent is unambiguous and the row count gets logged.
-                # This runs exactly once (the surrounding `if` block guarantees it).
+                # Explicitly set all existing rows to the column default. The DEFAULT
+                # clause above already does this on SQLite, but make the one-time bulk
+                # swap explicit so the intent is unambiguous and the row count gets
+                # logged. This runs exactly once (the surrounding `if` block guarantees
+                # it), and the literal has to track the DEFAULT above or the two
+                # statements would disagree about what a row without a choice holds.
                 cursor = self.conn.execute(
-                    "UPDATE user_preferences SET image_model = 'gpt-image-2'"
+                    "UPDATE user_preferences SET image_model = 'gpt-image-2.5-sunburst'"
                 )
                 row_count = cursor.rowcount
                 self.conn.commit()
                 self.log_info(
                     f"DB: Successfully added image_model column and migrated "
-                    f"{row_count} existing user(s) to gpt-image-2"
+                    f"{row_count} existing user(s) to gpt-image-2.5-sunburst"
                 )
 
         with self._migration_step("gpt-5.5 swap"):
@@ -1555,6 +1601,18 @@ class DatabaseManager(LoggerMixin):
                     f"DB: One-time migration — swapped {swapped} user(s) to gpt-5.5"
                 )
 
+        # Strictly BEFORE _migrate_gpt56. Two reasons, both data loss if inverted:
+        # (1) _migrate_gpt56's every-startup normalizer clamps each stored effort against
+        #     the model stored NEXT TO IT, so running it first would rewrite a gpt-5.5
+        #     `max` down to `xhigh` — a level Astra accepts — before the Astra swap could
+        #     preserve it. Going first, the swap reads the efforts users actually chose.
+        # (2) On a database that predates the `gpt56_migrated` sentinel, _migrate_gpt56's
+        #     one-time reset would flatten everyone to sol/medium, discarding the very
+        #     selections the Astra swap is supposed to carry over. Running after the swap,
+        #     it sees `gpt6_migrated` already present and stands down (see _migrate_gpt56).
+        # The gpt56 normalizer still runs afterwards, against rows already on Astra, where
+        # its only applicable rule is none/minimal -> low — already applied here.
+        self._migrate_gpt6()
         self._migrate_gpt56()
 
         with self._migration_step("settings_completed backfill"):
@@ -2020,17 +2078,29 @@ class DatabaseManager(LoggerMixin):
     def _migrate_gpt56(self):
         """GPT-5.6 model-lineup migration (2026-07-09).
 
+        Runs AFTER `_migrate_gpt6`, which is the ordering both parts now depend on
+        (see the comment at the call site in `_run_migrations`).
+
         Two parts, both safe to run on every startup:
         1. ONE-TIME (sentinel `gpt56_migrated` column, same pattern as the
            gpt55/gpt-image-2 swaps): move EVERYONE's default model to
            gpt-5.6-sol with medium reasoning. Users can re-customize globally
            and per channel/thread afterward — this only resets the default.
-        2. EVERY-STARTUP normalizer: only gpt-5.6-sol/terra/luna and gpt-5.5
-           are selectable; any other stored model (user prefs or per-thread
-           overrides) coerces to gpt-5.6-sol, and stored reasoning efforts a
-           model rejects are clamped (`minimal` is a 400 on 5.6 -> none;
-           `max` doesn't exist on 5.5 -> xhigh). Guarantees the API layer
-           never receives a dropped model name or an unsupported effort.
+           SUPERSEDED when `gpt6_migrated` is already on the table: the Astra swap
+           ran just before and carried every user's chosen effort forward, so this
+           historical reset would only throw that away. The sentinel column is still
+           planted (the branch must never re-evaluate) and the UPDATE is skipped.
+        2. EVERY-STARTUP normalizer: only the models in
+           `config.SUPPORTED_CHAT_MODELS` are selectable; any other stored
+           model (user prefs or per-thread overrides) coerces to
+           `config.gpt_model`, and stored reasoning efforts a model rejects are
+           clamped (`minimal` is a 400 on 5.6 -> none; `max` doesn't exist on
+           5.5 -> xhigh; gpt-6 rejects both `none` and `minimal` -> low).
+           Guarantees the API layer never receives a dropped model name or an
+           unsupported effort. The allowlist is read from config at RUN TIME,
+           never hard-coded: this part runs on every migration pass, so a
+           literal list silently resets every user off any newly added model on
+           the next restart.
 
         Both parts are individually isolated: a failure in the one-time swap must
         not take the every-startup normalizers down with it, since those are what
@@ -2040,32 +2110,61 @@ class DatabaseManager(LoggerMixin):
             cursor = self.conn.execute("PRAGMA table_info(user_preferences)")
             columns = [col[1] for col in cursor.fetchall()]
             if 'gpt56_migrated' not in columns:
+                # SUPERSEDED once the Astra swap has run. `_migrate_gpt6` goes first and
+                # has already moved everyone to gpt-6-astra keeping the effort they
+                # chose; re-running this historical reset on top would flatten those
+                # rows to sol/medium and throw the carried-over selections away. The
+                # sentinel column is still planted so this branch never re-evaluates.
+                superseded = 'gpt6_migrated' in columns
                 self.conn.execute("""
                     ALTER TABLE user_preferences
                     ADD COLUMN gpt56_migrated INTEGER DEFAULT 0
                 """)
-                cursor = self.conn.execute("""
-                    UPDATE user_preferences
-                    SET model = 'gpt-5.6-sol', reasoning_effort = 'medium', gpt56_migrated = 1
-                    WHERE gpt56_migrated = 0
-                """)
-                swapped = cursor.rowcount
-                self.conn.commit()
-                self.log_info(
-                    f"DB: One-time GPT-5.6 migration — swapped {swapped} user(s) to "
-                    f"gpt-5.6-sol with medium reasoning"
-                )
+                if superseded:
+                    self.conn.commit()
+                    self.log_info(
+                        "DB: One-time GPT-5.6 migration superseded by the GPT-6 Astra swap "
+                        "— sentinel planted, no user rows reset"
+                    )
+                else:
+                    cursor = self.conn.execute("""
+                        UPDATE user_preferences
+                        SET model = 'gpt-5.6-sol', reasoning_effort = 'medium', gpt56_migrated = 1
+                        WHERE gpt56_migrated = 0
+                    """)
+                    swapped = cursor.rowcount
+                    self.conn.commit()
+                    self.log_info(
+                        f"DB: One-time GPT-5.6 migration — swapped {swapped} user(s) to "
+                        f"gpt-5.6-sol with medium reasoning"
+                    )
 
-        with self._migration_step("gpt-5.6 normalizers"):
-            supported = "('gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5')"
-            cursor = self.conn.execute(f"""
+        with self._migration_step("chat model normalizers"):
+            # Built from config at run time, NOT from a literal: this step runs on every
+            # migration pass, so a hard-coded allowlist resets users off any model added
+            # after it was written the next time the bot restarts. The values are our own
+            # constants, but the IN clause still uses bound placeholders rather than
+            # interpolation so no model id can ever be read as SQL.
+            from config import SUPPORTED_CHAT_MODELS
+            from config import config as bot_config
+
+            supported_models = list(SUPPORTED_CHAT_MODELS)
+            model_placeholders = ", ".join("?" for _ in supported_models)
+            # config.validate() refuses to boot when gpt_model is not in SUPPORTED_CHAT_MODELS,
+            # so the reset target is guaranteed to be a member of the allowlist above.
+            fallback_model = bot_config.gpt_model
+            cursor = self.conn.execute(
+                f"""
                 UPDATE user_preferences
-                SET model = 'gpt-5.6-sol'
-                WHERE model IS NOT NULL AND model NOT IN {supported}
-            """)
+                SET model = ?
+                WHERE model IS NOT NULL AND model NOT IN ({model_placeholders})
+                """,
+                (fallback_model, *supported_models),
+            )
             if cursor.rowcount:
                 self.log_info(
-                    f"DB: Normalized {cursor.rowcount} user(s) from dropped models to gpt-5.6-sol"
+                    f"DB: Normalized {cursor.rowcount} user(s) from dropped models "
+                    f"to {fallback_model}"
                 )
             cursor = self.conn.execute("""
                 UPDATE user_preferences
@@ -2085,16 +2184,29 @@ class DatabaseManager(LoggerMixin):
                 self.log_info(
                     f"DB: Clamped reasoning max->xhigh for {cursor.rowcount} user(s) on gpt-5.5"
                 )
-            cursor = self.conn.execute(f"""
-                UPDATE threads
-                SET config_json = json_set(config_json, '$.model', 'gpt-5.6-sol')
-                WHERE config_json IS NOT NULL
-                  AND json_extract(config_json, '$.model') IS NOT NULL
-                  AND json_extract(config_json, '$.model') NOT IN {supported}
+            cursor = self.conn.execute("""
+                UPDATE user_preferences
+                SET reasoning_effort = 'low'
+                WHERE model LIKE 'gpt-6%' AND reasoning_effort IN ('none', 'minimal')
             """)
             if cursor.rowcount:
                 self.log_info(
-                    f"DB: Normalized {cursor.rowcount} thread override(s) to gpt-5.6-sol"
+                    f"DB: Clamped reasoning none/minimal->low for {cursor.rowcount} "
+                    f"user(s) on gpt-6 models"
+                )
+            cursor = self.conn.execute(
+                f"""
+                UPDATE threads
+                SET config_json = json_set(config_json, '$.model', ?)
+                WHERE config_json IS NOT NULL
+                  AND json_extract(config_json, '$.model') IS NOT NULL
+                  AND json_extract(config_json, '$.model') NOT IN ({model_placeholders})
+                """,
+                (fallback_model, *supported_models),
+            )
+            if cursor.rowcount:
+                self.log_info(
+                    f"DB: Normalized {cursor.rowcount} thread override(s) to {fallback_model}"
                 )
             cursor = self.conn.execute("""
                 UPDATE threads
@@ -2117,6 +2229,18 @@ class DatabaseManager(LoggerMixin):
             if cursor.rowcount:
                 self.log_info(
                     f"DB: Clamped {cursor.rowcount} thread override(s) max->xhigh on gpt-5.5"
+                )
+            cursor = self.conn.execute("""
+                UPDATE threads
+                SET config_json = json_set(config_json, '$.reasoning_effort', 'low')
+                WHERE config_json IS NOT NULL
+                  AND json_extract(config_json, '$.model') LIKE 'gpt-6%'
+                  AND json_extract(config_json, '$.reasoning_effort') IN ('none', 'minimal')
+            """)
+            if cursor.rowcount:
+                self.log_info(
+                    f"DB: Clamped {cursor.rowcount} thread override(s) none/minimal->low "
+                    f"on gpt-6 models"
                 )
             self.conn.commit()
 
@@ -2174,6 +2298,296 @@ class DatabaseManager(LoggerMixin):
             self.conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_user_memory_lookup ON user_memory (user_id)")
             self.conn.commit()
+
+    def _migrate_gpt6(self):
+        """GPT-6 Astra lineup migration (2026-09-08). ONE-TIME, sentinel-gated.
+
+        Moves EVERYONE to gpt-6-astra AND to gpt-image-2.5-sunburst while KEEPING the
+        reasoning effort they chose. Only `none` and `minimal` conflict with Astra's ladder
+        (`config.GPT6_EFFORTS` = low/medium/high/xhigh/max); both step up to the next
+        level Astra accepts, `low` — the same coercion `clamp_effort` applies at run
+        time, done once here so the stored value stops lying about the model. Every
+        other stored effort (low/medium/high/xhigh/max) survives untouched, and a NULL
+        effort stays NULL so the config default keeps applying.
+
+        The image settings move in the SAME step, same transaction, same sentinel: every
+        user row (a NULL image_model included — the choice becomes explicit), every
+        thread override that pins one, and every channel setting that pins one land on
+        gpt-image-2.5-sunburst, and image quality goes to `high` for EVERYONE — every user
+        row whatever it held, and every thread override that carries an `$.image_quality`
+        key at all (reverted to the everyone rule by owner ruling, 2026-09-09: the old
+        shipped default sat in almost every row and was never a pick, so an "only if unset"
+        rule would have left the fleet on it). A thread WITHOUT the key still inherits and
+        must keep doing so. `channel_settings` has no quality column, so
+        there is nothing to move there. `high` is legal on every supported image model,
+        legacy ones included (`QUALITIES_LEGACY` and `QUALITIES_25` in
+        message_processor/image_service.py), so this cannot strand a row on a value its
+        model rejects.
+
+        User rows also take `image_background = 'auto'` and the new `image_tier = 'large'`,
+        and their `image_size` moves onto the new default by
+        `_image_size_to_large_case` — the old shipped 1024x1024 (and anything unset)
+        becomes `auto`, every other grid cell steps up to the Large cell of its own shape,
+        and an off-grid size someone chose on purpose survives. Thread overrides get the
+        same size rule on `$.image_size`; `$.image_tier` is NOT written, so a thread that
+        never pinned a tier keeps inheriting the user's.
+
+        The `image_tier` COLUMN is added by its own earlier migration step
+        (`user_preferences.image_tier`), which is why the UPDATE below can write it
+        unconditionally.
+
+        The model name is a LITERAL here, unlike the run-time allowlist in
+        `_migrate_gpt56`'s normalizer: this is a historical one-time swap to one
+        specific model, not a policy that re-evaluates on every boot.
+
+        Runs immediately BEFORE `_migrate_gpt56`, not after. `_migrate_gpt56`'s
+        every-startup normalizer clamps efforts against the model that is stored at the
+        time it runs, so going second would let it rewrite a gpt-5.5 `max` down to
+        `xhigh` — an effort Astra accepts — before this swap ever saw it, and the user
+        would silently lose a level they had chosen. Going first, this swap reads the
+        efforts as the user actually stored them; `_migrate_gpt56`'s normalizer then
+        runs against rows already on Astra, where its only applicable rule is
+        none/minimal -> low, which this migration has already applied.
+
+        Idempotent: the sentinel column's presence is the guard, so it never runs a
+        second time and a user who re-selects another model afterwards keeps it.
+        Isolated in `_migration_step` — a failure here must not take later steps down.
+
+        ATOMIC: the connection is in autocommit (``isolation_level=None``) and
+        `_migration_step` swallows the exception, so without an explicit transaction a
+        failure partway through would leave the sentinel column committed and every
+        retry would skip the unfinished swap forever. The ALTER and all three UPDATE
+        groups run inside one `BEGIN IMMEDIATE`; any exception rolls the whole thing
+        back — SQLite's DDL is transactional, so the sentinel column disappears with it
+        — and re-raises so `_migration_step` still logs the failure loudly.
+        """
+        with self._migration_step("gpt-6 astra migration"):
+            cursor = self.conn.execute("PRAGMA table_info(user_preferences)")
+            columns = [col[1] for col in cursor.fetchall()]
+            if 'gpt6_migrated' not in columns:
+                if self.conn.in_transaction:
+                    # Autocommit means nothing should be open here; commit defensively
+                    # rather than earn "cannot start a transaction within a transaction".
+                    self.conn.commit()
+                self.conn.execute("BEGIN IMMEDIATE")
+                try:
+                    users_swapped, users_sized, threads_swapped, \
+                        threads_clamped, threads_images, threads_quality, \
+                        channels_swapped, channels_clamped, channels_images = \
+                        self._migrate_gpt6_writes()
+                except Exception:
+                    self.conn.rollback()
+                    raise
+                self.conn.execute("COMMIT")
+
+                self.log_info(
+                    f"DB: One-time GPT-6 migration — swapped {users_swapped} user(s) to "
+                    f"gpt-6-astra + gpt-image-2.5-sunburst at high image quality, with auto "
+                    f"background and the large size tier ({users_sized} moved to an auto "
+                    f"shape), keeping their chosen reasoning effort"
+                )
+                self.log_info(
+                    f"DB: One-time GPT-6 migration — swapped {threads_swapped} thread "
+                    f"override(s) to gpt-6-astra ({threads_clamped} clamped none/minimal->low), "
+                    f"{threads_images} to gpt-image-2.5-sunburst and {threads_quality} to high "
+                    f"image quality"
+                )
+                self.log_info(
+                    f"DB: One-time GPT-6 migration — swapped {channels_swapped} channel "
+                    f"setting(s) to gpt-6-astra ({channels_clamped} clamped none/minimal->low) "
+                    f"and {channels_images} to gpt-image-2.5-sunburst"
+                )
+
+    @staticmethod
+    def _image_size_to_large_case(expr: str) -> str:
+        """The SQL CASE that moves a stored image size onto the new shipped default.
+
+        GENERATED from `image_service.SHAPE_TIER_SIZES`, never hand-typed: the grid is a
+        table of measured API-legal cells, and a hand-copied CASE is one typo away from
+        stranding a user on a size the model rejects.
+
+        Two rules, in this order:
+
+        1. Nothing saved, `auto`, or `1024x1024` becomes `auto` — the shape is chosen per
+           request from then on. `1024x1024` is in that list because it was the OLD SHIPPED
+           DEFAULT, not a pick anyone made; it is also the 1:1 standard cell, which is why
+           it has to be matched before the grid rules below and skipped by them.
+        2. Any other grid cell moves to the LARGE cell of the SAME shape, which is the tier
+           the new defaults ship at (1536x1024 -> 1776x1184, 3840x2160 -> 1920x1088).
+
+        Anything else — an off-grid WxH someone deliberately chose — is left exactly as it is.
+
+        The grid is read from BOTH the live `SHAPE_TIER_SIZES` and `LEGACY_MAX_SIZES`. The 4K
+        `max` column was pulled from the live table on 2026-09-09 (experimental per OpenAI, mesh
+        artifacts at `high`), but those five-plus cells are still sitting in real rows, so the
+        CASE has to keep mapping them to their Large cell — 3840x2160 -> 1920x1088 above is one
+        of them. Dropping them from the CASE would strand a user on a size the settings modal no
+        longer offers.
+        """
+        from message_processor.image_service import LEGACY_MAX_SIZES, SHAPE_TIER_SIZES
+
+        whens = [f"WHEN {expr} IS NULL OR {expr} = '' OR {expr} = 'auto' "
+                 f"OR {expr} = '1024x1024' THEN 'auto'"]
+        for shape, row in SHAPE_TIER_SIZES.items():
+            large = row["large"]
+            cells = list(row.values())
+            legacy_max = LEGACY_MAX_SIZES.get(shape)
+            if legacy_max:
+                cells.append(legacy_max)
+            for cell in cells:
+                if cell == large or cell == "1024x1024":
+                    continue
+                whens.append(f"WHEN {expr} = '{cell}' THEN '{large}'")
+        indent = "\n                    "
+        return f"CASE{indent}{indent.join(whens)}{indent}ELSE {expr}\n                END"
+
+    def _migrate_gpt6_writes(self) -> Tuple[int, int, int, int, int, int, int, int, int]:
+        """Every write of the one-time Astra swap, run inside the caller's transaction.
+
+        Split out only so `_migrate_gpt6` can wrap the whole group in one
+        BEGIN/COMMIT/ROLLBACK without a deep try block. Never call it directly: outside
+        a transaction these writes commit one at a time and a mid-way failure strands
+        the database half-swapped with the sentinel already planted.
+
+        Returns (users_swapped, users_sized, threads_swapped, threads_clamped,
+        threads_images, threads_quality, channels_swapped, channels_clamped,
+        channels_images).
+        """
+        self.conn.execute("""
+            ALTER TABLE user_preferences
+            ADD COLUMN gpt6_migrated INTEGER DEFAULT 0
+        """)
+        # Counted BEFORE the UPDATE: afterwards a row that WAS `auto` and a row that BECAME
+        # `auto` are indistinguishable, and the log line is about the move.
+        cursor = self.conn.execute("""
+            SELECT COUNT(*) FROM user_preferences
+            WHERE image_size IS NULL OR image_size = '' OR image_size = 'auto'
+               OR image_size = '1024x1024'
+        """)
+        users_sized = int(cursor.fetchone()[0])
+        # Quality goes to `high` for EVERY user row, whatever it held (owner ruling,
+        # 2026-09-09). No count is taken: the number would just be `users_swapped` again.
+        cursor = self.conn.execute(f"""
+            UPDATE user_preferences
+            SET model = 'gpt-6-astra',
+                image_model = 'gpt-image-2.5-sunburst',
+                image_quality = 'high',
+                image_background = 'auto',
+                image_tier = 'large',
+                image_size = {self._image_size_to_large_case('image_size')},
+                reasoning_effort = CASE
+                    WHEN reasoning_effort IN ('none', 'minimal') THEN 'low'
+                    ELSE reasoning_effort
+                END,
+                gpt6_migrated = 1
+            WHERE gpt6_migrated = 0
+        """)
+        users_swapped = cursor.rowcount
+
+        # Thread overrides: json_set edits ONE key in place, so every other
+        # stored field (temperature, verbosity, ...) survives verbatim. Only
+        # rows that actually pin a model are touched — a config_json without a
+        # `$.model` key inherits the user/channel setting and must keep doing so.
+        cursor = self.conn.execute("""
+            UPDATE threads
+            SET config_json = json_set(config_json, '$.model', 'gpt-6-astra')
+            WHERE config_json IS NOT NULL
+              AND json_extract(config_json, '$.model') IS NOT NULL
+        """)
+        threads_swapped = cursor.rowcount
+        cursor = self.conn.execute("""
+            UPDATE threads
+            SET config_json = json_set(config_json, '$.reasoning_effort', 'low')
+            WHERE config_json IS NOT NULL
+              AND json_extract(config_json, '$.model') IS NOT NULL
+              AND json_extract(config_json, '$.reasoning_effort') IN ('none', 'minimal')
+        """)
+        threads_clamped = cursor.rowcount
+        # The image override is its own key: a thread can pin an image model without
+        # pinning a chat model, so this is keyed on `$.image_model` alone. An override
+        # that never set one inherits the user/channel choice and must keep doing so.
+        cursor = self.conn.execute("""
+            UPDATE threads
+            SET config_json = json_set(config_json, '$.image_model',
+                                       'gpt-image-2.5-sunburst')
+            WHERE config_json IS NOT NULL
+              AND json_extract(config_json, '$.image_model') IS NOT NULL
+        """)
+        threads_images = cursor.rowcount
+        # Quality is its own key again — a thread that never set one keeps inheriting the
+        # user/config default, which the new shipped default already puts at `high`.
+        #
+        # EVERY pin present is rewritten, whatever its value (owner ruling, 2026-09-09). The
+        # gate is `json_type` rather than `json_extract` for the reason spelled out on the
+        # size UPDATE below: a key present with a JSON `null` extracts as SQL NULL and would
+        # otherwise be indistinguishable from an absent key.
+        cursor = self.conn.execute("""
+            UPDATE threads
+            SET config_json = json_set(config_json, '$.image_quality', 'high')
+            WHERE config_json IS NOT NULL
+              AND json_type(config_json, '$.image_quality') IS NOT NULL
+        """)
+        threads_quality = cursor.rowcount
+        # And the size, by the same rule the user column gets. `$.image_tier` is deliberately
+        # NOT written: a thread that never pinned a tier inherits the user's, which this
+        # migration has just put at `large`, and pinning it here would freeze the inheritance.
+        #
+        # The gate is `json_type`, not `json_extract`: a key PRESENT with a JSON `null` value
+        # extracts as SQL NULL and would be skipped, leaving a pinned-but-empty size behind
+        # while NULL/''/auto/1024x1024 all move to `auto`. `json_type` distinguishes an
+        # absent key (SQL NULL) from a present null one ('null'), so present-and-null is
+        # rewritten; the CASE already maps the extracted NULL to `auto`. A thread WITHOUT the
+        # key still inherits the user/channel size and must keep doing so.
+        _size_case = self._image_size_to_large_case(
+            "json_extract(config_json, '$.image_size')")
+        self.conn.execute(f"""
+            UPDATE threads
+            SET config_json = json_set(config_json, '$.image_size', {_size_case})
+            WHERE config_json IS NOT NULL
+              AND json_type(config_json, '$.image_size') IS NOT NULL
+        """)
+
+        # Channel settings: NULL model means "no channel override" and must stay
+        # NULL, so only rows carrying a real model id are swapped.
+        cursor = self.conn.execute("""
+            UPDATE channel_settings
+            SET model = 'gpt-6-astra'
+            WHERE model IS NOT NULL AND model != ''
+        """)
+        channels_swapped = cursor.rowcount
+        cursor = self.conn.execute("""
+            UPDATE channel_settings
+            SET reasoning_effort = 'low'
+            WHERE model IS NOT NULL AND model != ''
+              AND reasoning_effort IN ('none', 'minimal')
+        """)
+        channels_clamped = cursor.rowcount
+        # Same rule for the channel image pin, on its own column: NULL/'' is "no
+        # override" and stays that way.
+        #
+        # `channel_settings.image_model` is added by _migrate_channel_capability_columns,
+        # which runs LATER in _run_migrations than this swap does. On a database old
+        # enough to still be missing it, the UPDATE would raise "no such column" and take
+        # the whole one-time swap down with it (this runs inside the caller's
+        # transaction), so the column's presence is checked first. Skipping is lossless:
+        # without the column no channel can be pinning an image model, and the ALTER that
+        # adds it later adds it NULL — i.e. "no override" — for every existing row.
+        cursor = self.conn.execute("PRAGMA table_info(channel_settings)")
+        if any(col[1] == 'image_model' for col in cursor.fetchall()):
+            cursor = self.conn.execute("""
+                UPDATE channel_settings
+                SET image_model = 'gpt-image-2.5-sunburst'
+                WHERE image_model IS NOT NULL AND image_model != ''
+            """)
+            channels_images = cursor.rowcount
+        else:
+            channels_images = 0
+
+        return (
+            users_swapped, users_sized, threads_swapped, threads_clamped,
+            threads_images, threads_quality, channels_swapped, channels_clamped,
+            channels_images,
+        )
 
     def _migrate_participation_redesign(self):
         """Layer 0 of the participation-backoff redesign. Idempotent and re-runnable.
@@ -2921,10 +3335,14 @@ class DatabaseManager(LoggerMixin):
             'enable_streaming': config.enable_streaming,
             'image_model': config.image_model,
             'image_size': config.default_image_size,
+            'image_tier': config.default_image_tier,
             'image_quality': config.default_image_quality,
             'image_background': config.default_image_background,
             'input_fidelity': config.default_input_fidelity,
             'vision_detail': config.default_detail_level,
+            # Fast tier is opt-in per person; a new user starts off it regardless of the
+            # admin gate, which only decides whether the control is offered at all.
+            'service_tier': 'standard',
             'settings_completed': False
         }
 
@@ -2934,8 +3352,10 @@ class DatabaseManager(LoggerMixin):
                 INSERT INTO user_preferences
                 (slack_user_id, slack_email, model, reasoning_effort, verbosity,
                  temperature, top_p, enable_web_search, enable_streaming,
-                 image_model, image_size, image_quality, image_background, input_fidelity, vision_detail, settings_completed)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 image_model, image_size, image_tier, image_quality, image_background,
+                 input_fidelity, vision_detail,
+                 service_tier, settings_completed)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 user_id, email, defaults['model'],
                 defaults['reasoning_effort'], defaults['verbosity'],
@@ -2943,9 +3363,10 @@ class DatabaseManager(LoggerMixin):
                 1 if defaults['enable_web_search'] else 0,
                 1 if defaults['enable_streaming'] else 0,
                 defaults['image_model'],
-                defaults['image_size'], defaults['image_quality'],
+                defaults['image_size'], defaults['image_tier'],
+                defaults['image_quality'],
                 defaults['image_background'], defaults['input_fidelity'],
-                defaults['vision_detail'], 0
+                defaults['vision_detail'], defaults['service_tier'], 0
             ))
             
             self.log_info(f"DB: Created default preferences for user {user_id}")
@@ -2972,9 +3393,10 @@ class DatabaseManager(LoggerMixin):
             values = []
             
             for field in ['model', 'reasoning_effort', 'verbosity', 'temperature',
-                         'top_p', 'image_size', 'image_quality', 'image_background',
-                         'input_fidelity', 'vision_detail',
-                         'slack_email', 'settings_completed', 'custom_instructions']:
+                         'top_p', 'image_size', 'image_tier', 'image_quality',
+                         'image_background', 'input_fidelity', 'vision_detail',
+                         'service_tier', 'slack_email', 'settings_completed',
+                         'custom_instructions']:
                 if field in preferences:
                     updates.append(f"{field} = ?")
                     values.append(preferences[field])
@@ -3418,6 +3840,7 @@ class DatabaseManager(LoggerMixin):
             "verbosity": config.default_verbosity,
             "image_model": config.image_model,
             "image_size": config.default_image_size,
+            "image_tier": config.default_image_tier,
             "image_quality": config.default_image_quality,
             "image_background": config.default_image_background,
             "input_fidelity": config.default_input_fidelity,
@@ -3607,6 +4030,7 @@ class DatabaseManager(LoggerMixin):
             "verbosity": bot_config.default_verbosity,
             "image_model": bot_config.image_model,
             "image_size": bot_config.default_image_size,
+            "image_tier": bot_config.default_image_tier,
             "image_quality": bot_config.default_image_quality,
             "image_background": bot_config.default_image_background,
             "input_fidelity": bot_config.default_input_fidelity,
@@ -5673,9 +6097,9 @@ class DatabaseManager(LoggerMixin):
                     model, temperature, top_p,
                     enable_web_search, enable_streaming,
                     reasoning_effort, verbosity,
-                    image_model, image_size, image_quality, image_background,
+                    image_model, image_size, image_tier, image_quality, image_background,
                     input_fidelity, vision_detail
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 user_id, email,
                 config.gpt_model, config.default_temperature, config.default_top_p,
@@ -5683,7 +6107,8 @@ class DatabaseManager(LoggerMixin):
                 1 if config.enable_streaming else 0,
                 config.default_reasoning_effort, config.default_verbosity,
                 config.image_model,
-                config.default_image_size, config.default_image_quality, config.default_image_background,
+                config.default_image_size, config.default_image_tier,
+                config.default_image_quality, config.default_image_background,
                 config.default_input_fidelity, config.default_detail_level
             ))
 
@@ -6377,9 +6802,10 @@ class DatabaseManager(LoggerMixin):
 
             # Handle regular fields
             for field in ['model', 'reasoning_effort', 'verbosity', 'temperature',
-                         'top_p', 'image_model', 'image_size', 'image_quality', 'image_background',
-                         'input_fidelity', 'vision_detail',
-                         'slack_email', 'settings_completed', 'custom_instructions']:
+                         'top_p', 'image_model', 'image_size', 'image_tier',
+                         'image_quality', 'image_background', 'input_fidelity',
+                         'vision_detail', 'service_tier', 'slack_email',
+                         'settings_completed', 'custom_instructions']:
                 if field in preferences:
                     update_fields.append(f"{field} = ?")
                     values.append(preferences[field])

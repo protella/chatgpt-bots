@@ -993,7 +993,7 @@ class ThreadManagementMixin(_Host):
                     thread_state._long_context_logged = True
                 except Exception:
                     pass
-                self.log_info(
+                self.log_warning(
                     f"Thread crossed the long-context billing tier: {current_tokens:,} input tokens "
                     f"> {config.LONG_CONTEXT_BILLING_THRESHOLD:,} (2x input / 1.5x output pricing applies)"
                 )

@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from openai_client.api.responses import _capture_web_search
+from openai_client.api.responses import _capture_web_search, _request_includes
 
 from message_processor.client_contract import Message
 from config import config
@@ -539,3 +539,110 @@ def test_later_turn_sees_query_and_source_url_in_the_annotation():
         "[used tools: web_search]\n"
         "[tool results: web_search → query: did the kettle ship]\n"
         "[tool results: web_search → sources: Kettle docs — https://example.com/docs/kettle]")
+
+
+# --------------------------------------------------- captured page text (web_search results)
+# Evidence said what the search DID; it could not say what the page SAID. Challenged on an
+# exact identifier read off a page, the bot had no way to check its own spelling and
+# over-retracted. `include=["web_search_call.results"]` returns the passages themselves.
+
+def _result(title, url, snippet):
+    return SimpleNamespace(type="text_result", title=title, url=url, snippet=snippet)
+
+
+def _searched(results, **action_fields):
+    # `results` rides the web_search_call ITEM, not its action — unlike everything `_search`
+    # sets. Present only when the request asked for `web_search_call.results`.
+    return SimpleNamespace(type="web_search_call", results=results,
+                           action=SimpleNamespace(type="search", **action_fields))
+
+
+def test_result_snippets_are_captured_as_one_read_entry():
+    sink = []
+    _capture_web_search(sink, _searched(
+        [_result("Kettle docs", "https://example.com/one", "The unit ships as KTL-7742-B."),
+         _result("Kettle specs", "https://example.com/two", "Capacity is 1.7 litres.")],
+        queries=["kettle model number"]))
+    assert sink == [{"tool_name": "web_search", "output": (
+        "query: kettle model number | read: "
+        "Kettle docs — https://example.com/one: The unit ships as KTL-7742-B. || "
+        "Kettle specs — https://example.com/two: Capacity is 1.7 litres.")}]
+
+
+def test_transport_noise_is_stripped_from_captured_snippets():
+    # Live snippets arrive wrapped in a wordlim header, a Published/Crawled metadata run,
+    # private-use cite markers and (on opened pages) L-prefixed line numbers.
+    noisy = ("[wordlim: 200] Published: 2026-02-01; Crawled: 2026-02-03;\n"
+             "L16: The unit ships as KTL-7742-B.citeturn0search0†\n"
+             "L17: Firmware is 4.2.")
+    sink = []
+    _capture_web_search(sink, _searched(
+        [_result("Kettle docs", "https://example.com/one", noisy)],
+        queries=["kettle model number"]))
+    output = sink[0]["output"]
+    assert output == ("query: kettle model number | read: Kettle docs — "
+                      "https://example.com/one: The unit ships as KTL-7742-B. "
+                      "Firmware is 4.2.")
+    assert "wordlim" not in output
+    assert "Published:" not in output and "Crawled:" not in output
+    assert "L16:" not in output and "L17:" not in output
+    assert "" not in output and "" not in output
+    assert "turn0search0" not in output
+
+
+def test_results_are_read_as_dicts_and_as_objects_alike():
+    dict_item = {"type": "web_search_call",
+                 "action": {"type": "open_page", "url": "https://example.com/docs/kettle"},
+                 "results": [{"type": "text_result", "title": "Kettle docs",
+                              "url": "https://example.com/docs/kettle",
+                              "snippet": "L1: Model KTL-7742-B."}]}
+    sink = []
+    _capture_web_search(sink, SimpleNamespace(
+        type="web_search_call",
+        action=SimpleNamespace(type="open_page", url="https://example.com/docs/kettle"),
+        results=[_result("Kettle docs", "https://example.com/docs/kettle",
+                         "L1: Model KTL-7742-B.")]))
+    _capture_web_search(sink, SimpleNamespace(**dict_item))
+    expected = ("opened: https://example.com/docs/kettle | read: Kettle docs — "
+                "https://example.com/docs/kettle: Model KTL-7742-B.")
+    assert sink == [{"tool_name": "web_search", "output": expected},
+                    {"tool_name": "web_search", "output": expected}]
+
+
+@pytest.mark.parametrize("results", [
+    None,                                                   # include not requested
+    [],                                                     # requested, nothing returned
+    [_result("Kettle docs", "https://example.com/one", "[wordlim: 200]")],  # cleans to empty
+])
+def test_entry_is_unchanged_when_there_is_nothing_readable(results):
+    # No results must leave the record byte-identical to the evidence-only capture.
+    sink = []
+    _capture_web_search(sink, _searched(results, queries=["kettle model number"]))
+    assert sink == [{"tool_name": "web_search", "output": "query: kettle model number"}]
+
+
+# --------------------------------------------------------------- include list on the request
+
+_WEB_TOOL = {"type": "web_search"}
+
+
+def test_request_includes_is_none_when_neither_sink_is_collecting():
+    assert _request_includes(None, None, [_WEB_TOOL]) is None
+
+
+def test_request_includes_asks_only_for_reasoning_without_the_results_sink():
+    assert _request_includes([], None, [_WEB_TOOL]) == ["reasoning.encrypted_content"]
+
+
+def test_request_includes_asks_for_both_when_web_search_is_on_the_request():
+    assert _request_includes([], [], [{"type": "code_interpreter"}, _WEB_TOOL]) == [
+        "reasoning.encrypted_content", "web_search_call.results"]
+    # Tools arrive as objects on some paths, and the type is a prefix, not an exact match.
+    assert _request_includes(None, [], [SimpleNamespace(type="web_search_preview")]) == [
+        "web_search_call.results"]
+
+
+def test_request_includes_skips_results_when_no_web_search_tool_is_sent():
+    assert _request_includes([], [], [{"type": "code_interpreter"}]) == [
+        "reasoning.encrypted_content"]
+    assert _request_includes([], [], None) == ["reasoning.encrypted_content"]

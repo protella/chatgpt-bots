@@ -1156,7 +1156,13 @@ class SlackSettingsHandlersMixin(_Host):
         
         # Register modal action handlers (for dynamic updates)
         @self.app.action("model_select")
-        @self.app.action("image_model")  # Reshapes modal (filters background options, hides input_fidelity on v2)
+        @self.app.action("image_model")  # Reshapes modal (quality ladder, tier visibility, fidelity)
+        # Shape and tier are re-renders, not ack-only: the resolution readout underneath them has
+        # to change with whichever one the user just moved. These are section ACCESSORIES, which
+        # already emit interactions — `dispatch_action` is an input-block field and is not valid
+        # on a section block, so it appears nowhere here.
+        @self.app.action("image_ratio")
+        @self.app.action("image_tier")
         @track_ingress
         async def handle_model_change(ack, body, client):
             """Handle model selection changes for dynamic modal updates"""
@@ -1510,6 +1516,7 @@ class SlackSettingsHandlersMixin(_Host):
         @self.app.action("image_size")
         @self.app.action("image_quality")
         @self.app.action("image_background")
+        @self.app.action("service_tier")
         @track_ingress
         async def handle_modal_actions(ack):
             """Acknowledge modal actions that don't need processing"""

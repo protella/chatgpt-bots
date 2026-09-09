@@ -2,11 +2,80 @@
 User Settings Modal for Slack Bot
 Handles the interactive settings configuration interface
 """
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
+
+from message_processor.image_service import SHAPE_TIER_SIZES
 from config import config
 from logger import LoggerMixin
 import json
+import re
 import uuid
+
+
+# The shape × tier grid lives in image_service (it resolves model-chosen shapes at call time
+# too); this is the same object, not a copy.
+_SHAPE_TIER_SIZES = SHAPE_TIER_SIZES
+
+def _aspect_label(w: int, h: int) -> Optional[str]:
+    """The aspect ratio a size is known by, or None when it has no readable name.
+
+    Only the ratios people actually say out loud [OWNER 2026-09-09: "1:1, 4:3, 16:9, etc."]: a
+    grid cell answers with its shape key (1920x1088 is the `16:9` cell even though the /16 snap
+    makes it 1.76:1 exactly), and any other size snaps to the nearest named ratio when it is
+    within a few percent of one. Nothing is ever reduced by arithmetic — `17:11` is not a name."""
+    key = f"{w}x{h}"
+    for shape, row in _SHAPE_TIER_SIZES.items():
+        if key in row.values():
+            return shape
+    actual = w / h
+    best: Optional[str] = None
+    best_err = 0.03  # 3%: 1920x1088 is 1.6% off 16:9, 1200x800 is exactly 3:2
+    for name in _FRIENDLY_RATIOS:
+        a, b = (int(t) for t in name.split(":"))
+        err = abs(actual - a / b) / (a / b)
+        if err < best_err:
+            best, best_err = name, err
+    return best
+
+
+# The ratios a person recognises, both orientations. Order matters only for tie-breaks, which
+# the 3% tolerance makes practically impossible between neighbours this far apart.
+_FRIENDLY_RATIOS: Tuple[str, ...] = (
+    "1:1", "4:3", "3:4", "3:2", "2:3", "16:9", "9:16", "16:10", "10:16", "5:4", "4:5",
+    "21:9", "9:21", "2:1", "1:2", "3:1", "1:3",
+)
+
+
+# Display order for the shape select. `auto` first because it is the "let the model decide" answer.
+_IMAGE_SHAPES: Tuple[Tuple[str, str], ...] = (
+    ("auto", "Auto"),
+    ("1:1", "Square (1:1)"),
+    ("3:2", "Landscape (3:2)"),
+    ("2:3", "Portrait (2:3)"),
+    ("16:9", "Widescreen (16:9)"),
+    ("9:16", "Tall (9:16)"),
+    ("3:1", "Panorama (3:1)"),
+    ("1:3", "Skyscraper (1:3)"),
+)
+
+# No pixel counts in the labels — the resolution rides the context line underneath instead.
+_IMAGE_TIERS: Tuple[Tuple[str, str], ...] = (
+    ("standard", "Standard"),
+    ("large", "Large — more detail"),
+    # PULLED 2026-09-09 by the owner, with the `max` column of `image_service.SHAPE_TIER_SIZES`
+    # and the 4K half of the custom-size envelope. OpenAI's image guide says "Resolutions above
+    # 2560x1440 are experimental"
+    # (https://developers.openai.com/api/docs/guides/image-generation), and at those sizes
+    # `quality=high` renders visible mesh artifacts (measured 2026-09-09). Restore when the docs
+    # drop the experimental label:
+    #     ("max", "Maximum — 4K"),
+)
+
+# gpt-image-1 takes only the three named sizes, which are exactly the `standard` column of three
+# shapes. It gets no tier select at all, so the other four shapes have nothing to resolve to.
+_V1_SHAPES: Tuple[str, ...] = ("auto", "1:1", "3:2", "2:3")
+
+_WXH_RE = re.compile(r"^(\d{2,4})x(\d{2,4})$")
 
 
 class SettingsModal(LoggerMixin):
@@ -539,18 +608,22 @@ class SettingsModal(LoggerMixin):
         The channel modal's bargain, for one person's own store: one multiline textarea, one note
         per line, edit or delete lines and Save to reconcile against the open-time seed.
 
-        THE CHECKBOX IS NOT REDUNDANT. The textarea is seeded only up to `_MEMORY_TEXTAREA_MAX`
-        and the reconciler deletes only rows it seeded, so blanking the box forgets what was
-        SHOWN and silently keeps everything past the budget — a delete affordance that quietly
-        under-delivers on "forget everything". The checkbox is wired to a full-store delete, which
-        is the only control that means what it says. `list_facts` is where anything past the
-        budget can still be read in full.
+        THE CHECKBOX APPEARS ONLY WHEN THE BOX COULD NOT SHOW EVERYTHING. Blanking the box
+        already forgets everything that was shown, so with nothing hidden the checkbox would say
+        twice what the empty textarea already says. Past `_MEMORY_TEXTAREA_MAX` that stops being
+        true: the reconciler deletes only rows it seeded, so blanking a truncated box silently
+        keeps the rest — a delete affordance that quietly under-delivers on "forget everything".
+        That is the case the checkbox is for, wired to a full-store delete. `list_facts` is where
+        anything past the budget can still be read in full.
         """
         memory_input: Dict[str, Any] = {
             "type": "plain_text_input", "action_id": self.USER_MEMORY_ACTION,
             "multiline": True, "max_length": self._MEMORY_TEXTAREA_MAX,
-            "placeholder": {"type": "plain_text",
-                            "text": "e.g. Prefers short answers with the code first."},
+            "placeholder": {
+                "type": "plain_text",
+                "text": ("e.g. Prefers short answers with the code first.\n\n"
+                         "One note per line. Private to your DMs — never shown in channels."),
+            },
         }
         # Slack rejects an empty initial_value, so only set it when there's something to seed.
         if textarea_value:
@@ -561,31 +634,30 @@ class SettingsModal(LoggerMixin):
              "text": {"type": "mrkdwn", "text": "*What I remember about you*"}},
             {"type": "input", "block_id": self.USER_MEMORY_BLOCK, "optional": True,
              "element": memory_input,
-             "label": {"type": "plain_text", "text": "Personal memory"},
-             "hint": {"type": "plain_text",
-                      "text": "One note per line. Private to your DMs — never shown in channels."}},
+             "label": {"type": "plain_text", "text": "Personal memory"}},
         ]
         if hidden_count > 0:
             blocks.append({"type": "context", "elements": [
                 {"type": "mrkdwn", "text": f"_+{hidden_count} more not shown_"}]})
 
-        forget_option = {
-            "text": {"type": "plain_text", "text": "Forget everything, including items not shown"},
-            "value": self.USER_MEMORY_FORGET_VALUE,
-        }
-        forget_element: Dict[str, Any] = {
-            "type": "checkboxes", "action_id": self.USER_MEMORY_FORGET_ACTION,
-            "options": [forget_option],
-        }
-        if forget_all:
-            forget_element["initial_options"] = [forget_option]
-        blocks.append({
-            "type": "input", "block_id": self.USER_MEMORY_FORGET_BLOCK, "optional": True,
-            "element": forget_element,
-            "label": {"type": "plain_text", "text": "Clear personal memory"},
-            "hint": {"type": "plain_text",
-                     "text": "Deletes every note above and any beyond what fits here. No undo."},
-        })
+            forget_option = {
+                "text": {"type": "plain_text",
+                         "text": "Forget everything, including items not shown"},
+                "value": self.USER_MEMORY_FORGET_VALUE,
+            }
+            forget_element: Dict[str, Any] = {
+                "type": "checkboxes", "action_id": self.USER_MEMORY_FORGET_ACTION,
+                "options": [forget_option],
+            }
+            if forget_all:
+                forget_element["initial_options"] = [forget_option]
+            blocks.append({
+                "type": "input", "block_id": self.USER_MEMORY_FORGET_BLOCK, "optional": True,
+                "element": forget_element,
+                "label": {"type": "plain_text", "text": "Clear personal memory"},
+                "hint": {"type": "plain_text",
+                         "text": "Deletes every note above and any beyond what fits here. No undo."},
+            })
         blocks.append({"type": "divider"})
         return blocks
 
@@ -715,6 +787,7 @@ class SettingsModal(LoggerMixin):
                 }]
             })
         # Model selection (always shown)
+        from config import SUPPORTED_CHAT_MODELS
         blocks.append({
             "type": "section",
             "block_id": "model_block",
@@ -731,14 +804,19 @@ class SettingsModal(LoggerMixin):
                     "text": {"type": "plain_text", "text": self._get_model_display_name(selected_model)},
                     "value": selected_model
                 },
+                # Built from the same constant `selected_model` is coerced against. Hard-coding
+                # this list is how a newly supported model becomes a legal `initial_option` that
+                # is absent from `options` — Slack rejects the entire view for that.
                 "options": [
-                    {"text": {"type": "plain_text", "text": "GPT-5.6 Sol (Flagship)"}, "value": "gpt-5.6-sol"},
-                    {"text": {"type": "plain_text", "text": "GPT-5.6 Terra (Balanced)"}, "value": "gpt-5.6-terra"},
-                    {"text": {"type": "plain_text", "text": "GPT-5.6 Luna (Fast)"}, "value": "gpt-5.6-luna"},
-                    {"text": {"type": "plain_text", "text": "GPT-5.5"}, "value": "gpt-5.5"}
+                    {"text": {"type": "plain_text", "text": self._get_model_display_name(m)},
+                     "value": m}
+                    for m in SUPPORTED_CHAT_MODELS
                 ]
             }
         })
+
+        # Fast service tier — personal scope only, never written into a thread config.
+        blocks.extend(self._fast_tier_blocks(settings, selected_model, scope))
 
         blocks.append({"type": "divider"})
 
@@ -750,6 +828,56 @@ class SettingsModal(LoggerMixin):
 
         return blocks
     
+    def _fast_tier_blocks(self, settings: Dict, selected_model: str,
+                          scope: Optional[str]) -> List[Dict]:
+        """The fast-service-tier control, or the context line that stands in for it.
+
+        Slack has NO disabled form control, so "greyed out" is rendered as *no control at all* —
+        a context block saying why. A checkbox that visibly rejects the click is worse, and Slack
+        fights it.
+
+        Rendered ONLY in the global/personal scope. `service_tier` is a personal setting: a
+        channel is not one person, and thread settings are whole-document replacements
+        (`save_thread_config_async` replaces `config_json` outright), so a hidden checkbox in the
+        thread modal would silently delete a stored opt-in.
+        """
+        if scope != 'global':
+            return []
+
+        from config import FAST_SERVICE_TIER_MODELS
+
+        def _context(text: str) -> Dict[str, Any]:
+            return {"type": "context", "elements": [{"type": "mrkdwn", "text": text}]}
+
+        # The admin gate. `standard` means no user may turn fast on, whatever their model.
+        if config.openai_service_tier != 'fast':
+            return [_context("⚡ *Fast responses* — Disabled by your system administrator.")]
+
+        if selected_model not in FAST_SERVICE_TIER_MODELS:
+            name = self._get_model_display_name(selected_model)
+            return [_context(f"⚡ *Fast responses* — not available on {name}.")]
+
+        option = {
+            "text": {"type": "mrkdwn", "text": "⚡ *Fast responses*\nUp to 2x faster."},
+            "value": "fast"
+        }
+        accessory: Dict[str, Any] = {
+            "type": "checkboxes",
+            "action_id": "service_tier",
+            "options": [option]
+        }
+        # Slack wants the array omitted entirely rather than empty, and the initial option must be
+        # the same object that appears in `options`.
+        if settings.get('service_tier') == 'fast':
+            accessory["initial_options"] = [option]
+
+        return [{
+            "type": "section",
+            "block_id": "service_tier_block",
+            "text": {"type": "mrkdwn", "text": "Response speed:"},
+            "accessory": accessory
+        }]
+
     def _add_gpt55_settings(self, settings: Dict, selected_model: str = 'gpt-5.6-sol') -> List[Dict]:
         """Add model-specific settings blocks (reasoning ladder, temp/top_p when reasoning=none).
 
@@ -764,12 +892,15 @@ class SettingsModal(LoggerMixin):
             web_search_enabled = True
         self.log_debug(f"Settings passed to _add_gpt55_settings: enable_web_search={settings.get('enable_web_search')}, evaluated as {web_search_enabled}")
 
-        from config import config, clamp_effort, GPT56_EFFORTS, GPT55_EFFORTS
+        from config import config, clamp_effort, effort_ladder
         current_reasoning = settings.get('reasoning_effort', 'none')
         self.log_debug(f"Building reasoning options for {selected_model}, current: {current_reasoning}")
 
-        # Build options list per model family
-        effort_values = GPT56_EFFORTS if selected_model.startswith('gpt-5.6') else GPT55_EFFORTS
+        # ONE definition of the ladder, shared with the resolver. This used to read the raw
+        # constants and treat anything that was not 5.6 as 5.5, which offered GPT-6 an effort of
+        # `none` — a value that 400s. Advertising a choice the submit-time clamp then silently
+        # overwrites is the exact disagreement `effort_ladder` exists to end.
+        effort_values = effort_ladder(selected_model)
         reasoning_options = [
             {"text": {"type": "plain_text", "text": self._get_reasoning_display(v)}, "value": v}
             for v in effort_values
@@ -784,7 +915,7 @@ class SettingsModal(LoggerMixin):
             old_reasoning = current_reasoning
             current_reasoning = clamp_effort(selected_model, current_reasoning)
             if current_reasoning not in available_values:
-                current_reasoning = 'none'
+                current_reasoning = clamp_effort(selected_model, config.default_reasoning_effort)
             self.log_warning(f"Current reasoning '{old_reasoning}' not in available options, clamped to '{current_reasoning}'")
 
         # Build the reasoning block
@@ -811,7 +942,9 @@ class SettingsModal(LoggerMixin):
             self.log_debug(f"Set initial_option for reasoning: {current_reasoning}")
         else:
             if available_values:
-                default_value = 'none'
+                # This branch runs when Slack fails to report a selection. `'none'` is not a legal
+                # GPT-6 value, so the workspace default (clamped to the model) stands in instead.
+                default_value = clamp_effort(selected_model, config.default_reasoning_effort)
                 reasoning_block["accessory"]["initial_option"] = {
                     "text": {"type": "plain_text", "text": self._get_reasoning_display(default_value)},
                     "value": default_value
@@ -895,6 +1028,172 @@ class SettingsModal(LoggerMixin):
         blocks.append({"type": "divider"})
         return blocks
 
+    @staticmethod
+    def image_size_for(shape: str, tier: str) -> str:
+        """Resolve a (shape, tier) pair to what gets stored in `image_size`.
+
+        `auto` stores the literal "auto" — the tier is ignored, exactly as it is ignored at
+        render time. A shape that is already a WxH is the synthetic "Custom: …" option coming
+        back unchanged, and passes straight through.
+        """
+        if shape == "auto":
+            return "auto"
+        row = _SHAPE_TIER_SIZES.get(shape)
+        if row is None:
+            return shape if _WXH_RE.match(shape) else "auto"
+        return row.get(tier) or row["standard"]
+
+    @staticmethod
+    def shape_tier_for(size: str, shapes: Sequence[str], tiers: Sequence[str],
+                       tier: Optional[str] = None) -> Optional[Tuple[str, str]]:
+        """Reverse-map a stored `image_size` onto the controls CURRENTLY rendered.
+
+        None means the stored value is not producible by those controls — an off-grid legacy
+        size, a size the model chose on an earlier turn, or a grid size carried onto
+        gpt-image-1 — and the caller injects the synthetic option for it.
+
+        Under Auto the shape is the model's to pick but the TIER is still the person's, so the
+        saved `image_tier` is what comes back rather than a hard-coded "standard" — that is the
+        bug this parameter exists to fix.
+
+        A legacy `max` — saved before the 4K tier was pulled — maps to `large` BEFORE any
+        default is consulted, matching `image_service.user_defaults`. The two disagreeing is a
+        real bug, not cosmetics: under `DEFAULT_IMAGE_TIER=standard` the modal showed Standard
+        while the renderer used Large, and saving the view wrote the downgrade back. Any other
+        tier the rendered controls cannot offer falls back to the configured default (itself put
+        through the same `max` mapping) and then to what the controls do offer — on gpt-image-1
+        only `standard` is rendered, so that wins. Returning a tier that is not in `tiers` would
+        put an initial_option outside its own option list, which Slack rejects for the whole view.
+        """
+        if size == "auto":
+            default_tier = getattr(config, "default_image_tier", "large")
+            if default_tier == "max":
+                default_tier = "large"
+            if tier == "max" and "large" in tiers:
+                tier = "large"
+            if tier not in tiers:
+                tier = default_tier if default_tier in tiers else (
+                    tiers[0] if tiers else "standard")
+            return ("auto", str(tier))
+        for shape in shapes:
+            row = _SHAPE_TIER_SIZES.get(shape) or {}
+            for tier in tiers:
+                if row.get(tier) == size:
+                    return (shape, tier)
+        return None
+
+    @staticmethod
+    def _resolution_line(size: str, tier: Optional[str] = None) -> str:
+        """The context line under the size controls: the pixel size and, when it has a name, the
+        aspect ratio. No pixel counts — the owner ruled them noise (2026-09-09).
+
+        Under Auto there is no single resolution to state, but the tier still applies to whatever
+        shape the model picks, so the line names the tier and shows the 16:9 cell as the example.
+        `tier` is None on models that render no tier select at all (gpt-image-1).
+        """
+        if (size or "") == "auto" and tier:
+            label = dict(_IMAGE_TIERS).get(tier, tier).split(" —")[0]
+            example = (_SHAPE_TIER_SIZES.get("16:9") or {}).get(tier)
+            if example:
+                ex_w, ex_h = example.split("x")
+                return (f"_Resolution: chosen per image at {label} "
+                        f"(e.g. {ex_w} × {ex_h} for 16:9)_")
+            return f"_Resolution: chosen per image at {label}_"
+        match = _WXH_RE.match(size or "")
+        if not match:
+            return "_Resolution: chosen by the model_"
+        w, h = int(match.group(1)), int(match.group(2))
+        ratio = _aspect_label(w, h)
+        return f"_Resolution: {w} × {h} · {ratio}_" if ratio else f"_Resolution: {w} × {h}_"
+
+    def _image_size_blocks(self, settings: Dict, supports_custom_sizes: bool) -> List[Dict]:
+        """Shape (+ size tier, where the model takes custom sizes) and the resolution readout.
+
+        Storage is unchanged: `image_size` still holds a resolved WxH or "auto". These two
+        controls are only how a person picks one without being shown pixel arithmetic.
+        """
+        shape_keys = [s for s, _ in _IMAGE_SHAPES] if supports_custom_sizes else list(_V1_SHAPES)
+        tier_keys = [t for t, _ in _IMAGE_TIERS] if supports_custom_sizes else ["standard"]
+
+        stored_size = str(settings.get('image_size') or 'auto')
+        stored_tier = settings.get('image_tier')
+        match = self.shape_tier_for(stored_size, shape_keys, tier_keys,
+                                    str(stored_tier) if stored_tier else None)
+
+        # SYNTHETIC OPTION. Slack rejects the whole view when `initial_option` is not also in
+        # `options`, so the same dict OBJECT is used in both places rather than two equal copies.
+        # The tier the select opens on when the stored size does not name one itself: the saved
+        # `image_tier`, coerced to what these controls offer. It must not silently become
+        # "standard", because the tier select is extracted on submit whatever the shape is, and
+        # a person with a custom size would lose their saved tier just by opening the modal.
+        _, fallback_tier = cast(Tuple[str, str],
+                                self.shape_tier_for("auto", shape_keys, tier_keys,
+                                                    str(stored_tier) if stored_tier else None))
+
+        synthetic: Optional[Dict[str, Any]] = None
+        if match is not None:
+            shape, tier = match
+        elif _WXH_RE.match(stored_size):
+            w, h = stored_size.split('x')
+            ratio = _aspect_label(int(w), int(h))
+            label = f"Custom: {w} × {h}" + (f" ({ratio})" if ratio else "")
+            synthetic = {"text": {"type": "plain_text", "text": label}, "value": stored_size}
+            shape, tier = stored_size, fallback_tier
+        else:
+            # Not a size at all (a value from a schema that never existed). Fall back to auto.
+            shape, tier = "auto", fallback_tier
+
+        shape_options: List[Dict[str, Any]] = [
+            {"text": {"type": "plain_text", "text": label}, "value": key}
+            for key, label in _IMAGE_SHAPES if key in shape_keys
+        ]
+        if synthetic is not None:
+            shape_options.insert(0, synthetic)
+            initial_shape = synthetic
+        else:
+            initial_shape = next(o for o in shape_options if o["value"] == shape)
+
+        blocks: List[Dict[str, Any]] = [{
+            "type": "section",
+            "block_id": "image_ratio_block",
+            "text": {"type": "mrkdwn", "text": "Image shape:"},
+            "accessory": {
+                "type": "static_select",
+                "action_id": "image_ratio",
+                "placeholder": {"type": "plain_text", "text": "Select shape"},
+                "initial_option": initial_shape,
+                "options": shape_options
+            }
+        }]
+
+        if supports_custom_sizes:
+            tier_options: List[Dict[str, Any]] = [
+                {"text": {"type": "plain_text", "text": label}, "value": key}
+                for key, label in _IMAGE_TIERS
+            ]
+            initial_tier = next(o for o in tier_options if o["value"] == tier)
+            blocks.append({
+                "type": "section",
+                "block_id": "image_tier_block",
+                "text": {"type": "mrkdwn", "text": "Size:"},
+                "accessory": {
+                    "type": "static_select",
+                    "action_id": "image_tier",
+                    "placeholder": {"type": "plain_text", "text": "Select size"},
+                    "initial_option": initial_tier,
+                    "options": tier_options
+                }
+            })
+
+        blocks.append({
+            "type": "context",
+            "elements": [{"type": "mrkdwn",
+                          "text": self._resolution_line(
+                              self.image_size_for(shape, tier),
+                              tier if supports_custom_sizes else None)}]
+        })
+        return blocks
+
     def _add_common_settings(self, settings: Dict,
                             user_memory: Optional[Dict[str, Any]] = None) -> List[Dict]:
         """Add settings common to all models"""
@@ -928,10 +1227,6 @@ class SettingsModal(LoggerMixin):
             "label": {
                 "type": "plain_text",
                 "text": "How would you like the AI to respond? (Custom GPT Instructions)"
-            },
-            "hint": {
-                "type": "plain_text",
-                "text": "Tell the AI your preferences for tone, format, or style"
             },
             "optional": True
         })
@@ -990,20 +1285,24 @@ class SettingsModal(LoggerMixin):
         block_id = "features_block_gpt5"
         action_id = "features_with_mcp"
 
-        features_block: Dict[str, Any] = {
-            "type": "section",
-            "block_id": block_id,
-            "text": {"type": "mrkdwn", "text": "Enable features:"},
-            "accessory": {
-                "type": "checkboxes",
-                "action_id": action_id,
-                "options": feature_options
-            }
+        # An `actions` block, not a `section` + accessory: the *Features* header above already
+        # names this group, and a section must carry text, so the redundant "Enable features:"
+        # label is what forced the section shape. Ids stay byte-identical either way.
+        checkboxes: Dict[str, Any] = {
+            "type": "checkboxes",
+            "action_id": action_id,
+            "options": feature_options
         }
 
         # Only add initial_options if we have some (Slack requires array or omitted entirely)
         if initial_options:
-            features_block["accessory"]["initial_options"] = initial_options
+            checkboxes["initial_options"] = initial_options
+
+        features_block: Dict[str, Any] = {
+            "type": "actions",
+            "block_id": block_id,
+            "elements": [checkboxes]
+        }
 
         blocks.append(features_block)
 
@@ -1047,34 +1346,18 @@ class SettingsModal(LoggerMixin):
             }
         })
 
-        # Image size (orientation)
-        selected_image_size = self._coerce_choice(
-            settings.get('image_size', '1024x1024'),
-            {'1024x1024', '1024x1536', '1536x1024', 'auto'}, '1024x1024')
-        blocks.append({
-            "type": "section",
-            "block_id": "image_size_block",
-            "text": {"type": "mrkdwn", "text": "Image orientation:"},
-            "accessory": {
-                "type": "static_select",
-                "action_id": "image_size",
-                "placeholder": {"type": "plain_text", "text": "Select size"},
-                "initial_option": {
-                    "text": {"type": "plain_text", "text": self._get_image_size_display(selected_image_size)},
-                    "value": selected_image_size
-                },
-                "options": [
-                    {"text": {"type": "plain_text", "text": "Square 1:1"}, "value": "1024x1024"},
-                    {"text": {"type": "plain_text", "text": "Portrait 2:3"}, "value": "1024x1536"},
-                    {"text": {"type": "plain_text", "text": "Landscape 3:2"}, "value": "1536x1024"},
-                    {"text": {"type": "plain_text", "text": "Auto"}, "value": "auto"}
-                ]
-            }
-        })
+        # Image shape and size tier. The pair resolves to the single stored `image_size` (a WxH
+        # or "auto") on submit and is reverse-mapped from it here — no schema change.
+        from message_processor.image_service import (backgrounds_for, qualities_for,
+                                                     supports_custom_sizes,
+                                                     supports_input_fidelity)
+        custom_sizes = supports_custom_sizes(selected_image_model)
+        blocks.extend(self._image_size_blocks(settings, custom_sizes))
 
-        # Image quality
+        # Image quality — the legal set is per-model (the 2.5 family adds `xhigh` and `max`).
+        legal_qualities = qualities_for(selected_image_model)
         selected_image_quality = self._coerce_choice(
-            settings.get('image_quality', 'auto'), {'auto', 'low', 'medium', 'high'}, 'auto')
+            settings.get('image_quality', 'auto'), set(legal_qualities), 'auto')
         blocks.append({
             "type": "section",
             "block_id": "image_quality_block",
@@ -1088,26 +1371,24 @@ class SettingsModal(LoggerMixin):
                     "value": selected_image_quality
                 },
                 "options": [
-                    {"text": {"type": "plain_text", "text": "Auto"}, "value": "auto"},
-                    {"text": {"type": "plain_text", "text": "Low (Faster, cheaper)"}, "value": "low"},
-                    {"text": {"type": "plain_text", "text": "Medium (Balanced)"}, "value": "medium"},
-                    {"text": {"type": "plain_text", "text": "High (Best quality)"}, "value": "high"}
+                    {"text": {"type": "plain_text", "text": self._get_image_quality_display(q)},
+                     "value": q}
+                    for q in legal_qualities
                 ]
             }
         })
 
-        # Image background — filter unsupported options based on image model
-        # gpt-image-2 does not support transparent backgrounds
-        is_image_v2 = selected_image_model.startswith('gpt-image-2')
+        # Image background — read from the capability table, which says every model takes all
+        # three (transparent + png returns 200 on gpt-image-2; the belief that it did not was
+        # wrong, and it cost users the option on what was then the default model).
+        legal_backgrounds = backgrounds_for(selected_image_model)
         background_options = [
-            {"text": {"type": "plain_text", "text": "Auto"}, "value": "auto"},
-            {"text": {"type": "plain_text", "text": "Opaque"}, "value": "opaque"},
+            {"text": {"type": "plain_text", "text": self._get_image_background_display(b)},
+             "value": b}
+            for b in legal_backgrounds
         ]
-        if not is_image_v2:
-            background_options.insert(1, {"text": {"type": "plain_text", "text": "Transparent"}, "value": "transparent"})
 
-        # Coerce the saved value against the visible options: 'transparent' vanishes under v2, and
-        # any fully-stale value falls back to 'auto', so initial_option always matches an option.
+        # Coerce the saved value against the visible options, so initial_option always matches.
         saved_background = self._coerce_choice(
             settings.get('image_background', 'auto'),
             {opt['value'] for opt in background_options}, 'auto')
@@ -1128,8 +1409,9 @@ class SettingsModal(LoggerMixin):
             }
         })
 
-        # Input fidelity for edits — hidden on gpt-image-2 (model auto-handles fidelity)
-        if not is_image_v2:
+        # Input fidelity for edits — only gpt-image-1 takes the parameter; the 2.x models 400 on
+        # it, so they get no control (they handle fidelity themselves).
+        if supports_input_fidelity(selected_image_model):
             selected_input_fidelity = self._coerce_choice(
                 settings.get('input_fidelity', 'high'), {'high', 'low'}, 'high')
             blocks.append({
@@ -1279,12 +1561,22 @@ class SettingsModal(LoggerMixin):
             else:
                 extracted['custom_instructions'] = None
         
-        # Image settings
-        image_size_block = values.get('image_size_block', {})
-        if 'image_size' in image_size_block:
-            selected = image_size_block['image_size'].get('selected_option')
+        # Image settings. Shape and size tier are two controls that resolve to the ONE stored
+        # `image_size` key; the tier block is absent on models without custom sizes, and
+        # `standard` is then the only column that exists.
+        ratio_block = values.get('image_ratio_block', {})
+        tier_block = values.get('image_tier_block', {})
+        tier_selected = (tier_block.get('image_tier') or {}).get('selected_option') or {}
+        if 'image_ratio' in ratio_block:
+            selected = ratio_block['image_ratio'].get('selected_option')
             if selected:
-                extracted['image_size'] = selected['value']
+                extracted['image_size'] = self.image_size_for(
+                    selected['value'], tier_selected.get('value') or 'standard')
+        # The tier is stored in its OWN key as well, independently of the shape: under Auto the
+        # shape resolves to the literal "auto" and the tier is the only thing left carrying the
+        # person's size choice through to render time.
+        if tier_selected.get('value'):
+            extracted['image_tier'] = tier_selected['value']
 
         image_quality_block = values.get('image_quality_block', {})
         if 'image_quality' in image_quality_block:
@@ -1315,7 +1607,16 @@ class SettingsModal(LoggerMixin):
             selected = vision_block['vision_detail'].get('selected_option')
             if selected:
                 extracted['vision_detail'] = selected['value']
-        
+
+        # Fast service tier. The block exists only in the global scope and only when the admin
+        # gate is on and the model is eligible; anywhere else its absence leaves the stored value
+        # alone (global preference updates are partial).
+        service_tier_block = values.get('service_tier_block', {})
+        if 'service_tier' in service_tier_block:
+            selected_options = service_tier_block['service_tier'].get('selected_options') or []
+            extracted['service_tier'] = (
+                'fast' if any(o.get('value') == 'fast' for o in selected_options) else 'standard')
+
         return extracted
     
     def validate_settings(self, settings: Dict) -> Dict:
@@ -1353,16 +1654,25 @@ class SettingsModal(LoggerMixin):
             validated.pop('temperature', None)
             validated.pop('top_p', None)
 
+        # Same treatment for the fast tier: only some models honour it, and a value saved against
+        # an ineligible model would buy nothing while looking like it had been granted.
+        from config import FAST_SERVICE_TIER_MODELS
+        if model not in FAST_SERVICE_TIER_MODELS:
+            validated.pop('service_tier', None)
+
         return validated
     
     # Helper methods for display names
     def _get_model_display_name(self, model: str) -> str:
         """Get user-friendly model name"""
         display_names = {
-            'gpt-5.6-sol': 'GPT-5.6 Sol (Flagship)',
-            'gpt-5.6-terra': 'GPT-5.6 Terra (Balanced)',
-            'gpt-5.6-luna': 'GPT-5.6 Luna (Fast)',
-            'gpt-5.5': 'GPT-5.5',
+            # Taglines follow OpenAI's own model classification (developers.openai.com/api/docs/models
+            # and learn.chatgpt.com/docs/models, read 2026-09-09), shortened to fit a picker row.
+            'gpt-6-astra': 'GPT-6 Astra (Most capable)',
+            'gpt-5.6-sol': 'GPT-5.6 Sol (Complex professional work)',
+            'gpt-5.6-terra': 'GPT-5.6 Terra (Balanced, everyday work)',
+            'gpt-5.6-luna': 'GPT-5.6 Luna (Fast and affordable)',
+            'gpt-5.5': 'GPT-5.5 (Previous generation)',
         }
         return display_names.get(model, model)
     
@@ -1399,14 +1709,25 @@ class SettingsModal(LoggerMixin):
         return value if value in valid else default
 
     def _get_image_size_display(self, size: str) -> str:
-        """Get display name for image size"""
-        displays = {
-            '1024x1024': 'Square 1:1',
-            '1024x1536': 'Portrait 2:3',
-            '1536x1024': 'Landscape 3:2',
-            'auto': 'Auto'
-        }
-        return displays.get(size, 'Square 1:1')
+        """A stored `image_size` in the vocabulary the modal now speaks.
+
+        A grid value reads as its shape and tier with the pixels in brackets
+        ("Widescreen · Large (1920 × 1088)"); anything off-grid keeps its raw dimensions.
+        """
+        if not size or size == 'auto':
+            return 'Auto'
+        shape_labels = dict(_IMAGE_SHAPES)
+        tier_labels = dict(_IMAGE_TIERS)
+        match = self.shape_tier_for(size, [s for s, _ in _IMAGE_SHAPES],
+                                    [t for t, _ in _IMAGE_TIERS])
+        wxh = _WXH_RE.match(size)
+        pixels = f"{wxh.group(1)} × {wxh.group(2)}" if wxh else size
+        if match is None:
+            return f"Custom ({pixels})"
+        shape, tier = match
+        # The emoji belongs on the select option, not in a one-line summary.
+        label = shape_labels.get(shape, shape).split(' ', 1)[-1]
+        return f"{label} · {tier_labels.get(tier, tier).split(' —')[0]} ({pixels})"
     
     def _get_fidelity_display(self, fidelity: str) -> str:
         """Get display name for input fidelity"""
@@ -1427,11 +1748,16 @@ class SettingsModal(LoggerMixin):
 
     def _get_image_quality_display(self, quality: str) -> str:
         """Get display name for image quality"""
+        # Multipliers are MEASURED image-token counts relative to High (sunburst, three sizes,
+        # 2026-09-09); `auto` bills like Low on the 2.5 family. Owner asked for them on the
+        # picker so the cost of a click is visible where the click happens.
         displays = {
-            'auto': 'Auto',
-            'low': 'Low (Faster, cheaper)',
-            'medium': 'Medium (Balanced)',
-            'high': 'High (Best quality)'
+            'auto': 'Auto (≈ Low)',
+            'low': 'Low (0.1× cost)',
+            'medium': 'Medium (0.25× cost)',
+            'high': 'High (1× · default)',
+            'xhigh': 'Extra High (2× cost)',
+            'max': 'Maximum (4× cost)'
         }
         return displays.get(quality, 'Auto')
 
@@ -1447,8 +1773,12 @@ class SettingsModal(LoggerMixin):
     def _get_image_model_display_name(self, model: str) -> str:
         """Get user-friendly image model name"""
         displays = {
-            'gpt-image-2': 'GPT Image 2',
-            'gpt-image-1': 'GPT Image 1',
+            # Static-select rows truncate around 30 characters in Slack's dropdown, so these stay
+            # short; the longer classification lives in the tool descriptions, not the picker.
+            'gpt-image-2.5-flare': 'GPT-Image-2.5 Flare (Faster)',
+            'gpt-image-2.5-sunburst': 'GPT-Image-2.5 Sunburst (Best)',
+            'gpt-image-2': 'GPT-Image-2 (Legacy)',
+            'gpt-image-1': 'GPT-Image-1 (Legacy)',
             'gpt-image-1-mini': 'GPT Image 1 Mini',
         }
         return displays.get(model, model)

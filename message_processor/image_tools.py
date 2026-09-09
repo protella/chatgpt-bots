@@ -43,17 +43,12 @@ from message_processor.turn_runtime import (EffectRevoked, LaunchNotRecorded,
                                             mark_tool_launched as _mark_launched,
                                             run_effect as _run_effect)
 from message_processor.image_service import (
-    ALL_BACKGROUNDS,
-    FIDELITIES,
-    FORMATS,
-    NAMED_SIZES,
-    QUALITIES,
-    backgrounds_for,
+    SHAPES,
     defaults_sentence,
-    image_model_for,
-    is_v2,
+    normalize_size,
     resolve_settings,
-    supports_input_fidelity,
+    size_for_shape,
+    user_defaults,
 )
 
 logger = setup_logger(name="slack_bot.ImageTools")
@@ -97,54 +92,58 @@ def _reset_semaphore_for_tests() -> None:
 
 
 # --- schemas -----------------------------------------------------------------------------
+#
+# The image tools take NO settings arguments. The person's saved size, quality, background,
+# format and fidelity are what runs, and the model does not get to depart from them — it used
+# to, on any call, silently and without telling anyone. What the schemas still carry is the
+# work itself: what to draw, which images to edit, what to call the file.
+#
+# The ONE exception is `aspect`, and it is not a settings argument: a person whose saved shape
+# is Auto has delegated exactly that one thing, so the model names the shape and we render it
+# at their saved tier. Tier, quality, background, format and model stay out of reach.
 
-def _overrides_schema(thread_config: Dict[str, Any]) -> Dict[str, Any]:
-    """The option space for the SELECTED image model.
+_ASPECT_PROPERTY: Dict[str, Any] = {
+    "type": "string",
+    "enum": list(SHAPES),
+    "description": ("The shape this image wants, from the request or what it is for "
+                    "(a slide → 16:9, a phone wallpaper → 9:16, a portrait → 2:3). "
+                    "Used only when the person's saved shape is Auto."),
+}
 
-    Built per request, because the legal values differ by model: gpt-image-2 has no
-    transparent background and takes arbitrary WxH sizes. Advertising `transparent` and then
-    silently coercing it to `auto` would teach the model it got something it did not.
 
-    The image model itself is deliberately absent — it is the user's choice and the one hard
-    constraint, so the model cannot express a different one even by accident.
+def _aspect_is_delegated(thread_config: Optional[Dict[str, Any]]) -> bool:
+    """True when the person's saved shape is Auto, so the model picks it per request."""
+    return user_defaults(thread_config)["size"] == "auto"
+
+
+def _with_aspect(properties: Dict[str, Any], required: List[str],
+                 thread_config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """The per-thread parameters object, carrying `aspect` only when it is the model's to give.
+
+    A per-thread schema is already rebuilt per turn, so it can say the exact truth: with a
+    saved WxH the argument does not exist (offering an ignored knob is how a model learns to
+    argue with settings), and with a saved Auto it is REQUIRED — there is no shape without it.
     """
-    model = image_model_for(thread_config)
-    size: Dict[str, Any] = {
-        "type": "string",
-        "description": "Image dimensions.",
-    }
-    if is_v2(model):
-        size["description"] = (
-            f"Image dimensions: one of {', '.join(NAMED_SIZES)}, or a custom WxH. Each side "
-            "must be DIVISIBLE BY 16 (so 1920x1080 is invalid), between 256 and 3840 wide "
-            "and 256 and 2160 tall, and no more extreme than 3:1. For a 16:9 slide use "
-            "1536x864. A near-miss is snapped to the nearest valid size.")
-    else:
-        size["enum"] = list(NAMED_SIZES)
+    props = dict(properties)
+    req = list(required)
+    if _aspect_is_delegated(thread_config):
+        props["aspect"] = dict(_ASPECT_PROPERTY)
+        req.append("aspect")
+    return {"type": "object", "properties": props, "required": req,
+            "additionalProperties": False}
 
-    props: Dict[str, Any] = {
-        "size": size,
-        "quality": {"type": "string", "enum": list(QUALITIES),
-                    "description": "Rendering quality. Higher costs more and takes longer."},
-        "background": {"type": "string", "enum": backgrounds_for(model),
-                       "description": "Background treatment."},
-        "format": {"type": "string", "enum": list(FORMATS), "description": "Output file format."},
-    }
-    if supports_input_fidelity(model):
-        props["input_fidelity"] = {
-            "type": "string", "enum": ["low", "high"],
-            "description": ("Editing only: how closely to preserve the source image. "
-                            "'high' keeps faces/logos/layout intact."),
-        }
-    return {
-        "type": "object",
-        "description": ("Task-specific departures from the user's saved defaults. OMIT THIS "
-                        "ENTIRELY unless the task has a concrete reason to differ — a wide "
-                        "image for a title slide, an opaque background for print. Do not "
-                        "restate the defaults."),
-        "properties": props,
-        "additionalProperties": False,
-    }
+
+def _with_aspect_static(properties: Dict[str, Any], required: List[str]) -> Dict[str, Any]:
+    """The channel-surface parameters object: `aspect` always offered, never required.
+
+    The static surface is a function of the channel, not of the requester, so it cannot know
+    whose saved shape is Auto. It offers the argument to everyone and the executor decides —
+    ignoring it outright for anyone whose shape is saved.
+    """
+    props = dict(properties)
+    props["aspect"] = dict(_ASPECT_PROPERTY)
+    return {"type": "object", "properties": props, "required": list(required),
+            "additionalProperties": False}
 
 
 def get_generate_image_schema(thread_config: Dict[str, Any]) -> Dict[str, Any]:
@@ -164,25 +163,25 @@ def get_generate_image_schema(thread_config: Dict[str, Any]) -> Dict[str, Any]:
             "with code_interpreter; an image model would draw a convincing chart with "
             "invented values.\n\n"
             f"The user's saved image settings are: {defaults_sentence(thread_config)}. "
-            "They apply automatically.\n\n"
+            "They apply automatically and you do not change them. If the request plainly "
+            "cannot work at those settings you may mention it in a line, the way a colleague "
+            "would — rarely, and never as a check before making something.\n\n"
             "Say one short line to the user acknowledging you are making it (e.g. \"Making "
             "that now — it'll land here shortly.\"). Do not describe the image you are about "
             "to make; they will see it."
         ),
-        "parameters": {
-            "type": "object",
-            "properties": {
+        "parameters": _with_aspect(
+            {
                 "prompt": {
                     "type": "string",
                     "description": ("What the image should depict, in the user's terms. It is "
                                     "rewritten into a fuller prompt for you automatically — "
                                     "do not pad it with style boilerplate."),
                 },
-                "overrides": _overrides_schema(thread_config),
             },
-            "required": ["prompt"],
-            "additionalProperties": False,
-        },
+            ["prompt"],
+            thread_config,
+        ),
     }
 
 
@@ -202,20 +201,18 @@ def get_create_image_asset_schema(thread_config: Dict[str, Any]) -> Dict[str, An
             "If the user just wants an image, use generate_image instead — it does not block "
             "and it posts the image for you."
         ),
-        "parameters": {
-            "type": "object",
-            "properties": {
+        "parameters": _with_aspect(
+            {
                 "prompt": {"type": "string", "description": "What the image should depict."},
                 "filename": {
                     "type": "string",
                     "description": ("Filename to save it under in /mnt/data, e.g. "
                                     "'cover.png'. Use something your code can refer to."),
                 },
-                "overrides": _overrides_schema(thread_config),
             },
-            "required": ["prompt", "filename"],
-            "additionalProperties": False,
-        },
+            ["prompt", "filename"],
+            thread_config,
+        ),
     }
 
 
@@ -252,7 +249,6 @@ def get_edit_image_schema(thread_config: Dict[str, Any]) -> Optional[Dict[str, A
                     "type": "string",
                     "description": "The change to make, in the user's terms.",
                 },
-                "overrides": _overrides_schema(thread_config),
             },
             "required": ["source_image_ids", "prompt"],
             "additionalProperties": False,
@@ -271,57 +267,6 @@ def get_edit_image_schema(thread_config: Dict[str, Any]) -> Optional[Dict[str, A
 _STATIC_CATALOG_POINTER = ("Ids come from the tool-target catalogs in this turn's evidence, not "
                            "from memory. If the id you want is not listed there, say so instead "
                            "of guessing one.")
-
-
-def _overrides_schema_static() -> Dict[str, Any]:
-    """The SUPERSET option space: every option every image model accepts.
-
-    The legal subset depends on the configured image model, which is a channel fact the schema
-    is no longer allowed to encode. ``resolve_settings`` enforces it against the pinned
-    allowlist and names the legal values back when it drops an override.
-    """
-    return {
-        "type": "object",
-        "description": ("Task-specific departures from the saved image defaults. OMIT THIS "
-                        "ENTIRELY unless the task has a concrete reason to differ — a wide "
-                        "image for a title slide, an opaque background for print. Do not "
-                        "restate the defaults. Not every option below is legal on every image "
-                        "model: the evidence for this turn names the model in force and what "
-                        "it accepts, and an option it cannot honor is dropped and reported "
-                        "back rather than silently changed."),
-        "properties": {
-            "size": {
-                "type": "string",
-                "description": (
-                    f"Image dimensions: one of {', '.join(NAMED_SIZES)} on any model. The "
-                    "gpt-image-2 family also takes a custom WxH — each side DIVISIBLE BY 16 "
-                    "(so 1920x1080 is invalid), 256-3840 wide, 256-2160 tall, no more extreme "
-                    "than 3:1; for a 16:9 slide use 1536x864, and a near-miss is snapped to the "
-                    "nearest valid size. The gpt-image-1 family takes only the named sizes."),
-            },
-            "quality": {"type": "string", "enum": list(QUALITIES),
-                        "description": "Rendering quality. Higher costs more and takes longer."},
-            "background": {
-                "type": "string", "enum": list(ALL_BACKGROUNDS),
-                "description": ("Background treatment. 'transparent' is a gpt-image-1 family "
-                                "option only."),
-            },
-            "format": {"type": "string", "enum": list(FORMATS),
-                       "description": "Output file format."},
-            "compression": {
-                "type": "integer", "minimum": 0, "maximum": 100,
-                "description": ("Output compression for jpeg/webp, 0-100. Ignored for png, "
-                                "which is always lossless."),
-            },
-            "input_fidelity": {
-                "type": "string", "enum": list(FIDELITIES),
-                "description": ("Editing only: how closely to preserve the source image. 'high' "
-                                "keeps faces/logos/layout intact. The gpt-image-2 family "
-                                "auto-handles this and ignores it."),
-            },
-        },
-        "additionalProperties": False,
-    }
 
 
 def get_generate_image_schema_static(thread_config: Optional[Dict[str, Any]] = None
@@ -343,26 +288,26 @@ def get_generate_image_schema_static(thread_config: Optional[Dict[str, Any]] = N
             "Do NOT use this to chart or plot data. Charts are computed from real numbers "
             "with code_interpreter; an image model would draw a convincing chart with "
             "invented values.\n\n"
-            "The image model and the saved size/quality/background/format defaults are named "
-            "in this turn's evidence and apply automatically.\n\n"
+            "The image model and the saved size/quality/background/format settings are named "
+            "in this turn's evidence and apply automatically; you do not change them. If the "
+            "request plainly cannot work at those settings you may mention it in a line, the "
+            "way a colleague would — rarely, and never as a check before making something."
+            "\n\n"
             "Say one short line to the user acknowledging you are making it (e.g. \"Making "
             "that now — it'll land here shortly.\"). Do not describe the image you are about "
             "to make; they will see it."
         ),
-        "parameters": {
-            "type": "object",
-            "properties": {
+        "parameters": _with_aspect_static(
+            {
                 "prompt": {
                     "type": "string",
                     "description": ("What the image should depict, in the user's terms. It is "
                                     "rewritten into a fuller prompt for you automatically — "
                                     "do not pad it with style boilerplate."),
                 },
-                "overrides": _overrides_schema_static(),
             },
-            "required": ["prompt"],
-            "additionalProperties": False,
-        },
+            ["prompt"],
+        ),
     }
 
 
@@ -390,20 +335,17 @@ def get_create_image_asset_schema_static(thread_config: Optional[Dict[str, Any]]
             "If the user just wants an image, use generate_image instead — it does not block "
             "and it posts the image for you."
         ),
-        "parameters": {
-            "type": "object",
-            "properties": {
+        "parameters": _with_aspect_static(
+            {
                 "prompt": {"type": "string", "description": "What the image should depict."},
                 "filename": {
                     "type": "string",
                     "description": ("Filename to save it under in /mnt/data, e.g. "
                                     "'cover.png'. Use something your code can refer to."),
                 },
-                "overrides": _overrides_schema_static(),
             },
-            "required": ["prompt", "filename"],
-            "additionalProperties": False,
-        },
+            ["prompt", "filename"],
+        ),
     }
 
 
@@ -435,7 +377,6 @@ def get_edit_image_schema_static(thread_config: Optional[Dict[str, Any]] = None
                     "type": "string",
                     "description": "The change to make, in the user's terms.",
                 },
-                "overrides": _overrides_schema_static(),
             },
             "required": ["source_image_ids", "prompt"],
             "additionalProperties": False,
@@ -446,10 +387,31 @@ def get_edit_image_schema_static(thread_config: Optional[Dict[str, Any]] = None
 # --- shared helpers ----------------------------------------------------------------------
 
 def _effective_config(thread_config: Optional[Dict[str, Any]],
-                      overrides: Optional[Dict[str, Any]]) -> tuple:
-    """Fold overrides onto the user's prefs and return a thread_config carrying the result,
-    so downstream code (which reads thread_config) needs no new parameter."""
-    settings, rejected = resolve_settings(thread_config, overrides)
+                      aspect: Optional[str] = None
+                      ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Resolve the user's saved image settings and return a thread_config carrying them,
+    so downstream code (which reads thread_config) needs no new parameter.
+
+    ``aspect`` is the shape the MODEL named, and it is consulted in exactly one case: the
+    person's saved size is ``auto``, i.e. they chose to delegate the shape. Then the pair
+    (shape, saved tier) resolves to a real WxH here, before anything downstream sees the
+    config. A saved WxH wins over any aspect and nothing is said about it — the user's shape
+    is not a suggestion. An unknown aspect leaves ``auto`` in place, which is what the API
+    gets today.
+
+    The resolved cell is run through ``normalize_size`` for the SAVED MODEL before it is
+    stored. The grid is a table of custom WxH sizes, and a model that takes only the named
+    sizes (gpt-image-1) 400s on every one of them — ``create_image_asset`` sends this size
+    straight to the API, so an unchecked cell would be a hard failure there. Rejected means
+    the shape cannot be honored on this model, so the size stays ``auto``: exactly what that
+    model did before an aspect could be named at all.
+    """
+    settings, _ = resolve_settings(thread_config)
+    if settings["size"] == "auto" and aspect:
+        resolved = size_for_shape(aspect, settings["tier"])
+        if resolved != "auto":
+            usable, _note = normalize_size(settings["model"], resolved)
+            settings["size"] = usable or "auto"
     cfg = dict(thread_config or {})
     cfg.update({
         "image_model": settings["model"],
@@ -460,7 +422,7 @@ def _effective_config(thread_config: Optional[Dict[str, Any]],
         "image_compression": settings["compression"],
         "input_fidelity": settings["input_fidelity"],
     })
-    return settings, rejected, cfg
+    return settings, cfg
 
 
 def _thread_key(ctx) -> str:
@@ -521,7 +483,13 @@ async def execute_generate_image(ctx, args: Dict[str, Any]) -> Dict[str, Any]:
     thread_key = _thread_key(ctx)
     tm = processor.thread_manager
 
-    settings, rejected, effective_cfg = _effective_config(ctx.thread_config, args.get("overrides"))
+    # The model may only name a SHAPE, and only when the person delegated it by saving Auto.
+    # `_effective_config` is what decides whether it counts; `chose_shape` below reports the
+    # outcome, not the argument, so the log never claims a pick that was ignored.
+    aspect = args.get("aspect")
+    saved_size = user_defaults(ctx.thread_config)["size"]
+    settings, effective_cfg = _effective_config(ctx.thread_config, aspect)
+    chose_shape = saved_size == "auto" and settings["size"] != "auto"
 
     # RESERVE THE SLOT. The capacity read and this registration must run with NO await between
     # them. This executor runs under the turn's thread lock, but that does NOT serialize it
@@ -659,7 +627,9 @@ async def execute_generate_image(ctx, args: Dict[str, Any]) -> Dict[str, Any]:
     if turn is not None:
         turn.visible_action_committed = True
     logger.info(f"Detached image generation {generation_id} for {thread_key} "
-                f"(model={settings['model']} size={settings['size']})")
+                f"(model={settings['model']} size={settings['size']} "
+                f"quality={settings['quality']}"
+                + (f" aspect={aspect}" if chose_shape else "") + ")")
 
     result = {
         "ok": True,
@@ -668,8 +638,6 @@ async def execute_generate_image(ctx, args: Dict[str, Any]) -> Dict[str, Any]:
                     "Acknowledge briefly; do not describe the image."),
         "settings": {k: settings[k] for k in ("model", "size", "quality", "background")},
     }
-    if rejected:
-        result["ignored_overrides"] = rejected
     return result
 
 
@@ -735,7 +703,7 @@ async def execute_create_image_asset(ctx, args: Dict[str, Any]) -> Dict[str, Any
     reservation: Dict[str, Any] = {"_reservation_id": uuid4().hex, "image_data": None}
     assets.append(reservation)
 
-    settings, rejected, _ = _effective_config(ctx.thread_config, args.get("overrides"))
+    settings, _ = _effective_config(ctx.thread_config, args.get("aspect"))
     filename = _safe_filename(args.get("filename") or "image", settings["format"])
 
     # T2-28: the slot is reserved; the `finally` below releases it on EVERY non-success exit —
@@ -869,8 +837,6 @@ async def execute_create_image_asset(ctx, args: Dict[str, Any]) -> Dict[str, Any
                        "come out as intended, fix it before building it into anything."
                        if shown else "")),
     }
-    if rejected:
-        result["ignored_overrides"] = rejected
     return result
 
 
@@ -932,7 +898,7 @@ async def execute_edit_image(ctx, args: Dict[str, Any]) -> Dict[str, Any]:
         resolved.append(entry)
 
     thread_key = _thread_key(ctx)
-    settings, rejected, _ = _effective_config(ctx.thread_config, args.get("overrides"))
+    settings, _ = _effective_config(ctx.thread_config)
 
     # F38: every source id resolved — downloads and an image-model edit are about to run.
     turn = getattr(ctx, "turn", None)
@@ -1083,8 +1049,6 @@ async def execute_edit_image(ctx, args: Dict[str, Any]) -> Dict[str, Any]:
                 "describe it."),
             "sources": [e["image_id"] for e in resolved],
         }
-        if rejected:
-            result["ignored_overrides"] = rejected
         return result
     finally:
         # abort(), not cancel_rotation(): a rotation tick may already have queued a deferred

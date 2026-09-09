@@ -6,8 +6,9 @@ The properties worth defending, in rough order of how much they'd hurt to get wr
    THIS TURN's catalog snapshot; an invented id, or one belonging to another thread, must be
    an error the model can recover from — never a silent "closest match". Editing the wrong
    image is an expensive, irreversible side effect that lands in someone's Slack thread.
-2. **The image model is the user's.** It appears in no schema, so the model cannot express a
-   different one; an override that names one anyway is dropped and reported.
+2. **The image SETTINGS are the user's — all of them.** Size, quality, background, format and
+   fidelity appear in no schema, so the model cannot express a different one. It used to be
+   able to override any of them on any call, silently; that is withdrawn.
 3. **The three tools have three different execution contracts**, and confusing them is how you
    get a turn that posts nothing: generate_image DETACHES (posts itself later),
    create_image_asset BLOCKS and posts NOTHING (the bytes go into the sandbox), edit_image
@@ -30,7 +31,7 @@ import pytest
 from PIL import Image
 
 from config import config
-from message_processor import image_delivery, image_tools as it
+from message_processor import image_delivery, image_service as svc, image_tools as it
 from openai_client.container_errors import AUTO_CONTAINER
 from openai_client.utilities import ImageData
 from message_processor.thread_manager import AsyncThreadStateManager
@@ -224,26 +225,133 @@ def _prop_names(node):
 
 # ====================================================================== schemas (factories)
 
-def test_v2_schema_offers_no_transparent_and_no_input_fidelity():
-    schema = it.get_generate_image_schema(_cfg(image_model="gpt-image-2"))
-    overrides = schema["parameters"]["properties"]["overrides"]["properties"]
+def _every_schema(cfg):
+    """Both surfaces of all three image tools: the per-request factories and the channel-static
+    variants. A settings argument reappearing on any one of them is the regression."""
+    return {
+        "generate_image": it.get_generate_image_schema(cfg),
+        "create_image_asset": it.get_create_image_asset_schema(cfg),
+        "edit_image": it.get_edit_image_schema(cfg),
+        "generate_image (static)": it.get_generate_image_schema_static(cfg),
+        "create_image_asset (static)": it.get_create_image_asset_schema_static(cfg),
+        "edit_image (static)": it.get_edit_image_schema_static(cfg),
+    }
 
-    assert overrides["background"]["enum"] == ["auto", "opaque"]
-    # gpt-image-2 auto-handles fidelity — advertising it would invite a param the API rejects.
-    assert "input_fidelity" not in overrides
-    # Free-form WxH rather than an enum, with the divisible-by-16 rule stated up front.
-    assert "enum" not in overrides["size"]
-    assert "DIVISIBLE BY 16" in overrides["size"]["description"]
+
+@pytest.mark.parametrize("model", ["gpt-image-1", "gpt-image-2", "gpt-image-2.5-flare"])
+def test_no_schema_offers_the_model_a_way_to_change_the_users_settings(model):
+    # The tools used to carry an `overrides` object letting the model depart from the person's
+    # saved size/quality/background/format/fidelity on any call, silently. Withdrawn: their
+    # saved settings are what runs, so the tools take no settings arguments at all.
+    cfg = _cfg(image_model=model, **{it.CATALOG_KEY: CATALOG, it.CI_CONTAINER_KEY: "cntr_x"})
+    for name, schema in _every_schema(cfg).items():
+        assert "overrides" not in _prop_names(schema), name
+        assert not ({"size", "quality", "background", "format", "compression",
+                     "input_fidelity"} & _prop_names(schema)), name
 
 
-def test_v1_schema_offers_transparent_and_input_fidelity():
-    schema = it.get_generate_image_schema(_cfg(image_model="gpt-image-1"))
-    overrides = schema["parameters"]["properties"]["overrides"]["properties"]
+# ---------------------------------------------------------------- the aspect argument
 
-    assert "transparent" in overrides["background"]["enum"]
-    assert overrides["input_fidelity"]["enum"] == ["low", "high"]
-    # v1 takes only the named sizes, so they are a closed enum.
-    assert overrides["size"]["enum"] == ["1024x1024", "1024x1536", "1536x1024", "auto"]
+def _params(schema):
+    return schema["parameters"]
+
+
+@pytest.mark.parametrize("factory", ["generate_image", "create_image_asset"])
+def test_aspect_is_required_when_the_saved_shape_is_auto(factory):
+    """Saved Auto is the person delegating the shape, so there is no image without one."""
+    cfg = _cfg(image_size="auto")
+    schema = (it.get_generate_image_schema(cfg) if factory == "generate_image"
+              else it.get_create_image_asset_schema(cfg))
+    params = _params(schema)
+    assert "aspect" in params["properties"]
+    assert "aspect" in params["required"]
+    assert params["properties"]["aspect"]["enum"] == list(svc.SHAPES)
+
+
+@pytest.mark.parametrize("factory", ["generate_image", "create_image_asset"])
+def test_aspect_is_absent_when_the_person_saved_a_shape(factory):
+    """Offering a knob the executor ignores is how a model learns to argue with settings."""
+    cfg = _cfg(image_size="1536x1024")
+    schema = (it.get_generate_image_schema(cfg) if factory == "generate_image"
+              else it.get_create_image_asset_schema(cfg))
+    params = _params(schema)
+    assert "aspect" not in params["properties"]
+    assert "aspect" not in params["required"]
+
+
+def test_edit_image_never_takes_an_aspect():
+    """An edit keeps the source's shape; there is nothing to choose."""
+    cfg = _cfg(image_size="auto", **{it.CATALOG_KEY: CATALOG})
+    assert "aspect" not in _prop_names(it.get_edit_image_schema(cfg))
+    assert "aspect" not in _prop_names(it.get_edit_image_schema_static(cfg))
+
+
+@pytest.mark.parametrize("name", ["generate_image", "create_image_asset"])
+def test_the_static_schemas_offer_aspect_to_everyone_and_require_it_of_nobody(name):
+    """The channel surface is a function of the channel, not of the requester, so it cannot
+    know whose shape is saved. It offers the argument always; the executor decides."""
+    for cfg in (None, _cfg(image_size="auto"), _cfg(image_size="1536x1024")):
+        schema = (it.get_generate_image_schema_static(cfg) if name == "generate_image"
+                  else it.get_create_image_asset_schema_static(cfg))
+        params = _params(schema)
+        assert "aspect" in params["properties"]
+        assert "aspect" not in params["required"]
+
+
+def test_the_executor_renders_a_model_chosen_shape_at_the_saved_tier():
+    settings, cfg = it._effective_config(_cfg(image_size="auto", image_tier="standard"), "16:9")
+    assert settings["size"] == "1360x768"
+    assert cfg["image_size"] == "1360x768"
+
+    large, large_cfg = it._effective_config(_cfg(image_size="auto", image_tier="large"), "16:9")
+    assert large["size"] == "1920x1088"
+    assert large_cfg["image_size"] == "1920x1088"
+
+    # The 4K tier was pulled 2026-09-09; a legacy saved `max` renders at Large.
+    legacy, legacy_cfg = it._effective_config(_cfg(image_size="auto", image_tier="max"), "16:9")
+    assert legacy["size"] == "1920x1088"
+    assert legacy_cfg["image_size"] == "1920x1088"
+
+
+def test_the_executor_leaves_auto_alone_without_a_usable_aspect():
+    """No aspect, or one that names no grid cell — the API picks, exactly as it does today."""
+    for aspect in (None, "", "4:5", "sideways"):
+        settings, cfg = it._effective_config(_cfg(image_size="auto"), aspect)
+        assert settings["size"] == "auto", aspect
+        assert cfg["image_size"] == "auto", aspect
+
+
+def test_a_shape_the_saved_model_cannot_render_falls_back_to_auto():
+    """gpt-image-1 takes only the named sizes, so a grid cell resolved at the saved tier is a
+    hard 400 there — `create_image_asset` hands the size straight to the API. The resolution
+    runs through `normalize_size` for the saved model, so an unrenderable cell becomes `auto`,
+    which is what that model did before an aspect could be named."""
+    cfg_in = _cfg(image_model="gpt-image-1", image_size="auto", image_tier="large")
+    settings, cfg = it._effective_config(cfg_in, "16:9")
+    assert settings["size"] == "auto"
+    assert cfg["image_size"] == "auto"
+
+    # The 2.x models take custom sizes, so the same call still resolves the cell.
+    settings, cfg = it._effective_config(
+        _cfg(image_model="gpt-image-2.5-sunburst", image_size="auto", image_tier="large"), "16:9")
+    assert settings["size"] == "1920x1088"
+    assert cfg["image_size"] == "1920x1088"
+
+
+def test_a_saved_shape_beats_any_aspect_the_model_names():
+    """The user's shape is not a suggestion, and nothing is said about the ignored argument."""
+    settings, cfg = it._effective_config(_cfg(image_size="1536x1024"), "9:16")
+    assert settings["size"] == "1536x1024"
+    assert cfg["image_size"] == "1536x1024"
+
+
+def test_no_schema_description_carries_cost_language():
+    # Cost is not a design input in this repo and does not belong in a live prompt.
+    cfg = _cfg(**{it.CATALOG_KEY: CATALOG, it.CI_CONTAINER_KEY: "cntr_x"})
+    for name, schema in _every_schema(cfg).items():
+        blob = json.dumps(schema).lower()
+        for word in ("costs more", "cheaper", "expensive", "price", "cost"):
+            assert word not in blob, (name, word)
 
 
 @pytest.mark.parametrize("model", ["gpt-image-1", "gpt-image-2"])
@@ -440,20 +548,20 @@ async def test_edit_cancellation_stops_the_status_rotation(_stub_checklist):
 
 
 @pytest.mark.asyncio
-async def test_edit_reports_overrides_it_could_not_honor(monkeypatch):
+async def test_edit_runs_on_the_users_saved_settings(monkeypatch):
     monkeypatch.setattr(image_delivery, "publish_image",
                         AsyncMock(return_value="https://files.slack.com/edited.png"))
     oc = _openai()
     res = await it.execute_edit_image(
-        _ctx(_FakeProcessor(openai_client=oc), catalog=CATALOG),
+        _ctx(_FakeProcessor(openai_client=oc),
+             thread_config=_cfg(image_background="transparent"), catalog=CATALOG),
         {"source_image_ids": ["img_7"], "prompt": "cut it out",
-         "overrides": {"background": "transparent"}})
+         "overrides": {"background": "opaque"}})
 
-    # gpt-image-2 has no transparent background: the user's default is used and the model is
-    # TOLD, rather than being left to believe it received a cutout.
+    # Whatever the model puts in the call, the person's saved background is what reaches the API.
     assert res["ok"] is True
-    assert any("transparent" in note for note in res["ignored_overrides"])
-    assert oc.edit_image.await_args.kwargs["background"] == "auto"
+    assert "ignored_overrides" not in res
+    assert oc.edit_image.await_args.kwargs["background"] == "transparent"
 
 
 @pytest.mark.asyncio
@@ -638,20 +746,20 @@ async def test_generate_at_the_per_thread_cap_schedules_nothing(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_generate_passes_overrides_through_and_reports_the_rejected_ones():
+async def test_generate_runs_on_the_users_saved_settings():
     proc = _FakeProcessor()
-    res = await it.execute_generate_image(_ctx(proc), {
-        "prompt": "a title slide",
-        "overrides": {"size": "1920x1080", "background": "transparent",
-                      "model": "gpt-image-1"},
-    })
+    res = await it.execute_generate_image(
+        _ctx(proc, thread_config=_cfg(image_size="1024x1536", image_background="opaque")), {
+            "prompt": "a title slide",
+            "overrides": {"size": "1920x1080", "background": "transparent",
+                          "model": "gpt-image-1"},
+        })
 
     cfg = proc._finish_image_generation_background.call_args.kwargs["thread_config"]
-    assert cfg["image_size"] == "1920x1088"           # snapped onto the 16px grid
-    assert cfg["image_background"] == "auto"          # transparent dropped (gpt-image-2)
+    assert cfg["image_size"] == "1024x1536"           # the user's size, not the model's
+    assert cfg["image_background"] == "opaque"
     assert cfg["image_model"] == "gpt-image-2"        # the user's model, not the model's pick
-    notes = " ".join(res["ignored_overrides"])
-    assert "1920x1088" in notes and "transparent" in notes and "fixed by the user's" in notes
+    assert "ignored_overrides" not in res             # nothing to reject: nothing was offered
 
 
 @pytest.mark.asyncio
@@ -1070,22 +1178,6 @@ class TestStaticChannelSchemas:
                 "source_image_ids"]["items"]
         assert items == {"type": "string"}
 
-    def test_overrides_are_the_superset_of_every_model(self):
-        # One schema for both families: transparent (v1-only) and input_fidelity (v1-only) are
-        # advertised, and resolve_settings drops them with a reason when the model is v2.
-        for name in self.STATICS:
-            props = self._all()[name]["parameters"]["properties"]["overrides"]["properties"]
-            assert props["background"]["enum"] == ["auto", "transparent", "opaque"], name
-            assert props["input_fidelity"]["enum"] == ["low", "high"], name
-            assert props["quality"]["enum"] == list(it.QUALITIES), name
-            assert props["format"]["enum"] == list(it.FORMATS), name
-            assert props["compression"]["type"] == "integer", name
-            assert (props["compression"]["minimum"], props["compression"]["maximum"]) == (0, 100)
-            # Size cannot be an enum: one family takes named sizes, the other free WxH.
-            assert "enum" not in props["size"], name
-            assert "DIVISIBLE BY 16" in props["size"]["description"], name
-            assert "1024x1024" in props["size"]["description"], name
-
     def test_the_static_schemas_still_never_offer_the_image_model(self):
         for name, schema in self._all(_cfg()).items():
             assert not ({"model", "image_model"} & _prop_names(schema)), name
@@ -1107,86 +1199,16 @@ class TestStaticChannelSchemas:
 
     def test_a_returned_schema_is_not_shared_mutable_state(self):
         first = it.get_generate_image_schema_static()
-        first["parameters"]["properties"]["overrides"]["properties"].pop("size")
-        assert "size" in it.get_generate_image_schema_static()[
-            "parameters"]["properties"]["overrides"]["properties"]
-
-
-# ====================================================================== executor legality
-
-@pytest.mark.unit
-class TestSupersetLegality:
-    """The superset schema advertises options a given image model cannot honor, so the executor
-    is now the only thing that says no — and it has to say WHICH values are legal, or the model
-    has no way to correct itself. It re-tries with the same illegal value otherwise."""
-
-    def _reject(self, cfg, overrides):
-        _settings, rejected, _ = it._effective_config(cfg, overrides)
-        return " | ".join(rejected)
-
-    def test_a_v2_transparent_background_names_the_legal_values(self):
-        note = self._reject(_cfg(image_model="gpt-image-2"), {"background": "transparent"})
-        assert "gpt-image-2" in note
-        assert "legal background for gpt-image-2: auto, opaque" in note
-
-    def test_a_v2_input_fidelity_says_it_is_not_an_option_there(self):
-        note = self._reject(_cfg(image_model="gpt-image-2"), {"input_fidelity": "low"})
-        assert "auto-handled" in note and "gpt-image-2" in note
-
-    def test_a_v1_custom_size_names_the_named_sizes(self):
-        note = self._reject(_cfg(image_model="gpt-image-1"), {"size": "1536x864"})
-        assert "legal size for gpt-image-1" in note
-        assert "1024x1536" in note
-        # v1 has no custom-size rule to offer, so it must not be advertised in the refusal.
-        assert "divisible by 16" not in note
-
-    def test_a_v2_impossible_size_still_names_the_v2_rule(self):
-        note = self._reject(_cfg(image_model="gpt-image-2"), {"size": "5000x100"})
-        assert "3:1" in note and "divisible by 16" in note
-
-    def test_quality_format_and_compression_all_name_their_legal_values(self):
-        note = self._reject(_cfg(), {"quality": "ultra", "format": "tiff", "compression": 500})
-        assert "legal quality" in note and "auto, low, medium, high" in note
-        assert "legal format" in note and "png, jpeg, webp" in note
-        assert "legal compression" in note and "0-100" in note
-
-    def test_a_legal_override_on_the_same_call_still_lands(self):
-        settings, rejected, _ = it._effective_config(
-            _cfg(image_model="gpt-image-2"), {"background": "transparent", "quality": "high"})
-        assert settings["quality"] == "high"
-        assert settings["background"] == "auto"      # the saved default, not the illegal value
-        assert rejected
-
-    @pytest.mark.asyncio
-    async def test_the_rejection_reaches_the_model_through_the_tool_result(self):
-        # The whole chain: superset schema offers it, executor drops it, the model is told.
-        proc = _FakeProcessor(openai_client=_openai())
-        res = await it.execute_create_image_asset(
-            _ctx(proc, container_id="cntr_abc123",
-                 thread_config=_cfg(image_model="gpt-image-2")),
-            {"prompt": "a cover", "filename": "cover.png", "overrides": {"background": "transparent"}})
-
-        assert res["ok"] is True
-        assert any("legal background for gpt-image-2" in n for n in res["ignored_overrides"])
-
-    def test_the_pinned_allowlist_is_what_resolution_enforces(self):
-        from message_processor import image_service as svc
-        for model in ("gpt-image-1", "gpt-image-2"):
-            legal = svc.legal_options(model)
-            for background in legal["background"]:
-                effective, rejected = svc.resolve_settings(
-                    _cfg(image_model=model), {"background": background})
-                assert effective["background"] == background and rejected == [], (model, background)
-            for quality in legal["quality"]:
-                _, rejected = svc.resolve_settings(_cfg(image_model=model), {"quality": quality})
-                assert rejected == [], (model, quality)
+        first["parameters"]["properties"].pop("prompt")
+        assert "prompt" in it.get_generate_image_schema_static()[
+            "parameters"]["properties"]
 
 
 @pytest.mark.unit
 class TestEvidenceHelpers:
     """What the static schemas stopped saying, the turn's evidence block says instead."""
 
-    def test_image_settings_evidence_names_model_legality_and_defaults(self):
+    def test_image_settings_evidence_names_model_legality_and_settings(self):
         from message_processor import image_service as svc
         lines = svc.settings_evidence_lines(
             _cfg(image_model="gpt-image-2", image_size="1024x1536", image_quality="high"))
@@ -1194,11 +1216,18 @@ class TestEvidenceHelpers:
 
         assert lines[0] == svc.SETTINGS_EVIDENCE_HEADER
         assert "gpt-image-2" in body and "not selectable" in body
-        assert "auto, opaque" in body                     # its legal backgrounds
-        assert "transparent" not in body                  # …and only its own
+        assert "auto, transparent, opaque" in body        # every model takes all three
+        assert "auto, low, medium, high" in body          # its legal qualities — no xhigh/max
+        assert "xhigh" not in body and "max" not in body
         assert "divisible by 16" in body                  # its size rule
         assert "size=1024x1536" in body and "quality=high" in body
         assert all("\n" not in line for line in lines)
+
+    def test_the_2_5_evidence_offers_the_full_quality_ladder(self):
+        from message_processor import image_service as svc
+        body = "\n".join(svc.settings_evidence_lines(
+            _cfg(image_model="gpt-image-2.5-flare")))
+        assert "auto, low, medium, high, xhigh, max" in body
 
     def test_v1_settings_evidence_offers_transparent_and_fidelity(self):
         from message_processor import image_service as svc

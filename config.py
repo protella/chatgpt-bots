@@ -114,9 +114,12 @@ def pipeline_status(stage: str, default: str, **fmt) -> str:
 
 
 # Model knowledge cutoff dates
-# Supported models: gpt-5.6-sol (default), gpt-5.6-terra, gpt-5.6-luna, gpt-5.5
+# Supported models: gpt-6-astra (default), gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.5
 # (gpt-5.6-luna doubles as the utility model)
 MODEL_KNOWLEDGE_CUTOFFS = {
+    # GPT-6 Astra (April 2026 cutoff, 1.05M context window, released September 3, 2026)
+    "gpt-6-astra": "April 30, 2026",
+
     # GPT-5.6 family (Feb 2026 cutoff, 1.05M context window, released July 9, 2026)
     "gpt-5.6-sol": "February 16, 2026",
     "gpt-5.6-terra": "February 16, 2026",
@@ -130,21 +133,24 @@ MODEL_KNOWLEDGE_CUTOFFS = {
 }
 
 # The full user-selectable model set (order = modal display order)
-SUPPORTED_CHAT_MODELS = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"]
+SUPPORTED_CHAT_MODELS = ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+                         "gpt-5.5"]
 
 # What OPENAI_SERVICE_TIER may say. `standard` is OUR name for "send no service_tier at all" —
 # the API's own default is the literal `"default"` and it does not accept `"standard"`, so the
 # parameter is omitted rather than sent. `fast` buys up to 2.5x faster output at 2x price and is
-# honored only on the model below; everything else pays standard rates for nothing.
+# honored only on the models below; everything else pays standard rates for nothing.
 SUPPORTED_SERVICE_TIERS = ("standard", "fast")
-FAST_SERVICE_TIER_MODEL = "gpt-5.6-sol"
+# Both verified live 2026-09-08: `service_tier="fast"` returns 200 on each.
+FAST_SERVICE_TIER_MODELS = frozenset({"gpt-5.6-sol", "gpt-6-astra"})
 
 # The image models a channel or a person may select. Promoted here from the literal that used to
 # live inside the personal modal so the modal's option list and the channel resolver's allowlist
 # are the same object and cannot drift apart. Deliberately NOT a schema CHECK on
 # `channel_settings.image_model`: the lineup changes, and a constraint would turn adding a model
 # into a migration.
-SUPPORTED_IMAGE_MODELS = ("gpt-image-2", "gpt-image-1")
+SUPPORTED_IMAGE_MODELS = ("gpt-image-2.5-flare", "gpt-image-2.5-sunburst",
+                          "gpt-image-2", "gpt-image-1")
 
 # The verbosity vocabulary, for the same reason: the channel modal's option list, the channel
 # resolver's allowlist and the boot check on DEFAULT_VERBOSITY are one list.
@@ -152,8 +158,20 @@ SUPPORTED_VERBOSITIES = ("low", "medium", "high")
 
 # Reasoning-effort ladders per model family (verified live 2026-07-09:
 # `max` returns 200 on ALL three 5.6 tiers; `minimal` 400s on all of them)
+# GPT-6 verified live 2026-09-08: low/medium/high/xhigh/max return 200; BOTH `none` and
+# `minimal` 400 with "Supported values are: 'low', 'medium', 'high', 'xhigh', and 'max'".
+GPT6_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 GPT56_EFFORTS = ["none", "low", "medium", "high", "xhigh", "max"]
 GPT55_EFFORTS = ["none", "low", "medium", "high", "xhigh"]
+
+# The two efforts that carry a MIGRATION rule rather than a ladder position. Neither is on
+# GPT-6's ladder and `minimal` is on nobody's, so both are what a channel configured under an
+# older family still has stored; OpenAI's own guidance is "if you use none or minimal, start
+# with low", and spec 2.2 adopts it. They are translated by `clamp_effort` instead of falling
+# back, which is NOT the respec 6.2 rule for an ordinary off-ladder rung: a stored `max` on
+# gpt-5.5 is still refused for the global default, because `max` is a rung the modal renders
+# and the resolver and the modal must agree about what a channel is running.
+MIGRATED_EFFORTS = frozenset({"none", "minimal"})
 
 
 def effective_channel_model(stored: Optional[str], fallback: str) -> str:
@@ -176,14 +194,24 @@ def effort_ladder(model: str) -> List[str]:
     ladder. The resolver and the modal share it for the same reason they share
     `effective_channel_model`: two spellings of this test disagreed about anything that was
     neither 5.5 nor 5.6.
+
+    GPT-6 is tested FIRST because its ladder is the odd one out: it is the only family with no
+    `none`, so falling through to either 5.x ladder would advertise a value that 400s.
     """
-    return GPT56_EFFORTS if (model or "").startswith("gpt-5.6") else GPT55_EFFORTS
+    name = model or ""
+    if name.startswith("gpt-6"):
+        return GPT6_EFFORTS
+    return GPT56_EFFORTS if name.startswith("gpt-5.6") else GPT55_EFFORTS
 
 
 def clamp_effort(model: str, effort: Optional[str]) -> str:
     """Coerce a stored/legacy reasoning effort into one the model accepts.
 
     Guarantees bad stored settings can never reach the API:
+    - GPT-6: neither `none` nor `minimal` exists (both 400) -> `low`, per OpenAI's own
+      migration guidance ("if you use none or minimal, start with low"). Load-bearing:
+      UTILITY_REASONING_EFFORT defaults to `none`, and every `none` already stored in
+      user_preferences / channel_settings / threads.config_json will meet GPT-6.
     - 5.6 family: `minimal` is unsupported (400) -> `none`; full ladder incl. `max`.
     - gpt-5.5 / gpt-5-mini and anything else: `max` doesn't exist -> `xhigh`;
       `minimal` stays valid on gpt-5-mini and maps to `low` on gpt-5.5 (its modal
@@ -191,6 +219,10 @@ def clamp_effort(model: str, effort: Optional[str]) -> str:
     Unknown values fall back to `medium`.
     """
     effort = (effort or "medium").lower()
+    if model.startswith("gpt-6"):
+        if effort in ("none", "minimal"):
+            return "low"
+        return effort if effort in GPT6_EFFORTS else "medium"
     if model.startswith("gpt-5.6"):
         if effort == "minimal":
             return "none"
@@ -201,6 +233,32 @@ def clamp_effort(model: str, effort: Optional[str]) -> str:
         return "low"
     valid = GPT55_EFFORTS + ["minimal"]
     return effort if effort in valid else "medium"
+
+
+def supports_sampling(model: str, effort: str) -> bool:
+    """Whether `temperature`/`top_p` may be sent at all.
+
+    Verified live 2026-09-08: GPT-6 rejects both unconditionally — `temperature=1.0` is
+    tolerated but any other value 400s ("'temperature' is not supported with this model"),
+    and `top_p` 400s at every value including 1.0. So neither key is sent on that family;
+    relying on a tolerated value is how the next release breaks us.
+
+    5.5 and the 5.6 family accept them only at `effort == "none"`; every other effort is a
+    reasoning turn where temperature is forced to 1.0.
+    """
+    if model.startswith("gpt-6"):
+        return False
+    return (model.startswith("gpt-5.5") or model.startswith("gpt-5.6")) and effort == "none"
+
+
+def supports_cache_breakpoints(model: Optional[str]) -> bool:
+    """Whether `prompt_cache_breakpoint` content parts are legal on `model`.
+
+    ONE definition: the request builder's channel allowlist and `attach_cache_breakpoint` each
+    used to spell this as an inline `startswith("gpt-5.6")`, which meant a new family had to be
+    added in two places or the marker would be stripped from parts that were allowed to keep it.
+    """
+    return str(model or "").startswith(("gpt-5.6", "gpt-6"))
 
 
 # Spec §3b: on a channel turn these settings belong to the CHANNEL, not to whoever happened to
@@ -267,13 +325,16 @@ class BotConfig:
         default_factory=lambda: os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY") or "")
     
     # Model configuration
-    gpt_model: str = field(default_factory=lambda: os.getenv("GPT_MODEL", "gpt-5.6-sol"))
+    gpt_model: str = field(default_factory=lambda: os.getenv("GPT_MODEL", "gpt-6-astra"))
     utility_model: str = field(default_factory=lambda: os.getenv("UTILITY_MODEL", "gpt-5.6-luna"))
-    image_model: str = field(default_factory=lambda: os.getenv("GPT_IMAGE_MODEL", "gpt-image-2"))
+    image_model: str = field(
+        default_factory=lambda: os.getenv("GPT_IMAGE_MODEL", "gpt-image-2.5-sunburst"))
 
     # Service tier. `standard` (the default, and what prod ships) omits the parameter entirely;
     # `fast` attaches `service_tier: "fast"` to the user-facing responder call ONLY, and only on
-    # FAST_SERVICE_TIER_MODEL. Normalized in __post_init__ — an unusable value warns and falls
+    # a FAST_SERVICE_TIER_MODELS member. It is also the ADMIN GATE for the per-user fast-tier
+    # setting: `standard` here means no user may turn fast on, whatever their preference says.
+    # Normalized in __post_init__ — an unusable value warns and falls
     # back to `standard` rather than 400ing every turn.
     openai_service_tier: str = field(
         default_factory=lambda: os.getenv("OPENAI_SERVICE_TIER", "standard"))
@@ -358,8 +419,14 @@ class BotConfig:
     vision_max_tokens: int = field(default_factory=lambda: int(os.getenv("VISION_MAX_TOKENS", "8192")))
     
     # Image generation parameters (gpt-image-2 / gpt-image-1)
-    default_image_size: str = field(default_factory=lambda: os.getenv("DEFAULT_IMAGE_SIZE", "1024x1024"))
-    default_image_quality: str = field(default_factory=lambda: os.getenv("DEFAULT_IMAGE_QUALITY", "auto"))  # auto, low, medium, high
+    # `auto` is the shipped default: the model names the SHAPE per request (the `aspect`
+    # tool argument) and it renders at `default_image_tier`. A WxH here pins the shape instead.
+    default_image_size: str = field(default_factory=lambda: os.getenv("DEFAULT_IMAGE_SIZE", "auto"))
+    # The size tier a model-chosen shape renders at: standard / large / max
+    # (`image_service.TIERS`). Personal setting, never a channel capability — a channel is not
+    # one person. Only consulted while the saved size is `auto`.
+    default_image_tier: str = field(default_factory=lambda: os.getenv("DEFAULT_IMAGE_TIER", "large"))
+    default_image_quality: str = field(default_factory=lambda: os.getenv("DEFAULT_IMAGE_QUALITY", "high"))  # auto, low, medium, high
     default_image_background: str = field(default_factory=lambda: os.getenv("DEFAULT_IMAGE_BACKGROUND", "auto"))  # transparent, opaque, auto
     default_image_number: int = field(default_factory=lambda: int(os.getenv("DEFAULT_IMAGE_NUMBER", "1")))  # Number of images
     default_image_format: str = field(default_factory=lambda: os.getenv("DEFAULT_IMAGE_FORMAT", "png"))
@@ -1205,25 +1272,25 @@ class BotConfig:
 
     def is_long_context(self, tokens: int) -> bool:
         """True when an input of `tokens` crosses OpenAI's long-context billing tier
-        (>272K input → 2x input / 1.5x output on 5.5 and the 5.6 family)."""
+        (>272K input → 2x input / 1.5x output on 5.5, the 5.6 family and GPT-6)."""
         return tokens > self.LONG_CONTEXT_BILLING_THRESHOLD
 
     def get_model_token_limit(self, model: str) -> int:
         """Get the effective input token limit for a specific model
 
         This returns the maximum number of input tokens we should send.
-        GPT-5.6 family (sol/terra/luna) and GPT-5.5 all share the verified
-        1.05M window: 1.05M total - ~130k reserved = ~920k usable.
+        GPT-6, the GPT-5.6 family (sol/terra/luna) and GPT-5.5 all share the
+        verified 1.05M window: 1.05M total - ~130k reserved = ~920k usable.
         Anything else (unknown/legacy, e.g. gpt-5-mini): the conservative
         400k window with a 50k reserve.
 
         Args:
-            model: Model name (e.g., 'gpt-5.6-sol', 'gpt-5.5')
+            model: Model name (e.g., 'gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.5')
 
         Returns:
             Buffered token limit for safe operation
         """
-        if model.startswith('gpt-5.6') or model.startswith('gpt-5.5'):
+        if model.startswith(('gpt-6', 'gpt-5.6', 'gpt-5.5')):
             return int(self.gpt54_max_tokens * self.gpt54_token_buffer_percentage)
         # Unknown/legacy models: use the conservative 400k window
         return int(self.gpt5_max_tokens * self.token_buffer_percentage)
@@ -1270,10 +1337,16 @@ class BotConfig:
             # GPT-5 specific
             "reasoning_effort": self.default_reasoning_effort,
             "verbosity": self.default_verbosity,
-            
+
+            # Fast tier. PERSONAL setting, never channel-scoped — a channel is not one person.
+            # "standard" means off; the admin gate (OPENAI_SERVICE_TIER) can veto it regardless.
+            "service_tier": "standard",
+
+
             # Image generation
             "image_model": self.image_model,
             "image_size": self.default_image_size,
+            "image_tier": self.default_image_tier,
             "image_quality": self.default_image_quality,
             "image_background": self.default_image_background,
             "image_number": self.default_image_number,
@@ -1314,6 +1387,9 @@ class BotConfig:
             user_config['temperature'] = user_prefs['temperature']
         if user_prefs.get('top_p') is not None:
             user_config['top_p'] = user_prefs['top_p']
+        # NULL means "never chose" and leaves the system default ("standard") standing.
+        if user_prefs.get('service_tier'):
+            user_config['service_tier'] = user_prefs['service_tier']
 
         # Feature toggles
         if user_prefs.get('enable_web_search') is not None:
@@ -1329,6 +1405,8 @@ class BotConfig:
             user_config['image_model'] = user_prefs['image_model']
         if user_prefs.get('image_size'):
             user_config['image_size'] = user_prefs['image_size']
+        if user_prefs.get('image_tier'):
+            user_config['image_tier'] = user_prefs['image_tier']
         if user_prefs.get('image_quality'):
             user_config['image_quality'] = user_prefs['image_quality']
         if user_prefs.get('image_background'):
@@ -1459,10 +1537,16 @@ class BotConfig:
         # THE EFFORT RULE. `clamp_effort` answers an unrecognised effort with the literal
         # "medium", which is not necessarily what the operator configured — so the fallback is the
         # global default CLAMPED AGAINST THE RESOLVED MODEL, never a literal.
+        # `none` and `minimal` are the exception to the refusal rule, per spec 2.2: they are
+        # legacy stored values rather than rungs anyone chose off this model's ladder, and
+        # OpenAI's migration guidance translates them to `low`. Every other off-ladder value
+        # still falls back to the clamped global default, which is respec 6.2 unchanged.
         ladder = effort_ladder(model)
         effort = _stored("reasoning_effort")
         if effort is not _UNSET_SETTING and effort in ladder:
             profile["reasoning_effort"] = effort
+        elif effort is not _UNSET_SETTING and effort in MIGRATED_EFFORTS:
+            profile["reasoning_effort"] = clamp_effort(model, effort)
         else:
             fallback = clamp_effort(model, self.default_reasoning_effort)
             if effort is not _UNSET_SETTING:

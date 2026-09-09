@@ -6,7 +6,8 @@ from typing import Any, Callable, Dict, List, Optional
 import aiohttp
 from openai import AsyncOpenAI
 
-from config import FAST_SERVICE_TIER_MODEL, clamp_effort, config
+from config import (FAST_SERVICE_TIER_MODELS, clamp_effort, config,
+                    supports_cache_breakpoints, supports_sampling)
 from logger import LoggerMixin, setup_logger
 from openai_client.container_errors import is_container_gone
 
@@ -44,11 +45,11 @@ _CHANNEL_PART_KEYS: Dict[Any, tuple] = {
 def attach_cache_breakpoint(part: Dict[str, Any], model: Optional[str]) -> Dict[str, Any]:
     """Mark a content part as an explicit prompt-cache breakpoint.
 
-    Explicit breakpoints exist only on the 5.6 family; on anything else the marker is an
+    Explicit breakpoints exist on the 5.6 family and GPT-6; on anything else the marker is an
     unknown parameter, so the part comes back unchanged and the miss is logged. Returns a NEW
     dict when it marks — never mutates the caller's part.
     """
-    if not str(model or "").startswith("gpt-5.6"):
+    if not supports_cache_breakpoints(model):
         _request_log.debug(
             f"prompt_cache_breakpoint unsupported on {model}; part left unmarked")
         return part
@@ -64,7 +65,7 @@ def _channel_input_items(input_items: List[Dict[str, Any]],
     is rebuilt from `_CHANNEL_PART_KEYS` rather than forwarded, so the caller's dict is never
     mutated and a 5.5 retry never edits an input a later 5.6 retry reuses.
     """
-    keep_breakpoints = model.startswith("gpt-5.6")
+    keep_breakpoints = supports_cache_breakpoints(model)
     items: List[Dict[str, Any]] = []
     for item in input_items or []:
         if not isinstance(item, dict):
@@ -112,6 +113,7 @@ def _build_request_params(
     system_prompt: Optional[str] = None,
     max_output_tokens: Optional[int] = None,
     reasoning_effort: Optional[str] = None,
+    effort_override: Optional[str] = None,
     verbosity: Optional[str] = None,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
@@ -139,17 +141,33 @@ def _build_request_params(
     ``layout="channel"`` is the one canonical shape (spec §3): instructions for every path,
     allowlisted input items, cache policy applied everywhere.
 
-    ``service_tier_eligible`` is the fast tier's opt-in. This builder also serves
-    reconsideration, background and research calls, so it cannot tell a user-facing turn from a
-    housekeeping one by itself — only a caller that flags itself may buy the 2x price.
+    ``service_tier_eligible`` is the fast tier's opt-in. It carries BOTH facts: that this call
+    site is a user-facing turn rather than a housekeeping one (this builder also serves
+    reconsideration, background and research calls), and that the person whose turn it is asked
+    for the fast tier. Only a caller that flags itself may buy the 2x price.
+
+    ``effort_override`` is one call's departure from the thread's baseline effort. On GPT-6 the
+    baseline STAYS in top-level ``reasoning.effort`` and the override rides a trailing
+    ``configuration_update`` input item, because a changed top-level effort is a full prompt-cache
+    miss there while the item preserves the cache (measured 2026-09-08: 4016 cached tokens kept).
+    On every other family it simply replaces the top-level effort, which is today's behaviour.
     """
     model = model or config.gpt_model
     temperature = temperature if temperature is not None else config.default_temperature
     max_output_tokens = max_output_tokens or config.default_max_tokens
     top_p = top_p if top_p is not None else config.default_top_p
     # Clamp guards against stored/legacy efforts the model rejects (`minimal` on 5.6,
-    # `max` on 5.5).
+    # `max` on 5.5, both `none` and `minimal` on GPT-6).
+    gpt6 = model.startswith("gpt-6")
     effort = clamp_effort(model, reasoning_effort or config.default_reasoning_effort)
+    config_update: Optional[Dict[str, Any]] = None
+    if effort_override:
+        overridden = clamp_effort(model, effort_override)
+        if gpt6:
+            config_update = {"type": "configuration_update",
+                             "reasoning": {"effort": overridden}}
+        else:
+            effort = overridden
     channel = layout == "channel"
 
     if channel:
@@ -163,10 +181,18 @@ def _build_request_params(
         items = [{"role": "developer", "content": system_prompt}] if system_prompt else []
         items += [{"role": msg["role"], "content": msg["content"]} for msg in input_items]
 
+    if config_update is not None:
+        # AFTER the channel allowlist has run: `_CHANNEL_TYPED_ITEMS` does not carry
+        # `configuration_update`, so an item appended before normalization is dropped.
+        items = [*items, config_update]
+
     params: Dict[str, Any] = {"model": model, "input": items}
     if tools is not None or legacy_kind == "tools":
         params["tools"] = tools
-    params["temperature"] = temperature
+    if not gpt6:
+        # This slot, not the sampling branch below: the 5.5/5.6 request shape is shipped and
+        # must stay byte-identical, key order included. GPT-6 sends neither sampling key.
+        params["temperature"] = temperature
     params["max_output_tokens"] = max_output_tokens
     params["store"] = store
     if stream:
@@ -184,32 +210,45 @@ def _build_request_params(
     params["text"] = {"verbosity": verbosity or config.default_verbosity}
 
     # gpt-5.5 and the 5.6 family allow temperature/top_p when reasoning=none
-    # (5.6 verified live 2026-07-09: effort=none + temperature/top_p -> 200)
-    if (model.startswith("gpt-5.5") or model.startswith("gpt-5.6")) and effort == "none":
+    # (5.6 verified live 2026-07-09: effort=none + temperature/top_p -> 200).
+    # GPT-6 allows neither at any effort (verified live 2026-09-08), so it takes no branch here.
+    if supports_sampling(model, effort):
         params["top_p"] = top_p
-    else:
+    elif not gpt6:
         params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
 
-    if channel or legacy_cache_params:
-        # gpt-5.5 keeps the explicit 24h retention param; the 5.6 family caches implicitly
-        # (retention is deprecated there) and takes explicit breakpoints instead. The
-        # per-thread key routes repeat calls to the same cache shard on both.
+    # GPT-6 enters unconditionally: its cache shape is not an opt-in the way 5.5's retention
+    # param was, it is how the family caches, and `legacy_cache_params=False` on a non-channel
+    # call was silently dropping both the key and the ttl. The `channel or legacy_cache_params`
+    # gate stays exactly as it was for 5.5/5.6, whose serialized requests must not move.
+    if channel or legacy_cache_params or gpt6:
+        # Three families, three cache shapes. gpt-5.5 keeps the explicit 24h retention param;
+        # the 5.6 family caches implicitly (retention is deprecated there) and takes explicit
+        # breakpoints instead; GPT-6 also caches implicitly but accepts ONLY `{"ttl": "30m"}`
+        # in prompt_cache_options — "24h" is a 400 there, and prompt_cache_retention returns
+        # 200 as a deprecated no-op, which is exactly why it must not be sent. The per-thread
+        # key routes repeat calls to the same cache shard on all three.
         if model.startswith("gpt-5.5"):
             params["prompt_cache_retention"] = "24h"
-        if prompt_cache_key and (model.startswith("gpt-5.5") or model.startswith("gpt-5.6")):
+        if prompt_cache_key and (model.startswith("gpt-5.5") or model.startswith("gpt-5.6")
+                                 or gpt6):
             params["prompt_cache_key"] = prompt_cache_key
-        if prompt_cache_options:
+        if gpt6:
+            # "30m" is both the only accepted value and the default; sending it is
+            # belt-and-braces against the default moving.
+            params["prompt_cache_options"] = prompt_cache_options or {"ttl": "30m"}
+        elif prompt_cache_options:
             if model.startswith("gpt-5.6"):
                 params["prompt_cache_options"] = prompt_cache_options
             else:
                 _request_log.debug(
                     f"prompt_cache_options dropped: unsupported on {model}")
 
-    # Fast tier: an eligible call site, `fast` in config, and the one model that honors it. A
+    # Fast tier: an eligible call site, `fast` in config, and a model that honors it. A
     # `standard` config sends NOTHING — the API's default is the literal "default" and
     # "standard" is not a value it accepts, so omission is the only correct way to say it.
     if (service_tier_eligible and config.openai_service_tier == "fast"
-            and model == FAST_SERVICE_TIER_MODEL):
+            and model in FAST_SERVICE_TIER_MODELS):
         params["service_tier"] = "fast"
     return params
 
@@ -706,11 +745,14 @@ class OpenAIClient(LoggerMixin):
         conservative — any failure → {"action": "none"} (no write)."""
         return await responses_api.extract_memory(self, exchange_text=exchange_text, existing_memory=existing_memory)
 
-    async def summarize_tool_result(self, text: str, max_chars: int) -> Optional[str]:
-        """F16: compress ONE overlong MCP tool output to a single line under max_chars,
-        preserving URLs/titles/dates/figures/IDs verbatim. Returns None on any failure
-        (caller falls back to truncation); never raises."""
-        return await responses_api.summarize_tool_result(self, text=text, max_chars=max_chars)
+    async def summarize_tool_result(self, text: str, max_chars: int,
+                                    context: Optional[str] = None) -> Optional[str]:
+        """F16: compress ONE overlong external tool output to a single line under max_chars,
+        preserving URLs/titles/dates/figures/IDs verbatim. ``context`` is the request the
+        assistant was answering, so the summary can keep what bears on it. Returns None on
+        any failure (caller falls back to truncation); never raises."""
+        return await responses_api.summarize_tool_result(self, text=text, max_chars=max_chars,
+                                                         context=context)
 
     async def _safe_api_call(
         self,

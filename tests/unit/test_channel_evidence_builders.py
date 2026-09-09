@@ -500,3 +500,27 @@ class TestMembership:
         """
         out = build_membership_suffix(14)
         assert "recently active" not in out
+
+
+class TestImageSettingsEvidence:
+    """The image half of the channel turn's tool-evidence block (image_service)."""
+
+    def test_a_saved_shape_is_stated_outright(self):
+        from message_processor import image_service as svc
+        body = "\n".join(svc.settings_evidence_lines(
+            {"image_model": "gpt-image-2", "image_size": "1536x1024"}))
+        assert "size=1536x1024" in body
+        assert "aspect argument" not in body
+
+    def test_under_auto_the_line_names_the_delegation_and_the_tier(self):
+        """A bare `auto` in a live prompt reads as "the API decides everything". Under a
+        saved Auto the person delegated exactly one thing — the shape — and the tier it
+        renders at is fixed, so the evidence has to say both."""
+        from message_processor import image_service as svc
+        body = "\n".join(svc.settings_evidence_lines(
+            {"image_model": "gpt-image-2.5-sunburst", "image_size": "auto",
+             "image_tier": "standard"}))
+        assert "settings this image call will run with: shape=" in body
+        assert "shape=chosen by you per request via the aspect argument" in body
+        assert "rendered at the standard tier" in body
+        assert "size=auto," not in body

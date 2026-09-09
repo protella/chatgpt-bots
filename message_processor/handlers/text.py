@@ -6,7 +6,7 @@ import time
 from typing import Any, Dict, List, Mapping, Optional, cast
 
 from message_processor.client_contract import BaseClient, Message, Response
-from config import config, pipeline_status
+from config import config, pipeline_status, SUPPORTED_CHAT_MODELS
 from message_processor import participation_telemetry
 from message_processor._host import _Host
 from message_processor.dm_reconsideration import pin_dm_turn_context
@@ -1417,7 +1417,10 @@ class TextHandlerMixin(_Host):
                     container_gone_sink=containers_gone,
                     # W2: the user-facing responder call — the only one that may buy the fast
                     # tier. Reconsideration, background and research calls never pass this.
-                    service_tier_eligible=True
+                    # It now also carries the PERSON'S own choice: fast is a personal setting,
+                    # and a channel is not one person, so a channel turn never buys it.
+                    service_tier_eligible=(not channel_turn
+                                           and thread_config.get("service_tier") == "fast")
                 )
                 response_text = result["text"]
                 response_segments = result.get("segments")
@@ -1458,7 +1461,8 @@ class TextHandlerMixin(_Host):
                         mcp_results_sink=mcp_results,
                         artifacts_sink=artifacts,
                         container_gone_sink=containers_gone,
-                        service_tier_eligible=True
+                        service_tier_eligible=(not channel_turn
+                                               and thread_config.get("service_tier") == "fast")
                     )
                     response_text = result["text"]
                     tools_actually_used = result["tools_used"]
@@ -1482,7 +1486,8 @@ class TextHandlerMixin(_Host):
                         mcp_results_sink=mcp_results,
                         artifacts_sink=artifacts,
                         container_gone_sink=containers_gone,
-                        service_tier_eligible=True
+                        service_tier_eligible=(not channel_turn
+                                               and thread_config.get("service_tier") == "fast")
                     )
                     response_text = result["text"]
                     tools_actually_used = result["tools_used"]
@@ -1504,7 +1509,8 @@ class TextHandlerMixin(_Host):
                         prompt_cache_key=cache_key if channel_turn else None,
                         layout=request_layout,
                         attempt_sink=attempt_sink,
-                        service_tier_eligible=True
+                        service_tier_eligible=(not channel_turn
+                                               and thread_config.get("service_tier") == "fast")
                     )
                 else:
                     response_text = await self.openai_client.create_text_response(
@@ -1519,7 +1525,8 @@ class TextHandlerMixin(_Host):
                         layout=request_layout,
                         usage_sink=usage_info,
                         attempt_sink=attempt_sink,
-                        service_tier_eligible=True
+                        service_tier_eligible=(not channel_turn
+                                               and thread_config.get("service_tier") == "fast")
                     )
         except Exception as api_error:
             # Usage-estimator backstop: the API is the final authority on context
@@ -1792,7 +1799,8 @@ class TextHandlerMixin(_Host):
                     tool_provenance += await build_result_digests_summarized(
                         mcp_results, self.openai_client,
                         config.tool_result_digest_chars, config.tool_result_turn_chars,
-                        config.tool_result_summarize_input_chars)
+                        config.tool_result_summarize_input_chars,
+                        context=(message.text or "").strip() or None)
                 else:
                     tool_provenance += build_result_digests(
                         mcp_results, config.tool_result_digest_chars, config.tool_result_turn_chars)
@@ -3260,8 +3268,10 @@ class TextHandlerMixin(_Host):
                     # the suppression rather than itself.
                     hidden_suppression_sink=hidden_stale,
                     # W2: the user-facing responder call — the only one that may buy
-                    # the fast tier (see the non-streaming twin).
-                    service_tier_eligible=True
+                    # the fast tier (see the non-streaming twin), and the one that carries
+                    # the person's own choice. Personal setting, so never on a channel turn.
+                    service_tier_eligible=(not channel_turn
+                                           and thread_config.get("service_tier") == "fast")
                 )
                 response_text = loop_result["text"]
                 response_segments = loop_result.get("segments")
@@ -3305,7 +3315,8 @@ class TextHandlerMixin(_Host):
                     artifacts_sink=artifacts,
                     container_gone_sink=containers_gone,
                     hidden_suppression_sink=hidden_stale,
-                    service_tier_eligible=True
+                    service_tier_eligible=(not channel_turn
+                                           and thread_config.get("service_tier") == "fast")
                 )
             else:
                 # Generate response without tools
@@ -3324,7 +3335,8 @@ class TextHandlerMixin(_Host):
                     usage_sink=usage_info,
                     attempt_sink=attempt_sink,
                     hidden_suppression_sink=hidden_stale,
-                    service_tier_eligible=True
+                    service_tier_eligible=(not channel_turn
+                                           and thread_config.get("service_tier") == "fast")
                 )
 
             # F32: artifacts the model produced this turn. The reply text may carry dead
@@ -3991,7 +4003,8 @@ class TextHandlerMixin(_Host):
                         tool_provenance += await build_result_digests_summarized(
                             mcp_results, self.openai_client,
                             config.tool_result_digest_chars, config.tool_result_turn_chars,
-                            config.tool_result_summarize_input_chars)
+                            config.tool_result_summarize_input_chars,
+                            context=(message.text or "").strip() or None)
                     else:
                         tool_provenance += build_result_digests(
                             mcp_results, config.tool_result_digest_chars, config.tool_result_turn_chars)
@@ -4519,9 +4532,13 @@ class TextHandlerMixin(_Host):
                 f"Added code_interpreter to tools array (container="
                 f"{container if isinstance(container, str) else 'auto'})")
 
-        # Add MCP tools if enabled AND model is GPT-5 AND MCP servers configured
+        # Add MCP tools if enabled AND the model is one we support AND MCP servers configured.
+        # B4: this used to read `model.startswith('gpt-5')`, which silently dropped every MCP
+        # server the moment a newer family shipped — the modal still offered MCP, no tool ever
+        # went out. Every model in SUPPORTED_CHAT_MODELS does MCP, so ask that question instead
+        # of re-encoding a version prefix that rots again at the next generation.
         mcp_enabled = thread_config.get('enable_mcp', config.mcp_enabled_default)
-        if mcp_enabled and model.startswith('gpt-5') and self.mcp_manager.has_mcp_servers():
+        if mcp_enabled and model in SUPPORTED_CHAT_MODELS and self.mcp_manager.has_mcp_servers():
             mcp_tools = self.mcp_manager.get_tools_for_openai()
 
             # Filter out excluded MCP server(s) if specified (str or set)

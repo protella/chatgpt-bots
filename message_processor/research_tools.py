@@ -1567,7 +1567,15 @@ async def _consume_research_stream(processor, *, messages: List[Dict[str, Any]],
         # sent the job anything since the last one. Forwarded verbatim — this function knows
         # nothing about notes, and shouldn't.
         pre_round_input_callback=pre_round_input_callback,
-        model=model, system_prompt=system_prompt, reasoning_effort=effort,
+        # The thread's BASELINE effort stays on top-level reasoning.effort and the job's own
+        # effort rides as the override — on GPT-6 that is a trailing configuration_update item,
+        # which keeps the prompt-cache prefix intact instead of invalidating it. The VALUE the
+        # job runs at is unchanged (deep research has always ignored the thread's own effort);
+        # only the transport differs. A thread with no stored baseline passes None here and the
+        # builder falls through to its configured default.
+        model=model, system_prompt=system_prompt,
+        reasoning_effort=(getattr(tool_context, "thread_config", None) or {}).get("reasoning_effort"),
+        effort_override=effort,
         verbosity=verbosity, store=False, **extra)
     return {"text": (result.get("text") or "") if isinstance(result, dict) else (result or ""),
             "tools_used": observed}
@@ -2705,7 +2713,7 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
                 thread_root=thread_root, job_id=job_id, task=task, snapshot=snapshot,
                 deliverables=deliverables, system_prompt=system_prompt, model=model,
                 effort=effort, verbosity=verbosity, timeout_s=timeout_s, card=card,
-                steering_callback=steering_callback)
+                steering_callback=steering_callback, thread_config=thread_config)
             # ONE close+sweep, whichever of the two reasons brought us here. RESEARCH-ONLY: the
             # report is written and there is no build phase behind it, so the working rounds are
             # over. EMPTY: there is no round left whatever the mode. With deliverables AND a
@@ -2838,7 +2846,8 @@ async def _run_research_phase(*, processor, client, channel_id: str, thread_root
                               deliverables: List[Dict[str, str]], system_prompt: Optional[str],
                               model: str, effort: str, verbosity: str, timeout_s: float,
                               card: "_ResearchCard",
-                              steering_callback: Optional[_SteeringCallback] = None) -> tuple:
+                              steering_callback: Optional[_SteeringCallback] = None,
+                              thread_config: Optional[Dict[str, Any]] = None) -> tuple:
     """Phase 1 — investigate. Returns ``(report_text, tools_used)``.
 
     Posts NOTHING. What comes back is material for the delivery decision, not a Slack message —
@@ -2850,8 +2859,14 @@ async def _run_research_phase(*, processor, client, channel_id: str, thread_root
     # card bookkeeping must not compete with real work for the round budget.
     job_registry = ToolRegistry()
     job_registry.register(get_update_todos_schema(), _make_update_todos(card))
+    # `thread_config` rides along for its BASELINE effort only (the build phase's context has
+    # carried it all along). Deep research still runs at its own configured effort — what the
+    # baseline buys is a cache hit: on GPT-6 the departure travels as a trailing
+    # configuration_update instead of a changed top-level reasoning.effort, which would miss
+    # the prefix cache outright. Absent, the builder falls back to its configured default.
     job_ctx = ToolContext(channel_id=channel_id, thread_ts=thread_root,
-                          trigger_ts=thread_root, client=client, processor=processor)
+                          trigger_ts=thread_root, client=client, processor=processor,
+                          thread_config=thread_config)
 
     # snapshot + an appended developer instruction to execute the task.
     instruction = _RESEARCH_JOB_INSTRUCTION.format(

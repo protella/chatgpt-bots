@@ -241,7 +241,8 @@ class TestBotConfig:
         assert thread_config["reasoning_effort"] == 'medium'
         assert thread_config["verbosity"] == 'medium'
         assert thread_config["enable_streaming"] is True
-        assert thread_config["image_size"] == "1024x1024"
+        assert thread_config["image_size"] == "auto"
+        assert thread_config["image_tier"] == "large"
         assert thread_config["image_quality"] == "auto"
         assert thread_config["image_background"] == "auto"
     
@@ -289,11 +290,36 @@ class TestBotConfig:
     def test_image_generation_parameters(self, mock_env):
         """Test image generation parameters"""
         config = BotConfig()
-        assert config.default_image_size == "1024x1024"
-        assert config.default_image_quality == "auto"  # auto, low, medium, high
+        # `auto` size means the SHAPE is chosen per request and rendered at the tier below.
+        assert config.default_image_size == "auto"
+        assert config.default_image_tier == "large"
+        assert config.default_image_quality == "auto"  # mock_env pins it; the shipped fallback is below
         assert config.default_image_background == "auto"  # auto, transparent, opaque
         assert config.default_image_number == 1
         assert config.default_image_format == "png"
+
+    def test_image_size_and_tier_ship_auto_at_large(self, mock_env, monkeypatch):
+        """The shipped fallbacks, with nothing in the environment: the shape is chosen per
+        request (`auto`) and rendered at `large`, on Sunburst."""
+        monkeypatch.delenv("DEFAULT_IMAGE_SIZE", raising=False)
+        monkeypatch.delenv("DEFAULT_IMAGE_TIER", raising=False)
+        monkeypatch.delenv("GPT_IMAGE_MODEL", raising=False)
+        config = BotConfig()
+        assert config.default_image_size == "auto"
+        assert config.default_image_tier == "large"
+        assert config.image_model == "gpt-image-2.5-sunburst"
+
+    def test_user_prefs_bridge_carries_the_image_tier(self, mock_env):
+        """A saved tier has to reach thread_config, or the modal's Size select would set a
+        value nothing ever reads."""
+        config = BotConfig()
+        bridged = config._map_user_prefs({"image_tier": "max"})
+        assert bridged["image_tier"] == "max"
+
+    def test_image_quality_ships_high_when_unset(self, mock_env, monkeypatch):
+        """The shipped fallback is `high` (owner ruling 2026-09-09); the env var only overrides it."""
+        monkeypatch.delenv("DEFAULT_IMAGE_QUALITY", raising=False)
+        assert BotConfig().default_image_quality == "high"
     
     def test_emoji_configuration(self, mock_env):
         """Test emoji settings"""
@@ -776,3 +802,139 @@ class TestImageImportConfig:
         """The check rejects unusable, not unusual — a short deadline is an owner's choice."""
         with patch.dict(os.environ, {var: good}):
             BotConfig()
+
+
+# ============================================================== GPT-6 Astra registry + ladders
+
+class TestGpt6Astra:
+    """Astra's ladder is the odd one out: it is the only family with NO `none`.
+
+    `UTILITY_REASONING_EFFORT` defaults to `none`, and every `none` already sitting in
+    user_preferences / channel_settings / threads.config_json will meet Astra, so the clamp is
+    the thing standing between a stored legacy value and a 400 on every turn.
+    """
+
+    def test_astra_is_the_first_supported_model(self):
+        from config import SUPPORTED_CHAT_MODELS
+        assert SUPPORTED_CHAT_MODELS[0] == "gpt-6-astra"
+
+    def test_the_ladder_has_no_none(self):
+        from config import effort_ladder
+        ladder = effort_ladder("gpt-6-astra")
+        assert ladder == ["low", "medium", "high", "xhigh", "max"]
+        assert "none" not in ladder and "minimal" not in ladder
+
+    @pytest.mark.parametrize("stored, expected", [
+        # OpenAI's own migration guidance: "if you use none or minimal, start with low".
+        ("none", "low"),
+        ("minimal", "low"),
+        ("low", "low"),
+        ("medium", "medium"),
+        ("high", "high"),
+        ("xhigh", "xhigh"),
+        ("max", "max"),            # unlike 5.5, Astra has `max`
+        ("wildly-wrong", "medium"),
+        (None, "medium"),
+    ])
+    def test_clamp_effort_on_astra(self, stored, expected):
+        from config import clamp_effort
+        assert clamp_effort("gpt-6-astra", stored) == expected
+
+    @pytest.mark.parametrize("model, effort, expected", [
+        # GPT-6 rejects temperature and top_p at every effort — `temperature=1.0` is tolerated,
+        # but the API's own error text calls the parameter unsupported, and relying on a
+        # tolerated value is how the next release breaks us.
+        ("gpt-6-astra", "none", False),
+        ("gpt-6-astra", "low", False),
+        ("gpt-6-astra", "max", False),
+        # 5.5 and 5.6 accept both, but only on a non-reasoning turn.
+        ("gpt-5.6-sol", "none", True),
+        ("gpt-5.6-sol", "medium", False),
+        ("gpt-5.5", "none", True),
+        ("gpt-5.5", "high", False),
+        ("gpt-5-mini", "none", False),
+    ])
+    def test_supports_sampling_truth_table(self, model, effort, expected):
+        from config import supports_sampling
+        assert supports_sampling(model, effort) is expected
+
+    def test_the_knowledge_cutoff_is_registered(self):
+        from config import MODEL_KNOWLEDGE_CUTOFFS
+        assert MODEL_KNOWLEDGE_CUTOFFS["gpt-6-astra"] == "April 30, 2026"
+
+    def test_get_model_token_limit_takes_the_1_05m_branch(self, mock_env):
+        config = BotConfig()
+        assert config.get_model_token_limit("gpt-6-astra") == int(
+            config.gpt54_max_tokens * config.gpt54_token_buffer_percentage)
+        # …which is NOT the conservative 400k window an unknown model would get.
+        assert config.get_model_token_limit("gpt-6-astra") != config.get_model_token_limit(
+            "unknown-model")
+
+
+class TestFastTierPreference:
+    """`service_tier` is a PERSONAL setting that rides the config hierarchy like any other."""
+
+    def test_both_eligible_models_are_in_the_set(self):
+        from config import FAST_SERVICE_TIER_MODELS
+        assert FAST_SERVICE_TIER_MODELS == frozenset({"gpt-5.6-sol", "gpt-6-astra"})
+        assert "gpt-5.6-luna" not in FAST_SERVICE_TIER_MODELS
+        assert "gpt-5.5" not in FAST_SERVICE_TIER_MODELS
+
+    def test_the_system_default_is_off(self, mock_env):
+        config = BotConfig()
+        assert config._default_thread_config()["service_tier"] == "standard"
+
+    def test_a_saved_preference_is_mapped_through(self, mock_env):
+        config = BotConfig()
+        assert config._map_user_prefs({"service_tier": "fast"})["service_tier"] == "fast"
+        assert config._map_user_prefs({"service_tier": "standard"})["service_tier"] == "standard"
+
+    def test_a_null_preference_leaves_the_system_default_standing(self, mock_env):
+        # NULL is every pre-existing row: "never chose", not "chose standard".
+        config = BotConfig()
+        assert "service_tier" not in config._map_user_prefs({"service_tier": None})
+        assert "service_tier" not in config._map_user_prefs({})
+
+
+class TestChannelEffortAcrossFamilies:
+    """A stored channel effort off the resolved model's ladder is translated, not discarded.
+
+    Spec 2.2: `none` and `minimal` become `low` on GPT-6. Both are exactly what a channel
+    configured under a 5.x model carries, so answering them with the workspace default would
+    quietly move the channel to a machine it never chose. Only a token no family has ever
+    accepted is corruption, and only corruption earns the fallback.
+    """
+
+    @pytest.mark.parametrize("model, stored, expected", [
+        ("gpt-6-astra", "none", "low"),        # no `none` on this ladder -> migration guidance
+        ("gpt-6-astra", "minimal", "low"),     # legacy token, same landing
+        ("gpt-6-astra", "high", "high"),       # on the ladder: untouched
+        ("gpt-6-astra", "max", "max"),         # Astra has `max`, unlike 5.5
+        ("gpt-5.6-sol", "minimal", "none"),    # 5.6 translates `minimal` its own way
+    ])
+    def test_a_known_effort_is_clamped_against_the_resolved_model(
+            self, mock_env, model, stored, expected):
+        from config import BotConfig
+        config = BotConfig()
+        profile = config._channel_capability_profile(
+            {"model": model, "reasoning_effort": stored}, "C_TEST")
+        assert profile["reasoning_effort"] == expected
+
+    @pytest.mark.parametrize("model, stored", [
+        ("gpt-6-astra", "turbo"),    # no family has ever accepted it: corruption
+        ("gpt-5.5", "max"),          # a rung the modal renders, absent HERE: respec 6.2
+    ])
+    def test_an_off_ladder_value_still_falls_back_to_the_clamped_default(
+            self, mock_env, model, stored):
+        """The exception is `none`/`minimal` and nothing else.
+
+        A stored `max` on gpt-5.5 stays refused: `max` is a real rung the settings modal
+        renders, and nudging it to `xhigh` would leave the resolver claiming an effort the
+        modal shows as inherited.
+        """
+        from config import BotConfig, clamp_effort
+        config = BotConfig()
+        profile = config._channel_capability_profile(
+            {"model": model, "reasoning_effort": stored}, "C_TEST")
+        assert profile["reasoning_effort"] == clamp_effort(
+            model, config.default_reasoning_effort)

@@ -23,6 +23,10 @@ MAX_CATALOG = 12
 # Longest description we put next to an id. Enough to disambiguate, not a wall of text.
 _DESC_CHARS = 110
 
+# The kinds whose `prompt` column holds an ENHANCED generation prompt worth reusing verbatim.
+# An uploaded (or imported) image has no prompt of ours to reuse.
+_PROMPTED_KINDS = ("generated", "edited")
+
 
 def image_id_for(row_id: Any) -> str:
     return f"img_{row_id}"
@@ -135,6 +139,30 @@ async def _dm_widening(db, thread_key: str, seen: set, *, room: int) -> List[Dic
     return widened
 
 
+def _reusable_prompt(entry: Dict[str, Any]) -> str:
+    """The full enhanced prompt behind a generated/edited image, collapsed to ONE line.
+
+    "Generate that again with the same prompt" was impossible: the enhanced prompt lives in
+    `images.prompt`, rebuilt history redacts tool arguments, and the catalog line showed only the
+    110-char description. So the model had nothing to reuse and re-enhanced from scratch, getting
+    a different picture. It is carried in full — a paraphrase is not the same prompt.
+
+    Single-line is a hard requirement, not tidiness: `catalog_evidence_lines` splits
+    `catalog_lines` on newlines and would otherwise scatter one image across several entries.
+
+    Uncapped, deliberately. A 2000-char ceiling used to guard against a pathological row, but a
+    truncated prompt is not the same prompt — "generate that again" would silently re-enhance
+    the missing tail and hand back a different picture, which is the exact failure this line
+    exists to stop.
+    """
+    if (entry.get("kind") or "") not in _PROMPTED_KINDS:
+        return ""
+    text = " ".join((entry.get("prompt") or "").split())
+    if not text:
+        return ""
+    return text
+
+
 def catalog_lines(entries: List[Dict[str, Any]]) -> str:
     """The human-readable half of the enum — what each id actually is."""
     lines = []
@@ -144,7 +172,12 @@ def catalog_lines(entries: List[Dict[str, Any]]) -> str:
         # "the image I just sent" and "that chart from earlier" are different requests.
         if e.get("origin"):
             marker += f" [{e['origin']}]"
-        lines.append(f"{e['image_id']}{marker} — {e['kind']}: {_describe(e)}")
+        line = f"{e['image_id']}{marker} — {e['kind']}: {_describe(e)}"
+        prompt = _reusable_prompt(e)
+        if prompt:
+            line += (' · generation prompt (reuse verbatim for "same prompt again"; edits '
+                     f'describe only the change): "{prompt}"')
+        lines.append(line)
     return "\n".join(lines)
 
 

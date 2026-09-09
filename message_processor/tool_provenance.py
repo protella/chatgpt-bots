@@ -22,6 +22,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from config import config
+from openai_client.api.responses import WEB_SEARCH_PASSAGE_MARKER
 
 # The external `_Used Tools:_` attribution footer (handlers/text.py appends this to the
 # VISIBLE message). It is deliberately user-facing chrome and must never reach model
@@ -249,13 +250,20 @@ async def build_result_digests_summarized(
     per_call_chars: int,
     per_turn_chars: int,
     input_chars: int,
+    context: Optional[str] = None,
 ) -> List[Dict[str, str]]:
     """F16 capture-time variant of :func:`build_result_digests`: a captured output longer
     than ``per_call_chars`` is SUMMARIZED once (utility model, low effort) instead of
     hard-cut, so the URL/figure/title that made it worth keeping survives. Applies to every
-    external source the sink carries — MCP outputs and web-search evidence alike — though
-    the web-search entries (a query, or a `sources:` list of titles+URLs) are small by
-    construction and normally take the verbatim path.
+    external source the sink carries — MCP outputs and web-search evidence alike.
+
+    ``context`` is this turn's request text. It is passed to every summarizer call so the
+    note keeps what bears on what was asked instead of everything that looks like a figure.
+    It also widens the trigger for the web-search entries that carry PASSAGE PROSE — the ones
+    whose evidence line was extended with ``WEB_SEARCH_PASSAGE_MARKER`` — because a passage is
+    verbose relative to the question even when it fits under ``per_call_chars``. A query-only
+    or ``sources:`` entry is already the shape a note wants, so it keeps the over-cap-only
+    rule, as do MCP entries. With no context, nothing under the cap is summarized.
 
     Restructure honesty: the pure/deterministic budget + truncation logic stays in the sync
     :func:`build_result_digests`. This async pre-pass ONLY does the utility calls — it
@@ -278,12 +286,18 @@ async def build_result_digests_summarized(
             prepared.append(entry)  # let the pure builder skip it uniformly
             continue
         text = str(output)
-        if len(text) <= per_call_chars:
+        # Web-search PASSAGES are summarized whenever we know the request, even under the cap:
+        # a raw passage is verbose relative to the question. A query/sources entry carries no
+        # marker and is left alone, as are MCP entries — both stay over-cap-only.
+        always = (bool(context) and str(name) == "web_search"
+                  and WEB_SEARCH_PASSAGE_MARKER in text)
+        if len(text) <= per_call_chars and not always:
             prepared.append(entry)  # fits already — no utility call (verbatim path)
             continue
         summary = None
         try:
-            summary = await openai_client.summarize_tool_result(text[:input_chars], per_call_chars)
+            summary = await openai_client.summarize_tool_result(
+                text[:input_chars], per_call_chars, context=context)
         except Exception:
             summary = None  # defensive: the client contract is non-raising, but never trust it
         if summary:

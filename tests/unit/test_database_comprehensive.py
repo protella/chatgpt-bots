@@ -339,6 +339,7 @@ class TestDatabaseManagerComprehensive:
         mock_config.image_model = "gpt-image-2"
         mock_config.default_image_quality = "high"
         mock_config.default_image_background = "auto"
+        mock_config.default_image_tier = "large"
 
         user_id = "U123"
         email = "test@example.com"
@@ -372,6 +373,7 @@ class TestDatabaseManagerComprehensive:
         mock_config.image_model = "gpt-image-2"
         mock_config.default_image_quality = "high"
         mock_config.default_image_background = "auto"
+        mock_config.default_image_tier = "large"
 
         user_id = "U123"
 
@@ -399,6 +401,7 @@ class TestDatabaseManagerComprehensive:
             mock_config.image_model = "gpt-image-2"
             mock_config.default_image_quality = "high"
             mock_config.default_image_background = "auto"
+            mock_config.default_image_tier = "large"
             temp_db.create_default_user_preferences(user_id)
 
         # Update preferences
@@ -443,6 +446,7 @@ class TestDatabaseManagerComprehensive:
             mock_config.image_model = "gpt-image-2"
             mock_config.default_image_quality = "high"
             mock_config.default_image_background = "auto"
+            mock_config.default_image_tier = "large"
             temp_db.create_default_user_preferences(user_id)
 
         prefs = temp_db.get_user_preferences(user_id)
@@ -543,6 +547,7 @@ class TestDatabaseManagerCritical:
             mock_config.image_model = "gpt-image-2"
             mock_config.default_image_quality = "high"
             mock_config.default_image_background = "auto"
+            mock_config.default_image_tier = "large"
 
             # Create and verify defaults
             defaults = temp_db.create_default_user_preferences(user_id)

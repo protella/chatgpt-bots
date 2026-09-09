@@ -704,6 +704,11 @@ def _make_legacy_db(db):
 
     The three legacy markers the v3 migrations key off: the `messages` mirror
     table, `documents.content`, and the missing `gpt56_migrated` sentinel.
+
+    BOTH model sentinels come off. A real pre-v3 database predates the gpt-5.6
+    migration, so it necessarily predates the gpt-6 Astra one as well — leaving
+    `gpt6_migrated` behind would build a shape no live database can have, and would
+    quietly make the Astra swap a no-op in every test that starts from here.
     """
     db.conn.execute("""
         CREATE TABLE messages (
@@ -714,6 +719,7 @@ def _make_legacy_db(db):
     db.conn.execute("INSERT INTO messages (thread_id, role, content) VALUES ('C1:1','user','hi')")
     db.conn.execute("ALTER TABLE documents ADD COLUMN content TEXT")
     db.conn.execute("ALTER TABLE user_preferences DROP COLUMN gpt56_migrated")
+    db.conn.execute("ALTER TABLE user_preferences DROP COLUMN gpt6_migrated")
 
 
 class _ExplodingConn:
@@ -756,10 +762,13 @@ class TestV3MigrationBackup:
         db2 = DatabaseManager("slack")
 
         # The swap did happen (live DB is on the new lineup) ...
+        # The Astra swap runs first and carries the chosen effort over, and the
+        # historical everyone->sol/medium reset behind it stands down, so `high`
+        # survives instead of being flattened to `medium`.
         live = db2.conn.execute(
             "SELECT model, reasoning_effort FROM user_preferences WHERE slack_user_id='U1'"
         ).fetchone()
-        assert (live["model"], live["reasoning_effort"]) == ("gpt-5.6-sol", "medium")
+        assert (live["model"], live["reasoning_effort"]) == ("gpt-6-astra", "high")
 
         # ... and exactly one pre-v3-upgrade backup was taken.
         pre = _backups(tmp_path, "pre-v3-upgrade")
@@ -807,7 +816,7 @@ class TestV3MigrationBackup:
         snap = sqlite3.connect(str(tmp_path / "backups" / mirror))
         row = snap.execute(
             "SELECT model FROM user_preferences WHERE slack_user_id='U1'").fetchone()
-        assert row[0] == "gpt-5.6-sol"  # already lost — hence the earlier backup
+        assert row[0] == "gpt-6-astra"  # already lost — hence the earlier backup
         snap.close()
         db2.conn.close()
 
@@ -874,9 +883,10 @@ class TestMigrationStepIsolation:
         assert any("Migration step 'pre-v3 backup' FAILED" in e for e in errors)
         assert any("detection exploded" in e for e in errors)
         # A middle step still landed ...
+        from config import config as bot_config
         assert db.conn.execute(
             "SELECT model FROM user_preferences WHERE slack_user_id='U1'"
-        ).fetchone()[0] == "gpt-5.6-sol"
+        ).fetchone()[0] == bot_config.gpt_model
         # ... and so did the last one.
         tables = {r[0] for r in db.conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
@@ -942,9 +952,10 @@ class TestMigrationStepIsolation:
             db.conn = real_conn
 
         assert any("Migration step 'gpt-5.6 migration' FAILED" in e for e in errors)
+        from config import config as bot_config
         assert db.conn.execute(
             "SELECT model FROM user_preferences WHERE slack_user_id='U1'"
-        ).fetchone()[0] == "gpt-5.6-sol"  # normalizer still ran
+        ).fetchone()[0] == bot_config.gpt_model  # normalizer still ran
         db.conn.close()
 
 
@@ -995,3 +1006,30 @@ class TestSingleStreamSchema:
             "INSERT INTO bot_meta (key, value) VALUES ('k', 'v')")
         temp_db.init_schema()  # second boot
         assert temp_db.get_meta("k") == "v"
+
+    def test_user_preferences_carries_the_image_tier_column(self, temp_db):
+        assert "image_tier" in self._columns(temp_db, "user_preferences")
+
+    def test_bare_user_row_falls_to_the_shipped_image_defaults(self, temp_db):
+        """The column DEFAULTs, on the path an explicit INSERT would mask: the shipped
+        shape is `auto` at the `large` tier, on Sunburst."""
+        temp_db.conn.execute(
+            "INSERT INTO user_preferences (slack_user_id) VALUES ('U_BARE')")
+        row = temp_db.conn.execute(
+            "SELECT image_model, image_size, image_tier FROM user_preferences "
+            "WHERE slack_user_id = 'U_BARE'").fetchone()
+        assert (row["image_model"], row["image_size"], row["image_tier"]) == (
+            "gpt-image-2.5-sunburst", "auto", "large")
+
+    def test_created_defaults_and_updates_carry_the_tier(self, temp_db):
+        """`create_default_user_preferences` has to write it, and
+        `update_user_preferences` has to accept it — a column neither one reaches is a
+        setting the modal can save and nothing can read back."""
+        from config import config as bot_config
+        defaults = temp_db.create_default_user_preferences("U_T", "t@example.com")
+        assert defaults["image_tier"] == bot_config.default_image_tier
+
+        temp_db.update_user_preferences("U_T", {"image_tier": "max"})
+        row = temp_db.conn.execute(
+            "SELECT image_tier FROM user_preferences WHERE slack_user_id = 'U_T'").fetchone()
+        assert row["image_tier"] == "max"

@@ -85,6 +85,8 @@ TOOL_RESULT_SUMMARIZE_PROMPT = """You compress ONE external tool result into a c
 
 Rewrite the tool output as a SINGLE LINE of plain text, no more than {max_chars} characters. Preserve verbatim every URL, report title, date, figure, and ID exactly as written — those are the details that make the result reusable, so never paraphrase, abbreviate, reformat, or drop them. Cut only prose, boilerplate, and repetition to fit.
 
+When the request the assistant was answering is shown to you, it decides what belongs in the note. Keep what bears on that request and drop what does not, however quotable it looks — a detail is not worth keeping because it is a number, a name, or a table; it is worth keeping because the request turns on it. Material about other subjects the output happens to cover is what you cut first. The verbatim rule holds over everything that survives that judgment: anything the request is about is reproduced exactly, never summarized into a paraphrase of itself.
+
 Output ONLY the summary line — no preamble, no markdown, no quotes, no newlines."""
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sys
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -449,6 +450,96 @@ def _url_citations(item: Any) -> List[str]:
     return sources
 
 
+_CITE_SPAN_RE = re.compile("\ue200.*?(?:\ue201|$)", re.DOTALL)
+_PUA_LEFTOVER_RE = re.compile("[\ue200-\ue20f]")
+_WORDLIM_RE = re.compile(r"\[wordlim:\s*\d+\]")
+_LINE_PREFIX_RE = re.compile(r"(?m)(?:^|(?<=\s))L\d+:[ \t]*")
+_META_PREFIX_RE = re.compile(
+    r"^\s*(?:Published|Crawled|Content type|Source|Total lines)\s*:[^;\n]*[;\n]?")
+
+
+def _clean_snippet(text: Any) -> str:
+    """Strip the transport noise the API wraps a web-search passage in, leaving prose.
+
+    Live snippets (openai 3.10.0, `include=["web_search_call.results"]`) carry four kinds of
+    junk that are meaningless to a later turn and cost digest budget: private-use cite
+    markers (a U+E200…U+E201 span, sometimes with U+E202/U+2020 inside), a `[wordlim: N]`
+    header, a `Published: …; Crawled: …;` metadata run at the front, and `L16:` line-number
+    prefixes on opened pages. Everything else is kept verbatim — the identifiers and
+    spellings this capture exists to preserve live in the prose."""
+    if not text:
+        return ""
+    out = _CITE_SPAN_RE.sub("", str(text))
+    out = _PUA_LEFTOVER_RE.sub("", out)
+    out = _WORDLIM_RE.sub("", out)
+    out = _LINE_PREFIX_RE.sub("", out)
+    while True:
+        stripped = _META_PREFIX_RE.sub("", out, count=1)
+        if stripped == out:
+            break
+        out = stripped
+    return " ".join(out.split())
+
+
+# Separator between a web-search action's evidence line and the passages it actually read.
+# Its presence in a captured `web_search` output is the only signal that the entry carries
+# passage prose rather than a bare query or a `sources:` list, so tool_provenance imports it
+# rather than repeating the literal.
+WEB_SEARCH_PASSAGE_MARKER = " | read: "
+
+
+def _web_search_results(item: Any) -> List[str]:
+    """`<title> — <url>: <snippet>` for each passage a `web_search_call` actually read.
+
+    Present only when the request asked for them (see :func:`_request_includes`); the SDK
+    exposes them through `model_extra`, so `getattr` reaches them on model objects, and some
+    paths hand the whole result over as a plain dict — both shapes are read, as in
+    :func:`_action_field`. A result whose snippet cleans to nothing is dropped rather than
+    recorded as a bare URL, which the action evidence already carries."""
+    raw = item.get("results") if isinstance(item, dict) else getattr(item, "results", None)
+    lines: List[str] = []
+    for result in raw if isinstance(raw, (list, tuple)) else []:
+        if isinstance(result, dict):
+            title, url = result.get("title"), result.get("url")
+            snippet = result.get("snippet")
+        else:
+            title = getattr(result, "title", None)
+            url = getattr(result, "url", None)
+            snippet = getattr(result, "snippet", None)
+        body = _clean_snippet(snippet)
+        if not body:
+            continue
+        label = " — ".join(str(part) for part in (title, url) if part)
+        lines.append(f"{label}: {body}" if label else body)
+    return lines
+
+
+def _request_includes(function_call_sink: Optional[List[Dict[str, Any]]],
+                      mcp_results_sink: Optional[List[Dict[str, Any]]],
+                      tools: Optional[List[Any]]) -> Optional[List[str]]:
+    """The `include` list for one Responses request, or None when it would be empty.
+
+    Two independent asks, each gated on the sink that consumes it:
+      * `reasoning.encrypted_content` — a stateless tool loop (store=False) must round-trip
+        reasoning items between rounds, so the function-call sink implies it.
+      * `web_search_call.results` — the ~200-word passages the model actually read, asked
+        for only when result memory is being collected AND a web-search tool is on the
+        request. Asking for it without the tool is a wasted parameter.
+
+    Returning None when nothing applies keeps the request byte-identical to before this
+    existed for every call that neither loops tools nor searches."""
+    includes: List[str] = []
+    if function_call_sink is not None:
+        includes.append("reasoning.encrypted_content")
+    if mcp_results_sink is not None:
+        for tool in tools or []:
+            tool_type = tool.get("type") if isinstance(tool, dict) else getattr(tool, "type", None)
+            if isinstance(tool_type, str) and tool_type.startswith("web_search"):
+                includes.append("web_search_call.results")
+                break
+    return includes or None
+
+
 def _capture_web_search(mcp_results_sink: Optional[List[Dict[str, Any]]], item: Any) -> None:
     """F12: harvest web-search EVIDENCE into the same result-memory sink the MCP capture
     feeds, as {"tool_name": "web_search", "output": …} entries in capture order.
@@ -470,17 +561,24 @@ def _capture_web_search(mcp_results_sink: Optional[List[Dict[str, Any]]], item: 
     the calls that report them, and `url_citation` is the only signal for which pages the
     ANSWER used — so here the annotations are evidence in their own right, not a bonus.
 
-    Queries, patterns and URLs ONLY. Page text and snippet bodies are never captured (CLAUDE.md
-    derived-artifact rules): these entries persist to the DB and replay into every later
-    turn of the thread. Truncation/budgeting happen later in build_result_digests, and the
-    `enable_tool_result_memory` gate is applied where the MCP entries' is — at persist time
-    in the text handler, not at capture. Never raises; no-ops when the sink is None."""
+    The passages the search READ are captured too, appended to the action evidence as
+    `read: <title> — <url>: <snippet> || …` and cleaned by :func:`_clean_snippet`. Evidence
+    alone was not enough: challenged on an exact identifier it had read off a page, the bot
+    could re-state its queries but could not check its own spelling, and over-retracted. The
+    passages are a derived artifact of the same class as MCP results and document
+    extractions, which the DB already holds. They persist and replay into every later turn,
+    so nothing is capped here: truncation and budgeting happen later in
+    build_result_digests, and the `enable_tool_result_memory` gate is applied where the MCP
+    entries' is — at persist time in the text handler, not at capture. Never raises; no-ops when the sink is None."""
     if mcp_results_sink is None:
         return
     try:
         if getattr(item, "type", None) == "web_search_call":
             evidence = _web_search_action_evidence(item)
             if evidence:
+                passages = _web_search_results(item)
+                if passages:
+                    evidence = f"{evidence}{WEB_SEARCH_PASSAGE_MARKER}" + " || ".join(passages)
                 mcp_results_sink.append({"tool_name": "web_search", "output": evidence})
             return
         sources = _url_citations(item)
@@ -683,8 +781,9 @@ async def create_text_response_with_tools(
         tools=tools,
         tool_choice=tool_choice,
         # Stateless tool loop: reasoning items must round-trip between rounds, which
-        # requires their encrypted content when store=False
-        include=["reasoning.encrypted_content"] if function_call_sink is not None else None,
+        # requires their encrypted content when store=False. Web-search passages ride the
+        # same parameter when result memory is on — see _request_includes.
+        include=_request_includes(function_call_sink, mcp_results_sink, tools),
         prompt_cache_key=prompt_cache_key,
         prompt_cache_options=prompt_cache_options,
         layout=layout,
@@ -1102,6 +1201,7 @@ async def create_streaming_response_with_tools(
     top_p: Optional[float] = None,
     system_prompt: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    effort_override: Optional[str] = None,
     verbosity: Optional[str] = None,
     store: bool = False,
     tool_callback: Optional[Callable[[str, str], Any]] = None,
@@ -1133,6 +1233,9 @@ async def create_streaming_response_with_tools(
         top_p: Top-p sampling
         system_prompt: System prompt to use
         reasoning_effort: Reasoning effort for GPT-5 reasoning models
+        effort_override: This call's departure from `reasoning_effort`. On GPT-6 it rides a
+            trailing `configuration_update` input item so the prompt cache survives; on every
+            other family it replaces the top-level effort. See `_build_request_params`.
         verbosity: Output verbosity for GPT-5 reasoning models
         store: Whether to store the response
         tool_callback: Optional callback for tool events (event_type, status)
@@ -1158,6 +1261,7 @@ async def create_streaming_response_with_tools(
         system_prompt=system_prompt,
         max_output_tokens=max_tokens,
         reasoning_effort=reasoning_effort,
+        effort_override=effort_override,
         verbosity=verbosity,
         temperature=temperature,
         top_p=top_p,
@@ -1167,8 +1271,9 @@ async def create_streaming_response_with_tools(
         tool_choice=tool_choice,
         parallel_tool_calls=True,
         # Stateless tool loop: reasoning items must round-trip between rounds, which
-        # requires their encrypted content when store=False
-        include=["reasoning.encrypted_content"] if function_call_sink is not None else None,
+        # requires their encrypted content when store=False. Web-search passages ride the
+        # same parameter when result memory is on — see _request_includes.
+        include=_request_includes(function_call_sink, mcp_results_sink, tools),
         prompt_cache_key=prompt_cache_key,
         prompt_cache_options=prompt_cache_options,
         layout=layout,
@@ -1942,17 +2047,31 @@ async def extract_memory(self, exchange_text: str, existing_memory: Optional[Lis
         return {"action": "none"}
 
 
-async def summarize_tool_result(self, text: str, max_chars: int) -> Optional[str]:
-    """F16: compress ONE overlong MCP tool output to a single line under ``max_chars``,
+async def summarize_tool_result(self, text: str, max_chars: int,
+                                context: Optional[str] = None) -> Optional[str]:
+    """F16: compress ONE overlong external tool output to a single line under ``max_chars``,
     preserving URLs/titles/dates/figures/IDs verbatim (utility model, low effort).
+
+    ``context`` is the request the assistant was answering when the tool ran. When given, it
+    leads the user message so the summarizer can tell what bears on the request from what is
+    merely numeric — a question about model ids should not come back holding a pricing table.
+    Verbatim preservation of anything the request IS about is unchanged.
 
     Best-effort and NON-BLOCKING for the reply pipeline: returns the summary string, or
     ``None`` on any error/timeout/empty output so the caller falls back to today's
     truncation. Never raises. The caller applies the input-char budget guard before
     calling, so ``text`` is already bounded."""
+    request_line = (context or "").strip()
+    if request_line:
+        user_content = (
+            f"The request the assistant was answering:\n{request_line}\n\n"
+            f"Tool output:\n{text}\n\nRespond with ONLY the single-line summary."
+        )
+    else:
+        user_content = f"Tool output:\n{text}\n\nRespond with ONLY the single-line summary."
     conversation_messages = [
         {"role": "developer", "content": TOOL_RESULT_SUMMARIZE_PROMPT.format(max_chars=max_chars)},
-        {"role": "user", "content": f"Tool output:\n{text}\n\nRespond with ONLY the single-line summary."},
+        {"role": "user", "content": user_content},
     ]
 
     request_params = {
@@ -2146,8 +2265,9 @@ async def _create_text_response_with_tools_with_timeout(
         tools=tools,
         tool_choice=tool_choice,
         # Stateless tool loop: reasoning items must round-trip between rounds, which
-        # requires their encrypted content when store=False
-        include=["reasoning.encrypted_content"] if function_call_sink is not None else None,
+        # requires their encrypted content when store=False. Web-search passages ride the
+        # same parameter when result memory is on — see _request_includes.
+        include=_request_includes(function_call_sink, mcp_results_sink, tools),
         prompt_cache_key=prompt_cache_key,
         prompt_cache_options=prompt_cache_options,
         layout=layout,

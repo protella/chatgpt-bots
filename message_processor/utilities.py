@@ -1696,7 +1696,8 @@ class MessageUtilitiesMixin(_Host):
             try:
                 usable = config.get_model_token_limit(model)
                 total = (config.gpt54_max_tokens
-                         if model.startswith(("gpt-5.6", "gpt-5.5")) else config.gpt5_max_tokens)
+                         if model.startswith(("gpt-6", "gpt-5.6", "gpt-5.5"))
+                         else config.gpt5_max_tokens)
                 model_context += (
                     f" Your context window is {total:,} tokens, of which about {usable:,} are "
                     f"usable for input here — the rest is reserved for your output and estimator "
@@ -2747,7 +2748,8 @@ def build_capability_state_suffix(capability_profile: Optional[Dict[str, Any]] =
             line += f", knowledge cutoff {cutoff}"
         try:
             usable = config.get_model_token_limit(model)
-            total = (config.gpt54_max_tokens if str(model).startswith(("gpt-5.6", "gpt-5.5"))
+            total = (config.gpt54_max_tokens
+                     if str(model).startswith(("gpt-6", "gpt-5.6", "gpt-5.5"))
                      else config.gpt5_max_tokens)
             line += (f". Context window {total:,} tokens, of which about {usable:,} are usable "
                      "for input here — the rest is reserved for your output and estimator "

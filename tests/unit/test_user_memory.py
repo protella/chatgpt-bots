@@ -397,7 +397,7 @@ def _blocks_by_id(view):
 
 
 @pytest.mark.asyncio
-async def test_the_user_modal_seeds_the_memory_box_and_offers_the_forget_checkbox(db):
+async def test_the_user_modal_seeds_the_memory_box_and_hides_the_forget_checkbox(db):
     await db.add_user_memory_async(USER, "prefers short answers", author=USER)
     await db.add_user_memory_async(USER, "owns the billing service", author=USER)
     store = _modal(db)
@@ -408,10 +408,8 @@ async def test_the_user_modal_seeds_the_memory_box_and_offers_the_forget_checkbo
     blocks = _blocks_by_id(view)
     box = blocks[SettingsModal.USER_MEMORY_BLOCK]["element"]
     assert box["initial_value"] == "prefers short answers\nowns the billing service"
-    forget = blocks[SettingsModal.USER_MEMORY_FORGET_BLOCK]["element"]
-    assert forget["type"] == "checkboxes"
-    assert "initial_options" not in forget
-    assert forget["options"][0]["value"] == SettingsModal.USER_MEMORY_FORGET_VALUE
+    # Everything fits in the box, so blanking it already forgets everything: no checkbox.
+    assert SettingsModal.USER_MEMORY_FORGET_BLOCK not in blocks
     # The seed rides the session row, not private_metadata (which holds only the session id).
     session_state = store.db.create_modal_session_async.await_args.args[2]
     assert [pair[1] for pair in session_state["user_mem_seed"]] == [
@@ -434,6 +432,11 @@ async def test_rows_past_the_textarea_budget_are_counted_not_seeded(db):
     assert len(session_state["user_mem_seed"]) == 1
     contexts = [b for b in view["blocks"] if b.get("type") == "context"]
     assert any("+2 more not shown" in b["elements"][0]["text"] for b in contexts)
+    # Blanking a truncated box would keep the hidden rows, so here the checkbox earns its place.
+    forget = _blocks_by_id(view)[SettingsModal.USER_MEMORY_FORGET_BLOCK]["element"]
+    assert forget["type"] == "checkboxes"
+    assert "initial_options" not in forget
+    assert forget["options"][0]["value"] == SettingsModal.USER_MEMORY_FORGET_VALUE
 
 
 @pytest.mark.asyncio

@@ -302,7 +302,9 @@ def test_the_channel_view_has_six_controls_and_one_model_select(monkeypatch):
 
     assert values("channel_web_search_block") == ["inherit", "on", "off"]
     assert values("channel_mcp_block") == ["inherit", "on", "off"]
-    assert values("channel_image_model_block") == ["inherit", "gpt-image-2", "gpt-image-1"]
+    assert values("channel_image_model_block") == [
+        "inherit", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "gpt-image-2",
+        "gpt-image-1"]
     # No stored row → all three sit on inherit rather than freezing today's global into the view.
     for block_id in ("channel_web_search_block", "channel_mcp_block",
                      "channel_image_model_block"):
@@ -409,7 +411,29 @@ async def test_an_old_modal_submission_preserves_the_new_fields(capability_db):
 # context, and the "forget everything" checkbox) directly under Custom Instructions. That is the
 # ONLY intended change to this view; the digest is what makes a second, unintended one loud. The
 # AsyncMock db yields no rows, so this pins the empty-store rendering.
-_PERSONAL_MODAL_GOLDEN = "2f7d6b5c6427dcf11b3302d1a764f1e8850a423c56cb88a3cc2e95c6ce8f4775"
+# RE-CAPTURED again for the GPT-6 Astra / gpt-image-2.5 round, which deliberately changes this
+# view in four places: the model radio is rebuilt from SUPPORTED_CHAT_MODELS (so Astra leads it),
+# the image-model select carries the two 2.5 models and the new display names, the single
+# "Image orientation" select becomes `image_ratio_block` (+ `image_tier_block` on a model with
+# custom sizes), and a context line under them carries the resolution. Every difference from the
+# previous digest was diffed against the shipped view before this was pinned; nothing else moved.
+# RE-CAPTURED again for the settings-modal copy round, four deliberate changes: the Custom
+# Instructions hint is gone, the personal-memory hint moved into the textarea placeholder, the
+# "forget everything" checkbox now renders only when the box could not show every note (an empty
+# store hides it), and the features checkboxes are an `actions` block instead of a section whose
+# only text was the redundant "Enable features:". Same block_id and action_id either way. Both
+# renders were taken off one source file and diffed block by block: exactly four differences, one
+# per change above. This capture also carries the concurrent aspect-ratio/display-name work
+# (_IMAGE_SHAPES, _aspect_label, _resolution_line, the model and image-model label helpers), which
+# lands in the same view and is deliberate; it is invisible to the diff above because both sides
+# of that diff were rendered from the same file.
+# RE-PINNED 2026-09-09 (§4.8.5 modal copy). The delta against the previous pin is COPY ONLY, and
+# was proved so: re-rendering this fixture with the two old label dicts monkeypatched back in
+# reproduces cc6ce4e6…227c80 exactly. What changed is the six image-quality rows (they now carry
+# the measured cost multipliers) and the two 2.5 image-model rows ("(Best)" / "(Faster)"). The
+# tier-under-Auto work is invisible here: this fixture stores 1024x1536 on gpt-image-1, which
+# renders no tier select.
+_PERSONAL_MODAL_GOLDEN = "7f4622613e65101acec84bfeeb28571b3474cb9b7c729cfc29237509ef1bb528"
 
 
 @pytest.mark.asyncio
@@ -535,3 +559,26 @@ def test_the_personal_image_options_follow_the_shared_constant(monkeypatch):
     values = [o["value"] for o in accessory["options"]]
     assert values == ["gpt-image-3", "gpt-image-2", "gpt-image-1"]
     assert accessory["initial_option"]["value"] in values
+
+
+# ------------------------------------------------------- the new lineup on the channel surface
+
+def test_the_channel_image_model_select_offers_all_four_models():
+    from config import SUPPORTED_IMAGE_MODELS
+    view = _capability_modal().build_channel_settings_modal("C1", None, "tag_only")
+    block = next(b for b in view["blocks"] if b.get("block_id") == "channel_image_model_block")
+    values = [o["value"] for o in block["element"]["options"]]
+    # `inherit` first, then the constant — the select's allowlist and the resolver's are one list.
+    assert values == ["inherit", *SUPPORTED_IMAGE_MODELS]
+
+
+def test_a_gpt6_channel_is_offered_no_none_effort():
+    """The channel's ladder comes from `effort_ladder(effective_channel_model(...))`, so a
+    channel pinned to Astra must not be shown a value that is a hard 400 there."""
+    from config import GPT6_EFFORTS
+    view = _capability_modal().build_channel_settings_modal(
+        "C1", {"model": "gpt-6-astra"}, "tag_only")
+    block = next(b for b in view["blocks"] if b.get("block_id") == "channel_effort_block")
+    values = [o["value"] for o in block["element"]["options"]]
+    assert values == ["inherit", *GPT6_EFFORTS]
+    assert "none" not in values

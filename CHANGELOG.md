@@ -4,6 +4,62 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.2.0] - 2026-09-09
+
+### ✨ Added
+
+- **GPT-6 Astra is here, and it is the new default model.** Selectable in settings alongside the
+  GPT-5.6 family and GPT-5.5. Its reasoning ladder runs `low` through `max` — it has no "None"
+  level, so the settings modal stops offering one when Astra is selected and quietly moves an
+  existing "None" setting to "Low".
+- **GPT-Image-2.5, in two flavours.** **Sunburst** is the new default image model — the highest
+  fidelity, and the one to pick when editing precision matters. **Flare** is the faster sibling.
+  GPT-Image-2 and GPT-Image-1 remain available.
+- **Two new image quality levels, Extra High and Maximum**, on the 2.5 models.
+- **Image size is now a shape and a size, not a single dropdown.** Pick a shape — Square,
+  Landscape, Portrait, Widescreen, Tall, Panorama or Skyscraper — and a size — Standard or Large.
+  The exact resolution is shown underneath and updates as you change either one. (Sizes above
+  2560x1440 are experimental per OpenAI's guide and render with visible artifacts, so they are
+  held back for now.)
+  On GPT-Image-1, which only accepts three fixed sizes, just the shape control appears.
+  **With the shape on Auto, the bot picks the shape each request calls for** — a slide comes out
+  widescreen, a phone wallpaper tall — and renders it at the size you chose.
+- **Quality options show what they cost relative to High** (Low 0.1×, Medium 0.25×, Extra High
+  2×, Maximum 4×), measured on the 2.5 models.
+- **"Same prompt again" works.** The full prompt used for every generated or edited image is kept
+  with the image, so the bot can reuse it verbatim later in the thread, even after a restart.
+- **A "Fast responses" setting**, for workspaces whose administrator has enabled it. Where it is
+  turned off, the setting says so rather than silently doing nothing.
+- **Web search results the bot actually read are remembered in the thread.** Follow-up questions
+  can build on what a search found without running it again, and the remembered passages are
+  kept to the prose, not the transport noise around it.
+
+### 🐛 Fixed
+
+- **Transparent backgrounds work on GPT-Image-2.** They were being silently switched to automatic
+  on the belief that the model could not do them. It can.
+- **Custom image sizes near the top and bottom of the allowed range no longer fail.** Some
+  requests were adjusted to dimensions the image API then rejected, and some legal sizes — large
+  squares in particular — were reshaped into something else.
+
+### 🔧 Changed
+
+- **Everyone moves to GPT-6 Astra and GPT-Image-2.5 Sunburst on first start**, keeping the
+  reasoning effort they had picked — "None" and "Minimal" become "Low", the lowest level Astra
+  accepts. Image settings move to the new defaults too: shape Auto, size Large, background Auto,
+  and quality High where none had been chosen. A shape you had chosen yourself is kept, at the
+  Large size. The shipped defaults follow: `GPT_IMAGE_MODEL=gpt-image-2.5-sunburst`,
+  `DEFAULT_IMAGE_SIZE=auto`, `DEFAULT_IMAGE_TIER=large`, `DEFAULT_IMAGE_QUALITY=high`.
+- **Dependencies:** openai 3.10.0 (from 3.6.0), slack-sdk 3.44.1.
+
+### ⬆️ Upgrading
+
+- Add `OPENAI_SERVICE_TIER` to your `.env` and set it to `standard` or `fast`. This is the
+  administrator switch behind the new "Fast responses" setting; without it, nobody can turn fast
+  responses on.
+- To keep the previous defaults, pin `GPT_MODEL` and `GPT_IMAGE_MODEL` in your `.env`. Otherwise
+  the bot moves to GPT-6 Astra and GPT-Image-2.5 Sunburst on the next restart.
+
 ## [3.1.11] - 2026-09-08
 
 ### 🐛 Fixed

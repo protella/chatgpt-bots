@@ -693,6 +693,11 @@ _RESPONDER_CALLS = frozenset({
     "_create_text_response_with_timeout", "_create_text_response_with_tools_with_timeout",
 })
 
+# What every one of those call sites must pass. NOT a literal `True` any more: fast is a
+# personal setting, so the call site asks whether this turn belongs to one person and whether
+# that person turned it on. Compared token-wise so the line may be re-wrapped but not re-worded.
+_ELIGIBILITY_EXPRESSION = 'not channel_turn and thread_config.get("service_tier") == "fast"'
+
 _SKIP_DIRS = {"tests", ".venv", "venv", "Docs", "data", "htmlcov", "logs", "metrics_reports",
               "__pycache__", ".git", "status_messages"}
 
@@ -743,7 +748,15 @@ class TestEligibilityBoundary:
 
     def test_every_responder_call_in_the_handler_is_marked_eligible(self):
         """The other direction: a responder call site added to the handler and NOT marked would
-        run the user's turn on the standard pool while the operator believes they bought fast."""
+        run the user's turn on the standard pool while the operator believes they bought fast.
+
+        The marker is no longer a literal `True`. Fast is a PERSONAL setting now, so each call
+        site passes the guarded expression
+        `(not channel_turn and thread_config.get("service_tier") == "fast")` — a channel is not
+        one person, and the person's own choice is what buys the tier. The count check is the
+        load-bearing half either way: it is what catches a NEW responder call site arriving
+        unmarked.
+        """
         import ast
 
         with open(os.path.join(_REPO_ROOT, _THE_ONLY_CALLER), encoding="utf-8") as fh:
@@ -755,16 +768,17 @@ class TestEligibilityBoundary:
             name = node.func.attr
             if name not in _RESPONDER_CALLS:
                 continue
-            eligible = any(kw.arg == "service_tier_eligible"
-                           and isinstance(kw.value, ast.Constant) and kw.value.value is True
-                           for kw in node.keywords)
-            found.setdefault(name, []).append(eligible)
+            marker = next((kw.value for kw in node.keywords
+                           if kw.arg == "service_tier_eligible"), None)
+            expected = ast.unparse(ast.parse(_ELIGIBILITY_EXPRESSION, mode="eval").body)
+            found.setdefault(name, []).append(
+                marker is not None and ast.unparse(marker) == expected)
 
         assert found, "found no responder calls at all — this test has lost its target"
         unmarked = {n: flags for n, flags in found.items() if not all(flags)}
         assert not unmarked, (
-            f"responder calls in {_THE_ONLY_CALLER} missing service_tier_eligible=True: "
-            f"{sorted(unmarked)}")
+            f"responder calls in {_THE_ONLY_CALLER} do not pass the guarded eligibility "
+            f"expression {_ELIGIBILITY_EXPRESSION!r}: {sorted(unmarked)}")
         assert sum(len(v) for v in found.values()) == 8, (
             f"the handler's responder call sites moved; recount and re-read them: {found}")
 
@@ -793,6 +807,9 @@ def _handler_host(streaming: bool) -> MagicMock:
     host.handler = method.__get__(host)
     host._background_tasks = set()
     host._is_reaction_only = TextHandlerMixin._is_reaction_only
+    # The REAL DM/channel discriminator, not a MagicMock: `channel_turn` is half of the
+    # eligibility expression, and a mock surface makes every turn look like a DM.
+    host._turn_surface = TextHandlerMixin._turn_surface
 
     async def _passthru(m, *a, **k):
         return m
@@ -816,6 +833,16 @@ def _handler_host(streaming: bool) -> MagicMock:
     host._build_tools_array = MagicMock(return_value=[{"type": "function", "name": "t"}])
     host._materialize_request_tools = MagicMock(
         return_value=(MagicMock(), {"model": "gpt-5.6-sol"}, True, None))
+
+    async def _channel_attempt(*a, **k):
+        """The channel branch's one assembly call. Scenery like everything else here — what
+        matters is that the branch RUNS, so `channel_turn` is really True downstream."""
+        request = SimpleNamespace(
+            input_items=[{"role": "user", "content": "hi"}], instructions="sys",
+            tools=[{"type": "function", "name": "t"}], prompt_cache_key="C1:9000.0")
+        return (request, MagicMock(), MagicMock(), {"model": "gpt-5.6-sol"}, True, "", None)
+
+    host._assemble_channel_attempt = _channel_attempt
     host._build_tool_context = MagicMock(return_value=SimpleNamespace(
         background_job_started=False, sandbox_image_assets=[], mounted_files=[]))
     host._current_image_urls = MagicMock(return_value=[])
@@ -825,21 +852,26 @@ def _handler_host(streaming: bool) -> MagicMock:
     return host
 
 
-async def _drive_handler(host, *, streaming: bool):
+async def _drive_handler(host, *, streaming: bool, channel_id: str = "C1",
+                         service_tier: Optional[str] = None):
     from unittest.mock import patch
 
     from message_processor.client_contract import Message
 
-    message = Message(text="what's the total?", user_id="U1", channel_id="C1",
+    message = Message(text="what's the total?", user_id="U1", channel_id=channel_id,
                       thread_id="9000.0", metadata={"ts": "9000.0"})
     thread_state = SimpleNamespace(
-        messages=[{"role": "user", "content": "hi"}], channel_id="C1", thread_ts="9000.0",
+        messages=[{"role": "user", "content": "hi"}], channel_id=channel_id,
+        thread_ts="9000.0",
         current_model="gpt-5.6-sol", config_overrides={}, has_summary_head=False,
         channel_directives=None, record_usage=MagicMock(), last_usage=None, participants={})
 
     async def fake_config(**kw):
-        return {"model": "gpt-5.6-sol", "temperature": 1.0, "max_tokens": 100,
-                "enable_streaming": streaming, "enable_code_interpreter": False}
+        cfg = {"model": "gpt-5.6-sol", "temperature": 1.0, "max_tokens": 100,
+               "enable_streaming": streaming, "enable_code_interpreter": False}
+        if service_tier is not None:
+            cfg["service_tier"] = service_tier
+        return cfg
 
     client = MagicMock()
     client.name = "Slack"
@@ -854,14 +886,27 @@ async def _drive_handler(host, *, streaming: bool):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("streaming", [True, False], ids=["streaming", "non-streaming"])
-async def test_the_real_handler_marks_its_responder_call_eligible(streaming):
+@pytest.mark.parametrize("channel_id, service_tier, expected", [
+    # A DM is one person, and that person asked for fast.
+    ("D1", "fast", True),
+    # …the same person who did not.
+    ("D1", "standard", False),
+    # NULL: every pre-existing row. "Never chose", not "chose fast".
+    ("D1", None, False),
+    # A channel is not one person, so nobody's personal tier follows them into it — the same
+    # reasoning that already keeps temperature/top_p out of a channel turn.
+    ("C1", "fast", False),
+])
+async def test_the_real_handler_marks_its_responder_call_eligible(
+        streaming, channel_id, service_tier, expected):
     """The link the wrapper tests cannot make: the production handler, driven for real, is what
-    turns eligibility on. Delete `service_tier_eligible=True` from the call site and this fails
-    — which is the whole point, because nothing else notices."""
+    decides eligibility. Break the guarded expression at the call site and this fails — which is
+    the whole point, because nothing else notices."""
     host = _handler_host(streaming)
-    await _drive_handler(host, streaming=streaming)
+    await _drive_handler(host, streaming=streaming, channel_id=channel_id,
+                         service_tier=service_tier)
 
     call = (host.openai_client.create_streaming_response_with_tool_loop if streaming
             else host.openai_client.create_text_response_with_tool_loop)
     assert call.await_count == 1, "the handler did not reach the responder call"
-    assert call.await_args.kwargs.get("service_tier_eligible") is True
+    assert call.await_args.kwargs.get("service_tier_eligible") is expected

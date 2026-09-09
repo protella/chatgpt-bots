@@ -5,14 +5,10 @@ from typing import Any, Callable, Dict, List, Optional
 
 import aiohttp
 from config import config
+from message_processor.image_service import supports_input_fidelity
 from message_processor.prompts import IMAGE_EDIT_SYSTEM_PROMPT, IMAGE_GEN_SYSTEM_PROMPT
 
 from ..utilities import ImageData
-
-
-def _is_v2(model_id: str) -> bool:
-    """Return True if model is gpt-image-2 family (different param surface than v1)."""
-    return bool(model_id) and model_id.startswith("gpt-image-2")
 
 
 async def generate_image(
@@ -27,17 +23,20 @@ async def generate_image(
     enhance_prompt: bool = True,
     conversation_history: Optional[List[Dict[str, Any]]] = None,
 ) -> ImageData:
-    """Generate an image using OpenAI image model (gpt-image-1, gpt-image-1-mini, gpt-image-2).
+    """Generate an image using an OpenAI image model (gpt-image-1, gpt-image-2, gpt-image-2.5).
 
     Args:
         client: OpenAI client instance
         prompt: Text description of the image to generate
         model: Image model ID. Defaults to config.image_model.
-        size: Image dimensions (1024x1024, 1024x1536, 1536x1024, auto); gpt-image-2
-            also accepts arbitrary WxH (multiples of 16, aspect <=3:1, up to 3840x2160)
-        quality: Rendering quality (auto, low, medium, high) - affects cost and detail
-        background: Background type (auto, transparent, opaque). gpt-image-2 does NOT
-            support transparent — coerced to auto with a warning.
+        size: Image dimensions (1024x1024, 1024x1536, 1536x1024, auto); the 2.x models
+            also accept arbitrary WxH (sides divisible by 16, longest edge <=2560, total
+            pixels within the envelope's budget, aspect <=3:1) — see
+            image_service.normalize_size. The 2560 cap is ours, not the API's: resolutions
+            above 2560x1440 are experimental per OpenAI's image guide, so they are disabled.
+        quality: Rendering quality (auto, low, medium, high; the 2.5 family adds xhigh, max)
+        background: Background type (auto, transparent, opaque). Every supported model
+            accepts all three, transparent included (probed live 2026-09-08).
         format: Output format (png, jpeg, webp)
         compression: Compression level for jpeg/webp (0-100); PNG must be 100
         enhance_prompt: Whether to enhance the prompt with AI
@@ -55,13 +54,6 @@ async def generate_image(
     background = background or config.default_image_background
     format = format or config.default_image_format
     compression = compression if compression is not None else config.default_image_compression
-
-    # gpt-image-2 does not support transparent backgrounds — coerce to auto
-    if _is_v2(effective_model) and background == "transparent":
-        self.log_warning(
-            "gpt-image-2 does not support background=transparent; falling back to auto"
-        )
-        background = "auto"
 
     # Enhance prompt if requested
     enhanced_prompt = prompt
@@ -393,10 +385,11 @@ async def edit_image(
     enhance_prompt: bool = True,
     conversation_history: Optional[List[Dict[str, Any]]] = None,
 ) -> ImageData:
-    """Edit or combine images using OpenAI image model.
+    """Edit or combine images using an OpenAI image model.
 
-    Supports gpt-image-1, gpt-image-1-mini, gpt-image-2. gpt-image-2 ignores
-    input_fidelity (auto-handled) and rejects background=transparent.
+    Supports gpt-image-1, gpt-image-2 and gpt-image-2.5. Only gpt-image-1 takes
+    `input_fidelity` — the 2.x models 400 on it, so it is omitted for them. Every supported
+    model accepts background=transparent (probed live 2026-09-08).
     """
 
     self = client
@@ -405,19 +398,12 @@ async def edit_image(
         self.log_warning(f"Limiting to 16 images for editing (received {len(input_images)})")
         input_images = input_images[:16]
 
-    # Resolve model + apply v2 param guards
+    # Resolve model + apply per-model param guards
     effective_model = model or config.image_model
 
     # Default quality/background
     quality = quality or config.default_image_quality
     background = background or config.default_image_background
-
-    # gpt-image-2 does not support transparent backgrounds
-    if _is_v2(effective_model) and background == "transparent":
-        self.log_warning(
-            "gpt-image-2 does not support background=transparent; falling back to auto"
-        )
-        background = "auto"
 
     # Enhance prompt if requested
     enhanced_prompt = prompt
@@ -471,11 +457,14 @@ async def edit_image(
             "n": 1,
         }
 
-        # input_fidelity is auto-handled on gpt-image-2; only send for v1 family
-        if not _is_v2(effective_model):
+        # Only gpt-image-1 takes input_fidelity; every other model 400s on the parameter, so
+        # the capability table decides rather than a model-id prefix (which cannot tell
+        # gpt-image-2 and gpt-image-2.5 apart).
+        if supports_input_fidelity(effective_model):
             params["input_fidelity"] = input_fidelity
         else:
-            self.log_debug("gpt-image-2 auto-handles fidelity; omitting input_fidelity param")
+            self.log_debug(
+                f"{effective_model} does not take input_fidelity; omitting the param")
 
         # Only add compression for JPEG/WebP (PNG must be 100)
         if output_format in ["jpeg", "webp"]:

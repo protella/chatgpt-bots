@@ -560,3 +560,97 @@ def test_f16_summarize_prompt_has_verbatim_preservation_contract():
     # {max_chars} is filled at call time from the per-call cap
     assert "{max_chars}" in TOOL_RESULT_SUMMARIZE_PROMPT
     assert "2000 characters" in TOOL_RESULT_SUMMARIZE_PROMPT.format(max_chars=2000)
+
+
+# ------------------------------------------- question-aware summaries (request context)
+
+@pytest.mark.asyncio
+async def test_context_forwarded_to_summarizer_as_kwarg():
+    # The turn's request rides along to every summarizer call as the `context` kwarg, so the
+    # note can keep what bears on the question instead of everything that looks like a figure.
+    client = _summarizer_client(return_value="kept link=http://x/1")
+    await tp.build_result_digests_summarized(
+        [{"tool_name": "reportpro", "output": "y" * 5000}],
+        client, per_call_chars=200, per_turn_chars=6000, input_chars=20000,
+        context="which model ids are current?")
+    kwargs = client.summarize_tool_result.call_args.kwargs
+    assert kwargs["context"] == "which model ids are current?"
+
+
+@pytest.mark.asyncio
+async def test_web_search_passage_under_cap_summarized_only_with_context():
+    # A raw passage is verbose relative to the question even when it fits under the cap, so a
+    # web_search entry carrying passage prose is summarized when the request is known — and
+    # only then. The marker the capture writes is what identifies passage prose.
+    from openai_client.api.responses import WEB_SEARCH_PASSAGE_MARKER
+
+    passage = ("query: model ids" + WEB_SEARCH_PASSAGE_MARKER
+               + "Pricing — http://x/p: rates and tiers")
+    assert len(passage) < 500
+
+    with_ctx = _summarizer_client(return_value="model ids: a, b — http://x/p")
+    out = await tp.build_result_digests_summarized(
+        [{"tool_name": "web_search", "output": passage}],
+        with_ctx, per_call_chars=500, per_turn_chars=6000, input_chars=20000,
+        context="which model ids are current?")
+    assert with_ctx.summarize_tool_result.call_count == 1
+    assert out[0]["result_digest"] == "model ids: a, b — http://x/p"
+
+    without_ctx = _summarizer_client(return_value="unused")
+    out = await tp.build_result_digests_summarized(
+        [{"tool_name": "web_search", "output": passage}],
+        without_ctx, per_call_chars=500, per_turn_chars=6000, input_chars=20000)
+    without_ctx.summarize_tool_result.assert_not_called()
+    assert out[0]["result_digest"] == passage
+
+    # A query-only entry carries no passage prose: already the shape a note wants, so it
+    # stays verbatim under the cap even with the request in hand.
+    query_only = _summarizer_client(return_value="unused")
+    out = await tp.build_result_digests_summarized(
+        [{"tool_name": "web_search", "output": "query: model ids"}],
+        query_only, per_call_chars=500, per_turn_chars=6000, input_chars=20000,
+        context="which model ids are current?")
+    query_only.summarize_tool_result.assert_not_called()
+    assert out[0]["result_digest"] == "query: model ids"
+
+
+@pytest.mark.asyncio
+async def test_mcp_under_cap_never_summarized_with_or_without_context():
+    # MCP entries keep the over-cap-only rule: a context does not widen the trigger for them.
+    short = "Ice Cream 2025-12-10 link=http://x/1"
+    for context in ("what did the ice cream report say?", None):
+        client = _summarizer_client(return_value="unused")
+        out = await tp.build_result_digests_summarized(
+            [{"tool_name": "reportpro", "output": short}],
+            client, per_call_chars=2000, per_turn_chars=6000, input_chars=20000,
+            context=context)
+        client.summarize_tool_result.assert_not_called()
+        assert out[0]["result_digest"] == short
+
+
+@pytest.mark.asyncio
+async def test_summarize_tool_result_puts_request_into_user_message():
+    """With a context, the request the assistant was answering leads the user message; without
+    one, the message is the tool output alone (today's shape)."""
+    from openai_client.api import responses as R
+
+    fake = MagicMock()
+    fake.log_info = fake.log_debug = fake.log_warning = fake.log_error = lambda *a, **k: None
+    resp = SimpleNamespace(
+        output=[SimpleNamespace(content=[SimpleNamespace(text="model ids link=http://x/1")])])
+    fake._safe_api_call = AsyncMock(return_value=resp)
+
+    request = "<@U123> Riley asked which model ids are current"
+    result = await R.summarize_tool_result(
+        fake, text="y" * 5000, max_chars=2000, context=request)
+    assert result == "model ids link=http://x/1"
+    user_msg = fake._safe_api_call.call_args.kwargs["input"][1]
+    assert user_msg["role"] == "user"
+    assert request in user_msg["content"]
+    assert "y" * 100 in user_msg["content"]          # the tool output still rides along
+    dev = fake._safe_api_call.call_args.kwargs["input"][0]["content"]
+    assert "Keep what bears on that request" in dev
+
+    fake._safe_api_call = AsyncMock(return_value=resp)
+    await R.summarize_tool_result(fake, text="y" * 5000, max_chars=2000)
+    assert request not in fake._safe_api_call.call_args.kwargs["input"][1]["content"]

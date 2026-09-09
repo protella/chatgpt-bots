@@ -1,8 +1,8 @@
 # Core dependencies
 python-dotenv>=1.2.2
-openai>=2.53.0  # GPT-5.6 family support (max effort literal, prompt_cache_options)
+openai>=3.9.0  # GPT-6 Astra (3.8.0) + prompt-cache diagnostics (3.9.0)
 slack_bolt>=1.30.0
-slack_sdk>=3.43.0  # imported directly (WebClient, SlackApiError); do not rely on slack_bolt's transitive pin
+slack_sdk>=3.44.1  # imported directly (WebClient, SlackApiError); do not rely on slack_bolt's transitive pin
 Pillow>=12.3.0
 croniter>=6.2.4
 pytz>=2026.3

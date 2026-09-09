@@ -138,3 +138,65 @@ def test_a_widened_entry_is_labelled_in_the_tool_description():
     ])
     assert "img_9 (most recent) — uploaded: this turn's picture" in lines
     assert "img_7 [earlier in this DM] — uploaded: yesterday's picture" in lines
+
+
+# --- the reusable generation prompt (F34 follow-up) --------------------------------------
+#
+# "Generate that again with the same prompt" could not be honoured: the enhanced prompt is in
+# `images.prompt`, rebuilt history redacts tool arguments, and the catalog line carried only a
+# 110-char description. The prompt now rides the line in full, on ONE line.
+
+
+def test_a_generated_image_carries_its_full_prompt_not_a_110_char_stub():
+    prompt = "a cinematic wide shot of a lighthouse at dusk, " * 20  # ~940 chars
+    lines = image_catalog.catalog_lines([
+        {"image_id": "img_843", "kind": "generated", "analysis": "a lighthouse at dusk",
+         "prompt": prompt},
+    ])
+
+    assert len(prompt.strip()) > 900, "the fixture must exercise the long-prompt case"
+    assert prompt.strip() in lines, "the enhanced prompt is reusable only if it is verbatim"
+    assert "generation prompt" in lines
+    assert "a lighthouse at dusk" in lines, "the description half is unchanged"
+    assert "…" not in lines, "nothing is truncated at this length"
+
+
+def test_a_long_prompt_is_carried_whole_with_no_character_ceiling():
+    """There is no cap. A truncated prompt is not the same prompt: "generate that again"
+    would re-enhance the missing tail and hand back a different picture."""
+    prompt = "an isometric cutaway of a lighthouse, every deck labelled, " * 51  # ~3000 chars
+    lines = image_catalog.catalog_lines([
+        {"image_id": "img_844", "kind": "generated", "analysis": "a lighthouse cutaway",
+         "prompt": prompt},
+    ])
+
+    assert len(prompt.strip()) > 3000, "the fixture must exceed the old 2000-char ceiling"
+    assert prompt.strip() in lines, "the whole prompt rides the line, verbatim"
+    assert "…" not in lines, "nothing is truncated at any length"
+
+
+def test_an_uploaded_image_renders_exactly_as_before():
+    """No prompt of ours to reuse — the line must not grow a 'generation prompt' clause."""
+    lines = image_catalog.catalog_lines([
+        {"image_id": "img_9", "kind": "uploaded", "analysis": "a screenshot of a dashboard",
+         "prompt": ""},
+    ])
+
+    assert lines == "img_9 (most recent) — uploaded: a screenshot of a dashboard"
+    assert "generation prompt" not in lines
+
+
+def test_a_multiline_prompt_is_collapsed_so_evidence_stays_one_line_per_image():
+    # catalog_evidence_lines splits on newlines: an embedded newline would scatter one image
+    # across several entries and break the id-per-line contract.
+    entries = [
+        {"image_id": "img_5", "kind": "edited", "analysis": "a chart",
+         "prompt": "make the bars blue\n\nand widen the axis labels"},
+        {"image_id": "img_4", "kind": "uploaded", "analysis": "the original chart", "prompt": ""},
+    ]
+
+    lines = image_catalog.catalog_evidence_lines(entries)
+
+    assert lines[0] == image_catalog.EVIDENCE_HEADER
+    assert len(lines) == 3, "one header line plus exactly one line per image"
+    assert "make the bars blue and widen the axis labels" in lines[1]
