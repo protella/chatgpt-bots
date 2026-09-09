@@ -1047,6 +1047,14 @@ async def create_streaming_response_with_tool_loop(
     # prior_committed so a cross-attempt partial (F8) also counts as committed.
     visible_committed = bool(prior_committed)
     rescued = False     # the empty-cap-forced-final retry fires at most once per turn
+    # ...but not every caller wants it. "one forced tool round, and the call IS the answer" is a
+    # legitimate shape: the background-job delivery planner (message_processor/research_tools.py)
+    # seeds tool_choice="required" with a rounds cap of 1, reads its reply out of the `deliver`
+    # tool args, discards this loop's return value, and tells the model to write NOTHING after
+    # the call. Its wind-down round is SUPPOSED to be empty, so the rescue there is two wasted
+    # model calls and two misleading warnings per job. Captured here, before the loop clears the
+    # seeded tool_choice below.
+    rescue_enabled = not (tool_choice == "required" and rounds_cap == 1)
     # Every round's visible text, in order — a pre-tool preamble and the post-tool text are
     # SEPARATE rounds. ``aggregate_segments`` (the chat handler) returns the seam-joined whole so
     # the thread remembers exactly what Slack showed instead of just the last round's "Fixed."
@@ -1100,7 +1108,7 @@ async def create_streaming_response_with_tool_loop(
             # would post an empty string, which Slack rejects outright. `visible_committed` is the
             # streaming loop's own record of whether the room has already read anything.
             # no_response_needed has returned long before here, so chosen silence is untouched.
-            empty_final = (tool_choice == "none" and not visible_committed
+            empty_final = (rescue_enabled and tool_choice == "none" and not visible_committed
                            and not (final_text or "").strip())
             if empty_final and not rescued:
                 rescued = True                       # at most once per turn; cannot recurse

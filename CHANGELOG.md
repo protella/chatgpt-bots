@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.2.2] - 2026-09-09
+
+### 🐛 Fixed
+
+- **Background-job deliveries no longer make two wasted model calls.** The one-round delivery
+  step ends with an intentionally empty round, which the empty-reply safeguard mistook for a lost
+  answer and retried twice before logging an "out of tool budget" note. Nothing reached Slack,
+  but every job paid the extra calls. The safeguard now stays out of that step.
+
 ## [3.2.1] - 2026-09-09
 
 ### 🐛 Fixed

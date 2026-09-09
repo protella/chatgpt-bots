@@ -1883,6 +1883,44 @@ class TestEmptyCapForcedFinalIsRescued:
         assert out["terminal_action"] == "no_reply"
         assert state["n"] == 1
 
+    async def test_a_forced_single_round_caller_is_not_rescued(self, monkeypatch):
+        """Prod, 2026-09-09: the background-job delivery planner calls this loop with
+        tool_choice="required" and a rounds cap of 1. Its reply lives in the `deliver` tool args,
+        not in the text, and the prompt tells the model to write nothing after the call — so the
+        cap-forced wind-down round is empty ON PURPOSE. The rescue fired anyway: two wasted model
+        calls and two misleading warnings per delivered job."""
+        warnings = []
+
+        class _LoudClient(_Client):
+            def log_warning(self, msg, *a, **k):
+                warnings.append(str(msg))
+
+        state = {"n": 0, "last_input": []}
+
+        async def fake_streaming(client, messages, tools, stream_callback, tool_callback=None,
+                                 function_call_sink=None, tool_choice=None, **params):
+            state["n"] += 1
+            assert state["n"] <= 5, "the loop never wound down"
+            state["last_input"] = list(messages)
+            if state["n"] == 1 and function_call_sink is not None:
+                function_call_sink.append(_call("deliver", "c1"))
+            return ""
+
+        monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
+                            fake_streaming)
+        out = await tool_loop.create_streaming_response_with_tool_loop(
+            _LoudClient(), messages=[], tools=[], registry=_registry_with("deliver"),
+            tool_context=ToolContext(), stream_callback=lambda c: None,
+            max_tool_rounds=1, max_tool_calls=1, tool_choice="required")
+
+        assert out["text"] == ""                     # the quiet exit, not the fallback note
+        assert out["text"] != tool_loop._EMPTY_FINAL_FALLBACK
+        assert state["n"] == 2                       # forced tool round + wind-down. No retry.
+        assert not any(tool_loop._EMPTY_FINAL_RESCUE in str(m.get("content"))
+                       for m in state["last_input"] if isinstance(m, dict))
+        assert not [w for w in warnings if "out-of-budget" in w or "returned nothing" in w]
+        assert [w for w in warnings if "Tool loop cap hit" in w]
+
 
 @pytest.mark.asyncio
 class TestRescueSurvivesTheHandlerRebuild:
