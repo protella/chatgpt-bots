@@ -784,6 +784,15 @@ class BotConfig:
     # calls cap is the binding budget and the rounds cap is a runaway backstop only.
     max_tool_rounds: int = field(default_factory=lambda: int(os.getenv("MAX_TOOL_ROUNDS", "20")))
     max_tool_calls_per_turn: int = field(default_factory=lambda: int(os.getenv("MAX_TOOL_CALLS_PER_TURN", "20")))
+    # ...and a ceiling WITHIN one round on PRODUCTIVE calls, enforced BEFORE dispatch. A round's
+    # calls run in parallel, so the turn cap alone stops only the NEXT round — by which time a
+    # single response of 20 parallel searches has already run them all, spent the whole turn on
+    # round one, and left nothing for the answer. The number is derived, not picked: the turn
+    # budget above is 20, and a legitimate turn needs at least ~3 productive rounds to iterate
+    # (gather -> read -> answer), so 20/3 rounds down to 6. 6 also sits above
+    # SEARCH_REPLY_FETCH_CONCURRENCY (4), the tuned parallel-Slack-fetch width, so an honest
+    # parallel scan is not crippled by it. Env-overridable so it can be retuned without a deploy.
+    max_tool_calls_per_round: int = field(default_factory=lambda: max(1, int(os.getenv("MAX_TOOL_CALLS_PER_ROUND", "6"))))
     # Per-executor timeout (seconds); a timed-out tool returns an error result to the model.
     tool_call_timeout: float = field(default_factory=lambda: float(os.getenv("TOOL_CALL_TIMEOUT", "20")))
     # Truncation cap on a single tool result fed back to the model (characters).

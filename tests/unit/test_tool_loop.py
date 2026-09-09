@@ -1672,3 +1672,285 @@ class TestMixedHostedAndBridgeRound:
         manager.adopt.assert_awaited_once_with("C1:1.1", "cntr_hosted")
         assert ctx.sandbox.container_id == "cntr_hosted"
         assert _ci_container(fake.tools_seen[1]) == "cntr_hosted"
+
+
+# ------------------------------------------- per-round productive fan-out cap + empty-final rescue
+
+@pytest.mark.asyncio
+class TestPerRoundFanOutCap:
+    """Prod, 2026-09-08: one response carried 20 parallel `search_slack` calls. All 20 dispatched,
+    together burning ~1000 Slack API calls in twenty seconds, the turn cap tripped on round ONE,
+    and the forced final had nothing left to work with. The free-tool path has had a per-round
+    burst cap all along; the productive path never did."""
+
+    async def test_one_round_cannot_spend_the_whole_turn_budget(self, monkeypatch):
+        monkeypatch.setattr(config, "max_tool_calls_per_round", 3)
+        executed = []
+
+        async def _spy(ctx, args):
+            executed.append(args)
+            return {"ok": True}
+
+        state = {"n": 0, "last_input": []}
+
+        async def fake_streaming(client, messages, tools, stream_callback, tool_callback=None,
+                                 function_call_sink=None, tool_choice=None, **params):
+            state["n"] += 1
+            state["last_input"] = list(messages)
+            if state["n"] == 1 and function_call_sink is not None:
+                function_call_sink.extend(_call("search_slack", f"c{i}") for i in range(20))
+                return ""
+            return "stopped"
+
+        monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
+                            fake_streaming)
+        out = await tool_loop.create_streaming_response_with_tool_loop(
+            _Client(), messages=[], tools=[], registry=_registry_with("search_slack", _spy),
+            tool_context=ToolContext(), stream_callback=lambda c: None,
+            max_tool_rounds=9, max_tool_calls=20)
+
+        assert out["text"] == "stopped"
+        # Three ran, seventeen never touched Slack at all.
+        assert len(executed) == 3, f"{len(executed)} calls dispatched against a round cap of 3"
+        replayed = state["last_input"]
+        made = [m for m in replayed if m.get("type") == "function_call"]
+        answered = [m for m in replayed if m.get("type") == "function_call_output"]
+        assert len(made) == 20
+        assert {m["call_id"] for m in made} == {m["call_id"] for m in answered}
+        # Refused for FAN-OUT, not for budget: the turn still has 17 calls left, and telling the
+        # model its budget was spent would be a lie that makes it give up.
+        refused = [m for m in answered if "too_many_calls_this_round" in str(m.get("output"))]
+        assert len(refused) == 17
+        assert not [m for m in answered if "over_budget" in str(m.get("output"))]
+
+    async def test_the_non_streaming_twin_holds_the_same_line(self, monkeypatch):
+        monkeypatch.setattr(config, "max_tool_rounds", 9)
+        monkeypatch.setattr(config, "max_tool_calls_per_turn", 20)
+        monkeypatch.setattr(config, "max_tool_calls_per_round", 3)
+        executed = []
+
+        async def _spy(ctx, args):
+            executed.append(args)
+            return {"ok": True}
+
+        fake = _FakeRounds([
+            ("", [_call("search_slack", f"c{i}") for i in range(20)]),
+            ("stopped", []),
+        ])
+        monkeypatch.setattr(tool_loop.responses_api, "create_text_response_with_tools", fake)
+        out = await tool_loop.create_text_response_with_tool_loop(
+            _Client(), messages=[], tools=[], registry=_registry_with("search_slack", _spy),
+            tool_context=ToolContext())
+
+        assert out["text"] == "stopped"
+        assert len(executed) == 3
+        replayed = fake.invocations[-1]["messages"]
+        answered = [m for m in replayed if m.get("type") == "function_call_output"]
+        assert len([m for m in answered
+                    if "too_many_calls_this_round" in str(m.get("output"))]) == 17
+
+    async def test_the_turn_budget_still_binds_past_the_round_cap(self, monkeypatch):
+        """A round cap that let the model re-issue the same shotgun forever would be a worse bug
+        than the one it fixes. `_charge` bills only what RAN, so the suppressed calls cost
+        nothing — but each round that runs its allowed N is charged N calls AND a round, so both
+        budgets still march to the cap and the loop terminates."""
+        monkeypatch.setattr(config, "max_tool_calls_per_round", 3)
+        executed = []
+
+        async def _spy(ctx, args):
+            executed.append(args)
+            return {"ok": True}
+
+        state = {"n": 0}
+
+        async def fake_streaming(client, messages, tools, stream_callback, tool_callback=None,
+                                 function_call_sink=None, tool_choice=None, **params):
+            state["n"] += 1
+            assert state["n"] <= 10, "the loop never reached its forced final round"
+            if tool_choice != "none" and function_call_sink is not None:
+                function_call_sink.extend(
+                    _call("search_slack", f"c{state['n']}_{i}") for i in range(20))
+            return "stopped" if tool_choice == "none" else ""
+
+        monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
+                            fake_streaming)
+        out = await tool_loop.create_streaming_response_with_tool_loop(
+            _Client(), messages=[], tools=[], registry=_registry_with("search_slack", _spy),
+            tool_context=ToolContext(), stream_callback=lambda c: None,
+            max_tool_rounds=9, max_tool_calls=9)
+
+        assert out["text"] == "stopped"
+        # Three rounds of three, then the turn cap forces the final answer.
+        assert len(executed) == 9
+        # Past the turn remainder the refusal changes back to over_budget: that IS true now.
+        assert state["n"] == 4
+
+
+@pytest.mark.asyncio
+class TestEmptyCapForcedFinalIsRescued:
+    """Same prod incident, second defect. The cap-forced final round returned 0 chars, the loop
+    returned "", the handler posted it, and Slack rejected the empty message — the user asked a
+    question in a channel and got complete silence."""
+
+    def _stream_fake(self, state, retry_text):
+        async def fake_streaming(client, messages, tools, stream_callback, tool_callback=None,
+                                 function_call_sink=None, tool_choice=None, **params):
+            state["n"] += 1
+            state["saw_rescue"] = any(tool_loop._EMPTY_FINAL_RESCUE in str(m.get("content"))
+                                      for m in messages if isinstance(m, dict))
+            if state["n"] == 1 and function_call_sink is not None:
+                function_call_sink.extend(_call("search_slack", f"c{i}") for i in range(3))
+            return retry_text if state["saw_rescue"] else ""
+        return fake_streaming
+
+    async def _drive_stream(self, monkeypatch, retry_text):
+        monkeypatch.setattr(config, "max_tool_calls_per_round", 3)
+        state = {"n": 0, "saw_rescue": False}
+        monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
+                            self._stream_fake(state, retry_text))
+        out = await tool_loop.create_streaming_response_with_tool_loop(
+            _Client(), messages=[], tools=[], registry=_registry_with("search_slack"),
+            tool_context=ToolContext(), stream_callback=lambda c: None,
+            max_tool_rounds=9, max_tool_calls=3)
+        return out, state
+
+    async def test_streaming_empty_final_gets_one_plain_text_retry(self, monkeypatch):
+        out, state = await self._drive_stream(monkeypatch, "Found two of the three, here they are.")
+
+        assert out["text"] == "Found two of the three, here they are."
+        assert state["n"] == 3          # tool round, empty forced final, rescued retry
+
+    async def test_streaming_falls_back_to_the_honest_note(self, monkeypatch):
+        out, state = await self._drive_stream(monkeypatch, "")
+
+        assert out["text"] == tool_loop._EMPTY_FINAL_FALLBACK
+        assert state["n"] == 3          # exactly one retry — the flag stops it recursing
+
+    async def _drive_text(self, monkeypatch, retry_text):
+        monkeypatch.setattr(config, "max_tool_rounds", 9)
+        monkeypatch.setattr(config, "max_tool_calls_per_turn", 3)
+        monkeypatch.setattr(config, "max_tool_calls_per_round", 3)
+        state = {"n": 0, "saw_rescue": False}
+
+        async def fake(client, messages, tools, return_metadata=True, function_call_sink=None,
+                       tool_choice=None, **params):
+            state["n"] += 1
+            state["saw_rescue"] = any(tool_loop._EMPTY_FINAL_RESCUE in str(m.get("content"))
+                                      for m in messages if isinstance(m, dict))
+            if state["n"] == 1 and function_call_sink is not None:
+                function_call_sink.extend(_call("search_slack", f"c{i}") for i in range(3))
+            return {"text": retry_text if state["saw_rescue"] else "", "tools_used": []}
+
+        monkeypatch.setattr(tool_loop.responses_api, "create_text_response_with_tools", fake)
+        out = await tool_loop.create_text_response_with_tool_loop(
+            _Client(), messages=[], tools=[], registry=_registry_with("search_slack"),
+            tool_context=ToolContext())
+        return out, state
+
+    async def test_the_non_streaming_twin_is_rescued_too(self, monkeypatch):
+        out, state = await self._drive_text(monkeypatch, "Here is what I did find.")
+
+        assert out["text"] == "Here is what I did find."
+        assert state["n"] == 3
+
+    async def test_the_non_streaming_twin_falls_back_too(self, monkeypatch):
+        out, state = await self._drive_text(monkeypatch, "")
+
+        assert out["text"] == tool_loop._EMPTY_FINAL_FALLBACK
+        assert state["n"] == 3
+
+    async def test_chosen_silence_is_never_rescued(self, monkeypatch):
+        """no_response_needed returns "" ON PURPOSE. The rescue must not put words in a turn the
+        model decided to stay out of."""
+        monkeypatch.setattr(config, "max_tool_rounds", 9)
+        monkeypatch.setattr(config, "max_tool_calls_per_turn", 3)
+        state = {"n": 0}
+
+        async def fake(client, messages, tools, return_metadata=True, function_call_sink=None,
+                       tool_choice=None, **params):
+            state["n"] += 1
+            if state["n"] == 1 and function_call_sink is not None:
+                function_call_sink.append(
+                    _call("no_response_needed", "c1", '{"reason": "nothing_to_add"}'))
+            return {"text": "", "tools_used": []}
+
+        monkeypatch.setattr(tool_loop.responses_api, "create_text_response_with_tools", fake)
+        out = await tool_loop.create_text_response_with_tool_loop(
+            _Client(), messages=[], tools=[], registry=_registry_with("no_response_needed"),
+            tool_context=ToolContext())
+
+        assert out["text"] == ""
+        assert out["terminal_action"] == "no_reply"
+        assert state["n"] == 1
+
+
+@pytest.mark.asyncio
+class TestRescueSurvivesTheHandlerRebuild:
+    """Codex review. Substituting only `text` was a no-op: the chat handler hands the returned
+    ROUNDS to `consume_destination_marker(segments=...)`, which ignores `text` entirely whenever
+    segments is not None and re-joins the parsed rounds. An empty list is not None, so the
+    fallback was discarded and the user got the same silence all over again."""
+
+    async def test_the_fallback_is_what_the_handler_would_rebuild(self, monkeypatch):
+        from message_processor.destination_tools import consume_destination_marker
+
+        monkeypatch.setattr(config, "max_tool_rounds", 9)
+        monkeypatch.setattr(config, "max_tool_calls_per_turn", 3)
+        monkeypatch.setattr(config, "max_tool_calls_per_round", 3)
+        state = {"n": 0}
+
+        async def fake(client, messages, tools, return_metadata=True, function_call_sink=None,
+                       tool_choice=None, **params):
+            state["n"] += 1
+            if state["n"] == 1 and function_call_sink is not None:
+                function_call_sink.extend(_call("search_slack", f"c{i}") for i in range(3))
+            return {"text": "", "tools_used": []}
+
+        monkeypatch.setattr(tool_loop.responses_api, "create_text_response_with_tools", fake)
+        out = await tool_loop.create_text_response_with_tool_loop(
+            _Client(), messages=[], tools=[], registry=_registry_with("search_slack"),
+            tool_context=ToolContext())
+
+        assert out["text"] == tool_loop._EMPTY_FINAL_FALLBACK
+        # The handler's own call, which is the only one that decides what Slack receives.
+        rebuilt = consume_destination_marker(out["text"], segments=out["segments"])
+        assert rebuilt == tool_loop._EMPTY_FINAL_FALLBACK
+
+
+@pytest.mark.asyncio
+class TestSilenceTerminalRespectsTheRoundCap:
+    """Codex review. `_handle_no_reply_terminal` budgeted siblings off the TURN remainder alone,
+    so `no_response_needed` plus nineteen siblings dispatched all nineteen — the same parallel
+    storm, arriving down the quiet path where the pre-dispatch round cap never runs."""
+
+    async def test_siblings_past_the_round_cap_are_not_dispatched(self, monkeypatch):
+        monkeypatch.setattr(config, "max_tool_rounds", 9)
+        monkeypatch.setattr(config, "max_tool_calls_per_turn", 20)
+        monkeypatch.setattr(config, "max_tool_calls_per_round", 3)
+        executed = []
+
+        async def _spy(ctx, args):
+            executed.append(args)
+            return {"ok": True}
+
+        registry = _registry_with("search_slack", _spy)
+        registry.register({"type": "function", "name": "no_response_needed",
+                           "parameters": {"type": "object", "properties": {}}}, _ok_exec())
+        state = {"n": 0}
+
+        async def fake(client, messages, tools, return_metadata=True, function_call_sink=None,
+                       tool_choice=None, **params):
+            state["n"] += 1
+            if state["n"] == 1 and function_call_sink is not None:
+                function_call_sink.append(
+                    _call("no_response_needed", "t1", '{"reason": "nothing_to_add"}'))
+                function_call_sink.extend(_call("search_slack", f"c{i}") for i in range(19))
+            return {"text": "", "tools_used": []}
+
+        monkeypatch.setattr(tool_loop.responses_api, "create_text_response_with_tools", fake)
+        out = await tool_loop.create_text_response_with_tool_loop(
+            _Client(), messages=[], tools=[], registry=registry, tool_context=ToolContext())
+
+        assert out["terminal_action"] == "no_reply"
+        # The terminal reserves one slot of the round cap; two siblings fit, seventeen never ran.
+        assert len(executed) == 2, f"{len(executed)} siblings dispatched against a round cap of 3"

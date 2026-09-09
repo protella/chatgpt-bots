@@ -463,25 +463,51 @@ _OVER_BUDGET_RESULT = {
     "message": ("Not run: this turn's tool budget was already spent. Work with what you have."),
 }
 
+# The ROUND cap's refusal, and deliberately NOT the one above. A call refused for fan-out still
+# has turn budget behind it, so telling it "this turn's tool budget was already spent" would be a
+# lie that makes the model give up while it can still work. This one says what actually happened
+# and what to do about it, which is the difference between a retry and a dead turn.
+_TOO_MANY_CALLS_THIS_ROUND_RESULT = {
+    "ok": False,
+    "error": "too_many_calls_this_round",
+    "message": ("Not run: you asked for too many tool calls at once. The ones that fit did run — "
+                "read their results, then make any further calls in the next round."),
+}
+
 
 def _over_budget_overrides(calls: List[Dict[str, Any]], free_names: set,
-                           remaining_allowance: int) -> Dict[int, Any]:
-    """Refuse the PRODUCTIVE calls in this round that exceed the turn's REMAINING call
-    allowance — BEFORE they are dispatched. Returns result_overrides for _run_tool_round.
+                           remaining_allowance: int,
+                           round_allowance: Optional[int] = None) -> Dict[int, Any]:
+    """Refuse the PRODUCTIVE calls in this round that exceed the turn's REMAINING call allowance
+    OR this round's fan-out cap — BEFORE they are dispatched. Returns result_overrides for
+    _run_tool_round.
 
     Same shape, and the same reason, as ``_free_call_overrides``: a round's calls dispatch in
     PARALLEL, so charging them afterwards stops only the NEXT round — by which time a single
     response carrying a dozen `import_web_image` calls has already run a dozen fetches, vision
     calls and Slack uploads against a budget of three. The cap has to bind before dispatch.
 
+    ``round_allowance`` (MAX_TOOL_CALLS_PER_ROUND) is the second half of that lesson, learned in
+    prod: 20 parallel `search_slack` calls in ONE response burned ~1000 Slack API calls in twenty
+    seconds, tripped the turn cap on round one, and left the forced final with nothing to say. The
+    turn remainder alone cannot stop that — only a per-round ceiling can, and the free-tool path
+    has had one (``_FREE_CALLS_PER_ROUND``) all along. The effective allowance is the SMALLER of
+    the two, so neither cap can be widened by the other.
+
     Order is the round's own call order: the first N run, the excess is refused. Refused, not
     dropped — a function_call left without a matching function_call_output earns a 400 on the
-    next request, so the excess gets ``_OVER_BUDGET_RESULT`` fed back instead.
+    next request. WHICH refusal it gets matters: past the turn remainder it is
+    ``_OVER_BUDGET_RESULT`` (the work is over), past only the round cap it is
+    ``_TOO_MANY_CALLS_THIS_ROUND_RESULT`` (come back next round).
 
     Free (bookkeeping) calls are invisible to this: they have their own allowance and must never
     be displaced by, or displace, productive work. ``_charge`` bills only what actually RAN, so
-    the calls suppressed here cost nothing — they did nothing."""
-    allowed = max(0, int(remaining_allowance))
+    the calls suppressed here cost nothing — they did nothing. That cannot become an infinite
+    loop of re-issued shotgun rounds: every round that runs its allowed N is charged N productive
+    calls AND a round, so both budgets still march to the cap."""
+    turn_allowance = max(0, int(remaining_allowance))
+    allowed = (turn_allowance if round_allowance is None
+               else min(turn_allowance, max(0, int(round_allowance))))
     overrides: Dict[int, Any] = {}
     taken = 0
     for c in calls:
@@ -489,8 +515,63 @@ def _over_budget_overrides(calls: List[Dict[str, Any]], free_names: set,
             continue
         taken += 1
         if taken > allowed:
-            overrides[id(c)] = _OVER_BUDGET_RESULT
+            overrides[id(c)] = (_OVER_BUDGET_RESULT if taken > turn_allowance
+                                else _TOO_MANY_CALLS_THIS_ROUND_RESULT)
     return overrides
+
+
+def _suppression_warning(overrides: Dict[int, Any], remaining_allowance: int) -> str:
+    """One warning line naming WHICH cap bound. The two are tuned separately and fail
+    differently — a turn that ran out of budget over many rounds is a different animal from one
+    shotgun round — so a log that says only "suppressed N" cannot tell them apart in prod."""
+    round_bound = sum(1 for r in overrides.values() if r is _TOO_MANY_CALLS_THIS_ROUND_RESULT)
+    turn_bound = len(overrides) - round_bound
+    why: List[str] = []
+    if round_bound:
+        why.append(f"{round_bound} past this round's fan-out cap "
+                   f"({config.max_tool_calls_per_round})")
+    if turn_bound:
+        why.append(f"{turn_bound} past this turn's remaining budget ({remaining_allowance})")
+    return (f"Suppressed {len(overrides)} productive call(s) — {', '.join(why)} — not dispatched; "
+            "the round runs what the allowance covers and the rest are answered with why")
+
+
+# Appended to the input when the cap-forced final round comes back with NOTHING. Prod, 2026-09-08:
+# one round spent the whole turn budget, the forced final returned 0 chars, and Slack rejected the
+# empty post — the user was answered with total silence. The model gets told plainly that the
+# tools are done and it must speak, exactly once per turn.
+_EMPTY_FINAL_RESCUE = (
+    "Your tool budget for this turn is spent and no more tools will run. Answer now, in plain "
+    "text, using what you have already gathered. If you genuinely cannot answer, say briefly "
+    "what you were doing and what you still need.")
+
+# ...and if even that comes back empty, the caller still has to post SOMETHING: an empty string
+# is not a reply, it is a dropped turn. Plain and non-apologetic.
+_EMPTY_FINAL_FALLBACK = (
+    "I ran out of tool budget on that one before I could put an answer together. Ask me again "
+    "and I'll go narrower.")
+
+
+def _fallback_segments() -> List[str]:
+    """The segment list that must ride WITH ``_EMPTY_FINAL_FALLBACK``, replacing the turn's own.
+
+    Substituting only ``text`` makes the whole rescue a no-op. The chat handler passes the
+    returned rounds to ``consume_destination_marker(..., segments=...)``, and
+    `message_processor/destination_tools.py` IGNORES its ``text`` argument whenever ``segments``
+    is not None — it re-joins the parsed rounds instead. An empty list is not None, so the
+    handler would rebuild "" and the user would get the same silence this whole path exists to
+    prevent. The two have to agree.
+
+    Replaced WHOLE, not appended to: `empty_final` already established that nothing visible was
+    ever committed, so anything still in the list is whitespace-only and must not survive into
+    the joined result."""
+    return [_EMPTY_FINAL_FALLBACK]
+
+
+def _empty_final_rescue_item() -> Dict[str, Any]:
+    """A FRESH dict each call — input item lists are appended to and replayed, and a shared
+    module-level dict would put the same object on two turns' inputs."""
+    return {"role": "developer", "content": _EMPTY_FINAL_RESCUE}
 
 
 async def _handle_no_reply_terminal(
@@ -550,7 +631,12 @@ async def _handle_no_reply_terminal(
     if remaining_budget is None:
         sibling_budget = len(productive)
     else:
-        sibling_budget = max(0, int(remaining_budget) - 1)  # the terminal reserves one slot
+        # The terminal reserves one slot of BOTH budgets, and the smaller one wins. Without the
+        # round cap here a silence terminal is a way AROUND it: `remaining_budget` is the turn
+        # remainder, so on a fresh turn `no_response_needed` plus nineteen `search_slack`
+        # siblings dispatches all nineteen — the exact parallel storm the per-round cap exists to
+        # stop, just arriving down the quiet path.
+        sibling_budget = max(0, min(int(remaining_budget), config.max_tool_calls_per_round) - 1)
     # Free calls are already capped per round by the caller's excess-bookkeeping suppression
     # (the excess ones arrive here inside `overrides`, answered but never dispatched).
     allowed_ids = {id(c) for c in productive[:sibling_budget]} | {id(c) for c in free_siblings}
@@ -679,6 +765,7 @@ async def create_text_response_with_tool_loop(
     free_calls = 0
     free_rounds_cap = max(1, config.max_tool_rounds * _FREE_ROUND_CEILING)
     free_calls_cap = max(1, config.max_tool_calls_per_turn * _FREE_ROUND_CEILING)
+    rescued = False     # the empty-cap-forced-final retry fires at most once per turn
 
     def _charge(calls: List[Dict[str, Any]], suppressed: Dict[int, Any]) -> None:
         """Bill a round. A round of PURE bookkeeping costs no round and no productive call;
@@ -736,9 +823,30 @@ async def create_text_response_with_tool_loop(
 
         calls = _function_calls(sink)
         if not calls or tool_choice == "none":
+            final_text = (join_segments(segments) if aggregate_segments
+                          else result.get("text", ""))
+            # The turn is about to deliver NOTHING: the caps forced this round, nothing visible
+            # was ever committed, and the round came back empty. Slack rejects an empty post, so
+            # returning "" here is how a user gets total silence to a direct question. Deliberately
+            # narrow: `tool_choice == "none"` means this is the cap-forced final and not the
+            # ordinary "model had nothing more to call" exit, and the no_response_needed terminal
+            # returned long before this point — chosen silence is never touched by it.
+            empty_final = (tool_choice == "none"
+                           and not any((s or "").strip() for s in segments)
+                           and not (final_text or "").strip())
+            if empty_final and not rescued:
+                rescued = True                       # at most once per turn; cannot recurse
+                self.log_warning("Cap-forced final round returned nothing — one plain-text "
+                                 "retry before the turn goes out empty")
+                input_items.append(_empty_final_rescue_item())
+                continue
+            if empty_final:
+                self.log_warning("Cap-forced final round returned nothing twice — posting the "
+                                 "out-of-budget note rather than nothing at all")
+                final_text = _EMPTY_FINAL_FALLBACK
+                segments = _fallback_segments()
             return {
-                "text": (join_segments(segments) if aggregate_segments
-                         else result.get("text", "")),
+                "text": final_text,
                 # The rounds this turn ran, in order. Under `aggregate_segments` these are the
                 # pieces `text` was joined from, BEFORE the seams went between them; otherwise
                 # `text` is the terminal one and these are the rest.
@@ -790,7 +898,8 @@ async def create_text_response_with_tool_loop(
             suppressed = {
                 **_free_call_overrides(calls, free_names, free_calls_cap - free_calls),
                 **_over_budget_overrides(calls, free_names,
-                                         config.max_tool_calls_per_turn - total_calls),
+                                         config.max_tool_calls_per_turn - total_calls,
+                                         config.max_tool_calls_per_round),
             }
             _charge(calls, suppressed)
             await _run_tool_round(
@@ -807,12 +916,11 @@ async def create_text_response_with_tool_loop(
 
         suppressed = _free_call_overrides(calls, free_names, free_calls_cap - free_calls)
         over_budget = _over_budget_overrides(calls, free_names,
-                                             config.max_tool_calls_per_turn - total_calls)
+                                             config.max_tool_calls_per_turn - total_calls,
+                                             config.max_tool_calls_per_round)
         if over_budget:
-            self.log_warning(
-                f"Suppressed {len(over_budget)} productive call(s) past this turn's remaining "
-                f"budget ({config.max_tool_calls_per_turn - total_calls}) — not dispatched; the "
-                "round runs what the allowance covers and the rest are answered over_budget")
+            self.log_warning(_suppression_warning(
+                over_budget, config.max_tool_calls_per_turn - total_calls))
         suppressed = {**suppressed, **over_budget}
         _charge(calls, suppressed)
         await _run_tool_round(self, registry, tool_context, sink, input_items, local_tool_calls,
@@ -894,7 +1002,11 @@ async def create_streaming_response_with_tool_loop(
                                     free_calls_cap - budget["free_calls"])
 
     def _suppress_over_budget(calls: List[Dict[str, Any]]) -> Dict[int, Any]:
-        return _over_budget_overrides(calls, free_names, calls_cap - budget["calls"])
+        # The ROUND cap stays on config even when a caller overrides the TURN caps: a research
+        # job is allowed a bigger turn, not a wider single burst — the fan-out is what melts the
+        # downstream API, and it does that just as fast on a job's budget as on a chat turn's.
+        return _over_budget_overrides(calls, free_names, calls_cap - budget["calls"],
+                                      config.max_tool_calls_per_round)
 
     def _charge(calls: List[Dict[str, Any]], suppressed: Dict[int, Any]) -> None:
         """Bill a round. A round of PURE bookkeeping costs no round and no productive call;
@@ -934,6 +1046,7 @@ async def create_streaming_response_with_tool_loop(
     # signal that decides whether a no_response_needed call is valid. Seeded by
     # prior_committed so a cross-attempt partial (F8) also counts as committed.
     visible_committed = bool(prior_committed)
+    rescued = False     # the empty-cap-forced-final retry fires at most once per turn
     # Every round's visible text, in order — a pre-tool preamble and the post-tool text are
     # SEPARATE rounds. ``aggregate_segments`` (the chat handler) returns the seam-joined whole so
     # the thread remembers exactly what Slack showed instead of just the last round's "Fixed."
@@ -981,8 +1094,27 @@ async def create_streaming_response_with_tool_loop(
 
         calls = _function_calls(sink)
         if not calls or tool_choice == "none":
+            final_text = join_segments(segments) if aggregate_segments else text
+            # Twin of the non-streaming rescue, and for the same prod failure: caps forced this
+            # round, nothing visible ever streamed, and the round came back empty — so the turn
+            # would post an empty string, which Slack rejects outright. `visible_committed` is the
+            # streaming loop's own record of whether the room has already read anything.
+            # no_response_needed has returned long before here, so chosen silence is untouched.
+            empty_final = (tool_choice == "none" and not visible_committed
+                           and not (final_text or "").strip())
+            if empty_final and not rescued:
+                rescued = True                       # at most once per turn; cannot recurse
+                self.log_warning("Cap-forced final round returned nothing — one plain-text "
+                                 "retry before the turn goes out empty")
+                input_items.append(_empty_final_rescue_item())
+                continue
+            if empty_final:
+                self.log_warning("Cap-forced final round returned nothing twice — posting the "
+                                 "out-of-budget note rather than nothing at all")
+                final_text = _EMPTY_FINAL_FALLBACK
+                segments = _fallback_segments()
             return {
-                "text": join_segments(segments) if aggregate_segments else text,
+                "text": final_text,
                 # The rounds this turn ran, in order — the SAME contract the non-streaming twin
                 # returns, so a caller reads one key and not two spellings of it. Under
                 # `aggregate_segments` these are exactly the pieces `text` was joined from,
@@ -1065,10 +1197,7 @@ async def create_streaming_response_with_tool_loop(
                 "not dispatched; the model is told to make a single call")
         over_budget = _suppress_over_budget(calls)
         if over_budget:
-            self.log_warning(
-                f"Suppressed {len(over_budget)} productive call(s) past this turn's remaining "
-                f"budget ({calls_cap - budget['calls']}) — not dispatched; the round runs what "
-                "the allowance covers and the rest are answered over_budget")
+            self.log_warning(_suppression_warning(over_budget, calls_cap - budget["calls"]))
         suppressed = {**suppressed, **over_budget}
         _charge(calls, suppressed)
         _replay_committed_text(input_items, text)

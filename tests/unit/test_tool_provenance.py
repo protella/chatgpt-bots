@@ -5,11 +5,17 @@ DB layer (roundtrip, idempotent upsert, age sweep), the processor persistence se
 (enabled/disabled/empty/no-ts), and deterministic rebuild reinjection with the pinned
 footer-strip → used-tools → reactions ordering, compaction-boundary skipping, config-off,
 and silent DB failure.
+
+Also covers F12 web-search evidence capture: the query and the cited URLs a stateless later
+turn reads back, and the defensive contract that keeps capture from ever touching a response.
 """
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
+
+from openai_client.api.responses import _capture_web_search
 
 from message_processor.client_contract import Message
 from config import config
@@ -379,3 +385,157 @@ async def test_rebuild_survives_db_provenance_read_failure(temp_db, monkeypatch)
     state = await proc._get_or_rebuild_thread_state(_incoming(), _client(history))
     # No annotation, but the rebuild completes and the message is present.
     assert any("Answer." in str(m.get("content")) for m in state.messages)
+
+
+# ------------------------------------------------- F12 web-search evidence capture
+
+# Why these live here: F7/F12 provenance is the ONLY memory a stateless turn has of its own
+# web search. With just the bare name in context, a challenged reply once retracted a
+# correct, sourced answer as invented — the query and the cited URLs are what make that
+# retraction impossible.
+
+def _part(annotations):
+    return SimpleNamespace(type="output_text", text="…", annotations=annotations)
+
+
+def _citation(url, title="T"):
+    return SimpleNamespace(type="url_citation", url=url, title=title)
+
+
+def _search(**fields):
+    return SimpleNamespace(type="web_search_call",
+                           action=SimpleNamespace(type="search", **fields))
+
+
+def test_captured_web_search_query_renders_as_tool_results_line():
+    sink = []
+    _capture_web_search(sink, SimpleNamespace(
+        type="web_search_call",
+        action={"type": "search", "query": "orbital tea kettles"}))
+    assert sink == [{"tool_name": "web_search", "output": "query: orbital tea kettles"}]
+    digests = tp.build_result_digests(sink, 2000, 6000)
+    line = tp.render_tool_results_annotation(digests)
+    assert line == "[tool results: web_search → query: orbital tea kettles]"
+
+
+def test_queries_list_is_read_when_the_scalar_query_is_absent():
+    # ActionSearch declares BOTH `queries: Optional[List[str]]` and `query: Optional[str]`,
+    # each defaulting to None — a search can arrive with only the list, and reading just the
+    # scalar would record nothing on exactly the turn this capture exists for.
+    sink = []
+    _capture_web_search(sink, _search(queries=["kettle ship date", "kettle ship date",
+                                               "kettle release notes"], query=None))
+    assert sink == [{"tool_name": "web_search",
+                     "output": "query: kettle ship date; kettle release notes"}]
+
+
+def test_search_sources_are_captured_alongside_the_queries():
+    sink = []
+    _capture_web_search(sink, _search(
+        queries=["kettle ship date"],
+        sources=[SimpleNamespace(type="url", url="https://example.com/one"),
+                 {"type": "url", "url": "https://example.com/two"}]))
+    assert sink == [{"tool_name": "web_search",
+                     "output": ("query: kettle ship date | sources: "
+                                "https://example.com/one, https://example.com/two")}]
+
+
+def test_open_page_action_records_the_url_opened():
+    sink = []
+    _capture_web_search(sink, SimpleNamespace(
+        type="web_search_call",
+        action=SimpleNamespace(type="open_page", url="https://example.com/docs/kettle")))
+    assert sink == [{"tool_name": "web_search",
+                     "output": "opened: https://example.com/docs/kettle"}]
+
+
+def test_find_in_page_action_records_pattern_and_url():
+    sink = []
+    _capture_web_search(sink, SimpleNamespace(
+        type="web_search_call",
+        action={"type": "find_in_page", "pattern": "ship date",
+                "url": "https://example.com/docs/kettle"}))
+    assert sink == [{"tool_name": "web_search",
+                     "output": 'found in page: "ship date" @ https://example.com/docs/kettle'}]
+
+
+def test_unrecognised_action_variant_captures_nothing_without_raising():
+    # The action union is the API's to extend; a member we have never seen must cost us
+    # an entry, never the response.
+    sink = []
+    _capture_web_search(sink, SimpleNamespace(
+        type="web_search_call",
+        action=SimpleNamespace(type="scroll_page", offset=400,
+                               url="https://example.com/docs/kettle")))
+    assert sink == []
+
+
+def test_captured_sources_dedupe_by_url_in_first_seen_order():
+    sink = []
+    item = SimpleNamespace(type="message", content=[
+        _part([_citation("https://example.com/b", "Beta"),
+               _citation("https://example.com/a", "Alpha")]),
+        # Same page cited again from a later paragraph, plus a non-citation annotation.
+        _part([_citation("https://example.com/b", "Beta again"),
+               SimpleNamespace(type="file_citation", url=None, title=None),
+               _citation("https://example.com/c", "Gamma")]),
+    ])
+    _capture_web_search(sink, item)
+    assert sink == [{"tool_name": "web_search",
+                     "output": ("sources: Beta — https://example.com/b; "
+                                "Alpha — https://example.com/a; "
+                                "Gamma — https://example.com/c")}]
+
+
+@pytest.mark.parametrize("item", [
+    SimpleNamespace(type="web_search_call"),                      # no action at all
+    SimpleNamespace(type="web_search_call", action=None),
+    SimpleNamespace(type="web_search_call", action={}),           # dict, no query
+    SimpleNamespace(type="web_search_call", action=SimpleNamespace()),  # object, no query
+    SimpleNamespace(type="web_search_call", action={"type": "search"}),  # no queries
+    SimpleNamespace(type="web_search_call", action={"query": "  "}),    # blank query
+    SimpleNamespace(type="message"),                              # no content
+    SimpleNamespace(type="message", content=None),
+    SimpleNamespace(type="message", content=[SimpleNamespace(type="output_text")]),
+    SimpleNamespace(type="message", content=[_part(None)]),
+    SimpleNamespace(type="message", content=[{"annotations": [{"type": "url_citation"}]}]),
+    object(),                                                     # nothing at all
+])
+def test_capture_is_silent_on_malformed_items(item):
+    sink = []
+    _capture_web_search(sink, item)  # must not raise
+    assert sink == []
+
+
+def test_capture_handles_both_action_shapes_and_dict_annotations():
+    sink = []
+    _capture_web_search(sink, _search(query="attribute shape"))
+    _capture_web_search(sink, SimpleNamespace(type="message", content=[
+        {"annotations": [{"type": "url_citation", "url": "https://example.com/d"}]}]))
+    assert sink == [
+        {"tool_name": "web_search", "output": "query: attribute shape"},
+        {"tool_name": "web_search", "output": "sources: https://example.com/d"},
+    ]
+
+
+def test_capture_no_ops_when_sink_is_none():
+    # No sink means result memory isn't being collected — capture must stay out of the way.
+    _capture_web_search(None, _search(queries=["q"]))
+    _capture_web_search(None, SimpleNamespace(
+        type="message", content=[_part([_citation("https://example.com/e")])]))
+
+
+def test_later_turn_sees_query_and_source_url_in_the_annotation():
+    # The whole point: what the NEXT turn reads back after a searched reply.
+    sink = []
+    _capture_web_search(sink, _search(queries=["did the kettle ship"]))
+    _capture_web_search(sink, SimpleNamespace(type="message", content=[
+        _part([_citation("https://example.com/docs/kettle", "Kettle docs")])]))
+    annotation = tp.render_provenance_annotations(
+        tp.build_provenance(None, ["web_search"])
+        + tp.build_result_digests(sink, config.tool_result_digest_chars,
+                                  config.tool_result_turn_chars))
+    assert annotation == (
+        "[used tools: web_search]\n"
+        "[tool results: web_search → query: did the kettle ship]\n"
+        "[tool results: web_search → sources: Kettle docs — https://example.com/docs/kettle]")

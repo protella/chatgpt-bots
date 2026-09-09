@@ -345,6 +345,153 @@ def _capture_mcp_result(mcp_results_sink, item, server_label):
         pass
 
 
+def _action_field(action: Any, name: str) -> Any:
+    """One field off a web-search action, across both live shapes: `action` arrives as a
+    plain dict on some SDK paths and as a model object on others."""
+    if isinstance(action, dict):
+        return action.get(name)
+    return getattr(action, name, None) if action is not None else None
+
+
+def _web_search_queries(item: Any) -> List[str]:
+    """Every query a `web_search_call`'s search action carries, in order, deduped.
+
+    `ActionSearch` (openai 3.10.0, `types/responses/response_function_web_search.py`)
+    declares BOTH ``queries: Optional[List[str]] = None`` and ``query: Optional[str] =
+    None``. A search can therefore arrive with the LIST populated and the scalar empty, so
+    reading only `query` goes blind on exactly the turns this capture exists for. The list
+    wins when present; the scalar is the fallback."""
+    action = getattr(item, "action", None)
+    raw = _action_field(action, "queries")
+    values = list(raw) if isinstance(raw, (list, tuple)) else [_action_field(action, "query")]
+    out: List[str] = []
+    for value in values:
+        text = str(value).strip() if value else ""
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def _web_search_action_evidence(item: Any) -> Optional[str]:
+    """A one-line record of what a `web_search_call` actually DID, per action variant.
+
+    The SDK models `action` as a discriminated union of three variants, and each one holds
+    different evidence — none of it page text:
+      * ``search`` → the queries, plus `sources` (``ActionSearchSource.url``): the pages the
+        search TOUCHED, which is strictly more than the answer happened to cite.
+      * ``open_page`` → the ``url`` the model opened.
+      * ``find_in_page`` → the ``pattern`` looked for and the ``url`` it was looked for in.
+
+    A variant we don't recognise records nothing rather than raising — the union is the
+    API's to extend, and a new member must not cost us the response. A typeless action
+    (raw-dict paths, and fixtures) is read as a search, which is the only variant that
+    carries queries at all."""
+    action = getattr(item, "action", None)
+    if action is None:
+        return None
+    action_type = _action_field(action, "type")
+    if action_type == "open_page":
+        url = _action_field(action, "url")
+        return f"opened: {url}" if url else None
+    if action_type == "find_in_page":
+        pattern = _action_field(action, "pattern")
+        url = _action_field(action, "url")
+        if pattern and url:
+            return f'found in page: "{pattern}" @ {url}'
+        return f"found in page: {url}" if url else None
+    if action_type not in (None, "search"):
+        return None
+    queries = _web_search_queries(item)
+    raw_sources = _action_field(action, "sources")
+    urls: List[str] = []
+    for source in raw_sources if isinstance(raw_sources, (list, tuple)) else []:
+        url = source.get("url") if isinstance(source, dict) else getattr(source, "url", None)
+        if url and url not in urls:
+            urls.append(str(url))
+    parts = []
+    if queries:
+        parts.append(f"query: {'; '.join(queries)}")
+    if urls:
+        parts.append(f"sources: {', '.join(urls)}")
+    return " | ".join(parts) or None
+
+
+def _web_search_query(item: Any) -> Optional[str]:
+    """The single query for the internal observer event (status cards, DEBUG logs).
+
+    Not the capture record — that is :func:`_web_search_action_evidence`. Kept scalar
+    because the event's consumers render one query; a multi-query search surfaces its
+    first, which beats today's None when only `queries` is populated."""
+    queries = _web_search_queries(item)
+    return queries[0] if queries else None
+
+
+def _url_citations(item: Any) -> List[str]:
+    """`<title> — <url>` for each `url_citation` on an assistant message's content parts,
+    deduplicated by url in first-seen order (a search-heavy answer cites the same page from
+    several paragraphs). Parts and annotations arrive as dicts or objects — handle both."""
+    sources: List[str] = []
+    seen: set = set()
+    for part in getattr(item, "content", None) or []:
+        annotations = (part.get("annotations") if isinstance(part, dict)
+                       else getattr(part, "annotations", None)) or []
+        for ann in annotations:
+            if isinstance(ann, dict):
+                ann_type, url, title = ann.get("type"), ann.get("url"), ann.get("title")
+            else:
+                ann_type = getattr(ann, "type", None)
+                url = getattr(ann, "url", None)
+                title = getattr(ann, "title", None)
+            if ann_type != "url_citation" or not url or url in seen:
+                continue
+            seen.add(url)
+            sources.append(f"{title} — {url}" if title else str(url))
+    return sources
+
+
+def _capture_web_search(mcp_results_sink: Optional[List[Dict[str, Any]]], item: Any) -> None:
+    """F12: harvest web-search EVIDENCE into the same result-memory sink the MCP capture
+    feeds, as {"tool_name": "web_search", "output": …} entries in capture order.
+
+    Why it exists: we are stateless (store=False, history rebuilt from Slack), so between
+    turns the model loses its queries, the pages it read and its citations. F7 recorded the
+    bare name `web_search` with an empty gist — "you used web search" and nothing else.
+    Challenged on a fact it HAD looked up, the likeliest continuation became "I made that
+    up": observed live as a false retraction of a correct, sourced answer.
+
+    Two item shapes feed it, and they answer different questions — the action says what the
+    search DID, the citations say what the answer STANDS ON:
+      * `web_search_call` → :func:`_web_search_action_evidence`, one line per action.
+      * an assistant `message` → its `url_citation` annotations, as one `sources: …` entry.
+
+    On trusting annotations here: `_note_container` deliberately refuses
+    `container_file_citation` for sandbox files, because the container listing is a strict
+    superset of them. Web search has no such listing — the action's own `sources` cover only
+    the calls that report them, and `url_citation` is the only signal for which pages the
+    ANSWER used — so here the annotations are evidence in their own right, not a bonus.
+
+    Queries, patterns and URLs ONLY. Page text and snippet bodies are never captured (CLAUDE.md
+    derived-artifact rules): these entries persist to the DB and replay into every later
+    turn of the thread. Truncation/budgeting happen later in build_result_digests, and the
+    `enable_tool_result_memory` gate is applied where the MCP entries' is — at persist time
+    in the text handler, not at capture. Never raises; no-ops when the sink is None."""
+    if mcp_results_sink is None:
+        return
+    try:
+        if getattr(item, "type", None) == "web_search_call":
+            evidence = _web_search_action_evidence(item)
+            if evidence:
+                mcp_results_sink.append({"tool_name": "web_search", "output": evidence})
+            return
+        sources = _url_citations(item)
+        if sources:
+            mcp_results_sink.append(
+                {"tool_name": "web_search", "output": "sources: " + "; ".join(sources)})
+    except Exception:
+        # Evidence capture must never interfere with response processing
+        pass
+
+
 def _note_container(artifacts_sink, item):
     """F32: record the code-interpreter container so the caller can LIST the files it wrote.
 
@@ -587,6 +734,9 @@ async def create_text_response_with_tools(
                 elif item_type == "web_search_call":
                     if "web_search" not in tools_actually_used:
                         tools_actually_used.append("web_search")
+                    # F12: the query — the bare name alone leaves a later turn nothing to
+                    # recall about its own search.
+                    _capture_web_search(mcp_results_sink, item)
                 elif item_type == "code_interpreter_call":
                     # F32: the model ran Python in the sandbox. Record the container so the
                     # caller can LIST the files it wrote.
@@ -619,6 +769,10 @@ async def create_text_response_with_tools(
                 elif item_type == "mcp_list_tools" and mcp_tools_sink is not None:
                     # Tool discovery payload — informational cache (server -> tools)
                     _collect_mcp_list_tools(mcp_tools_sink, item)
+                elif item_type == "message":
+                    # F12: the pages the answer cited. Only web search produces
+                    # `url_citation`, so this no-ops on every other turn.
+                    _capture_web_search(mcp_results_sink, item)
 
         if tools_actually_used:
             self.log_info(f"Generated response with tools: {len(output_text)} chars, used: {', '.join(tools_actually_used)}")
@@ -1145,13 +1299,12 @@ async def create_streaming_response_with_tools(
                             # available) to an internal observer. This mirrors the
                             # non-streaming path's web_search_call detection, so tools_used
                             # rebuilt from these events matches the create_*_with_tools result.
-                            action = getattr(item, 'action', None)
-                            query = None
-                            if isinstance(action, dict):
-                                query = action.get('query')
-                            elif action is not None:
-                                query = getattr(action, 'query', None)
+                            query = _web_search_query(item)
                             await _emit_tool_event({"kind": "web_search", "query": query})
+                            # F12: the observer event is fire-and-forget telemetry — capture
+                            # the same query as durable evidence, or the next turn has only
+                            # the bare tool name to reason from.
+                            _capture_web_search(mcp_results_sink, item)
                         elif item_type == 'mcp_call':
                             server_label = getattr(item, 'server_label', None)
                             tool_error = getattr(item, 'error', None)
@@ -1203,6 +1356,11 @@ async def create_streaming_response_with_tools(
                                 "code": getattr(item, "code", None),
                                 "container_id": getattr(item, "container_id", None),
                             })
+                        elif item_type == 'message':
+                            # F12: the completed message carries the `url_citation`
+                            # annotations naming the pages the answer cited — the streamed
+                            # text deltas do not. No-ops when nothing was cited.
+                            _capture_web_search(mcp_results_sink, item)
                     continue
                 elif event_type in ["response.done", "response.completed",
                                      "response.incomplete", "response.failed"]:
@@ -2044,6 +2202,9 @@ async def _create_text_response_with_tools_with_timeout(
                 elif item_type == "web_search_call":
                     if "web_search" not in tools_actually_used:
                         tools_actually_used.append("web_search")
+                    # F12: the query. Parity with the non-timeout twin — a retry must not
+                    # silently drop the search evidence either.
+                    _capture_web_search(mcp_results_sink, item)
                 elif item_type == "code_interpreter_call":
                     # F32: the model ran Python in the sandbox. Record the container so the
                     # caller can LIST the files it wrote.
@@ -2076,6 +2237,9 @@ async def _create_text_response_with_tools_with_timeout(
                     # Tool discovery payload — informational cache (server -> tools). Parity with
                     # the non-timeout twin — without this, a retry silently drops discovery.
                     _collect_mcp_list_tools(mcp_tools_sink, item)
+                elif item_type == "message":
+                    # F12: the pages the answer cited (twin parity).
+                    _capture_web_search(mcp_results_sink, item)
 
         if tools_actually_used:
             self.log_info(f"Generated response with tools and custom timeout: {len(output_text)} chars, used: {', '.join(tools_actually_used)}")

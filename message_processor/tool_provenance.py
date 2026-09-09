@@ -2,10 +2,18 @@
 invoked on a turn, and the rendering/stripping helpers shared by the text handlers and
 the thread-rebuild path.
 
-The record is names + short arg-derived gists ONLY — never tool results or content
+The F7 record is names + short arg-derived gists ONLY — never tool results or content
 (CLAUDE.md derived-artifact rules). It is persisted keyed by the reply's Slack ts and
 reinjected as a `[used tools: …]` annotation so the model can recall its own past tool
 use instead of confabulating about it.
+
+Alongside it, F12 stores a second class of entry — a short `result_digest` per external
+call, reinjected as `[tool results: …]` — because a NAME is not evidence. Two sources feed
+it: MCP call outputs, and web-search evidence (the queries issued and the `url_citation`
+URLs the answer cited). Web search earned its place the hard way: with only the bare name
+in context, a challenged reply retracted a correct, sourced answer as invented. The
+invariant that still holds is about LOCAL tools — Slack-fetch and document-read results
+never reach this path.
 """
 from __future__ import annotations
 
@@ -70,7 +78,7 @@ def _max_gist_chars() -> int:
 def _max_annotation_chars() -> int:
     return int(getattr(config, "tool_provenance_line_budget", 300))
 
-# F12: marker appended to a per-call MCP result digest when it is cut to the char cap.
+# F12: marker appended to a per-call result digest when it is cut to the char cap.
 TRUNCATION_MARKER = "… [truncated]"
 
 # Structural arg keys whose values describe the SHAPE of a call (pagination/sizing/
@@ -202,20 +210,23 @@ def render_used_tools_annotation(tools: Optional[List[Dict[str, Any]]]) -> str:
     return f"[used tools: {', '.join(names)}]"
 
 
-def build_result_digests(mcp_results: Optional[List[Dict[str, Any]]],
+def build_result_digests(tool_results: Optional[List[Dict[str, Any]]],
                          per_call_chars: int, per_turn_chars: int) -> List[Dict[str, str]]:
     """Build the F12 result-digest entries ``[{"tool_name", "result_digest"}]`` from the
-    captured ``mcp_call`` outputs (``[{"tool_name", "output"}]``, capture order).
+    captured external tool outputs (``[{"tool_name", "output"}]``, capture order).
 
-    ONLY MCP outputs reach this — local Slack-fetch/read_document results never do
-    (CLAUDE.md content rules; the caller passes MCP outputs only). Each output is
+    Two capture sources feed the sink, both external and both safe to persist: ``mcp_call``
+    outputs, and web-search evidence (the query issued, and the ``url_citation`` sources the
+    answer cited — queries and URLs only, never page text). LOCAL results — Slack-fetch,
+    read_document — never reach this (CLAUDE.md content rules; the caller passes only the
+    external sink). Generic on ``tool_name``: nothing here is MCP-specific. Each output is
     newline-flattened (kept to one annotation line, and so a digest can't smuggle a fake
     ``[reactions: …]`` line into context), truncated to ``per_call_chars`` with a
     ``… [truncated]`` marker, and the turn is bounded by ``per_turn_chars`` in first-come
     order — once the running total reaches the cap, later calls store NO digest."""
     out: List[Dict[str, str]] = []
     used = 0
-    for entry in mcp_results or []:
+    for entry in tool_results or []:
         name = entry.get("tool_name")
         output = entry.get("output")
         if not name or not output:
@@ -233,15 +244,18 @@ def build_result_digests(mcp_results: Optional[List[Dict[str, Any]]],
 
 
 async def build_result_digests_summarized(
-    mcp_results: Optional[List[Dict[str, Any]]],
+    tool_results: Optional[List[Dict[str, Any]]],
     openai_client: Any,
     per_call_chars: int,
     per_turn_chars: int,
     input_chars: int,
 ) -> List[Dict[str, str]]:
-    """F16 capture-time variant of :func:`build_result_digests`: an MCP output longer than
-    ``per_call_chars`` is SUMMARIZED once (utility model, low effort) instead of hard-cut,
-    so the URL/figure/title that made it worth keeping survives.
+    """F16 capture-time variant of :func:`build_result_digests`: a captured output longer
+    than ``per_call_chars`` is SUMMARIZED once (utility model, low effort) instead of
+    hard-cut, so the URL/figure/title that made it worth keeping survives. Applies to every
+    external source the sink carries — MCP outputs and web-search evidence alike — though
+    the web-search entries (a query, or a `sources:` list of titles+URLs) are small by
+    construction and normally take the verbatim path.
 
     Restructure honesty: the pure/deterministic budget + truncation logic stays in the sync
     :func:`build_result_digests`. This async pre-pass ONLY does the utility calls — it
@@ -257,7 +271,7 @@ async def build_result_digests_summarized(
     first ``input_chars`` of each output (budget guard). Never raises; never blocks on
     outputs that don't need summarizing."""
     prepared: List[Dict[str, Any]] = []
-    for entry in mcp_results or []:
+    for entry in tool_results or []:
         name = entry.get("tool_name")
         output = entry.get("output")
         if not name or not output:
@@ -285,7 +299,9 @@ async def build_result_digests_summarized(
 
 def render_tool_results_annotation(tools: Optional[List[Dict[str, Any]]]) -> str:
     """Render the F12 reinjected block — one ``[tool results: <tool_name> → <digest>]``
-    line per stored MCP digest, joined deterministically.
+    line per stored digest, joined deterministically. Digests come from any external source
+    the capture sink carries: MCP call outputs, and web-search queries/cited URLs (which is
+    how a later turn can still say WHAT it searched and which pages it stood on).
 
     Pure function of the immutable rows (F7-5 standard). Entries without a
     ``result_digest`` (the used-tools entries, and every old pre-F12 row) yield nothing."""

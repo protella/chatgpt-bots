@@ -1610,9 +1610,13 @@ class TextHandlerMixin(_Host):
         thread_state.record_usage(usage_info.get("input_tokens", 0),
                                   usage_info.get("output_tokens", 0))
 
-        # Feed any mcp_list_tools discovery payloads into the informational cache
+        # Feed any mcp_list_tools discovery payloads into the informational cache. Off the
+        # event loop: the cache write is a sync SQLite call whose 5s busy-wait, run on the
+        # loop thread, stalls the loop while an async BEGIN IMMEDIATE holder waits on that
+        # same loop to commit — measured 3 x 5s on prod (2026-09-03).
         for _label, _tools_payload in mcp_discovered.items():
-            self.mcp_manager.cache_discovered_tools_payload(_label, _tools_payload)
+            await asyncio.to_thread(
+                self.mcp_manager.cache_discovered_tools_payload, _label, _tools_payload)
 
         # §5.4a — BEFORE THE ENDING CASCADE, because every branch below it is a way for this turn
         # to end and a cross-thread post has to carry its provenance out of ALL of them. See
@@ -3379,9 +3383,11 @@ class TextHandlerMixin(_Host):
             thread_state.record_usage(usage_info.get("input_tokens", 0),
                                       usage_info.get("output_tokens", 0))
 
-            # Feed any mcp_list_tools discovery payloads into the informational cache
+            # Feed any mcp_list_tools discovery payloads into the informational cache (off the
+            # event loop — see the non-streaming twin above for why).
             for _label, _tools_payload in mcp_discovered.items():
-                self.mcp_manager.cache_discovered_tools_payload(_label, _tools_payload)
+                await asyncio.to_thread(
+                    self.mcp_manager.cache_discovered_tools_payload, _label, _tools_payload)
 
             # Ensure progress updater is cancelled if still running
             if progress_task and not progress_task.done():
@@ -3611,6 +3617,21 @@ class TextHandlerMixin(_Host):
             # We need to update the current message (which might be part 2, 3, etc)
             if native_finalized:
                 visible_content_delivered = True  # native stopStream delivered the final text (+ attribution)
+            elif current_message_id is None and not (response_text or "").strip():
+                # Nothing streamed AND no words to post. Slack rejects an empty block outright
+                # (`invalid_blocks`: "must be more than 0 characters"), so attempting the send
+                # is a guaranteed-failed round trip that logs a delivery ERROR and reads like a
+                # posting bug when the real fault is upstream — the turn produced no answer.
+                # Seen live 2026-09-08: a round spent the whole tool budget at once, the forced
+                # final came back empty, and this site fired a doomed post. The tool loop's
+                # empty-final rescue is what stops that; this guard only keeps the failure
+                # honest if one ever gets through. `final_post_failed` is still the right flag:
+                # it is what tells the caller nothing was delivered, so `streamed` cannot claim
+                # otherwise. main.py finds no text to re-post and the empty-response accounting
+                # classifies the turn exactly as it does today.
+                final_post_failed = True
+                self.log_warning(
+                    "Final response is empty and nothing streamed — posting nothing")
             elif current_message_id is None:
                 # No surface at all — an F39 final-post-only turn (a top-level channel reply,
                 # which deliberately wrote nothing until now), a status-only DM, or an F38

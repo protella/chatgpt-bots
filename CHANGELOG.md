@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.1.11] - 2026-09-08
+
+### 🐛 Fixed
+
+- **The bot no longer answers a hard question with total silence.** A reply that needed a lot of
+  digging could spend its entire tool allowance on one burst of searches, leaving nothing to write
+  the answer with. The empty answer was then rejected by Slack, so nothing was posted at all and
+  the question simply went unanswered. Tool use is now spread across the reply instead of firing
+  all at once, and a reply that still runs out of room says so rather than disappearing.
+- **The bot no longer denies having looked something up.** Asked where a fact came from, it could
+  claim it had invented an answer it had actually searched for and cited a source for. It now
+  remembers the searches it ran and the pages it read, so it can tell you where an answer came
+  from instead of guessing about its own work.
+- **A roughly fifteen-second freeze after using a connected data service is gone.**
+
 ## [3.1.10] - 2026-09-03
 
 ### 🔧 Changed
