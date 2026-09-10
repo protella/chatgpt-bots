@@ -274,12 +274,18 @@ posts already populated — the user reads what the job intends to do at t=0, no
 `update_todos`, a rewrite-the-whole-list tool: tick an item to `in_progress`/`done`, add a step it
 didn't foresee, drop one that turned out to be irrelevant.
 
+- **A background job carries NO round ration and NO elapsed-time limit.** Both phases pass
+  `NO_CAP`: a job runs until the model returns its final answer or the user cancels it
+  (`cancel_background_job`). The only hang protection left is the per-request transport watchdog
+  in `openai_client/base.py` and the local tool timeouts — both fire on a request that has stopped
+  producing, never on a job that is still working. The surviving budget guards are per-round: the
+  fan-out cap and the free-call burst cap, both aimed at a model repeating one call.
 - **`update_todos` is a FREE tool** — `free_tools` in `tool_loop.py` exempts it from the round and
   call budget. This is not a micro-optimisation: a live list fires on every transition, and on the
   meter those calls eat the budget the build phase needs for `mount_file` / `create_image_asset`.
   The card would starve the deck it is reporting on, and the loop would force a final answer before
   the file was ever built. The caps are a runaway guard; a status update is not what they guard
-  against, and the wall-clock timeout is what actually bounds a detached job. Free is still
+  against, and a detached job is bounded by the model finishing, not by a budget. Free is still
   *bounded* — free rounds AND free calls have their own ceilings, because a round's calls dispatch
   in parallel, so one "free" round could otherwise carry fifty updates.
 - **`_TodoState` is the source of truth; the card only renders it.** The render is lossy on purpose
@@ -296,6 +302,58 @@ didn't foresee, drop one that turned out to be irrelevant.
   job may grow the list to four once something is spinning (the spinner replaces the tail).
 - **On failure the in-flight step is pinned.** It is the one line that says where the job stopped;
   a plain "keep the last four" would evict it whenever later items had already completed.
+- **A LIVE LINE leads the context block** (F38), because milestones are minutes apart and a card
+  that does not move reads as a job that has died. It is the freshest of: the model's own
+  reasoning summary (`reasoning: {summary: "auto"}`, requested on job streams only) — its **bold
+  heading** when the part has one, else the part's FIRST complete sentence, because a live run
+  showed the last sentence is reliably filler and a half-written fragment is never shown at all
+  — or a hosted call: "Searching…" / "Searched: `<query>`", "Running code…" / "Ran code",
+  "Calling `<tool>`…" / "Called `<tool>`", "`<Tool>` failed". Searches run back to back, so a
+  search STARTING after one completed in the same request renders
+  "Searched: `<last query>` · searching…" (the query is trimmed, never the live half); bare
+  "Searching…" only before the first completion. With nothing heard yet the PHASE label stands
+  in ("Researching…",
+  "Building…", "Staging files…", "Planning delivery…", "Publishing…"). Past 20 s the text stays
+  and gains its age (`· 45s ago`, `· 2m ago`) rather than pretending to be current. It renders as
+  its own `plain_text` context element — model- and web-authored text is never parsed as mrkdwn —
+  beside the mrkdwn half that carries `todos as of H:MM` and the counters. Both phases drive it:
+  the build phase used to be handed `card=None`, which left the longest, quietest half of a job
+  with no live line at all.
+- **These are PROGRESS events, on a channel of their own.** `progress_callback` in
+  `openai_client/api/responses.py` is separate from `tool_event_callback`, SYNCHRONOUS (it is
+  called between two tokens of a live stream), and payload-shaped:
+  `{kind: summary|hosted, state: delta|done|start|complete|failed, request_seq, item_id,
+  summary_index, tool, label, text}`. Summaries accumulate per
+  `(request_seq, item_id, summary_index)` and a `.done` replaces what the deltas built; identical
+  text arriving again from any of the three paths is dropped, so a re-report never refreshes the
+  age. Counters and provenance stay on the completion channel — nothing here is ever counted.
+  Summaries never enter the response text accumulator, and encrypted-reasoning replay is untouched.
+- **ONE writer, 15-second pacing.** Producers — the progress observer, tool events, `update_todos`,
+  alerts — mutate card state, bump `revision`, `wake()` and RETURN; none of them awaits Slack,
+  because every one of them runs inside the model's own event path. A single writer task wakes on
+  a nudge or its own timer, snapshots immediately before the `chat.update`, and acks the revision
+  only if nothing moved while Slack was being called (otherwise the next tick carries it). Routine
+  writes obey the 15 s interval; an unrendered alert and the terminal verdict skip it. A 429 keeps
+  the state and parks every write for the `Retry-After` — the cooldown is WORKSPACE-wide, held on
+  the client in `slack_client/messaging.py`, so two jobs do not each spend a call rediscovering
+  it. `message_not_found` / `channel_not_found` disable that card and the job carries on.
+- **The alert is LATCHED.** It comes down only after a write has actually carried it
+  (`acked_revision >= alert_revision`) AND the model produces something again — that activity is
+  the "moving again" signal. A timer tick or a successful write never clears it. Without the latch
+  a hiccup raised and answered inside one pacing window would be coalesced out of existence and
+  the user would be left with an unexplained pause.
+- **Finalization order:** disable producers → enqueue the terminal revision → the writer performs
+  the terminal write with priority (queueing behind any in-flight one, retried through a 429) →
+  the writer closes. The job's `finally` joins the writer with a bounded wait inside the shutdown
+  grace — but the bound is on the JOB, not the verdict: a writer that still owes the card its
+  terminal state is left running, detached, and finishes on its own. Slack's `Retry-After` can
+  outlast the grace, and cancelling on the way past would leave the card reading "Publishing…"
+  forever over a job that ended minutes ago. `_transact_delivery` still owns success/partial
+  finalization, from publication receipts.
+- **`update_todos` is the milestone track, not the ticker.** The brief asks for a call at a genuine
+  change of step, outcome or plan, batched into a local call when one is going out anyway — never
+  standalone per search or to restate an unchanged status — and says plainly that a milestone call
+  costs a continuation while the live line costs nothing.
 
 **Known gap:** the delivery call sees the conversation as it was at *dispatch* (the snapshot), not
 as it is now. A user who says "actually, don't post that" while the job runs is not heard.

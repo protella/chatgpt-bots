@@ -4,6 +4,50 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.2.4] - 2026-09-09
+
+### ✨ Added
+
+- **The job status card now shows live activity between milestones.** Instead of sitting still
+  for minutes at a time, the card's bottom line says what the model is searching, reading or
+  building right now, refreshed about every 15 seconds — and it says how long ago that was when
+  a stretch of work goes quiet. Milestone updates to the checklist no longer interrupt the
+  model's work.
+
+### 🐛 Fixed
+
+- **A research job is no longer cut off for keeping its status card up to date.** Rounds whose
+  real work happened in web search, an MCP server or the sandbox were being counted as pure
+  bookkeeping, so ten rounds of research tripped a ceiling meant for a model looping on card
+  updates alone. The loop then switched every tool off and forced the report, which came back
+  saying it had found nothing, and the deck was built from that.
+- **Deliverables ship as finished, client-ready files.** A requested file is either finished work
+  or it does not ship; withholding it and explaining why is a failure too. Anything left out is
+  explained in the accompanying message, never as placeholders, "unverified" labels or commentary
+  about the research process inside the file itself.
+
+### 🔧 Changed
+
+- **Background jobs have no elapsed-time limit and no round ration.** The research and build
+  phases run until the model returns its answer or you cancel the job. A long job is no longer
+  cut off, wound down early or asked to wrap up against a clock. The remaining guards are a
+  per-round burst limit, a cap on repeated card updates, and the per-request transport watchdog
+  that ends a request which has stopped responding. `DEEP_RESEARCH_MAX_TOOL_ROUNDS`,
+  `DEEP_RESEARCH_MAX_BUILD_ROUNDS`, `DEEP_RESEARCH_TIMEOUT` and `DEEP_RESEARCH_BUILD_TIMEOUT`
+  are gone; remove them from `.env` if set.
+- **The build phase is told what the sandbox contains** (languages, libraries, LibreOffice, fonts
+  and OpenAI's slide, document and PDF toolkits) instead of discovering it every job. Tonight's
+  production deck spent most of a 22-minute build probing for tools it already had.
+- **Research verification guidance is now proportionate.** A material claim is checked against at
+  most a couple of authoritative sources and the job moves on, instead of searching for further
+  confirmation of something already established. Reports still separate established facts from
+  inference and from what could not be resolved.
+- **Background jobs log their per-request token usage and latency,** so the cost and duration of a
+  long job can be read from the logs without extra API calls.
+- **Status cards tell the truth about partial steps.** A step is marked done only when its
+  outcome was achieved; otherwise it is reworded to what actually happened. Cards update on a
+  meaningful change of step, outcome or plan, not per search.
+
 ## [3.2.3] - 2026-09-09
 
 ### 🐛 Fixed

@@ -71,6 +71,54 @@ class _NeverRaised(Exception):
     clauses below stay well-formed instead of branching on whether an import succeeded."""
 
 
+# A status card these errors name can never be written again — the message, or the channel it
+# lived in, is gone. Retrying is not resilience there, it is a write loop against a corpse for
+# as long as the job runs. Every OTHER Slack error is treated as transient and simply retried on
+# the next tick, which is the safe way round: a card that recovers costs nothing, a card
+# abandoned on a passing error costs the user their view of the job.
+_PERMANENT_CARD_ERRORS = frozenset({"message_not_found", "channel_not_found",
+                                    "cant_update_message"})
+# Where the workspace-wide chat.update cooldown is kept: on the CLIENT, because the rate limit
+# is the workspace's and every card in it shares one. Two jobs running side by side would
+# otherwise each discover the same 429 and each spend a call learning it.
+_CARD_COOLDOWN_ATTR = "_card_update_cooldown_until"
+
+
+@dataclass(frozen=True)
+class CardWriteResult:
+    """What one status-card `chat.update` actually did (F38).
+
+    Truthy iff the write landed, so callers that only ask "did it work" are unaffected by the
+    move away from a bare bool. `retry_after` is the number of seconds to wait before trying
+    again (Slack's own header on a 429, or what is left of the workspace cooldown);
+    `permanent` means never try this card again."""
+
+    ok: bool
+    retry_after: Optional[float] = None
+    permanent: bool = False
+    error: str = ""
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
+def _card_cooldown_left(client: Any) -> float:
+    """Seconds still owed on the workspace's chat.update cooldown, 0.0 when it is clear."""
+    until = getattr(client, _CARD_COOLDOWN_ATTR, 0.0)
+    if not isinstance(until, (int, float)):
+        return 0.0
+    return max(0.0, float(until) - time.monotonic())
+
+
+def _card_cooldown_start(client: Any, seconds: float) -> None:
+    """Park every card on this client for `seconds`. Extends an existing cooldown, never
+    shortens it — the longest Retry-After any card was handed is the workspace's answer."""
+    until = time.monotonic() + max(0.0, seconds)
+    current = getattr(client, _CARD_COOLDOWN_ATTR, 0.0)
+    if not isinstance(current, (int, float)) or until > current:
+        setattr(client, _CARD_COOLDOWN_ATTR, until)
+
+
 _EPOCH_REFUSED = (_epoch_fence.EpochEffectRefused if _epoch_fence is not None else _NeverRaised)
 
 
@@ -1950,20 +1998,49 @@ class SlackMessagingMixin(_Host):
             return None
 
     async def update_status_card(self, channel_id: str, ts: str, text: str,
-                                 blocks: list, receipts: Any = None) -> bool:
+                                 blocks: list, receipts: Any = None) -> CardWriteResult:
         """F30.1: update a blocks status card in place. `text` MUST stay CONSTANT across
         updates (Slack badges '(edited)' only when the top-level text changes; blocks-only
-        edits don't badge). Best-effort — returns False on failure, never raises.
+        edits don't badge). Best-effort — never raises.
+
+        Returns a `CardWriteResult` rather than a bare bool, because a card that writes on a
+        timer has to tell three failures apart: a 429 (wait exactly as long as Slack said, then
+        render the LATEST state — never the payload that was refused), a permanently
+        unwritable card (stop writing to it; the job carries on without its chrome), and
+        everything else (try again on the next tick). It is truthy iff the write landed, so a
+        caller that only wants "did it work" reads it exactly as it read the bool.
+
+        The cooldown a 429 starts is WORKSPACE-WIDE, held on this client: the rate limit
+        belongs to the workspace, not to one message, so two jobs running side by side must not
+        each spend a call rediscovering it. While it holds, this refuses without calling Slack
+        and says how long is left.
 
         `receipts` is accepted for symmetry with post_status_card and deliberately unused: an
         edit mints no ts, and the card's chrome row was written when it was posted."""
+        cooling = _card_cooldown_left(self)
+        if cooling > 0:
+            return CardWriteResult(ok=False, retry_after=cooling, error="cooldown")
         try:
             await self.app.client.chat_update(  # unleased-ok: a background job's own status card — a detached surface the guard exempts
                 channel=channel_id, ts=ts, text=text, blocks=blocks)
-            return True
+            return CardWriteResult(ok=True)
         except SlackApiError as e:
             self.log_debug(f"Status card update failed: {e}")
-            return False
+            response = getattr(e, "response", None)
+            error = (response.get("error") if response is not None else None) or ""
+            retry_after: Optional[float] = None
+            if error == "ratelimited" or getattr(response, "status_code", None) == 429:
+                headers = getattr(response, "headers", None) or {}
+                try:
+                    retry_after = float(headers.get("Retry-After") or 1)
+                except (TypeError, ValueError):
+                    retry_after = 1.0
+                # Same clamp the conversations.replies retry uses: honor what Slack asked for,
+                # but never sleep on a header that says an hour.
+                retry_after = min(max(retry_after, 0.5), 30.0)
+                _card_cooldown_start(self, retry_after)
+            return CardWriteResult(ok=False, retry_after=retry_after, error=str(error),
+                                   permanent=error in _PERMANENT_CARD_ERRORS)
 
     async def _replies_page_with_retry(self, kwargs: Dict, attempts: int = 3):
         """One conversations.replies page, honoring Retry-After on 429s (R1).

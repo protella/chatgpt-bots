@@ -16,6 +16,7 @@ from config import config
 from message_processor.thread_manager import AsyncThreadStateManager
 from message_processor.tool_registry import ToolContext, ToolRegistry
 import message_processor.research_tools as rt
+from slack_client.messaging import CardWriteResult
 
 
 # --------------------------------------------------------------- fakes
@@ -39,7 +40,9 @@ class _FakeClient:
 
     async def update_status_card(self, channel_id, ts, text, blocks, receipts=None):
         self.card_updates.append((channel_id, ts, text, blocks))
-        return True
+        # Same return type as the transport (F38) — the writer reads a structured result, and a
+        # fake that answered a bare bool would be testing a contract nothing ships.
+        return CardWriteResult(ok=True)
 
 
 class _SlowCardClient(_FakeClient):
@@ -685,12 +688,12 @@ async def test_delivery_flag_is_set_before_the_empty_research_failure(monkeypatc
 @pytest.mark.asyncio
 async def test_delivery_flag_is_set_before_the_timeout_note(monkeypatch):
     monkeypatch.setattr(config, "enable_research_label", False)
-    monkeypatch.setattr(config, "deep_research_timeout", 0.01)
     events = []
     tm = _SeamTM(events)
     tm.register_research("C1:100.0", "j1", "map the Q3 pricing shifts")
     proc = _FakeProcessor(openai_client=SimpleNamespace(
-        create_streaming_response_with_tool_loop=_ReturningStream(slow=True)), tm=tm)
+        create_streaming_response_with_tool_loop=_ReturningStream(
+            raises=asyncio.TimeoutError())), tm=tm)
 
     async def _fail(client, channel_id, thread_root, reason, receipts=None):
         events.append("failure_note")

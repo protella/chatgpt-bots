@@ -1036,32 +1036,15 @@ class BotConfig:
     # spend. Routed through clamp_effort against the thread's model.
     deep_research_reasoning_effort: str = field(default_factory=lambda: os.getenv("DEEP_RESEARCH_REASONING_EFFORT", "high"))
     deep_research_verbosity: str = field(default_factory=lambda: os.getenv("DEEP_RESEARCH_VERBOSITY", "medium"))
-    # Hard wall-clock bound on one research job (it makes one non-streaming Responses call with
-    # web_search + MCP). On timeout the job posts an honest failure note — never silent.
-    deep_research_timeout: float = field(default_factory=lambda: float(os.getenv("DEEP_RESEARCH_TIMEOUT", "600")))
     # Per-thread cap on concurrent research jobs (friendly structured rejection at the cap, which
     # the model relays). Deliberately per-thread, no global cap — mirrors image gen's choice.
     deep_research_max_per_thread: int = field(default_factory=lambda: max(1, int(os.getenv("DEEP_RESEARCH_MAX_PER_THREAD", "2"))))
-    # The job's tool-loop budget for PRODUCTIVE work. It is a runaway guard, not a ration: the
-    # thing that actually bounds a detached job's cost is DEEP_RESEARCH_TIMEOUT (wall clock).
-    # F37: card bookkeeping (update_todos) is exempt — it is passed as a `free_tool`, so a
-    # chatty todo list cannot eat the calls the build phase needs for mount_file /
-    # create_image_asset. Research spends almost nothing here (web_search is server-side and
-    # costs no round); the budget is for local tools. On cap the loop forces a final answer
-    # (tool_choice="none"), never an error.
-    deep_research_max_tool_rounds: int = field(default_factory=lambda: max(1, int(os.getenv("DEEP_RESEARCH_MAX_TOOL_ROUNDS", "10"))))
-    # F35: the BUILD phase — a second loop that runs only when the job declared `deliverables`,
-    # with a code sandbox + image/mount tools, to turn the findings into an actual file.
-    # It needs a bigger round budget than the research phase: mount, write code, read the
-    # traceback, fix, re-run, verify. Running out of rounds mid-build is the difference between
-    # a deck and an apology.
-    deep_research_build_timeout: float = field(default_factory=lambda: float(os.getenv("DEEP_RESEARCH_BUILD_TIMEOUT", "1800")))
     # Extra build-stream attempts after a TRANSIENT provider error (a dropped SSE stream, a 5xx,
     # a bare APIError with no status). The container is the persistence, so a retry resumes
-    # against work already done rather than starting over. The overall wall clock is still
-    # DEEP_RESEARCH_BUILD_TIMEOUT — retries share that one budget, they do not extend it.
+    # against work already done rather than starting over. Neither phase carries an elapsed-time
+    # limit or a round ration: a job ends when the model returns its answer, when the user
+    # cancels it, or when the transport watchdog / a local tool timeout fires.
     deep_research_build_retries: int = field(default_factory=lambda: max(0, int(os.getenv("DEEP_RESEARCH_BUILD_RETRIES", "2"))))
-    deep_research_max_build_rounds: int = field(default_factory=lambda: max(1, int(os.getenv("DEEP_RESEARCH_MAX_BUILD_ROUNDS", "16"))))
     # Label the findings post with a chat.postMessage username override ("<bot> [research: …]").
     # Needs the chat:write.customize scope, which the app may not have — on the first failure the
     # process falls back to plain posts for the rest of its life. Never breaks delivery.

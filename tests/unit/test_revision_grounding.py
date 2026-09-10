@@ -1293,6 +1293,9 @@ async def _drive_job(monkeypatch, *, mode, revises, deliverables=None):
 
     card = SimpleNamespace(
         start=_noop, set_phase=_noop, note_steering=_noop,
+        # F38: the job owns the card's writer lifecycle — start it after the post, and JOIN it
+        # in the `finally` so a pending terminal write still lands.
+        start_writer=lambda: None, close=_noop, reset_activity=lambda: None,
         finalize_failure=_noop, finalize_success=_noop, finalize_cancelled=_noop,
         todos=SimpleNamespace(as_prompt_block=lambda: "1. step"))
     monkeypatch.setattr(rt, "_ResearchCard", lambda **_kw: card)

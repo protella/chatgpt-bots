@@ -19,11 +19,18 @@ done, adding a step it didn't foresee, dropping one it doesn't need. Raw web_sea
 completions never add body lines; they bump live activity counters in the card's context line
 ("todos as of H:MM · N web searches · …"). The headline flips to ✅/❌ on finalize.
 
+F38 (the live line): milestones are minutes apart, so the context line LEADS with what the model
+is doing right now — the latest complete sentence of its own reasoning summary, or a hosted call
+("Searching…", "Searched: <query>", "Running code…", "Calling <tool>…") — falling back to the
+phase before the model has said anything, and gaining its age once it goes quiet. Producers only
+mutate card state and return; ONE writer task renders the latest state, paced at 15 seconds, so a
+card that moves every few seconds costs the model nothing at its own event boundaries.
+
 update_todos is a FREE tool (see `free_tools` in the tool loop): it spends no round budget, so
 keeping the card honest can never starve the build phase of the mount/image calls it needs.
 
 The job runs a streaming TOOL LOOP internally (web_search + configured MCP servers +
-update_todos; round budget DEEP_RESEARCH_MAX_TOOL_ROUNDS) — never streamed to Slack; the
+update_todos; no cumulative round ration — the clock winds it up) — never streamed to Slack; the
 stream is consumed only to observe tool activity (driving the card) and to accumulate the
 final text + tools_used. It then posts the report with a compact provenance trailer.
 Errors/timeouts finalize the card and post an honest one-line failure note — never silent.
@@ -34,6 +41,7 @@ import asyncio
 import contextlib
 import copy
 import importlib
+import re
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -48,6 +56,7 @@ from message_processor import document_tools, outbound_receipts
 from message_processor.artifacts import strip_citation_markers, strip_sandbox_links
 from message_processor.destination_tools import parse_destination_marker
 from message_processor.tool_registry import ToolContext, ToolRegistry
+from openai_client.api.tool_loop import NO_CAP
 
 # Process-lifetime flag: set once a labelled findings post fails (likely a missing
 # chat:write.customize scope) so we stop attempting the username override and post plainly
@@ -62,16 +71,25 @@ _RESEARCH_JOB_INSTRUCTION = (
     "TASK:\n{task}\n\n"
     "The user is watching a live status card. It ALREADY shows this plan, written when the job "
     "was dispatched:\n{todos}\n\n"
-    "Keep it true with the update_todos tool — that is the user's only view of what you are "
-    "doing. Mark a step `in_progress` when you start it and `done` when it is finished (batch "
-    "both into one call), and REVISE the plan when reality diverges: add a step you didn't "
-    "foresee, drop one that turned out to be unnecessary. It is a plan, not a contract. Four "
-    "steps max, under 80 characters each. Update as you go — a card that catches up at the end "
-    "is not a status card.\n\n"
-    "Cross-check multiple independent sources before stating a conclusion. A technical or "
-    "factual claim earns its place in the report only when a source you actually opened THIS "
-    "run supports it; a claim carried over from the conversation gets verified, not repeated. "
-    "Produce a clear, "
+    "Keep it true with the update_todos tool — it is the MILESTONE track on that card. Mark a "
+    "step `in_progress` when you start it and `done` when it is finished (batch both into one "
+    "call), and REVISE the plan when reality diverges: add a step you didn't foresee, drop one "
+    "that turned out to be unnecessary. It is a plan, not a contract. Four steps max, under 80 "
+    "characters each. Call it at a genuine change of step, outcome or plan — never per search "
+    "and never to restate an unchanged status — and when a LOCAL tool call is going out "
+    "anyway, batch it into that call (a web search or other hosted call is not a boundary you "
+    "can ride). The card ALSO carries a live line, fed automatically from your own work, "
+    "showing what you are searching or reading right now: that line costs you nothing, while a "
+    "milestone call costs a continuation, so spend one on a real change and let the live line "
+    "do the moment-to-moment narration. A card that catches up at the end is not a status "
+    "card.\n\n"
+    "Ground factual claims in evidence you inspected during this run. Claims carried over from "
+    "the conversation must be checked before you repeat them as facts. Verify each material "
+    "claim against at most a couple of authoritative, reliable sources, using direct evidence "
+    "wherever available. Once the evidence supports the claim or establishes an unresolved gap, "
+    "move on; do not keep searching for additional confirmation. Report the best-supported "
+    "answer, cite the sources you used, and distinguish established facts from inference and "
+    "unresolved uncertainty. Produce a clear, "
     "well-structured findings report that leads with the direct answer, supports each key "
     "claim with a source and a link, notes where sources disagree, and states honestly what "
     "remains uncertain or could not be verified. End with a short list of the sources/links "
@@ -91,11 +109,60 @@ _RESEARCH_FOR_BUILD_ADDENDUM = (
     "conversation and mount this thread's files, but it cannot search, and it must not "
     "invent. So write down the concrete material it will need: exact figures, dates, names and "
     "categories, laid out as plain markdown tables wherever something will be charted or "
-    "tabulated. Anything you leave out simply will not make it into the file.\n\n"
+    "tabulated. Obtain the substantive material the requested deliverables need; a list of gaps "
+    "does not fulfill the research task. Carry the supporting sources and necessary context into "
+    "the report, and identify any unresolved gaps there so the build can omit unsupported "
+    "content.\n\n"
     "But write the report FOR THE USER, not for the build phase. It is posted to them verbatim. "
     "Do not include layout directions, a proposed outline, chart placement notes, or any other "
     "instructions to yourself — no 'Recommended structure', no 'place this beside chart 2'. "
     "Just report what you found, with the numbers in it. The build phase can lay it out."
+)
+
+# What the code-interpreter container actually has, measured 2026-09-09 by probing a live
+# one. The image is OpenAI's and can change under us: when a fact here stops matching
+# reality, re-probe a container and correct the block — never fall back to telling the model
+# to go and look, which is the 15 minutes of `which node` this exists to end.
+_SANDBOX_ENVIRONMENT_BLOCK = (
+    "SANDBOX ENVIRONMENT (verified; do not spend rounds rediscovering it):\n"
+    "- Debian 13, 2 CPUs, 2 GB RAM, 32 GB disk. Work in /mnt/data (read inputs there, write "
+    "outputs there).\n"
+    "- NO network: no pip/npm installs, no downloads, no URLs. Everything you need is already "
+    "installed.\n"
+    "- Python 3.13 (/opt/pyvenv/bin/python, 508 packages) incl. python-pptx 1.0.2, python-docx, "
+    "openpyxl, xlsxwriter, reportlab, matplotlib, plotly, seaborn, pandas, numpy, scipy, "
+    "Pillow, PyMuPDF (fitz), pdfplumber, pypdf, lxml, weasyprint, CairoSVG, svglib, wordcloud, "
+    "pytesseract, imageio, moviepy, graphviz, networkx.\n"
+    "- Node 22 with pptxgenjs 4.0, sharp, skia-canvas, fontkit, tailwindcss, mathjax-full, "
+    "prismjs (global; also /usr/local/slides_js).\n"
+    "- Binaries: soffice/libreoffice (headless PPTX/DOCX → PDF), pandoc, pdftoppm, pdftotext, "
+    "tesseract, ffmpeg, ImageMagick (convert/magick in /opt/imagemagick/bin), ghostscript, "
+    "inkscape, chromium, xelatex/pdflatex/latexmk, graphviz dot, jq, zip/unzip.\n"
+    "- Fonts: 1,771 families installed. Microsoft names resolve to metric-compatible "
+    "substitutes (Arial → Arimo, Calibri → Carlito, Times New Roman → Tinos, Cambria → Caladea, "
+    "Georgia → Noto Serif, Helvetica → Nimbus Sans, Segoe UI/Aptos → Cantarell/Noto Sans). Also "
+    "present: Inter, Roboto, Lato, Open Sans, Liberation, DejaVu, EB Garamond, Noto. Pick from "
+    "these; do not run fc-list.\n"
+    "- Toolkits at /home/oai/skills (open a SKILL.md only when you need one of its tools):\n"
+    "  * slides/: container_tools/render_slides.py (PPTX or PDF → one PNG per slide, for visual "
+    "QA:\n"
+    "    `python /home/oai/skills/slides/container_tools/render_slides.py deck.pptx "
+    "--output_dir /mnt/data/.qa`),\n"
+    "    detect_font.py, create_montage.py; pptxgenjs_helpers/ (JS: text fitting, images, SVG, "
+    "LaTeX, layout builders);\n"
+    "    slide_templates/*.pptx (Academic, Brand_Design, Consulting_Proposal, Market_Research, "
+    "Pitch_Deck, Project_Kick-off).\n"
+    "  * docx/: render_docx.py (DOCX → PNG), scripts/ for tracked changes, comments, TOC, "
+    "captions, a11y, redaction, watermarks.\n"
+    "  * pdfs/: scripts/render_pdf.py, pdf_extract.py, pdf_edit.py, pdf_redact.py, "
+    "lo_convert_to_pdf.py, md_to_pdf.py, html_to_pdf.py, latex_to_pdf.py.\n"
+    "  * The skill docs mention an `artifact_tool` / `presentation_artifact_tool` Python "
+    "library. It is NOT installed here. Do not search for it; use python-pptx or pptxgenjs.\n"
+    "- Fast path for a deck: build with python-pptx (or pptxgenjs), save, render once with "
+    "render_slides.py, look at the PNGs, fix what is wrong, save. Inspect the rendered "
+    "deliverable and fix defects; each round of fixes warrants another inspection, but do not "
+    "run passes for their own sake. Finish when it meets the request. Delete QA renders and "
+    "scratch files before you finish so they are not mistaken for deliverables."
 )
 
 # The build phase's developer instruction. Operational, not aspirational: the failure this
@@ -109,13 +176,18 @@ _BUILD_JOB_INSTRUCTION = (
     "HOW:\n"
     "- Write Python in the code sandbox and actually produce the files. Describing them is a "
     "failure; only a file on disk counts.\n"
+    "- The sandbox is described below. Trust it and start building on your first round; do "
+    "not probe for tools, fonts or libraries it already lists.\n"
     "- Charts and tables must be computed from the figures in the findings above. Never make a "
     "number up to fill a slide, and never let an image model draw a chart — it will invent "
     "plausible-looking data.\n"
     "- You have NO web access here — do not claim otherwise, and never put a factual or "
     "technical claim into a deliverable that your source material (the findings, the "
-    "conversation, a mounted file) does not establish. If the material does not cover it, leave "
-    "it out or mark it unverified: a plausible guess reads as fact once it is in a document.\n"
+    "conversation, a mounted file) does not establish. Build a coherent, finished deliverable "
+    "from what the material supports. Omit unsupported content and explain what was left out in "
+    "your final message, never inside the file. Do not fill gaps with placeholders or "
+    "\"unverified\" labels. Write for the deliverable's intended audience; exclude commentary "
+    "about your own process or research limitations.\n"
     "- Need an illustration, a cover image, a diagram? Call create_image_asset — it puts the "
     "image INTO the sandbox for you to embed. Do not call it for charts.\n"
     "- Need a file the user shared, or one you produced earlier in this thread? Call mount_file "
@@ -130,9 +202,16 @@ _BUILD_JOB_INSTRUCTION = (
     "- Save ONLY the finished deliverables — nothing else. Then RE-OPEN each one and verify it "
     "(a .pptx must open in python-pptx with the slides you intended; a .pdf must have pages).\n"
     "- Keep the status card true with update_todos. It currently shows the plan below, carried "
-    "over from the research phase — REVISE it, do not restart it: the research steps are done, "
-    "so mark them done, and replace whatever remains with the real build steps. Four max, so "
-    "merge or drop the finished research steps to make room.\n"
+    "over from the research phase — REVISE it, do not restart it: the research phase has ended "
+    "— mark a research step done only if its outcome was achieved, otherwise reword it to what "
+    "actually happened; then replace whatever remains with the real build steps. Four max, so "
+    "merge or drop the finished research steps to make room. Call it at a genuine change of "
+    "step, outcome or plan, batched into a LOCAL tool call when one is going out anyway (the "
+    "sandbox is a hosted call and is not a boundary you can ride) — never per step of a script "
+    "and never to restate an unchanged status. The card also shows a live line of what you are "
+    "running, fed automatically and costing you nothing, while a milestone call costs a "
+    "continuation.\n\n"
+    "{sandbox}\n\n"
     "CURRENT TODO LIST:\n{todos}\n\n"
     "Your final message is a SHORT note (1-2 sentences) on what you built. The application "
     "posts the files — never write a `sandbox:` link, never say 'attached', and never claim a "
@@ -190,10 +269,6 @@ _BUILD_RESUME_NOTE = (
 _BUILD_RESUME_STEERING = (
     "\n\nMid-run updates you already received and must still honor:\n{notes}"
 )
-# No attempt is worth starting on the fag end of the budget: a build that gets seconds to
-# re-orient in its own container produces nothing and burns the tokens anyway.
-_BUILD_RETRY_MIN_REMAINING_S = 30.0
-
 # --- Revision grounding: the file a revision job starts FROM -------------------------------
 #
 # The incident this exists for: three revision passes on one built DOCX each REGENERATED
@@ -475,9 +550,9 @@ def get_start_background_job_schema() -> dict:
                     "type": "string",
                     "description": (
                         "SHORT topic tag for the research byline — 2-5 words, under 30 "
-                        "characters, e.g. 'fast-casual 2026 performance'. A tag, not a "
-                        "sentence: it renders as '[research: <label>]' next to every post "
-                        "from this job, and Slack hard-truncates long bylines."
+                        "characters. A tag, not a sentence: it renders as "
+                        "'[research: <label>]' next to every post from this job, and Slack "
+                        "hard-truncates long bylines."
                     ),
                 },
                 "deliverables": {
@@ -508,7 +583,7 @@ def get_start_background_job_schema() -> dict:
                             "filename": {
                                 "type": "string",
                                 "description": ("Filename with extension, e.g. "
-                                                "'ai-model-timeline.pptx'."),
+                                                "'deliverable.pptx'."),
                             },
                         },
                         "required": ["type", "description"],
@@ -534,11 +609,11 @@ def get_start_background_job_schema() -> dict:
                         "the job starts. Write the plan YOU would follow: the real phases of "
                         "the work, ending with the deliverable if there is one. The job revises "
                         "it as it learns (ticking items off, adding a step it didn't foresee), "
-                        "so it does not have to be perfect — but it is the user's only view of "
-                        "what is happening, so make it honest and specific to THIS task.\n\n"
-                        "Each step: UNDER 80 CHARACTERS, one line, no trailing period. Write "
-                        "like a commit subject — 'Pull pricing + context limits per vendor', "
-                        "not 'I will then proceed to gather the pricing information'. THREE "
+                        "so it does not have to be perfect — but it is the MILESTONE track the "
+                        "user reads (a live line under it shows moment-to-moment activity), so "
+                        "make it honest and specific to THIS task.\n\n"
+                        "Each step: UNDER 80 CHARACTERS, one line, no trailing period. Use "
+                        "a concise action phrase, without introductory narration. THREE "
                         "STEPS MAX here; the job can add a fourth once it is under way."
                     ),
                     "items": {"type": "string"},
@@ -698,10 +773,21 @@ def get_update_todos_schema() -> dict:
             "- EXACTLY ONE item `in_progress` at a time (that is the line showing the spinner). "
             "Zero is allowed only when every item is `done`.\n"
             "- UNDER 80 CHARACTERS per item, so it fits on ONE line without wrapping. A wrapped "
-            "line makes Slack collapse the whole card behind a 'Show more' link.\n\n"
-            "Call it as you go, not in a batch at the end — a status card that catches up "
-            "afterwards is not a status card. Batch the transitions though: mark one item done "
-            "AND the next in_progress in the SAME call."
+            "line makes Slack collapse the whole card behind a 'Show more' link.\n"
+            "- Mark an item `done` only when its stated outcome was achieved. If a step ends "
+            "with the evidence missing, reword the item to say what actually happened before "
+            "completing it.\n\n"
+            "WHEN to call it: at a genuine change of step, outcome or plan — and when a LOCAL "
+            "tool call is going out anyway, put it in the SAME batch as that call. A hosted "
+            "call (a web search, the sandbox) is not a boundary you can ride. Never as a call "
+            "of its own for a single search, and never to restate a status that has not "
+            "changed.\n"
+            "The card ALSO carries a live line showing what you are doing moment to moment. It "
+            "is fed automatically from your own work and costs you nothing; this call costs a "
+            "continuation. So this is the MILESTONE track, not the ticker. Batch the "
+            "transitions too: mark one item done AND the next in_progress in the SAME call.\n"
+            "A ✓ is your own claim about an outcome you achieved. It never claims the work was "
+            "delivered — what reached the user is decided after this job's output is posted."
         ),
         "parameters": {
             "type": "object",
@@ -794,6 +880,11 @@ _DELIVERY_INSTRUCTION = (
     "material that went into them. A file marked EXTRA was built beyond the declared list — "
     "post it when it is part of what the user asked for (a deck built alongside its photos), "
     "skip it when it is working material.\n"
+    "   Deliver the requested files as finished, client-ready work grounded in the source "
+    "material. Explain any omitted scope in the accompanying message. An unfinished file or an "
+    "explanation for withholding it does not fulfill the request. Honor an explicit user "
+    "condition on completeness or verification, and any later instruction withdrawing the "
+    "deliverable.\n"
     "2. WHETHER THE FULL REPORT GETS POSTED AS TEXT. If a file you are publishing already "
     "contains the findings, posting the report as well says the same thing twice, badly — Slack "
     "cannot render a markdown table and the report is full of them. But if NO file carries the "
@@ -906,8 +997,11 @@ def get_deliver_schema(artifact_ids: List[str], has_report: bool) -> dict:
     if artifact_ids:
         properties["publish"] = {
             "type": "array",
-            "description": ("The artifact_ids to post, in the order they should appear. Omit or "
-                            "leave empty to post no files at all."),
+            "description": ("The artifact_ids to post, in the order they should appear. "
+                            "Include the requested deliverables as finished, client-ready work. "
+                            "Explain any omitted scope in the reply; the files must stand on "
+                            "their own. Omit or leave empty "
+                            "to post no files at all."),
             "items": {"type": "string", "enum": list(artifact_ids)},
         }
     if has_report:
@@ -1123,13 +1217,175 @@ _CARD_MAX_LINES = 4
 # back — the thing four lines was supposed to kill. (Todo text has its own cap, _TODO_TEXT_CHARS.)
 _PHASE_GIST_CHARS = 90
 _SECTION_TEXT_LIMIT = 3000         # Slack's real cap on a section block's text
+# How often the card's ONE writer may make a ROUTINE write (owner ruling 2026-09-09): a job
+# must visibly move about every 15 seconds instead of going five minutes between milestones.
+# It is PACING, not a cap — nothing is ever dropped, intermediate states coalesce and the
+# writer always renders the latest one. Alerts and the terminal verdict are not routine and
+# do not wait for it.
+_CARD_WRITE_INTERVAL_S = 15.0
+# When the live line starts admitting its own age. Below this it reads as what is happening
+# now; above it the text stays but carries "· 45s ago", because summaries are not promised
+# every ten seconds and a card claiming current activity it cannot see is lying.
+_ACTIVITY_AGE_AFTER_S = 20.0
+# How long finalization waits for the writer to put the verdict on the card, and how long the
+# job's `finally` then waits for that writer to finish. Inside the process's existing 5s
+# shutdown grace, so a cancelled job still ends with a card that says so.
+_TERMINAL_WRITE_WAIT_S = 5.0
+# Slack entities and mrkdwn/heading delimiters, stripped out of model- and web-authored text
+# before it is rendered on the card: a query containing <!channel> would notify the room from
+# inside a status card, and stray formatting characters would reflow the whole context line.
+_SLACK_ENTITY_RE = re.compile(r"<[^<>\n]*>")
+_MRKDWN_CHARS_RE = re.compile(r"[*_~`>|]+")
+_HEADING_PREFIX_RE = re.compile(r"^#+\s*")
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+# A summary part's title line, CLOSED: the trailing ** is what says the title has finished
+# arriving, so a half-streamed one never reaches the card.
+_HEADING_LINE_RE = re.compile(r"^\*\*.+\*\*$")
 
 
 def _card_throttle_s() -> float:
-    """Card chat.update floor. Not a new magic number: Slack's real constraint on message
-    updates is ~1/sec per message, already encoded as STREAMING_MIN_INTERVAL — the same knob
-    the streaming path throttles on. Floor of 1.0 enforced."""
+    """Card chat.update floor — the writer's tick.
+
+    Not a new magic number: Slack's real constraint on message updates is ~1/sec per message,
+    already encoded as STREAMING_MIN_INTERVAL — the same knob the streaming path throttles on.
+    Floor of 1.0 enforced. Routine writes are paced far wider (_CARD_WRITE_INTERVAL_S); this is
+    how often the writer wakes to notice that something is owed."""
     return max(1.0, float(getattr(config, "streaming_min_interval", 1.0) or 1.0))
+
+
+def _age_label(seconds: float) -> str:
+    """'45s' / '2m' — the age suffix on a live line that has gone quiet. Coarse on purpose:
+    the number is there to say "a while", and a ticking second count is a stopwatch."""
+    total = max(0, int(seconds))
+    return f"{total}s" if total < 60 else f"{total // 60}m"
+
+
+def _sanitize_activity(raw: Any) -> str:
+    """Model-, web- or SDK-authored text, made safe for the card's context line.
+
+    Four things go before it is rendered: control/format characters (a bidi override in a
+    search query is not an accident), anything Slack would read as an entity — a mention, a
+    channel link, a `<url|label>` — the mrkdwn characters that would reflow the line around it,
+    and a markdown heading's own delimiters. Newlines collapse with the rest of the whitespace,
+    because this is ONE line. Length is the phase tail's existing allowance, not a new limit;
+    nothing left is no activity at all."""
+    text = "".join(ch for ch in str(raw or "")
+                   if unicodedata.category(ch) not in ("Cc", "Cf"))
+    text = _SLACK_ENTITY_RE.sub(" ", text)
+    text = _HEADING_PREFIX_RE.sub("", text.strip())
+    text = _MRKDWN_CHARS_RE.sub("", text)
+    # Whatever angle brackets survive were never a well-formed entity; escaped, they render as
+    # themselves instead of opening one.
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return _gist(text, _PHASE_GIST_CHARS)
+
+
+def _first_sentence(line: str, whole_line_ok: bool) -> str:
+    """The first COMPLETE sentence of one line, or "" when it has none.
+
+    ``whole_line_ok`` is for a line a newline already ended: it is finished whether or not it
+    carries terminal punctuation, so a heading or a bare clause still counts. The last line of a
+    still-streaming part gets no such benefit — it is a fragment until it is punctuated."""
+    first = _SENTENCE_SPLIT_RE.split(line)[0].strip()
+    if first.endswith((".", "!", "?")):
+        return first
+    return line if whole_line_ok else ""
+
+
+def _readable_summary(raw: Any) -> str:
+    """What one reasoning-summary part should say on the card, or "" if it can't say anything
+    yet.
+
+    The HEADING wins when the part has one. Summaries arrive as a **bold title** followed by
+    prose, and the title is the part's own answer to "what am I doing" — "Researching municipal
+    composting programs" — while the prose is working-out. Watching a live run, the last
+    sentence of a part was reliably filler ("This way, I can make the most of the information
+    while keeping it concise and relevant."), which is why the fallback is the part's FIRST
+    complete sentence rather than its latest: the first says what the model set out to do, the
+    last says how it feels about having done it.
+
+    A heading counts as complete once its closing ``**`` has arrived — that is its terminator,
+    exactly as a newline is for any other line — so a half-written title never flashes up.
+    Nothing readable yet returns "", which tells the card to keep what it is already showing."""
+    lines = [" ".join(line.split()) for line in str(raw or "").splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:
+        return ""
+    if _HEADING_LINE_RE.match(lines[0]):
+        return lines[0]
+    for line in lines[:-1]:
+        sentence = _first_sentence(line, whole_line_ok=True)
+        if sentence:
+            return sentence
+    return _first_sentence(lines[-1], whole_line_ok=False)
+
+
+# What a hosted call looks like on the live line, per (tool, state). START says what is
+# happening, COMPLETE says what happened — activity, never accomplishment: none of these ticks
+# a checklist item, and "Searched" is not "found".
+_HOSTED_TOOL_NAMES = {"web_search": "Web search", "code_interpreter": "Code",
+                      "mcp": "Tool call"}
+_SEARCHED_PREFIX = "Searched: "
+_SEARCHING_SUFFIX = " · searching…"
+
+
+def _searching_after(query: str) -> str:
+    """"Searched: <query> · searching…" — what the card shows while the NEXT search runs.
+
+    Measured on a live run: searches go out back to back, so by the time the writer takes its
+    snapshot the newest event is always the next search's START and the card showed nothing but
+    "Searching…" for two minutes while the counter climbed. The query that just completed is the
+    only concrete thing the job can report, and it is still true — it says what was just looked
+    up AND that more is happening. The query is trimmed, not the line: gisting the whole thing
+    would cut the live half off the end and leave a stale-looking "Searched: …"."""
+    room = _PHASE_GIST_CHARS - len(_SEARCHED_PREFIX) - len(_SEARCHING_SUFFIX)
+    return f"{_SEARCHED_PREFIX}{_gist(query, max(room, 16))}{_SEARCHING_SUFFIX}"
+
+
+def _hosted_activity(tool: Optional[str], state: Optional[str], label: Optional[str],
+                     last_query: Optional[str] = None) -> str:
+    """One live line for a hosted call, or "" for a shape we don't render.
+
+    ``last_query`` is the query of the previous COMPLETED search in the same request, which is
+    what a starting search can say instead of the bare "Searching…"."""
+    name = _sanitize_activity(label) if label else ""
+    if state == "start":
+        if tool == "web_search":
+            # The query is not knowable until the call completes, so a starting search can only
+            # report the one before it — bare "Searching…" is the truth only until then.
+            return _searching_after(last_query) if last_query else "Searching…"
+        if tool == "code_interpreter":
+            return "Running code…"
+        if tool == "mcp":
+            return f"Calling {name}…" if name else "Calling a tool…"
+        return ""
+    if state == "complete":
+        if tool == "web_search":
+            return f"{_SEARCHED_PREFIX}{name}" if name else "Searched the web"
+        if tool == "code_interpreter":
+            return "Ran code"
+        if tool == "mcp":
+            return f"Called {name}" if name else "Called a tool"
+        return ""
+    if state == "failed":
+        if tool == "mcp" and name:
+            return f"{name} failed"
+        return f"{_HOSTED_TOOL_NAMES.get(tool or '', 'A tool')} failed"
+    return ""
+
+
+def _card_outcome(result: Any) -> Tuple[bool, Optional[float], bool]:
+    """Read what one `update_status_card` call reported: (ok, retry_after, permanent).
+
+    The transport returns a `CardWriteResult`, but this is read defensively rather than
+    imported: the card is driven against stand-in clients that still answer a bare bool, and
+    `permanent` — the one outcome that stops the writer for good — is honored ONLY on a literal
+    True, so an attribute invented by a mock can never silently blind a running job's card."""
+    ok = bool(getattr(result, "ok", result))
+    retry = getattr(result, "retry_after", None)
+    retry_after = (float(retry) if isinstance(retry, (int, float))
+                   and not isinstance(retry, bool) else None)
+    return ok, retry_after, getattr(result, "permanent", False) is True
 
 
 def _now_label(clock: Callable[[], time.struct_time] = time.localtime) -> str:
@@ -1138,18 +1394,29 @@ def _now_label(clock: Callable[[], time.struct_time] = time.localtime) -> str:
 
 
 class _ResearchCard:
-    """Claude-parity live status card for a background job (F30.1 / F37).
+    """Claude-parity live status card for a background job (F30.1 / F37 / F38).
 
     Posts ONE blocks message — a section block rendering the live TODO LIST (◦ pending,
     {loader} in_progress, ✓ done) with a phase/verdict tail line, and a context block
-    "todos as of H:MM AM/PM · N web searches · …" carrying live activity counters — with the
-    same labelled identity as the findings, then updates it in place. The list itself lives in
+    "<what is happening now> · todos as of H:MM AM/PM · N web searches · …" — with the same
+    labelled identity as the findings, then updates it in place. The list itself lives in
     _TodoState (the card RENDERS it, does not own it); raw tool events only bump the counters,
-    so the card never degenerates into a per-search log. chat.update is THROTTLED to at most
-    one per ``_card_throttle_s()`` (STREAMING_MIN_INTERVAL) with a TRAILING flush, so the last event is never left
-    unshown. The notification `text` is CONSTANT (``_CARD_FALLBACK_TEXT``) across every update
-    so Slack never badges "(edited)". Every op is best-effort: a card failure is logged and
-    swallowed — it must NEVER kill the research job."""
+    so the card never degenerates into a per-search log.
+
+    PRODUCERS AND THE WRITER ARE SEPARATE (F38), which is the whole shape of this class. A
+    producer — the progress observer, a tool event, an update_todos apply, an alert — mutates
+    state, bumps ``_revision`` and RETURNS. None of them touches Slack, because every one of
+    them runs inside the model's own event path: a producer that awaited a chat.update would
+    put Slack's latency between the model and its next token, which is exactly what made card
+    updates cost a round boundary. A single writer task then renders the LATEST state at most
+    once per ``_CARD_WRITE_INTERVAL_S``, coalescing everything that happened in between. There
+    is no queue of payloads anywhere: what goes out is always rendered from current state, so a
+    write can never show something the card has already moved past.
+
+    The notification `text` is CONSTANT (``_CARD_FALLBACK_TEXT``) across every update so Slack
+    never badges "(edited)". Every op is best-effort: a card failure is logged and swallowed —
+    it must NEVER kill the research job, and a card that has become permanently unwritable
+    stops its writer and leaves the job running."""
 
     def __init__(self, *, processor, client, channel_id: str, thread_root: str, task: str,
                  label: Optional[str], todos: Optional["_TodoState"] = None,
@@ -1192,12 +1459,48 @@ class _ResearchCard:
         # in_progress (see _visible_lines), which is exactly the state a mid-build retry happens
         # in. The alert rides the context line instead, which renders unconditionally.
         self._alert: Optional[str] = None
-        self._steering_flush_tasks: set = set()
+        # The revision the alert was raised at. It is the LATCH: an alert may not be cleared
+        # until a write has actually carried it (`_acked_revision >= _alert_revision`), or a
+        # hiccup raised and answered inside one pacing window would be coalesced out of
+        # existence and the user would never learn why the job paused.
+        self._alert_revision = 0
         self._terminal: Optional[str] = None
-        self._dirty = False
+        # The live line: what the model is doing RIGHT NOW, and when it said so. Freshest wins —
+        # there is no history here, because the card shows one line and the newest thing the
+        # model did is the truest answer to "is this still moving?".
+        self._activity: Optional[str] = None
+        self._activity_ts: Optional[float] = None
+        # STORED, never recomputed at render time: the checklist is as old as the last time the
+        # model actually rewrote it, and a card that restamped the clock on every write would
+        # show a five-minute-old list as "todos as of" the current minute — the exact lie the
+        # timestamp exists to prevent. Seeded here because the plan the card opens with was
+        # written by the dispatching model a moment ago.
+        self._todo_ts: str = self._now_label()
+        # Producers are rejected from here on (finalization has begun).
         self._closed = False
-        self._last_update: Optional[float] = None
-        self._flush_task: Optional[asyncio.Future] = None
+        # Producer → writer handoff. `_revision` is bumped by every producer; `_acked_revision`
+        # is the revision the last successful write actually carried. They differ ⇒ the card
+        # owes Slack a write. A counter rather than a flag because the writer has to answer a
+        # question a flag cannot: "is the state I just wrote still the current one?"
+        self._revision = 0
+        self._acked_revision = 0
+        self._acked_blocks: Optional[List[Dict[str, Any]]] = None
+        # Earliest clock reading at which a ROUTINE write may go out. Alerts and the terminal
+        # verdict ignore it; only Slack's own back-pressure (the 429 cooldown) binds those.
+        self._next_write_at: float = 0.0
+        # The verdict is owed and not yet on the card. It outranks pacing, survives a refused
+        # write, and is the last thing the writer does before it closes.
+        self._terminal_pending = False
+        self._finished = False
+        # Set by a refused write (a 429, or the workspace cooldown the transport holds): NO
+        # write goes out before then, not even the terminal one, because that limit is Slack's
+        # and not ours to override. The state stays dirty and the next attempt renders it fresh.
+        self._cooldown_until: float = 0.0
+        # Set when Slack says this card can never be written again. The job carries on.
+        self._disabled = False
+        self._writer_task: Optional[asyncio.Future] = None
+        self._wake_event = asyncio.Event()
+        self._terminal_done = asyncio.Event()
         self._lock = asyncio.Lock()
 
     # --- rendering ---
@@ -1250,15 +1553,36 @@ class _ResearchCard:
             lines = lines + [f"{self._loader_emoji} {self._phase}"]
         return lines[-_CARD_MAX_LINES:]
 
-    def _context_line(self) -> str:
-        """Optional alert + 'todos as of H:MM' + live activity counters — the mechanical tool
-        events live here as counts, not as body lines. This block renders on EVERY card state,
-        which is why the alert lives here rather than on the phase tail."""
-        parts: List[str] = []
+    def _lead_segment(self) -> str:
+        """The head of the context line: the alert, else the live activity, else the phase.
+
+        Priority is a ranking of how much the user needs it. An ALERT is an out-of-band
+        condition they have to know about ("provider hiccup — retrying"), so it outranks
+        activity; a TERMINAL card supersedes both, because "Searching…" under a ✅ verdict is
+        just a lie about a job that has stopped.
+
+        With nothing heard from the model yet — the first seconds of a phase — the PHASE LABEL
+        stands in, so the line always says something true rather than going blank.
+
+        Activity older than `_ACTIVITY_AGE_AFTER_S` keeps its text and gains its age. Reasoning
+        summaries are not promised every ten seconds, and a card that keeps showing the last
+        thing it heard as though it were happening now claims movement it cannot see."""
+        if self._terminal is not None:
+            return ""
         if self._alert:
-            # First, because it is the one part of this line that is news.
-            parts.append(self._alert)
-        parts.append(f"todos as of {self._now_label()}")
+            return self._alert
+        if not self._activity:
+            return self._phase
+        age = self._clock() - (self._activity_ts if self._activity_ts is not None
+                               else self._clock())
+        if age < _ACTIVITY_AGE_AFTER_S:
+            return self._activity
+        return f"{self._activity} · {_age_label(age)} ago"
+
+    def _static_context(self) -> str:
+        """The part of the context line that does not move on a clock: when the checklist was
+        last rewritten, and the mechanical counters."""
+        parts: List[str] = [f"todos as of {self._todo_ts}"]
         if self._web_searches:
             n = self._web_searches
             parts.append(f"{n} web search{'es' if n != 1 else ''}")
@@ -1271,12 +1595,32 @@ class _ResearchCard:
             parts.append(f"{n} update{'s' if n != 1 else ''} passed along")
         return " · ".join(parts)
 
+    def _context_line(self) -> str:
+        """The whole context line as one string — what the two rendered elements read as
+        together, and the honest thing for a test or a log to assert on."""
+        lead = self._lead_segment()
+        return f"{lead} · {self._static_context()}" if lead else self._static_context()
+
+    def _context_elements(self) -> List[Dict[str, Any]]:
+        """The context block's elements: the DYNAMIC line first, as `plain_text`.
+
+        Plain text because it is the one part of the card written by the model and the open web
+        — a query or a sentence of reasoning — and plain_text is rendered rather than parsed, so
+        nothing inside it can become formatting, a link or a mention. The static half stays
+        mrkdwn. Slack joins context elements with a space, which is why the separator rides on
+        the second one."""
+        lead = self._lead_segment()
+        static = self._static_context()
+        if not lead:
+            return [{"type": "mrkdwn", "text": static}]
+        return [{"type": "plain_text", "text": lead, "emoji": True},
+                {"type": "mrkdwn", "text": f"· {static}"}]
+
     def _blocks(self) -> List[Dict[str, Any]]:
         return [
             {"type": "section",
              "text": {"type": "mrkdwn", "text": "\n".join(self._visible_lines())}},
-            {"type": "context",
-             "elements": [{"type": "mrkdwn", "text": self._context_line()}]},
+            {"type": "context", "elements": self._context_elements()},
         ]
 
     # --- posting / observing ---
@@ -1305,6 +1649,52 @@ class _ResearchCard:
                 self.channel_id, self.thread_root, _CARD_FALLBACK_TEXT, blocks,
                 receipts=self.receipts, receipt_class="background_job")
         self.ts = ts
+        if ts is not None:
+            # The post IS the first write: it starts the pacing window and it is what the card
+            # currently shows, so the writer has nothing to say until something moves.
+            self._next_write_at = self._clock() + _CARD_WRITE_INTERVAL_S
+            self._acked_revision = self._revision
+            self._acked_blocks = blocks
+
+    # --- producers: mutate state, bump the revision, wake the writer, RETURN ---------------
+    #
+    # Every method in this section runs inside the model's own event path — a stream event, a
+    # tool call, a retry decision. None of them awaits Slack, and none of them writes: that is
+    # the rule the whole class is built around. They mutate, bump `_revision`, call `_wake()`,
+    # and return.
+
+    def _wake(self) -> None:
+        """Tell the writer there is something to look at. Sync and never fails — the writer
+        also wakes on its own timer, so a missed nudge costs latency, never an update."""
+        try:
+            self._wake_event.set()
+        except Exception:  # noqa: BLE001 — a card nudge cannot be allowed to raise
+            pass
+
+    def _mark(self) -> None:
+        """Record that the card's state moved. The only thing a producer has to call.
+
+        A closed card ignores it: finalization is the last word, and a late producer must not
+        resurrect a card that has already shown its verdict."""
+        if self._closed:
+            return
+        self._revision += 1
+        self._wake()
+
+    def _clear_alert(self) -> None:
+        """Take the alert down — but only once it has actually been SEEN.
+
+        The latch is the whole point. A hiccup is raised and answered within seconds, and if the
+        clear were unconditional the two would coalesce inside one pacing window: the card would
+        never render the alert at all, and the user would be left with an unexplained pause. So
+        the clear waits until a write has carried the alert (`_acked_revision >=
+        _alert_revision`); until then the "moving again" event has to try again on the next one,
+        which it will, because the model keeps producing."""
+        if self._alert is None:
+            return
+        if self._acked_revision >= self._alert_revision:
+            self._alert = None
+            self._alert_revision = 0
 
     async def set_todos(self, todos: Any) -> Optional[str]:
         """Apply a model-authored list rewrite (update_todos). Returns an error string on
@@ -1317,9 +1707,12 @@ class _ResearchCard:
         error = self.todos.set(todos)
         if error:
             return error
+        # The timestamp belongs to THIS rewrite. Stamped here, where the model actually spoke,
+        # never at render time — see `_todo_ts`.
+        self._todo_ts = self._now_label()
         # The model is driving the card again, so whatever the alert was warning about is over.
-        self._alert = None
-        await self._request_update()
+        self._clear_alert()
+        self._mark()
         return None
 
     async def set_phase(self, phase: str) -> None:
@@ -1327,86 +1720,113 @@ class _ResearchCard:
 
         A phase is not a milestone. It is what the job is doing RIGHT NOW, so it belongs on the
         one line that gets replaced, not on a line that accumulates — spending a permanent slot
-        out of four on "Building…" would push a real accomplishment off the card."""
+        out of four on "Building…" would push a real accomplishment off the card. It is also
+        what the context line falls back to before the model has said anything.
+
+        A phase change RESETS the live activity: the research phase's last search does not
+        describe the build that just started, and leaving it up would have the card narrating
+        work that is over."""
         phase = " ".join((phase or "").split())
         if not phase:
             return
         self._phase = _gist(phase, _PHASE_GIST_CHARS)
-        await self._request_update()
+        self.reset_activity()
+        self._mark()
 
     async def set_alert(self, alert: Optional[str]) -> None:
         """Raise (or clear) the context-line alert — an out-of-band condition the card must show
         even while a todo is spinning, e.g. "Provider hiccup — retrying (2/3)…".
 
-        It is NOT sticky by design: the next model-driven card activity — an update_todos apply
-        or an activity counter bump — clears it, because that activity IS the "moving again"
-        signal. Nothing has to remember to take it down.
+        It is not sticky, but it IS latched: it comes down when the model produces something
+        again — that activity is the "moving again" signal — and only once a write has carried
+        it (see `_clear_alert`). Nothing mechanical takes it down: a writer tick or a successful
+        write is the card talking to itself, not the job moving again.
 
-        Which is also why it renders IMMEDIATELY instead of through the throttle. An alert is
-        raised and cleared by two events that can land inside the same one-second window, and a
-        coalesced update renders only the final state — the user would be told nothing at all
-        about the very thing the alert exists to tell them."""
+        Raising one also resets the live activity. An alert marks a transition — a retry against
+        a new attempt — and the last thing the dead attempt was doing is not what happens next.
+
+        The writer treats a standing, unrendered alert as PRIORITY: it does not wait out the
+        pacing interval, because news fifteen seconds late is not news."""
         text = " ".join((alert or "").split())
-        self._alert = _gist(text, _PHASE_GIST_CHARS) if text else None
-        await self._force_flush()
+        raised = _gist(text, _PHASE_GIST_CHARS) if text else None
+        if raised:
+            self._alert = raised
+            self.reset_activity()
+            self._mark()
+            # AFTER the bump, so the latch names the revision that carries the alert.
+            self._alert_revision = self._revision
+        else:
+            self._clear_alert()
+            self._mark()
+
+    def note_activity(self, text: Any) -> None:
+        """The live line: what the model is doing right now (F38).
+
+        Fed by the stream's PROGRESS channel — a reasoning summary, a search starting, a query
+        that just completed, the sandbox running, an MCP tool being called. Sync and Slack-free,
+        because it is called from inside the stream loop between two tokens.
+
+        Text IDENTICAL to what is already showing is dropped without refreshing the timestamp:
+        the same summary can reach us from three paths, and a card whose age suffix kept
+        resetting on re-reports of one sentence would be manufacturing the movement it exists to
+        report honestly.
+
+        It is activity, never accomplishment: nothing here ticks a checklist item, and the text
+        is sanitized before it is stored because it comes from the model and the open web."""
+        if self._closed:
+            return
+        clean = _sanitize_activity(text)
+        if not clean or clean == self._activity:
+            return
+        self._activity = clean
+        self._activity_ts = self._clock()
+        # The model is producing again, so a hiccup alert has been answered by events.
+        self._clear_alert()
+        self._mark()
+
+    def reset_activity(self) -> None:
+        """Drop the live line at a transition (phase change, request start, retry).
+        Deliberately not a write: the phase label stands in until the model speaks again."""
+        self._activity = None
+        self._activity_ts = None
 
     async def note_web_search(self) -> None:
         self._web_searches += 1
-        self._alert = None
-        await self._request_update()
+        self._clear_alert()
+        self._mark()
 
     async def note_mcp(self, label: Optional[str]) -> None:
         key = label or "MCP"
         self._mcp_calls[key] = self._mcp_calls.get(key, 0) + 1
-        self._alert = None
-        await self._request_update()
+        self._clear_alert()
+        self._mark()
 
     def bump_steering(self, n: int) -> None:
         """Count notes handed to the job, WITHOUT touching Slack. Sync on purpose: the drain
         that feeds it must not await between popping the notes and returning them, so the count
-        has to land inside that window while the Slack write is scheduled separately. A card
-        finalized before that write still renders the right number — finalize renders current
-        state, not a queued snapshot.
-
-        Marks the card dirty, which is not bookkeeping pedantry: `_flush` clears `_dirty` and
-        renders its blocks BEFORE awaiting Slack, so a bump landing during that write would
-        otherwise be invisible to the flush already in flight AND leave nothing to tell the next
-        one there was anything to say."""
+        has to land inside that window. The Slack write is the writer's problem, and it renders
+        current state — so a card finalized before the next tick still shows the right number."""
         if n > 0:
             self._steering_notes += n
-            # An activity counter moving IS the job showing signs of life (R2) — and inside a
-            # build phase, steering is the only counter there is: no web_search or MCP event
-            # ever reaches this card.
-            self._alert = None
-            self._dirty = True
+            # An activity counter moving IS the job showing signs of life (R2).
+            self._clear_alert()
+            self._mark()
 
     def request_steering_flush(self) -> None:
-        """Schedule the Slack write for a count that has already been bumped.
+        """Kept as the drain's second half, now only a nudge.
 
-        Every bump gets its own scheduled `_request_update`, and none is skipped because another
-        is still in the air. Skipping was the bug: a flush awaiting Slack I/O has already taken
-        its snapshot, so the update it is sending does not contain the count that arrived after
-        it started, and dropping the second request left the live card a note behind for as long
-        as the job kept running. The WRITES still coalesce — that is `_request_update`'s job, via
-        the throttle and its single trailing flush; this only guarantees one of them is asked.
-
-        Task references are held in a set until each finishes, never dropped on the floor: a bare
-        create_task result can be garbage-collected mid-flight (see _schedule_async_call in
-        message_processor/utilities.py), and the update it was going to make would simply never
-        happen. Best-effort like every other card op."""
-        if self.ts is None or self._closed:
-            return
-        task = asyncio.ensure_future(self._request_update())
-        self._steering_flush_tasks.add(task)
-        task.add_done_callback(self._steering_flush_tasks.discard)
+        It used to schedule a Slack write per bump, because a write already in flight held a
+        stale snapshot and nobody else would look at the newer count. The single writer removed
+        that race by construction: it renders from current state at its next tick, so the count
+        bumped a microsecond ago is in the next write whether or not anyone asked for one. The
+        call site keeps its shape — drain, bump, ask — and this keeps answering it."""
+        self._wake()
 
     async def note_steering(self, n: int) -> None:
-        """Bulk-increment and flush, for callers that CAN await — the closing sweep, which runs
-        outside the atomic drain window."""
+        """Bulk-increment, for callers that reach the card outside the atomic drain window."""
         if n <= 0:
             return
         self.bump_steering(n)
-        await self._request_update()
 
     async def finalize_success(self, line: Optional[str] = None) -> None:
         await self._finalize(line or "Reported findings below.", "✅")
@@ -1429,94 +1849,280 @@ class _ResearchCard:
         line = f"cancelled — {_gist(reason, 80)}" if reason else "cancelled (bot shutting down)"
         await self._finalize(line, "❌", failed=True)
 
-    # --- throttled update machinery ---
-    async def _request_update(self) -> None:
-        """Coalesce updates: flush now when the throttle window has elapsed, else schedule a
-        SINGLE trailing flush that renders the latest state (never leaving the card stale)."""
-        if self.ts is None or self._closed:
+    # --- the writer: ONE task, one chat.update at a time ------------------------------------
+
+    def start_writer(self) -> None:
+        """Start the card's single writer. Called by the job once the card has a ts.
+
+        Explicit rather than folded into `start()` so a caller that only wants to RENDER a card
+        (every test that drives `_writer_tick` by hand, and the finalize-only paths) never
+        acquires a background task it has to remember to stop."""
+        if self._writer_task is not None or self.ts is None or self._finished:
             return
-        self._dirty = True
-        now = self._clock()
-        throttle = _card_throttle_s()
-        if self._last_update is None or (now - self._last_update) >= throttle:
-            await self._flush()
-        elif self._flush_task is None or self._flush_task.done():
-            delay = throttle - (now - self._last_update)
-            self._flush_task = asyncio.ensure_future(self._delayed_flush(delay))
+        self._writer_task = asyncio.ensure_future(self._writer_loop())
 
-    async def _force_flush(self) -> None:
-        """Render the current state NOW, ignoring the throttle window.
+    def stop_writer(self) -> None:
+        """Cancel the writer outright. The blunt one — `close()` is what the job uses, because
+        it lets a pending terminal write land first."""
+        task = self._writer_task
+        self._writer_task = None
+        if task is not None and not task.done():
+            task.cancel()
 
-        For state whose whole value is being seen at the moment it happens, so being coalesced
-        into a later render loses it entirely. Unlike `_finalize` this leaves the card OPEN and
-        cancels nothing: a trailing flush already scheduled is still wanted, and re-rendering
-        current state is harmless. Best-effort — `_safe_update` swallows its own failures."""
-        if self.ts is None or self._closed:
+    async def close(self, timeout: Optional[float] = None) -> None:
+        """Let go of the writer, giving a pending TERMINAL write time to land.
+
+        Called from the job's `finally`, on every ending. The JOB is bounded here — it waits out
+        the grace period and then stops waiting — but the VERDICT is not: a writer that still
+        owes the card its terminal state is left running, detached, and finishes on its own.
+
+        That distinction is the whole point. Slack's `Retry-After` on a rate-limited write can
+        easily exceed the shutdown grace, and cancelling on the way past would leave the card
+        reading "Publishing…" forever over a job that finished minutes ago — the exact failure
+        the terminal write exists to prevent. The detached writer needs nothing from the job: it
+        waits out the cooldown, writes, and exits, or gives up if the card turns out to be
+        permanently unwritable. The task reference is KEPT (on `_writer_task`) so nothing
+        garbage-collects it mid-flight.
+
+        A writer with nothing terminal owed has no such claim and is cancelled as before."""
+        self._closed = True
+        self._wake()
+        task = self._writer_task
+        if task is None or task.done():
+            self._writer_task = None
             return
-        async with self._lock:
-            if self.ts is None or self._closed:
-                return
-            self._dirty = False
-            self._last_update = self._clock()
-            await self._safe_update(self._blocks())
-
-    async def _delayed_flush(self, delay: float) -> None:
         try:
-            await self._sleep(delay)
+            await asyncio.wait_for(asyncio.shield(task), timeout or _TERMINAL_WRITE_WAIT_S)
         except asyncio.CancelledError:
-            return
-        await self._flush()
-
-    async def _flush(self) -> None:
-        async with self._lock:
-            if self.ts is None or self._closed or not self._dirty:
+            if self._verdict_owed():
+                raise                   # the job is going; the verdict still has to land
+            task.cancel()
+            self._writer_task = None
+            raise
+        except asyncio.TimeoutError:
+            if self._verdict_owed():
+                self.processor.log_debug(
+                    "Research card verdict is still owed (rate-limited?) — leaving the writer "
+                    "to finish it after the job has ended")
                 return
-            self._dirty = False
-            self._last_update = self._clock()
-            await self._safe_update(self._blocks())
-        # THE FLUSH OWNS THE RE-CHECK, and nothing else can. The blocks above were rendered
-        # before the await, so an update that lands while that write is in the air is not in
-        # what just went out — and the caller that set `_dirty` for it found this very task
-        # still running and correctly scheduled nothing (one trailing flush is the whole point
-        # of the throttle). If the write that is finishing right now does not look behind
-        # itself, that state strands: dirty, newer than the last render, and with nobody left
-        # who is going to look at it.
-        if self._dirty and not self._closed and self.ts is not None:
-            delay = max(0.0, _card_throttle_s() - (self._clock() - (self._last_update or 0.0)))
-            # Replaces `_flush_task` deliberately: this IS that task, at its very end.
-            self._flush_task = asyncio.ensure_future(self._delayed_flush(delay))
+            self.processor.log_debug(
+                "Research card writer did not finish within the grace period — cancelling")
+            task.cancel()
+        except Exception as e:  # noqa: BLE001 — the writer's own failures are its business
+            self.processor.log_debug(f"Research card writer ended with {e}")
+        self._writer_task = None
+
+    def _verdict_owed(self) -> bool:
+        """Is there a terminal state the card still has to show, and any prospect of showing
+        it? A disabled card has no prospect, so nothing is owed and the writer may go."""
+        return self._terminal_pending and not self._disabled and self.ts is not None
+
+    async def _writer_loop(self) -> None:
+        """Wake on a producer's nudge or on the timer, then write if anything is owed.
+
+        The timer matters as much as the nudge: during a long silence nothing bumps the
+        revision, and it is this tick that ages the live line honestly instead of leaving a
+        five-minute-old "Searching…" reading as current."""
+        try:
+            while not self._finished and not self._disabled:
+                try:
+                    await asyncio.wait_for(self._wake_event.wait(), _card_throttle_s())
+                except asyncio.TimeoutError:
+                    pass
+                self._wake_event.clear()
+                await self._writer_tick()
+                if self._closed and not self._terminal_pending:
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — the card never takes the job down with it
+            self.processor.log_debug(f"Research card writer stopped: {e}")
+
+    def _write_due(self, now: float) -> bool:
+        """May a write go out at `now`? Pacing and back-pressure only — not whether the card has
+        anything to say.
+
+        A standing alert that has never been rendered, and the terminal verdict, are not routine
+        and skip the pacing interval. Neither skips a 429: that one is Slack's, not ours."""
+        if now < self._cooldown_until:
+            return False
+        if now >= self._next_write_at:
+            return True
+        return (self._terminal_pending
+                or (self._alert is not None
+                    and self._alert_revision > self._acked_revision))
+
+    async def _writer_tick(self) -> None:
+        """One writer beat: if a write is allowed and the rendered card has moved, render the
+        CURRENT state and send it.
+
+        The snapshot is taken here, immediately before the write, and never earlier — which is
+        what makes coalescing safe: ten producers between two ticks cost one write, and that
+        write carries the tenth one's state rather than the first one's.
+
+        After a successful write the revision is acked ONLY if nothing moved while Slack was
+        being called. If something did, `_revision > _acked_revision` still holds and the next
+        tick carries it — the state that arrived mid-write is exactly what a stale ack used to
+        strand."""
+        if self._finished or self._disabled or self.ts is None:
+            return
+        now = self._clock()
+        if not self._write_due(now):
+            return
+        terminal = self._terminal_pending
+        revision = self._revision
+        blocks = self._blocks()
+        if not terminal and revision == self._acked_revision and blocks == self._acked_blocks:
+            return                                  # nothing to say; don't spend a call
+        async with self._lock:
+            if self._finished or self._disabled or self.ts is None:
+                return
+            ok = await self._safe_update(blocks)
+            if ok:
+                self._next_write_at = self._clock() + _CARD_WRITE_INTERVAL_S
+                self._acked_blocks = blocks
+                if self._revision == revision:
+                    self._acked_revision = revision
+            if terminal and (ok or self._disabled):
+                # The verdict is on the card, or the card is gone and never will be. Either way
+                # this writer is done: nothing after a terminal state is worth saying.
+                self._terminal_pending = False
+                self._finished = True
+                self._terminal_done.set()
 
     async def _finalize(self, terminal_line: str, status_emoji: str = "✅",
                         failed: bool = False) -> None:
-        """Force the final state out (bypassing the throttle) and close the card so any pending
-        trailing flush becomes a no-op. Flips the headline ⏳ to the overall outcome emoji.
+        """Close the card on a verdict.
+
+        Order matters and is the ruling: disable producers, enqueue the terminal revision, let
+        the WRITER perform the terminal write with priority, then close. Closing first is what
+        rejects late producers — `_mark` is a no-op on a closed card, so an update_todos or a
+        stream event still in flight cannot reopen a card that has already said how the job
+        ended. If a write is in flight the terminal one queues behind it on the lock rather than
+        racing it.
 
         ``failed`` decides which todos survive the render: on a bad ending the unfinished step
         is the most important line on the card (it says where it stopped), on a good ending it
         is noise."""
+        if self._finished or self._terminal_pending:
+            return
         self._terminal = terminal_line
         self._status_emoji = status_emoji
         self._failed = failed
         # A retry alert is a promise of more work; the terminal line supersedes it either way.
         self._alert = None
-        if self._flush_task is not None and not self._flush_task.done():
-            self._flush_task.cancel()
-        async with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            if self.ts is None:
-                return
-            await self._safe_update(self._blocks())
+        self._alert_revision = 0
+        self.reset_activity()
+        self._closed = True
+        self._terminal_pending = True
+        self._revision += 1
+        self._wake()
+        if self.ts is None or self._disabled:
+            self._terminal_pending = False
+            self._finished = True
+            self._terminal_done.set()
+            return
+        await self._await_terminal()
 
-    async def _safe_update(self, blocks: List[Dict[str, Any]]) -> None:
-        if not hasattr(self.client, "update_status_card"):
+    async def _await_terminal(self) -> None:
+        """See the verdict onto the card.
+
+        With a writer running, the write is ITS job — this only waits for it, bounded, so a job
+        that is ending does not hang on a rate-limited card. With no writer (a card driven by
+        hand, and every finalize-only path) there is nobody else, so the write happens here."""
+        task = self._writer_task
+        if task is None or task.done():
+            await self._writer_tick()
             return
         try:
-            await self.client.update_status_card(
+            await asyncio.wait_for(self._terminal_done.wait(), _TERMINAL_WRITE_WAIT_S)
+        except asyncio.TimeoutError:
+            self.processor.log_debug(
+                "Research card verdict did not land within the grace period")
+
+    async def _safe_update(self, blocks: List[Dict[str, Any]]) -> bool:
+        """The ONE place a card is written. Returns whether the write landed.
+
+        Reads the transport's structured result so the writer can act on the two failures that
+        are not "try again in a moment": a 429 parks every write for exactly as long as Slack
+        asked (and the state stays dirty, so what goes out next is the LATEST card, not the
+        payload that was refused), and a permanently unwritable card — deleted message, gone
+        channel — stops the writer for good rather than looping against a corpse. The job
+        carries on either way; a card is chrome."""
+        if self._disabled or not hasattr(self.client, "update_status_card"):
+            return False
+        try:
+            result = await self.client.update_status_card(
                 self.channel_id, self.ts, _CARD_FALLBACK_TEXT, blocks)
         except Exception as e:  # noqa: BLE001 — card ops never break the research
             self.processor.log_debug(f"Research card update failed: {e}")
+            return False
+        ok, retry_after, permanent = _card_outcome(result)
+        if ok:
+            self._cooldown_until = 0.0
+            return True
+        if retry_after is not None:
+            self._cooldown_until = self._clock() + retry_after
+            self.processor.log_debug(
+                f"Research card write refused — next attempt in {retry_after}s")
+        if permanent:
+            self._disabled = True
+            self.processor.log_info(
+                "Research card can no longer be updated — the job continues without it")
+        return False
+
+class _JobUsageLog:
+    """One INFO line per completed model request of a background job.
+
+    `_capture_usage` (openai_client/api/responses.py) calls ``update()`` exactly once per
+    response that reported usage, so overriding that call IS the hook: no extra request, no new
+    plumbing through the tool loop. Duck-typed on purpose — the layer below only ever calls
+    ``update``, and a real dict would have nowhere to put the timing.
+
+    ``elapsed`` is measured from ``mark_request``, which the tool loop reaches through
+    ``pre_round_input_callback`` immediately before each round's request goes out. A
+    container-recovery retry re-sends inside the same round, so on that (rare) path the elapsed
+    figure covers both attempts. The hosted counters are this request's own: they are reset at
+    the same mark and fed by the tool-event stream the status card reads.
+
+    Never raises: a logging failure must not cost a job its round.
+    """
+
+    _HOSTED = ("web_search", "code_interpreter", "mcp")
+
+    def __init__(self, processor: Any, job_id: str) -> None:
+        self._processor = processor
+        self._job_id = job_id
+        self._started = time.monotonic()
+        self.hosted: Dict[str, int] = {k: 0 for k in self._HOSTED}
+
+    def mark_request(self) -> None:
+        self._started = time.monotonic()
+        for k in self.hosted:
+            self.hosted[k] = 0
+
+    def note_hosted(self, kind: str) -> None:
+        if kind in self.hosted:
+            self.hosted[kind] += 1
+
+    def update(self, usage: Dict[str, Any]) -> None:
+        """Called by the response layer the moment a response reports its usage."""
+        try:
+            elapsed = time.monotonic() - self._started
+
+            def _n(key: str) -> str:
+                # An absent key and a zero are different facts: the provider reported nothing
+                # about that dimension, versus it reported none of it.
+                value = (usage or {}).get(key)
+                return "-" if value is None else str(value)
+
+            self._processor.log_info(
+                f"[job {self._job_id}] request usage: input={_n('input_tokens')} "
+                f"cached={_n('cached_input_tokens')} output={_n('output_tokens')} "
+                f"reasoning={_n('reasoning_tokens')} elapsed={elapsed:.1f}s hosted: "
+                + " ".join(f"{k}={self.hosted[k]}" for k in self._HOSTED))
+        except Exception as e:  # noqa: BLE001 — telemetry never costs a round
+            self._processor.log_debug(f"Job usage log failed: {e}")
 
 
 async def _consume_research_stream(processor, *, messages: List[Dict[str, Any]],
@@ -1526,7 +2132,6 @@ async def _consume_research_stream(processor, *, messages: List[Dict[str, Any]],
                                    card: Optional["_ResearchCard"],
                                    artifacts_sink: Optional[List[Any]] = None,
                                    container_gone_sink: Optional[List[Any]] = None,
-                                   max_rounds: Optional[int] = None,
                                    pre_round_input_callback: Optional[
                                        Callable[[], Any]] = None,
                                    job_id: str = "",
@@ -1535,20 +2140,39 @@ async def _consume_research_stream(processor, *, messages: List[Dict[str, Any]],
 
     This is the streaming TOOL LOOP, not a single call — ``registry`` carries the job's one
     local tool (update_todos), passed as ``free_tools`` so card bookkeeping spends NO round
-    budget: the caps exist to stop a runaway loop, and a status update is not that. The
-    productive budget is DEEP_RESEARCH_MAX_TOOL_ROUNDS (the chat-turn cap of 4 would strangle a
-    job), left entirely for real work — mount_file, create_image_asset, the sandbox.
+    budget. There is no cumulative ration and no elapsed-time limit (``NO_CAP``): a job is done
+    when the model says it is done, and a ration only ever ended one mid-work. What still ends a
+    stuck one is the user's cancel, the per-request transport watchdog and a local tool timeout;
+    the per-round guards (fan-out cap, free-call burst cap) stay — they catch a model repeating
+    one call, not a job doing long, real work.
     Accumulates the final round's text, feeds observed web_search/MCP completions to the status
     card as activity counters, and rebuilds ``tools_used`` from those same events (update_todos
     deliberately excluded — the trailer attributes research sources, not card bookkeeping).
+
     Returns ``{"text", "tools_used"}``."""
     observed: List[str] = []
+    usage_log = _JobUsageLog(processor, job_id)
+    # The last completed web-search query of the CURRENT request — see `_on_progress`.
+    last_search: Dict[str, Any] = {"seq": None, "query": None}
+
+    async def _mark_and_steer() -> Any:
+        """One hook, three jobs: stamp the request's start for the usage line, clear the live
+        line so the previous round's last search cannot describe this one, then hand the round
+        over to the caller's steering callback untouched (the loop awaits this once per round,
+        immediately before the request)."""
+        usage_log.mark_request()
+        if card is not None:
+            card.reset_activity()
+        if pre_round_input_callback is None:
+            return []          # an empty list injects nothing and is not a malformed return
+        return await pre_round_input_callback()
 
     async def _stream_cb(_chunk):  # text deltas accumulate inside the API call, not posted
         return None
 
     async def _on_event(ev: Dict[str, Any]):
         kind = ev.get("kind")
+        usage_log.note_hosted(str(kind))
         if kind == "web_search":
             if "web_search" not in observed:
                 observed.append("web_search")
@@ -1573,8 +2197,38 @@ async def _consume_research_stream(processor, *, messages: List[Dict[str, Any]],
             processor.log_debug(f"[job {job_id}] sandbox code "
                                 f"({container_id or 'container?'}): {snippet}")
 
-    rounds_cap = max(1, int(max_rounds
-                            or getattr(config, "deep_research_max_tool_rounds", 10) or 10))
+    def _on_progress(ev: Dict[str, Any]) -> None:
+        """The LIVE channel (F38): what the model is doing between milestones.
+
+        Sync and Slack-free by contract — it is called from inside the stream loop, between two
+        tokens, so anything it awaited would sit between the model and its next one. It counts
+        NOTHING: counters and provenance are the completion channel's, above. Its only job is to
+        hand the card one line of text.
+
+        A summary with no COMPLETE sentence yet yields nothing and the card keeps showing what
+        it has — half a sentence, rewritten a second later, is not a status."""
+        if card is None:
+            return
+        kind = ev.get("kind")
+        if kind == "summary":
+            card.note_activity(_readable_summary(ev.get("text")))
+        elif kind == "hosted":
+            tool = cast(Optional[str], ev.get("tool"))
+            state = cast(Optional[str], ev.get("state"))
+            label = cast(Optional[str], ev.get("label"))
+            # The last query that COMPLETED in this request, so the next search's start can
+            # report it instead of a bare "Searching…". Scoped to the request and kept as ONE
+            # entry: a job runs hundreds of rounds, and a previous round's query describes work
+            # that is over.
+            if ev.get("request_seq") != last_search["seq"]:
+                last_search.update(seq=ev.get("request_seq"), query=None)
+            if tool == "web_search" and state == "complete" and label:
+                last_search["query"] = label
+            card.note_activity(_hosted_activity(
+                tool, state, label,
+                last_query=(cast(Optional[str], last_search["query"])
+                            if tool == "web_search" and state == "start" else None)))
+
     extra: Dict[str, Any] = {}
     if artifacts_sink is not None:
         # The build phase's whole point: the container ids observed during the loop are the
@@ -1585,17 +2239,22 @@ async def _consume_research_stream(processor, *, messages: List[Dict[str, Any]],
     result = await processor.openai_client.create_streaming_response_with_tool_loop(
         messages=messages, tools=tools, registry=registry, tool_context=tool_context,
         stream_callback=_stream_cb, tool_callback=None, tool_event_callback=_on_event,
-        max_tool_rounds=rounds_cap, max_tool_calls=rounds_cap,
-        # F37: update_todos is BOOKKEEPING — it costs neither a round nor a call. A live todo
-        # list naturally fires on every transition, and on the meter it would eat the build
-        # phase's budget for mount_file / create_image_asset, i.e. the card would starve the
-        # deck it is reporting on. The wall-clock timeout, not the round cap, is what actually
-        # bounds a runaway job.
+        # F38: the live channel, separate from the completion channel above. Summaries are
+        # requested only here — a job is the one caller with a surface that shows them, and the
+        # user is not watching a chat turn's reasoning.
+        progress_callback=_on_progress, reasoning_summary="auto",
+        max_tool_rounds=NO_CAP, max_tool_calls=NO_CAP,
+        # F37: update_todos is BOOKKEEPING — it costs neither a round nor a call. With no
+        # ration left to protect, what remains is the free ceiling and the per-round fan-out cap
+        # (config.max_tool_calls_per_round): guards against a model repeating ONE call, never
+        # against a job doing long, real work.
         free_tools=(_FREE_JOB_TOOLS,),
         # Mid-run steering: the loop asks this before each round whether the conversation has
         # sent the job anything since the last one. Forwarded verbatim — this function knows
-        # nothing about notes, and shouldn't.
-        pre_round_input_callback=pre_round_input_callback,
+        # nothing about notes, and shouldn't. The wrapper only stamps the usage line's clock.
+        pre_round_input_callback=_mark_and_steer,
+        # Per-request cost/latency for jobs, off the usage the response already reports.
+        usage_sink=usage_log,
         # The thread's BASELINE effort stays on top-level reasoning.effort and the job's own
         # effort rides as the override — on GPT-6 that is a trailing configuration_update item,
         # which keeps the prompt-cache prefix intact instead of invalidating it. The VALUE the
@@ -2254,7 +2913,7 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
     skip it. The deck would vanish, silently, and the more the user chatted the likelier it got.
 
     A stream cut off by a TRANSIENT provider error is retried (DEEP_RESEARCH_BUILD_RETRIES)
-    against that same container, under the one shared deadline — see the loop below.
+    against that same container — see the loop below.
 
     Never raises: a build failure costs the file, not the research report.
     """
@@ -2345,7 +3004,7 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
     findings_block = findings.strip() or _BUILD_ONLY_SOURCES
     instruction_item = {"role": "developer", "content": _BUILD_JOB_INSTRUCTION.format(
         task=task, deliverables=_deliverables_lines(deliverables), findings=findings_block,
-        todos=card.todos.as_prompt_block())}
+        sandbox=_SANDBOX_ENVIRONMENT_BLOCK, todos=card.todos.as_prompt_block())}
     # Corrections the research model already folded in. Built BEFORE the boundary drain below,
     # so the two never overlap: this item is what was already applied, those are what is new.
     applied_item: Optional[Dict[str, Any]] = None
@@ -2413,46 +3072,42 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
     # list existed), so mount_file / create_image_asset fail fast with "container_recycled" the
     # moment the build container idle-expires mid-run instead of pushing bytes into a corpse.
     build_ctx.container_gone_sink = containers_gone
-    timeout_s = float(getattr(config, "deep_research_build_timeout", 600) or 600)
 
     # What the build model SAID about its own work. In `build` mode there is no research report,
     # so without this the delivery model is handed a list of filenames and nothing else: it can
     # name the files it is posting but cannot say what they show, which reads as a job that ran
-    # and then refused to draw a conclusion. Kept even on timeout — a partial account of a
-    # partial build is still the only account there is.
+    # and then refused to draw a conclusion. Kept even when an attempt dies — a partial account
+    # of a partial build is still the only account there is.
     notes = ""
 
     # A transient provider error kills the STREAM, not the container — and the container is where
     # the build lives. So a cut-off attempt is resumable: re-enter the loop against the same
-    # container with a note telling the model to look at what it already produced. ONE overall
-    # deadline, shared by every attempt: a retry must not double the wall clock the job was
-    # budgeted, and DEEP_RESEARCH_BUILD_TIMEOUT is still what bounds a hung build.
+    # container with a note telling the model to look at what it already produced. No elapsed-time
+    # budget bounds the attempts: a build ends when the model says the files are built, when the
+    # user cancels, or when the transport watchdog kills a request that stopped producing bytes.
     total_attempts = 1 + max(0, int(getattr(config, "deep_research_build_retries", 0) or 0))
-    deadline = time.monotonic() + timeout_s
     # ONE item, however many retries happen: a second copy of the same instruction is not a
     # stronger instruction. Its TEXT is rewritten before each retry, though — see below.
     resume_item: Optional[Dict[str, Any]] = None
     attempt_input = build_input
 
     for attempt in range(1, total_attempts + 1):
-        remaining = deadline - time.monotonic()
         try:
-            result = await asyncio.wait_for(
-                _consume_research_stream(
-                    processor, messages=attempt_input, tools=tools, registry=registry,
-                    tool_context=build_ctx, model=model, system_prompt=system_prompt,
-                    effort=clamp_effort(model, getattr(config, "deep_research_reasoning_effort",
-                                                       "high") or "high"),
-                    verbosity=getattr(config, "deep_research_verbosity", "medium") or "medium",
-                    card=None, artifacts_sink=artifacts, container_gone_sink=containers_gone,
-                    pre_round_input_callback=steering_callback,
-                    # A build needs more rounds than a search: mount, write code, read the
-                    # traceback, fix it, re-run, verify. Running out of rounds mid-build is the
-                    # difference between a deck and an apology. A retry gets a FRESH budget —
-                    # it is re-doing the orientation the dead attempt already paid for.
-                    max_rounds=int(getattr(config, "deep_research_max_build_rounds", 16) or 16),
-                    job_id=job_id),
-                timeout=remaining)
+            result = await _consume_research_stream(
+                processor, messages=attempt_input, tools=tools, registry=registry,
+                tool_context=build_ctx, model=model, system_prompt=system_prompt,
+                effort=clamp_effort(model, getattr(config, "deep_research_reasoning_effort",
+                                                   "high") or "high"),
+                verbosity=getattr(config, "deep_research_verbosity", "medium") or "medium",
+                # F38: the SAME card the research phase drove. It used to be handed None here,
+                # which left the longest, quietest half of a job — minutes of sandbox work
+                # between two update_todos calls — with no live line at all.
+                card=card, artifacts_sink=artifacts, container_gone_sink=containers_gone,
+                pre_round_input_callback=steering_callback,
+                # No ration and no clock: a build is done when the files are built and verified,
+                # and running out of rounds mid-build is the difference between a deck and an
+                # apology.
+                job_id=job_id)
             # Only the LAST attempt's text survives; the earlier streams took theirs with them.
             # Acceptable: the container listing, not the model's account, is what the publisher
             # actually ships from.
@@ -2461,23 +3116,17 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 — the report still ships without the file
-            left = deadline - time.monotonic()
-            spent = left <= _BUILD_RETRY_MIN_REMAINING_S
-            # A TimeoutError here is AMBIGUOUS: it is either our own `wait_for` firing, or an
-            # SDK timeout from below — `_safe_api_call` re-raises `openai.APITimeoutError` as a
-            # builtin TimeoutError, so the exception itself cannot say which. The CLOCK can. With
-            # real budget still on it, this deadline did not expire, so the timeout came from a
-            # single call underneath and is exactly as transient as a dropped stream.
+            # A TimeoutError here comes from BELOW — `_safe_api_call` re-raises every timeout,
+            # `openai.APITimeoutError` included, as a builtin TimeoutError. That is the transport
+            # watchdog on ONE request, not a bound on the build, so it is exactly as transient as
+            # a dropped stream and the same container is still there to resume against.
             timed_out = isinstance(e, asyncio.TimeoutError)
-            if timed_out and spent:
-                processor.log_warning(f"Build phase {job_id} timed out after {timeout_s:.0f}s")
-                break
             # R4 leak: the recovery layer underneath may have DEMOTED this call to a throwaway
             # `auto` container. Retrying then resumes somewhere the work never happened, under a
             # note promising the model everything is still there. Terminal instead.
             retryable = (not containers_gone
                          and (timed_out or _is_retryable_build_error(e)))
-            if retryable and not spent and attempt < total_attempts:
+            if retryable and attempt < total_attempts:
                 processor.log_warning(
                     f"Build phase {job_id} attempt {attempt}/{total_attempts} failed "
                     f"(retrying): {e}")
@@ -2495,14 +3144,15 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
                 resume_item["content"] = _build_resume_text(applied_notes)
                 continue
             if timed_out:
-                processor.log_warning(f"Build phase {job_id} timed out after {timeout_s:.0f}s")
+                processor.log_warning(
+                    f"Build phase {job_id}: a model request timed out with no attempt left")
                 break
             processor.log_error(f"Build phase {job_id} failed: {e}", exc_info=True)
             break
 
-    # Hand back what the publisher needs, even after a timeout: a deck finished at second 599
-    # is still a deck. The container LISTING is the only source of truth about what exists —
-    # the model's word for it is not.
+    # Hand back what the publisher needs even after a failed attempt: a deck the model finished
+    # before its stream died is still a deck. The container LISTING is the only source of truth
+    # about what exists — the model's word for it is not.
     return {
         "ledger_key": ledger_key,
         "notes": notes,
@@ -2643,7 +3293,6 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
     thread_config = thread_config or {}
     effort = clamp_effort(model, getattr(config, "deep_research_reasoning_effort", "high") or "high")
     verbosity = getattr(config, "deep_research_verbosity", "medium") or "medium"
-    timeout_s = float(getattr(config, "deep_research_timeout", 600) or 600)
     tm = getattr(processor, "thread_manager", None)
     processor.log_info(
         f"Background job {job_id} ({mode}) running for {thread_key} "
@@ -2740,6 +3389,10 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
             raise
         except Exception as e:  # noqa: BLE001 — a card failure must never kill the research
             processor.log_debug(f"Research card start failed: {e}")
+        # F38: the card's ONE writer, from here until the `finally`. Every producer from now on
+        # only mutates state; this task is what turns that into chat.updates, paced and always
+        # rendering the latest. A card that never got a ts starts nothing.
+        card.start_writer()
 
         # Phase 1 — RESEARCH. Skipped entirely in `build` mode: the material already exists
         # (files in the thread, or what the dispatching model already knew), so a research pass
@@ -2751,7 +3404,7 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
                 processor=processor, client=client, channel_id=channel_id,
                 thread_root=thread_root, job_id=job_id, task=task, snapshot=snapshot,
                 deliverables=deliverables, system_prompt=system_prompt, model=model,
-                effort=effort, verbosity=verbosity, timeout_s=timeout_s, card=card,
+                effort=effort, verbosity=verbosity, card=card,
                 steering_callback=steering_callback, thread_config=thread_config)
             # ONE close+sweep, whichever of the two reasons brought us here. RESEARCH-ONLY: the
             # report is written and there is no build phase behind it, so the working rounds are
@@ -2798,6 +3451,10 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
             # helper does only sync work after its own stream await.
             late_notes = _close_steering_and_sweep()
             if build:
+                # The model has stopped producing, so nothing feeds the live line from here on.
+                # These three phases are what the card says instead of freezing on the last
+                # sandbox event while the files are pulled out and the delivery is decided.
+                await card.set_phase("Staging files…")
                 staged = await _stage_build(processor, job_id=job_id, build=build)
             await _release_build_container(processor, ledger_key=build_ledger_key)
             build_ledger_key = None
@@ -2811,6 +3468,7 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
             # them and the system took them, which is what the counter reports. Whether they
             # changed anything is the delivery reply's job to say, honestly, and it does.
             await card.note_steering(len(late_notes))
+        await card.set_phase("Planning delivery…")
         delivery_plan = await _plan_delivery(
             processor, job_id=job_id, task=task, report=text, staged=staged,
             snapshot=snapshot, system_prompt=system_prompt, model=model,
@@ -2820,6 +3478,7 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
             suppressed_inputs=(build or {}).get("suppressed_inputs"),
             embedded_ingredients=(build or {}).get("embedded_ingredients"))
 
+        await card.set_phase("Publishing…")
         _mark_delivering()
         ack: Dict[str, bool] = {}
         delivered = await _transact_delivery(
@@ -2854,14 +3513,17 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
             pass
         raise
     except asyncio.TimeoutError:
-        # Both halves: whatever is still queued, AND anything already swept but never surfaced
-        # because the failure landed after the sweep.
+        # Nothing here bounds the job by elapsed time any more, so a TimeoutError means ONE
+        # request stopped producing bytes and the transport watchdog killed it. Both halves:
+        # whatever is still queued, AND anything already swept but never surfaced because the
+        # failure landed after the sweep.
         _discard_notes(late_notes + _close_steering_and_sweep())
         _mark_delivering()
-        processor.log_warning(f"Background job {job_id} timed out after {timeout_s:.0f}s")
-        await card.finalize_failure("it ran past the time limit before finishing")
+        processor.log_warning(f"Background job {job_id}: a model request timed out")
+        await card.finalize_failure("a request to the model timed out before it finished")
         await _deliver_failure(client, channel_id, thread_root,
-                               "it ran past the time limit before finishing", receipts=receipts)
+                               "a request to the model timed out before it finished",
+                               receipts=receipts)
     except Exception as e:  # noqa: BLE001 — a job failure must post an honest note, never crash
         # As above: a delivery post that raised leaves already-swept notes in `late_notes`, and
         # a fresh sweep alone would find an empty queue and report nothing lost.
@@ -2872,6 +3534,10 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
         await card.finalize_failure(reason)
         await _deliver_failure(client, channel_id, thread_root, reason, receipts=receipts)
     finally:
+        # The card's writer outlives nothing. `close` JOINS it rather than killing it: a
+        # terminal write already on its way to Slack is the one write this job cannot afford to
+        # lose, so the cancel is a last resort after a bounded wait.
+        await card.close()
         # Whatever the ending — cancelled mid-build, timed out, crashed — the build phase's
         # container binding is this job's to drop. The success path already released it and
         # cleared the key; anything else lands here.
@@ -2885,7 +3551,7 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
 async def _run_research_phase(*, processor, client, channel_id: str, thread_root: str,
                               job_id: str, task: str, snapshot: List[Dict[str, Any]],
                               deliverables: List[Dict[str, str]], system_prompt: Optional[str],
-                              model: str, effort: str, verbosity: str, timeout_s: float,
+                              model: str, effort: str, verbosity: str,
                               card: "_ResearchCard",
                               steering_callback: Optional[_SteeringCallback] = None,
                               thread_config: Optional[Dict[str, Any]] = None) -> tuple:
@@ -2931,15 +3597,15 @@ async def _run_research_phase(*, processor, client, channel_id: str, thread_root
     # floor. Building is the build phase's job, and it has a container of its own.
     tools = [t for t in tools if t.get("type") != "code_interpreter"]
     tools.append(get_update_todos_schema())
-    # Internal streaming consumption bounds the WHOLE tool loop by the deep-research timeout.
-    result = await asyncio.wait_for(
-        _consume_research_stream(
-            processor, messages=job_input, tools=tools, registry=job_registry,
-            tool_context=job_ctx, model=model, system_prompt=system_prompt,
-            effort=effort, verbosity=verbosity, card=card,
-            pre_round_input_callback=steering_callback, job_id=job_id),
-        timeout=timeout_s,
-    )
+    # No wall around the loop: the phase runs until the model produces its report. An elapsed
+    # bound could only ever cancel a phase that was still finding things, and it kept nothing
+    # when it fired. What ends a stuck run instead is the user's cancel or the per-request
+    # transport watchdog, both of which act on a run that has genuinely stopped moving.
+    result = await _consume_research_stream(
+        processor, messages=job_input, tools=tools, registry=job_registry,
+        tool_context=job_ctx, model=model, system_prompt=system_prompt,
+        effort=effort, verbosity=verbosity, card=card,
+        pre_round_input_callback=steering_callback, job_id=job_id)
     # The report never passed through the chat turn's text cleanup — which is why web_search's
     # citation markers used to reach the user raw, rendering as
     # "…one-million-token context. cite:ship:turn12search1:walking:". The destination marker

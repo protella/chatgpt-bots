@@ -58,6 +58,20 @@ def _hidden_for(sink: Optional[List[BaseException]],
     return None
 
 
+def _next_request_seq() -> int:
+    """A number that identifies ONE streaming request, process-wide and monotonic.
+
+    Progress events are deduped on (request_seq, item_id, summary_index), and a tool loop makes
+    many requests in a row: without this, round two's `rs_1` would look like round one's and its
+    narration would be swallowed as a duplicate of text nobody is still showing."""
+    global _REQUEST_SEQ
+    _REQUEST_SEQ += 1
+    return _REQUEST_SEQ
+
+
+_REQUEST_SEQ = 0
+
+
 def _build(**kwargs) -> Dict[str, Any]:
     """The one request assembler, imported function-locally: openai_client.base imports THIS
     module, so a module-level import back into it is a cycle."""
@@ -104,9 +118,10 @@ def _capture_usage(usage_sink, response) -> Dict[str, Any]:
     """Copy response.usage into the caller's sink (usage-driven context budgeting), and hand the
     same numbers back so telemetry can read them without a second sink.
 
-    `cached_input_tokens` is written ONLY when the provider actually sent `input_tokens_details`.
-    An absent key and a zero are different facts — one says the cache reported nothing, the other
-    says it reported a miss — and the sink is compared by exact equality elsewhere.
+    `cached_input_tokens` is written ONLY when the provider actually sent `input_tokens_details`,
+    and `reasoning_tokens` only when it sent `output_tokens_details`. An absent key and a zero are
+    different facts — one says the provider reported nothing, the other says it reported none —
+    and the sink is compared by exact equality elsewhere.
     """
     captured: Dict[str, Any] = {}
     if response is None:
@@ -121,6 +136,11 @@ def _capture_usage(usage_sink, response) -> Dict[str, Any]:
         cached = (details.get("cached_tokens") if isinstance(details, dict)
                   else getattr(details, "cached_tokens", None))
         captured["cached_input_tokens"] = cached or 0
+    out_details = getattr(usage, "output_tokens_details", None)
+    if out_details is not None:
+        reasoning = (out_details.get("reasoning_tokens") if isinstance(out_details, dict)
+                     else getattr(out_details, "reasoning_tokens", None))
+        captured["reasoning_tokens"] = reasoning or 0
     if usage_sink is not None:
         usage_sink.update(captured)
     return captured
@@ -344,6 +364,101 @@ def _capture_mcp_result(mcp_results_sink, item, server_label):
     except Exception:
         # Result capture must never interfere with response processing
         pass
+
+
+def _progress_str(value: Any) -> Optional[str]:
+    """A STRING field off a live SDK event, or None.
+
+    Progress events are read straight off objects whose shape moves between SDK versions, and
+    whatever comes back is rendered to a human. Anything that is not already a non-empty string
+    is not a label — returning None is honest, where `str(value)` would put a repr on the card.
+    """
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _event_item_id(event: Any) -> str:
+    """The identity a progress event dedupes on: the item it belongs to, else its output index.
+
+    Empty when the event carries neither, which the caller reads as "cannot dedupe this" — an
+    unidentified duplicate is a repeated line, an over-eager dedupe is a missing one."""
+    for name in ("item_id", "id", "output_index"):
+        value = getattr(event, name, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, int):
+            return f"{name}:{value}"
+    return ""
+
+
+def _summary_index(event: Any) -> Optional[int]:
+    """The summary part this event belongs to, or None when the SDK does not say.
+
+    A response can carry several reasoning items and each item several summary parts, streamed
+    interleaved — accumulating on anything coarser splices two narrations together."""
+    index = getattr(event, "summary_index", None)
+    return index if isinstance(index, int) and not isinstance(index, bool) else None
+
+
+def _summary_part_text(part: Any) -> Optional[str]:
+    """The text of one reasoning-summary part, across the object and raw-dict shapes."""
+    if isinstance(part, dict):
+        return _progress_str(part.get("text"))
+    return _progress_str(getattr(part, "text", None))
+
+
+def _summary_part_texts(item: Any) -> List[str]:
+    """Every summary part on a COMPLETED reasoning item, in order.
+
+    The complementary path to the streamed deltas: when a response arrives with its summaries
+    already assembled (or an SDK version that does not stream the part events), this is where
+    the narration is. Never raises — a reasoning item with an unexpected `summary` shape costs
+    a progress line, not the response."""
+    try:
+        parts = getattr(item, "summary", None) or []
+        if isinstance(parts, (str, bytes)):
+            return []
+        return [text for text in (_summary_part_text(p) for p in parts) if text]
+    except Exception:  # noqa: BLE001 — progress observation never breaks a stream
+        return []
+
+
+def _hosted_status(item: Any) -> str:
+    """"complete" or "failed" for a finished hosted call, off whatever the item admits to.
+
+    An `error` field or a "failed" status is the only thing that makes a call a failure; an item
+    that says nothing about how it went is read as complete, because that is what the API's
+    silence has always meant here."""
+    if getattr(item, "error", None):
+        return "failed"
+    status = getattr(item, "status", None)
+    return "failed" if isinstance(status, str) and status.lower() == "failed" else "complete"
+
+
+def _web_search_label(item: Any) -> Optional[str]:
+    """What a completed `web_search_call` should be CALLED on a live surface.
+
+    The search variant's queries (plural joined, because a fan-out of three is one call and one
+    line), and for the other two action variants the thing the model actually did: the page it
+    opened, the pattern it looked for. Never the page text."""
+    queries = _web_search_queries(item)
+    if queries:
+        return " · ".join(queries)
+    action = getattr(item, "action", None)
+    for name in ("pattern", "url"):
+        value = _progress_str(_action_field(action, name))
+        if value:
+            return value
+    return None
+
+
+def _mcp_label(item_or_event: Any) -> Optional[str]:
+    """An MCP call's tool name when the SDK carries it, else the server it lives on.
+    "Calling get_menu_trends…" says more than "Calling acmedata…", so the name wins."""
+    for name in ("name", "tool_name", "server_label"):
+        value = _progress_str(getattr(item_or_event, name, None))
+        if value:
+            return value
+    return None
 
 
 def _action_field(action: Any, name: str) -> Any:
@@ -1202,6 +1317,7 @@ async def create_streaming_response_with_tools(
     system_prompt: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     effort_override: Optional[str] = None,
+    reasoning_summary: Optional[str] = None,
     verbosity: Optional[str] = None,
     store: bool = False,
     tool_callback: Optional[Callable[[str, str], Any]] = None,
@@ -1214,6 +1330,7 @@ async def create_streaming_response_with_tools(
     mcp_tools_sink: Optional[Dict[str, Any]] = None,
     mcp_results_sink: Optional[List[Dict[str, Any]]] = None,
     tool_event_callback: Optional[Callable[[Dict[str, Any]], Any]] = None,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     artifacts_sink: Optional[List[Dict[str, Any]]] = None,
     container_gone_sink: Optional[List[str]] = None,
     layout: str = "legacy",
@@ -1245,6 +1362,18 @@ async def create_streaming_response_with_tools(
             and the completion flush (stream_callback(None)) is skipped so the loop
             can run another round.
         tool_choice: Optional tool_choice override (e.g. "none" when the loop caps out)
+        reasoning_summary: "auto" asks the model to narrate its reasoning as summary parts.
+            Only a caller that also passes ``progress_callback`` has anywhere to put them.
+        progress_callback: Optional SYNCHRONOUS observer for LIVE progress. Distinct from
+            ``tool_event_callback``, which reports COMPLETED work and is what the caller's
+            counters and provenance are built from — nothing arriving here may be counted.
+            Each payload is
+            ``{"kind": "summary"|"hosted", "state": "delta"|"done"|"start"|"complete"|"failed",
+            "request_seq": int, "item_id": str, "summary_index": int|None,
+            "tool": "web_search"|"code_interpreter"|"mcp"|None, "label": str|None,
+            "text": str|None}``, where ``label`` is a completed search's queries (joined with
+            " · ") or an MCP tool name. It must not block: it is called between two tokens of a
+            live stream, which is the exact place this mechanism exists to keep clear.
         hidden_suppression_sink: the caller's registered stale-send refusals (see
             `_hidden_for`). ONE sink is threaded through every round of a tool loop, so a
             refusal hidden in round 1 keeps rounds 2..N silent too — and a generation failure
@@ -1262,6 +1391,7 @@ async def create_streaming_response_with_tools(
         max_output_tokens=max_tokens,
         reasoning_effort=reasoning_effort,
         effort_override=effort_override,
+        reasoning_summary=reasoning_summary,
         verbosity=verbosity,
         temperature=temperature,
         top_p=top_p,
@@ -1327,6 +1457,110 @@ async def create_streaming_response_with_tools(
             except Exception as e:  # noqa: BLE001
                 self.log_warning(f"tool_event_callback error: {e}")
 
+        # --- live progress (F38) -------------------------------------------------------
+        # A SEPARATE channel from the completion events above, and the separation is the
+        # contract: `tool_event_callback` says "this finished" and is what the consumer's
+        # counters and provenance are built from; everything below says "here is what is
+        # happening", and a consumer must never count it.
+        #
+        # SYNCHRONOUS by contract. It is called between two tokens of a live stream, so an
+        # observer that could await would be putting its own I/O inside the model's event
+        # path — the exact cost this whole mechanism exists to remove.
+        #
+        # Buffers are request-local and die with the request; `request_seq` is what keeps one
+        # round's item ids from colliding with the next round's.
+        request_seq = _next_request_seq()
+        summaries: Dict[Tuple[int, str, Optional[int]], str] = {}
+        hosted_seen: set = set()
+
+        def _emit_progress(payload: Dict[str, Any]) -> None:
+            """Hand one live-progress payload to the observer.
+
+            Swallows its failures at DEBUG — a surface that cannot render must not end a
+            generation — but never a cancellation, which is the run itself ending."""
+            if not progress_callback:
+                return
+            try:
+                progress_callback(payload)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                self.log_debug(f"progress_callback error: {e}")
+
+        def _emit_summary(item_id: str, index: Optional[int], text: Any, state: str) -> None:
+            """Accumulate one reasoning-summary part and emit it when it actually moved.
+
+            ``state`` is "delta" (the piece appends) or "done" (the whole part arrives and
+            REPLACES what the deltas built). Three paths can report the same part — the deltas,
+            the part's own done event, and the completed reasoning item — so an emission that
+            would carry text the observer has already been given is dropped here.
+
+            The comparison ignores surrounding whitespace, because that is the only thing that
+            usually differs between the paths: a `.done` whose text is the deltas plus a
+            trailing newline is the SAME narration, and re-emitting it would not merely refresh
+            an age — by then the surface may have moved on to a hosted call, and the re-report
+            would overwrite newer activity with something the model said a minute ago.
+
+            What is STORED is always the raw text, never the normalized form: deltas accumulate
+            by concatenation, so trimming what is kept would silently glue two words together
+            the next time a piece arrives."""
+            if not progress_callback:
+                return
+            piece = text if isinstance(text, str) else None
+            if not piece:
+                return
+            key = (request_seq, item_id, index)
+            current = summaries.get(key, "")
+            merged = piece if state == "done" else current + piece
+            moved = merged.strip() != current.strip()
+            summaries[key] = merged
+            if not moved:
+                return
+            _emit_progress({"kind": "summary", "state": state, "request_seq": request_seq,
+                            "item_id": item_id, "summary_index": index, "tool": None,
+                            "label": None, "text": merged})
+
+        def _emit_hosted(tool: str, state: str, item_id: str,
+                         label: Optional[str] = None) -> None:
+            """One hosted call's lifecycle, at most once per (tool, state, item).
+
+            Deduped because the same fact can arrive twice — a lifecycle event and then the
+            completed item, or a repeated `searching` — and a surface that showed it twice
+            would read as two searches. An event carrying no identity is emitted every time: a
+            repeated line costs nothing, a swallowed one leaves the surface describing the
+            previous call."""
+            if not progress_callback:
+                return
+            if item_id:
+                token = (tool, state, item_id)
+                if token in hosted_seen:
+                    return
+                hosted_seen.add(token)
+            _emit_progress({"kind": "hosted", "state": state, "request_seq": request_seq,
+                            "item_id": item_id, "summary_index": None, "tool": tool,
+                            "label": label, "text": None})
+
+        def _emit_hosted_lifecycle(event: Any, event_type: Any) -> None:
+            """The streamed lifecycle events, which are the only place a START is announced.
+            A completion also arrives here on some SDK versions; it is deduped against the
+            completed item below, which knows more (the query, the tool name)."""
+            if not isinstance(event_type, str):
+                return
+            tool = ("web_search" if ".web_search_call." in event_type else
+                    "code_interpreter" if ".code_interpreter_call." in event_type else
+                    "mcp" if ".mcp_call." in event_type else None)
+            if tool is None:
+                return
+            if event_type.endswith((".searching", ".interpreting", ".in_progress")):
+                state = "start"
+            elif event_type.endswith(".failed"):
+                state = "failed"
+            else:
+                return              # `.completed` is reported off the item, with its label
+            data = getattr(event, "data", event)
+            label = (_mcp_label(event) or _mcp_label(data)) if tool == "mcp" else None
+            _emit_hosted(tool, state, _event_item_id(event), label)
+
         # Process streaming events with timeout protection
         async for event in self._safe_stream_iteration(response, operation_type):
             try:
@@ -1348,6 +1582,27 @@ async def create_streaming_response_with_tools(
                             and getattr(event.item, 'type', None) == 'function_call'):
                         saw_function_call = True
                     continue  # Skip without logging
+                elif isinstance(event_type, str) and event_type.startswith(
+                        "response.reasoning_summary"):
+                    # The model narrating its own work (A). It is NOT the answer: nothing here
+                    # touches `complete_text`, or a job's scratch reasoning would be published
+                    # as its report. Consumed only by a caller that asked for summaries.
+                    if progress_callback:
+                        item_id = _event_item_id(event)
+                        index = _summary_index(event)
+                        if event_type == "response.reasoning_summary_text.delta":
+                            _emit_summary(item_id, index,
+                                          getattr(event, "delta", None), "delta")
+                        elif event_type == "response.reasoning_summary_text.done":
+                            _emit_summary(item_id, index,
+                                          getattr(event, "text", None), "done")
+                        elif event_type in ("response.reasoning_summary_part.added",
+                                            "response.reasoning_summary_part.done"):
+                            _emit_summary(
+                                item_id, index,
+                                _summary_part_text(getattr(event, "part", None)),
+                                "done" if event_type.endswith(".done") else "delta")
+                    continue
                 elif event_type in ["response.output_item.delta", "response.output_text.delta"]:
                     # Extract text from delta event
                     text_chunk = None
@@ -1399,6 +1654,12 @@ async def create_streaming_response_with_tools(
                     if hasattr(event, 'item'):
                         item = event.item
                         item_type = getattr(item, 'type', None)
+                        if item_type == 'reasoning' and progress_callback:
+                            # Complementary to the streamed part events: a response whose
+                            # summaries arrive already assembled has them HERE and nowhere else.
+                            # Same accumulator, so a part both paths saw is emitted once.
+                            for index, text in enumerate(_summary_part_texts(item)):
+                                _emit_summary(_event_item_id(item), index, text, "done")
                         if item_type == 'web_search_call':
                             # F30.1: surface the completed web search (with its query when
                             # available) to an internal observer. This mirrors the
@@ -1406,6 +1667,12 @@ async def create_streaming_response_with_tools(
                             # rebuilt from these events matches the create_*_with_tools result.
                             query = _web_search_query(item)
                             await _emit_tool_event({"kind": "web_search", "query": query})
+                            # The query is only knowable once the call COMPLETES, so a live
+                            # surface can say what was searched for but never what is being
+                            # searched for. Progress, not a count — the completion event above
+                            # is the one the consumer bills.
+                            _emit_hosted("web_search", _hosted_status(item),
+                                         _event_item_id(item), _web_search_label(item))
                             # F12: the observer event is fire-and-forget telemetry — capture
                             # the same query as durable evidence, or the next turn has only
                             # the bare tool name to reason from.
@@ -1421,6 +1688,8 @@ async def create_streaming_response_with_tools(
                             # F30.1: surface the completed MCP call to the internal observer.
                             if not tool_error:
                                 await _emit_tool_event({"kind": "mcp", "server_label": server_label})
+                            _emit_hosted("mcp", _hosted_status(item), _event_item_id(item),
+                                         _mcp_label(item))
                             if tool_callback and server_label:
                                 tool_id = f"mcp:{server_label}"
                                 try:
@@ -1461,6 +1730,8 @@ async def create_streaming_response_with_tools(
                                 "code": getattr(item, "code", None),
                                 "container_id": getattr(item, "container_id", None),
                             })
+                            _emit_hosted("code_interpreter", _hosted_status(item),
+                                         _event_item_id(item))
                         elif item_type == 'message':
                             # F12: the completed message carries the `url_citation`
                             # annotations naming the pages the answer cited — the streamed
@@ -1509,6 +1780,11 @@ async def create_streaming_response_with_tools(
                                     f"Stream completion callback error: {callback_error}")
                     break
                 elif event_type and ("call" in event_type or "tool" in event_type):
+                    # Live progress FIRST, and independently of `tool_callback`: the two
+                    # observers are unrelated, and a caller that registered only one of
+                    # them must still get it.
+                    if progress_callback:
+                        _emit_hosted_lifecycle(event, event_type)
                     # Handle specific tool events
                     if tool_callback:
                         try:

@@ -22,6 +22,7 @@ from config import config
 from message_processor.thread_manager import AsyncThreadStateManager
 from message_processor.tool_registry import ToolContext, ToolRegistry
 import message_processor.research_tools as rt
+from slack_client.messaging import CardWriteResult
 
 
 THREAD = "C1:100.0"
@@ -48,7 +49,9 @@ class _FakeClient:
 
     async def update_status_card(self, channel_id, ts, text, blocks, receipts=None):
         self.card_updates.append((channel_id, ts, text, blocks))
-        return True
+        # Same return type as the transport (F38) — the writer reads a structured result, and a
+        # fake that answered a bare bool would be testing a contract nothing ships.
+        return CardWriteResult(ok=True)
 
 
 class _FakeProcessor:
@@ -203,8 +206,12 @@ def _job_task(proc, client, *, job_id="j1", thread_key=THREAD, deliverables=None
 
 
 def _context_text(update_or_post):
-    """The context block's mrkdwn from a recorded card post/update tuple."""
-    return update_or_post[3][1]["elements"][0]["text"]
+    """The whole context block of a recorded card post/update, as one string.
+
+    F38 split it in two elements — the dynamic live line as `plain_text`, the static half as
+    mrkdwn — and Slack renders them as one line, which is what a reader sees and what a test
+    should assert on."""
+    return " ".join(e["text"] for e in update_or_post[3][1]["elements"])
 
 
 def _delivery_messages(stub) -> List[Dict[str, Any]]:
@@ -1189,10 +1196,10 @@ async def test_the_empty_ending_closes_and_sweeps_exactly_once(monkeypatch):
 @pytest.mark.asyncio
 async def test_a_timeout_ending_closes_the_gate_and_logs_the_discard(monkeypatch):
     monkeypatch.setattr(config, "enable_research_label", False)
-    monkeypatch.setattr(config, "deep_research_timeout", 0.05)
     tm = _RecordingTM()
     proc = _LoggingProcessor(openai_client=SimpleNamespace(
-        create_streaming_response_with_tool_loop=_ReturningStream(slow=True)), tm=tm)
+        create_streaming_response_with_tool_loop=_ReturningStream(
+            raises=asyncio.TimeoutError())), tm=tm)
     tm.register_research(THREAD, "j1", "map the Q3 pricing shifts", task=_FakeTask())
     assert tm.queue_job_note(THREAD, "j1", "drop the competitor section")["ok"] is True
     failures = _record_failures(monkeypatch)
@@ -1204,7 +1211,7 @@ async def test_a_timeout_ending_closes_the_gate_and_logs_the_discard(monkeypatch
     assert tm.events.index("close") < tm.events.index("mark")
     assert any("discarding 1 mid-run update" in w for w in proc.warnings)
     assert [r for _c, _t, r, _rc in failures] == [
-        "it ran past the time limit before finishing"]
+        "a request to the model timed out before it finished"]
 
 
 @pytest.mark.asyncio
@@ -1419,9 +1426,10 @@ async def test_the_card_counts_updates_as_passed_along_never_as_applied():
                             thread_root="100.0", task="t", label=None)
     card.ts = "CARD.1"
     await card.note_steering(1)
+    await card._writer_tick()
     assert "1 update passed along" in _context_text(client.card_updates[-1])
-    # The second write is coalesced by the card's throttle (that is the point of the throttle),
-    # so read the render itself rather than waiting a second for Slack.
+    # The second write is coalesced by the writer's pacing (that is the point of the pacing),
+    # so read the render itself rather than waiting fifteen seconds for Slack.
     await card.note_steering(2)
     line = card._context_line()
     assert "3 updates passed along" in line
@@ -1431,9 +1439,9 @@ async def test_the_card_counts_updates_as_passed_along_never_as_applied():
 
 
 @pytest.mark.asyncio
-async def test_a_card_finalized_before_the_flush_still_renders_the_bumped_count():
-    """The drain must not await, so the count lands synchronously and only the Slack write is
-    scheduled. If the job ends in that window the scheduled write never happens — the terminal
+async def test_a_card_finalized_before_the_writer_ticks_still_renders_the_bumped_count():
+    """The drain must not await, so the count lands synchronously and the Slack write is left
+    to the writer. If the job ends before that tick the write never happens — the terminal
     render has to carry the number anyway, which it does because finalize renders CURRENT
     state rather than a queued snapshot."""
     client = _FakeClient()
@@ -1441,26 +1449,30 @@ async def test_a_card_finalized_before_the_flush_still_renders_the_bumped_count(
     card = rt._ResearchCard(processor=proc, client=client, channel_id="C1",
                             thread_root="100.0", task="t", label=None)
     card.ts = "CARD.1"
-    card._last_update = card._clock()       # inside the throttle window: the flush is deferred
+    card._next_write_at = card._clock() + rt._CARD_WRITE_INTERVAL_S   # inside the window
 
     card.bump_steering(2)
     card.request_steering_flush()
+    await card._writer_tick()
     assert client.card_updates == []        # nothing written yet — the race this test is about
     await card.finalize_success("Reported findings below.")
 
     assert "2 updates passed along" in _context_text(client.card_updates[-1])
-    # The deferred writes are no-ops against a closed card rather than a resurrection of it.
-    await asyncio.gather(*list(card._steering_flush_tasks), return_exceptions=True)
+    # A late tick is a no-op against a closed card rather than a resurrection of it.
+    await card._writer_tick()
+    assert len(client.card_updates) == 1
     assert "✅ Reported findings below." in client.card_updates[-1][3][0]["text"]["text"]
 
 
 @pytest.mark.asyncio
 async def test_an_update_arriving_during_a_slack_write_still_reaches_the_live_card():
-    """The stale-card race. `_flush` clears the dirty flag and renders its blocks BEFORE
-    awaiting Slack, so a bump landing during that await is not in the message being sent. If the
-    second request is dropped merely because a flush is still in the air, the running card sits
-    a note behind for as long as the job keeps going — the terminal render eventually corrects
-    it, which is no comfort to someone watching a ten-minute job."""
+    """The stale-card race, as the single writer answers it (F38).
+
+    The writer renders its blocks BEFORE awaiting Slack, so a bump landing during that await is
+    not in the message being sent. There is no second scheduler to drop the request any more —
+    the bump moves the revision, the write that comes back sees the revision has moved on and
+    leaves the card dirty, and the next tick carries it. A running card can never sit a note
+    behind for as long as the job keeps going."""
 
     class _SlowCardClient(_FakeClient):
         def __init__(self):
@@ -1477,87 +1489,99 @@ async def test_an_update_arriving_during_a_slack_write_still_reaches_the_live_ca
             return await super().update_status_card(channel_id, ts, text, blocks,
                                                     receipts=receipts)
 
+    clock = [0.0]
     client = _SlowCardClient()
     card = rt._ResearchCard(processor=_FakeProcessor(), client=client, channel_id="C1",
-                            thread_root="100.0", task="t", label=None)
+                            thread_root="100.0", task="t", label=None,
+                            clock=lambda: clock[0])
     card.ts = "CARD.1"
 
-    # BOTH updates go through the drain's own path — that is the whole point. The first
-    # scheduled flush is what used to make the second one get skipped.
     card.bump_steering(1)
     card.request_steering_flush()
+    tick = asyncio.ensure_future(card._writer_tick())
     await asyncio.wait_for(client.writing.wait(), timeout=2)
 
-    # The write for note 1 is mid-flight and has already taken its snapshot. Note 2 lands now,
-    # while that first flush task is very much still in the air.
-    assert any(not t.done() for t in card._steering_flush_tasks)
+    # The write for note 1 is mid-flight and has already taken its snapshot. Note 2 lands now.
     card.bump_steering(1)
     card.request_steering_flush()
     client.release.set()
+    await asyncio.wait_for(tick, timeout=2)
+    assert "1 update passed along" in _context_text(client.card_updates[-1])
 
-    for _ in range(3):
-        await asyncio.gather(*list(card._steering_flush_tasks), return_exceptions=True)
-        # The second request lands inside the throttle window, so it defers to a trailing flush.
-        if card._flush_task is not None:
-            await asyncio.gather(card._flush_task, return_exceptions=True)
-
+    clock[0] = rt._CARD_WRITE_INTERVAL_S + 1.0
+    await card._writer_tick()
     assert "2 updates passed along" in _context_text(client.card_updates[-1])
 
 
 @pytest.mark.asyncio
-async def test_an_update_arriving_during_a_delayed_flush_still_reaches_the_live_card():
-    """The other half of the same race, and the one the throttle actually makes common. Here the
-    in-flight write is a TRAILING flush — `_flush_task` is set and not done — so the arriving
-    update is correctly refused a second trailing flush (one is the whole point) and correctly
-    marks the card dirty. Nobody is then left to act on it: the scheduler declined, and the
-    running flush had already rendered its blocks. Only the flush that is finishing can see
-    that state, which is why the re-check lives at the end of the flush and not in the
-    scheduler."""
+async def test_a_rate_limited_write_keeps_the_state_and_re_renders_the_latest():
+    """A 429 is not a lost update. The state stays dirty, the writer waits exactly as long as
+    Slack asked, and what goes out then is the card as it stands at that moment — never the
+    payload Slack refused, which by then is two notes out of date."""
 
-    class _SlowDelayedClient(_FakeClient):
+    class _RateLimitedOnce(_FakeClient):
         def __init__(self):
             super().__init__()
-            self.writing = asyncio.Event()
-            self.release = asyncio.Event()
             self.first = True
 
         async def update_status_card(self, channel_id, ts, text, blocks, receipts=None):
             if self.first:
                 self.first = False
-                self.writing.set()
-                await self.release.wait()
+                return CardWriteResult(ok=False, retry_after=5.0, error="ratelimited")
             return await super().update_status_card(channel_id, ts, text, blocks,
                                                     receipts=receipts)
 
-    async def _instant(_delay):
-        await asyncio.sleep(0)
-
-    client = _SlowDelayedClient()
+    clock = [0.0]
+    client = _RateLimitedOnce()
     card = rt._ResearchCard(processor=_FakeProcessor(), client=client, channel_id="C1",
-                            thread_root="100.0", task="t", label=None, sleep=_instant)
+                            thread_root="100.0", task="t", label=None,
+                            clock=lambda: clock[0])
     card.ts = "CARD.1"
-    # Inside the throttle window, so the first request DEFERS to a trailing flush rather than
-    # writing immediately — that is what makes this the delayed variant.
-    card._last_update = card._clock()
-
     card.bump_steering(1)
-    card.request_steering_flush()
-    await asyncio.wait_for(client.writing.wait(), timeout=2)
-    assert card._flush_task is not None and not card._flush_task.done()
+    await card._writer_tick()
+    assert client.card_updates == []              # refused, and nothing was written
 
-    # Update 2 lands while that trailing flush is parked in Slack, holding its own snapshot.
-    card.bump_steering(1)
-    card.request_steering_flush()
-    client.release.set()
+    card.bump_steering(1)                         # the card moves on while it waits
+    clock[0] = 4.0                                # still inside the Retry-After window
+    await card._writer_tick()
+    assert client.card_updates == []
 
-    for _ in range(6):
-        await asyncio.gather(*list(card._steering_flush_tasks), return_exceptions=True)
-        if card._flush_task is not None:
-            await asyncio.gather(card._flush_task, return_exceptions=True)
-        await asyncio.sleep(0)
-
+    clock[0] = 20.0
+    await card._writer_tick()
     assert "2 updates passed along" in _context_text(client.card_updates[-1])
-    assert card._dirty is False          # nothing left holding unsent state
+
+
+@pytest.mark.asyncio
+async def test_a_card_that_is_gone_stops_its_writer_and_the_job_carries_on():
+    """`message_not_found` — someone deleted the card. Retrying it every tick for the rest of a
+    ten-minute job is a write loop against a corpse, so the writer disables itself; the job
+    itself never learns about it, which is the point."""
+
+    class _DeletedCard(_FakeClient):
+        async def update_status_card(self, channel_id, ts, text, blocks, receipts=None):
+            await super().update_status_card(channel_id, ts, text, blocks, receipts=receipts)
+            return CardWriteResult(ok=False, error="message_not_found", permanent=True)
+
+    clock = [0.0]
+    client = _DeletedCard()
+    card = rt._ResearchCard(processor=_FakeProcessor(), client=client, channel_id="C1",
+                            thread_root="100.0", task="t", label=None,
+                            clock=lambda: clock[0])
+    card.ts = "CARD.1"
+    card.bump_steering(1)
+    await card._writer_tick()
+    assert len(client.card_updates) == 1
+    assert card._disabled is True
+
+    card.bump_steering(1)
+    clock[0] = 100.0
+    await card._writer_tick()
+    assert len(client.card_updates) == 1          # never tried again
+    # And the job's own ending still runs — a card is chrome, it does not fail anything, and
+    # it does not hang the ending waiting for a verdict that can never be written.
+    await card.finalize_success("Reported findings below.")
+    assert len(client.card_updates) == 1
+    await card.close()
 
 
 def test_the_context_line_says_nothing_when_no_update_was_passed_along():
@@ -1596,3 +1620,108 @@ def test_the_inflight_note_offers_the_steering_call_beside_the_stop_button():
     assert "work that should CONTINUE" in note
     assert "passed along" in note
     assert "only once the job's own output shows it" in note
+
+
+# --------------------------------------------------------------- finalization
+
+
+@pytest.mark.asyncio
+async def test_a_verdict_arriving_during_a_write_queues_behind_it_and_lands_last():
+    """The terminal write cannot race the routine one it interrupts. Both go through the one
+    writer path, so the verdict waits for the in-flight call and is then the LAST thing on the
+    card — a job that ended under a "Searching…" render is a job the user thinks is still up."""
+
+    class _SlowCardClient(_FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.writing = asyncio.Event()
+            self.release = asyncio.Event()
+            self.first = True
+
+        async def update_status_card(self, channel_id, ts, text, blocks, receipts=None):
+            if self.first:
+                self.first = False
+                self.writing.set()
+                await self.release.wait()
+            return await super().update_status_card(channel_id, ts, text, blocks,
+                                                    receipts=receipts)
+
+    client = _SlowCardClient()
+    card = rt._ResearchCard(processor=_FakeProcessor(), client=client, channel_id="C1",
+                            thread_root="100.0", task="t", label=None, clock=lambda: 0.0)
+    card.ts = "CARD.1"
+    card.bump_steering(1)
+    routine = asyncio.ensure_future(card._writer_tick())
+    await asyncio.wait_for(client.writing.wait(), timeout=2)
+
+    verdict = asyncio.ensure_future(card.finalize_success("Reported findings below."))
+    await asyncio.sleep(0)
+    assert len(client.card_updates) == 0        # the verdict is queued, not racing
+
+    client.release.set()
+    await asyncio.wait_for(asyncio.gather(routine, verdict), timeout=2)
+    assert len(client.card_updates) == 2
+    assert "✅ Reported findings below." in client.card_updates[-1][3][0]["text"]["text"]
+
+
+@pytest.mark.asyncio
+async def test_a_rate_limited_verdict_outlives_the_job_that_owed_it(monkeypatch):
+    """A 429 on the terminal write must not leave the card spinning forever over a job that
+    finished. Slack's Retry-After can outlast the shutdown grace, so the JOB stops waiting but
+    the WRITER does not: it is left running, waits out the window, writes, and exits."""
+
+    class _RateLimitedOnce(_FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.first = True
+
+        async def update_status_card(self, channel_id, ts, text, blocks, receipts=None):
+            if self.first:
+                self.first = False
+                return CardWriteResult(ok=False, retry_after=5.0, error="ratelimited")
+            return await super().update_status_card(channel_id, ts, text, blocks,
+                                                    receipts=receipts)
+
+    clock = [0.0]
+    # Slack asks for longer than the job is willing to wait — the case that used to lose the
+    # verdict, because the job's `finally` cancelled the writer on its way out.
+    monkeypatch.setattr(rt, "_TERMINAL_WRITE_WAIT_S", 0.05)
+    card = rt._ResearchCard(processor=_FakeProcessor(), client=_RateLimitedOnce(),
+                            channel_id="C1", thread_root="100.0", task="t", label=None,
+                            clock=lambda: clock[0])
+    card.ts = "CARD.1"
+    card.start_writer()                          # the REAL writer, not a hand-driven tick
+
+    await card.finalize_success("Reported findings below.")
+    assert card.client.card_updates == []
+    assert card._terminal_pending is True        # still owed, not dropped
+
+    await card.close()                           # the job lets go and ends
+    assert card._writer_task is not None and not card._writer_task.done()
+
+    clock[0] = 60.0                              # past the window Slack asked for
+    card._wake()
+    await asyncio.wait_for(card._writer_task, timeout=2)
+    assert "✅ Reported findings below." in card.client.card_updates[-1][3][0]["text"]["text"]
+    assert card._terminal_pending is False
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_job_still_gets_its_verdict_onto_the_card():
+    """Cancellation is the ending most likely to leave a card spinning: nobody is watching the
+    job any more. The terminal write happens first, THEN the writer closes, and `close` joins
+    it rather than killing it."""
+    client = _FakeClient()
+    card = rt._ResearchCard(processor=_FakeProcessor(), client=client, channel_id="C1",
+                            thread_root="100.0", task="t", label=None)
+    card.ts = "CARD.1"
+    card.start_writer()
+    await card.finalize_cancelled("user asked to stop")
+    await card.close()
+
+    body = client.card_updates[-1][3][0]["text"]["text"]
+    assert "❌ cancelled — user asked to stop" in body
+    assert card._writer_task is None
+    # A producer arriving after the verdict is refused, not applied to a dead card.
+    card.bump_steering(5)
+    assert "5 updates" not in _context_text(client.card_updates[-1])

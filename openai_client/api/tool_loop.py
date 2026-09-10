@@ -16,6 +16,7 @@ tools run, and only the final round's text reaches the user.
 """
 from __future__ import annotations
 
+import sys
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, cast
 
 from config import config
@@ -28,6 +29,13 @@ from message_processor.tool_registry import ToolContext, ToolRegistry, serialize
 from . import responses as responses_api
 
 logger = setup_logger(name="slack_bot.ToolLoop")
+
+# No cumulative ration at all: a background job is done when the model says it is done, not
+# after N rounds — a ration only ever ended one mid-work. Pass it for BOTH caps. Nothing on this
+# side then ends the turn early; what remains is the user's cancel, the per-request transport
+# watchdog (openai_client/base.py) and the per-round fan-out cap, which catch a hang without
+# cutting a job that is still working.
+NO_CAP = sys.maxsize
 
 
 def _call_ok(result: Any) -> bool:
@@ -343,6 +351,9 @@ _FREE_ROUND_CEILING = 2
 # is slack. Excess calls are not dispatched, but they ARE answered (see _EXCESS_FREE_RESULT):
 # the Responses API 400s on a function_call with no matching function_call_output.
 _FREE_CALLS_PER_ROUND = 2
+# Hosted (server-side) tools: they do the real work of a research job and never come back as a
+# local function call, so a round is only "bookkeeping" if none of these ran in it either.
+_HOSTED_TOOL_KINDS = frozenset({"web_search", "mcp", "code_interpreter"})
 _EXCESS_FREE_RESULT = {
     "ok": False,
     "error": "too_many_calls_this_round",
@@ -978,9 +989,18 @@ async def create_streaming_response_with_tool_loop(
     they are guarding against, and leaving it on the meter means a chatty todo list starves the
     build phase of the `mount_file` / `create_image_asset` calls it actually needs. Free rounds
     still have a ceiling of their own (``_FREE_ROUND_CEILING`` × the cap) so "free" can never
-    mean "unbounded": a model looping on update_todos alone is a runaway too, just a cheaper one.
+    mean "unbounded": a model looping on update_todos ALONE is a runaway too, just a cheaper one.
     A MIXED round (bookkeeping + real work) is fully productive — only the free calls in it ride
     free, so the round is charged normally.
+
+    Bookkeeping is what the ceiling guards, and a round that did HOSTED work (web_search, MCP,
+    code_interpreter) is not bookkeeping whatever its local calls were. Hosted tools never surface
+    as function calls, so a research round of "three searches and a card update" used to read as
+    pure bookkeeping and burn the free allowance until the loop forced a final answer mid-search.
+    Such a round is charged nothing at all — but ONLY for a caller that passed ``NO_CAP``, i.e. a
+    background job, which is meant to run until the model finishes. A CAPPED caller (the chat
+    turn) has nothing but the budget to end its turn, so its hosted rounds keep billing as free
+    rounds and the ceiling still applies unchanged.
 
     ``pre_round_input_callback`` is an ASYNC callable awaited once per round, immediately before
     the request; the list of input items it returns is appended to the running input. Generic,
@@ -992,10 +1012,31 @@ async def create_streaming_response_with_tool_loop(
     rounds_cap = int(max_tool_rounds) if max_tool_rounds is not None else config.max_tool_rounds
     calls_cap = (int(max_tool_calls) if max_tool_calls is not None
                  else config.max_tool_calls_per_turn)
+    # A job (NO_CAP on BOTH caps) is not on any budget here; a chat turn is. The distinction is
+    # read once and drives the hosted-work exemption in _charge below. Both, not either: a caller
+    # with one finite cap still expects that cap to end its turn, and an exemption that stopped
+    # charging its hosted rounds would let it run past the limit it asked for.
+    uncapped = rounds_cap == NO_CAP and calls_cap == NO_CAP
     free_names = {str(n) for n in (free_tools or ())}
     free_rounds_cap = max(1, rounds_cap * _FREE_ROUND_CEILING)
     free_calls_cap = max(1, calls_cap * _FREE_ROUND_CEILING)
     budget = {"rounds": 0, "calls": 0, "free_rounds": 0, "free_calls": 0}
+    # Did THIS round run a hosted tool? Reset before every request, read by _charge.
+    round_state = {"hosted_seen": False}
+    _caller_tool_event_callback = params.get("tool_event_callback")
+
+    async def _watch_tool_events(payload: Dict[str, Any]) -> None:
+        """Observe hosted-tool activity on the way past, then hand the event to the caller's
+        observer untouched (the research card is the one that consumes these)."""
+        if isinstance(payload, dict) and payload.get("kind") in _HOSTED_TOOL_KINDS:
+            round_state["hosted_seen"] = True
+        if _caller_tool_event_callback is None:
+            return
+        r = _caller_tool_event_callback(payload)
+        if r is not None and hasattr(r, "__await__"):
+            await r
+
+    params["tool_event_callback"] = _watch_tool_events
 
     def _suppress_excess_free(calls: List[Dict[str, Any]]) -> Dict[int, Any]:
         return _free_call_overrides(calls, free_names,
@@ -1016,14 +1057,27 @@ async def create_streaming_response_with_tool_loop(
         Free CALLS are counted too, not just free rounds — but only the ones that actually RAN.
         A suppressed call did no work, so billing it would let a burst exhaust the allowance
         without ever executing. It cannot loop on that forever: a round of nothing but free
-        calls is still a free ROUND, and those have their own ceiling."""
+        calls is still a free ROUND, and those have their own ceiling.
+
+        Unless the round did HOSTED work AND the caller passed ``NO_CAP`` for BOTH caps:
+        web_search / MCP / code_interpreter run server-side and leave no function call behind, so
+        a searching round looks locally identical to an idle one, and the free ceiling was never
+        meant to stop searching. That round is charged nothing, neither round nor call, and its
+        bookkeeping calls ride free too — but only for a job, which has no budget for the
+        exemption to eat into. A caller with ANY finite cap keeps billing its hosted rounds as
+        free rounds: the budget is the only thing that ends its turn, and an unbilled round would
+        carry it straight past the cap it asked for. What the ceiling still catches either way is
+        the round that did nothing but bookkeeping."""
         ran = [c for c in calls if id(c) not in suppressed]
         free = [c for c in ran if c.get("name") in free_names]
         productive = [c for c in ran if c.get("name") not in free_names]
-        budget["free_calls"] += len(free)
         if not productive and calls:
+            if round_state["hosted_seen"] and uncapped:
+                return
+            budget["free_calls"] += len(free)
             budget["free_rounds"] += 1
             return
+        budget["free_calls"] += len(free)
         budget["rounds"] += 1
         budget["calls"] += len(productive)
 
@@ -1031,6 +1085,20 @@ async def create_streaming_response_with_tool_loop(
         return (budget["rounds"] >= rounds_cap or budget["calls"] >= calls_cap
                 or budget["free_rounds"] >= free_rounds_cap
                 or budget["free_calls"] >= free_calls_cap)
+
+    def _should_force_final() -> bool:
+        """Asked once per round, right after the round is charged: is this the last one?
+
+        One reason winds a turn down — the budget ran out — and every round bills through here
+        so the three billing sites cannot drift apart on the answer. A caller that passed
+        ``NO_CAP`` never gets here with a True: it runs until the model stops asking for tools."""
+        if _capped():
+            self.log_warning(
+                f"Tool loop cap hit ({budget['rounds']} rounds / "
+                f"{budget['calls']} calls) — forcing final answer")
+            return True
+        return False
+
     input_items: List[Dict[str, Any]] = list(messages)
     tools_used_all: List[str] = []
     local_tool_calls: List[Dict[str, Any]] = []
@@ -1072,6 +1140,7 @@ async def create_streaming_response_with_tool_loop(
         # and know the items sit after complete tool pairs.
         await _inject_pre_round_items(self, pre_round_input_callback, input_items)
         sink: List[Dict[str, Any]] = []
+        round_state["hosted_seen"] = False       # per ROUND: set by _watch_tool_events below
         text = await responses_api.create_streaming_response_with_tools(
             self,
             messages=input_items,
@@ -1158,10 +1227,7 @@ async def create_streaming_response_with_tool_loop(
                 # The executor refused: the round ran (its committed preamble and outputs are
                 # already on the input) and the turn owes words. Charge it and continue.
                 _charge(calls, suppressed)
-                if _capped():
-                    self.log_warning(
-                        f"Tool loop cap hit ({budget['rounds']} rounds / "
-                        f"{budget['calls']} calls) — forcing final answer")
+                if _should_force_final():
                     tool_choice = "none"
                 continue
             # Either the reason is not one of the eight, or a visible reply already began (in
@@ -1190,11 +1256,7 @@ async def create_streaming_response_with_tool_loop(
                                   **_terminal_overrides(calls, terminal_call, terminal_result)})
             _merge_used(tools_used_all, [c.get("name") for c in calls if c.get("name")],
                         tool_context)
-            if _capped():
-                self.log_warning(
-                    f"Tool loop cap hit ({budget['rounds']} rounds / "
-                    f"{budget['calls']} calls) — forcing final answer"
-                )
+            if _should_force_final():
                 tool_choice = "none"
             continue
 
@@ -1216,9 +1278,5 @@ async def create_streaming_response_with_tool_loop(
         _merge_used(tools_used_all, [c.get("name") for c in calls if c.get("name")],
                         tool_context)
 
-        if _capped():
-            self.log_warning(
-                f"Tool loop cap hit ({budget['rounds']} rounds / "
-                f"{budget['calls']} calls) — forcing final answer"
-            )
+        if _should_force_final():
             tool_choice = "none"

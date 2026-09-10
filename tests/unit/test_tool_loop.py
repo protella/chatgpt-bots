@@ -454,6 +454,161 @@ class TestToolLoop:
         assert state["n"] <= 2 * tool_loop._FREE_ROUND_CEILING + 2
 
     @pytest.mark.asyncio
+    async def test_rounds_that_did_hosted_work_are_not_bookkeeping(self, monkeypatch):
+        """The prod failure: a research job wrapped up mid-search and reported finding nothing.
+
+        Its real work is HOSTED — web_search, MCP, code_interpreter — and none of those come back
+        as a local function call, so a round of "three searches plus a card update" read as pure
+        bookkeeping and spent the free allowance, and the loop forced a final answer with the
+        search still running. For a job (NO_CAP) a round that did hosted work is work: it costs
+        nothing at all, and twelve of them run to completion."""
+        state = {"n": 0}
+        seen_choices = []
+
+        async def fake_streaming(client, messages, tools, stream_callback, tool_callback=None,
+                                 function_call_sink=None, tool_choice=None, **params):
+            state["n"] += 1
+            seen_choices.append(tool_choice)
+            if state["n"] > 12:
+                return "the report"
+            r = params["tool_event_callback"]({"kind": "web_search", "query": "q"})
+            if r is not None and hasattr(r, "__await__"):
+                await r
+            if function_call_sink is not None:
+                function_call_sink.extend([_call("update_todos", f"t{state['n']}a"),
+                                           _call("update_todos", f"t{state['n']}b")])
+            return ""
+
+        monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
+                            fake_streaming)
+        out = await tool_loop.create_streaming_response_with_tool_loop(
+            _Client(), messages=[], tools=[], registry=_registry_with(name="update_todos"),
+            tool_context=ToolContext(), stream_callback=lambda c: None,
+            max_tool_rounds=tool_loop.NO_CAP, max_tool_calls=tool_loop.NO_CAP,
+            free_tools=("update_todos",))
+
+        assert state["n"] == 13, "the searching rounds were cut short"
+        assert out["text"] == "the report"
+        assert "none" not in seen_choices, "a searching round was billed as bookkeeping"
+
+    @pytest.mark.asyncio
+    async def test_hosted_work_for_a_capped_caller_keeps_the_free_ceiling(self, monkeypatch):
+        """The exemption belongs to the caller that passed NO_CAP. A chat turn is on a budget,
+        and that budget is the only thing that ever ends its turn — an unbilled "one search plus
+        one bookkeeping call" round would spin forever, holding the thread lock. Capped caller,
+        no exemption."""
+        state = {"n": 0}
+
+        async def fake_streaming(client, messages, tools, stream_callback, tool_callback=None,
+                                 function_call_sink=None, tool_choice=None, **params):
+            state["n"] += 1
+            if tool_choice == "none":
+                return "gave up"
+            r = params["tool_event_callback"]({"kind": "web_search", "query": "q"})
+            if r is not None and hasattr(r, "__await__"):
+                await r
+            if function_call_sink is not None:
+                function_call_sink.extend([_call("update_todos", f"t{state['n']}a"),
+                                           _call("update_todos", f"t{state['n']}b")])
+            return ""
+
+        monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
+                            fake_streaming)
+        out = await tool_loop.create_streaming_response_with_tool_loop(
+            _Client(), messages=[], tools=[], registry=_registry_with(name="update_todos"),
+            tool_context=ToolContext(), stream_callback=lambda c: None,
+            max_tool_rounds=2, max_tool_calls=2, free_tools=("update_todos",))
+
+        assert out["text"] == "gave up"
+        assert state["n"] <= 2 * tool_loop._FREE_ROUND_CEILING + 2
+
+    @pytest.mark.asyncio
+    async def test_one_finite_cap_is_enough_to_keep_the_free_ceiling(self, monkeypatch):
+        """Codex review: the exemption belongs to a caller with NO budget at all, so it takes
+        NO_CAP on BOTH caps. A caller that rationed its ROUNDS still expects that ration to end
+        its turn — exempting its hosted rounds from billing would carry it past the cap it
+        asked for, forever, holding the thread lock."""
+        state = {"n": 0}
+
+        async def fake_streaming(client, messages, tools, stream_callback, tool_callback=None,
+                                 function_call_sink=None, tool_choice=None, **params):
+            state["n"] += 1
+            if tool_choice == "none":
+                return "gave up"
+            r = params["tool_event_callback"]({"kind": "web_search", "query": "q"})
+            if r is not None and hasattr(r, "__await__"):
+                await r
+            if function_call_sink is not None:
+                function_call_sink.append(_call("update_todos", f"t{state['n']}"))
+            return ""
+
+        monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
+                            fake_streaming)
+        out = await tool_loop.create_streaming_response_with_tool_loop(
+            _Client(), messages=[], tools=[], registry=_registry_with(name="update_todos"),
+            tool_context=ToolContext(), stream_callback=lambda c: None,
+            max_tool_rounds=2, max_tool_calls=tool_loop.NO_CAP,
+            free_tools=("update_todos",))
+
+        assert out["text"] == "gave up", "the finite round cap never ended the turn"
+        assert state["n"] <= 2 * tool_loop._FREE_ROUND_CEILING + 2
+
+    @pytest.mark.asyncio
+    async def test_the_wrapped_event_callback_still_reaches_the_caller(self, monkeypatch):
+        """The loop watches hosted events on their way past; it does not eat them. The research
+        card is downstream of this and draws itself from exactly these payloads."""
+        received = []
+
+        async def caller_callback(payload):
+            received.append(payload)
+
+        async def fake_streaming(client, messages, tools, stream_callback, tool_callback=None,
+                                 function_call_sink=None, tool_choice=None, **params):
+            cb = params["tool_event_callback"]
+            await cb({"kind": "web_search", "query": "q"})
+            await cb({"kind": "code_interpreter", "status": "completed"})
+            return "done"
+
+        monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
+                            fake_streaming)
+        out = await tool_loop.create_streaming_response_with_tool_loop(
+            _Client(), messages=[], tools=[], registry=_registry_with(name="update_todos"),
+            tool_context=ToolContext(), stream_callback=lambda c: None,
+            free_tools=("update_todos",), tool_event_callback=caller_callback)
+
+        assert out["text"] == "done"
+        assert [p["kind"] for p in received] == ["web_search", "code_interpreter"]
+
+    @pytest.mark.asyncio
+    async def test_no_cap_is_accepted_without_any_callback(self, monkeypatch):
+        """NO_CAP used to demand a clock callback so that SOMETHING would end the turn. Jobs no
+        longer carry an elapsed-time limit at all: the loop ends when the model stops asking for
+        tools, and a hang is the transport watchdog's to catch, one request at a time."""
+        state = {"n": 0}
+
+        async def fake_streaming(client, messages, tools, stream_callback, tool_callback=None,
+                                 function_call_sink=None, tool_choice=None, **params):
+            state["n"] += 1
+            if state["n"] > 3:
+                return "done at last"
+            if function_call_sink is not None:
+                function_call_sink.append(_call("mount_file", f"m{state['n']}"))
+            return ""
+
+        async def _spy(ctx, args):
+            return {"ok": True}
+
+        monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
+                            fake_streaming)
+        out = await tool_loop.create_streaming_response_with_tool_loop(
+            _Client(), messages=[], tools=[], registry=_registry_with("mount_file", _spy),
+            tool_context=ToolContext(), stream_callback=lambda c: None,
+            max_tool_rounds=tool_loop.NO_CAP, max_tool_calls=tool_loop.NO_CAP)
+
+        assert out["text"] == "done at last"
+        assert state["n"] == 4, "the job was cut short by something that no longer exists"
+
+    @pytest.mark.asyncio
     async def test_a_burst_of_free_calls_is_refused_before_it_is_dispatched(self, monkeypatch):
         """Codex review, round 2. Counting free calls only stops the NEXT round — by then the
         storm has already happened: a round's tool calls dispatch in PARALLEL, so one "free"

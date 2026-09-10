@@ -15,6 +15,7 @@ from config import clamp_effort, config
 from message_processor.thread_manager import AsyncThreadStateManager
 from message_processor.tool_registry import ToolContext, ToolRegistry
 import message_processor.research_tools as rt
+from slack_client.messaging import CardWriteResult
 
 
 @pytest.fixture(autouse=True)
@@ -133,7 +134,9 @@ class _CardClient(_FakeClient):
 
     async def update_status_card(self, channel_id, ts, text, blocks, receipts=None):
         self.card_updates.append((channel_id, ts, text, blocks))
-        return True
+        # Same return type as the transport (F38) — the writer reads a structured result, and a
+        # fake that answered a bare bool would be testing a contract nothing ships.
+        return CardWriteResult(ok=True)
 
 
 def _card_body(update_or_post):
@@ -329,11 +332,14 @@ async def test_error_path_posts_failure_note(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_timeout_path_posts_failure_note(monkeypatch):
+async def test_a_request_timeout_posts_an_honest_failure_note(monkeypatch):
+    """Nothing bounds a job by elapsed time any more, so a TimeoutError can only come from the
+    per-request transport watchdog underneath. The note says that, not "it ran past the time
+    limit" — there is no limit to run past."""
     monkeypatch.setattr(config, "enable_deep_research", True)
-    monkeypatch.setattr(config, "deep_research_timeout", 0.01)
 
-    openai = SimpleNamespace(create_streaming_response_with_tool_loop=_StreamStub(slow=True))
+    openai = SimpleNamespace(create_streaming_response_with_tool_loop=_StreamStub(
+        raises=asyncio.TimeoutError()))
     proc = _FakeProcessor(openai_client=openai, tm=AsyncThreadStateManager())
     client = _FakeClient()
     await rt._run_background_job(
@@ -341,7 +347,7 @@ async def test_timeout_path_posts_failure_note(monkeypatch):
         thread_key="C1:100.0", job_id="j1", task="the task",
         snapshot=[], system_prompt=None, model="gpt-5.6-sol")
     assert len(client.sent) == 2                     # the dispatch ack, then the note
-    assert "time limit" in client.sent[1][2]
+    assert "timed out" in client.sent[1][2]
 
 
 @pytest.mark.asyncio
@@ -419,13 +425,17 @@ def test_finish_research_only_own_entry():
 
 # --------------------------------------------------------------- config defaults
 
-def test_config_defaults():
+def test_config_defaults(monkeypatch):
     assert config.enable_deep_research is True
     assert config.deep_research_reasoning_effort == "high"
     assert config.deep_research_verbosity == "medium"
-    assert float(config.deep_research_timeout) == 600.0
+    # A job has no elapsed-time limit at all: neither field exists any more.
+    from dataclasses import fields as _fields
+    from config import BotConfig
+    names = {f.name for f in _fields(BotConfig)}
+    assert "deep_research_timeout" not in names
+    assert "deep_research_build_timeout" not in names
     assert config.deep_research_max_per_thread == 2
-    assert config.deep_research_max_tool_rounds == 10
     assert config.enable_research_label is True
     # Effort routes through clamp_effort against a real model (never rejected).
     assert clamp_effort("gpt-5.6-sol", config.deep_research_reasoning_effort) in {
@@ -571,10 +581,44 @@ async def test_consume_stream_returns_text_and_tools_equivalent():
     assert out["tools_used"] == ["web_search", "acmedata"]
     # store=False and no Slack streaming (tool_callback not used for status).
     assert stub.kwargs["store"] is False
-    # F30.2: the job's OWN round budget rides the call — the 4-round chat cap would
-    # strangle milestone reporting.
-    assert stub.kwargs["max_tool_rounds"] == config.deep_research_max_tool_rounds
-    assert stub.kwargs["max_tool_calls"] == config.deep_research_max_tool_rounds
+    # No ration and no clock: a job is done when the model is done.
+    assert stub.kwargs["max_tool_rounds"] == rt.NO_CAP
+    assert stub.kwargs["max_tool_calls"] == rt.NO_CAP
+    # Per-request usage/latency logging rides the sink the response layer already fills.
+    assert isinstance(stub.kwargs["usage_sink"], rt._JobUsageLog)
+
+
+@pytest.mark.asyncio
+async def test_a_job_stream_logs_usage_for_every_request():
+    """One INFO line per completed model request, off the usage the response already reports —
+    no second API call. The hosted counters are that request's own, reset before each round."""
+    stub = _StreamStub(text="the report", events=[
+        {"kind": "web_search", "query": "q1"},
+        {"kind": "web_search", "query": "q2"},
+        {"kind": "code_interpreter", "status": "completed"},
+    ])
+    proc = _FakeProcessor(openai_client=SimpleNamespace(
+        create_streaming_response_with_tool_loop=stub))
+    logged: list = []
+    proc.log_info = logged.append
+
+    await rt._consume_research_stream(
+        proc, messages=[], tools=[], registry=ToolRegistry(), tool_context=ToolContext(),
+        model="gpt-5.6-sol", system_prompt="DEV", effort="high", verbosity="medium",
+        card=None, job_id="j1")
+
+    sink = stub.kwargs["usage_sink"]
+    sink.update({"input_tokens": 900, "cached_input_tokens": 768, "output_tokens": 40,
+                 "reasoning_tokens": 32})
+    line = next(m for m in logged if "request usage" in m)
+    assert line.startswith("[job j1] request usage: ")
+    assert "input=900 cached=768 output=40 reasoning=32" in line
+    assert "web_search=2 code_interpreter=1 mcp=0" in line
+
+    # A provider that reported nothing about a dimension is not the same as one reporting zero.
+    logged.clear()
+    sink.update({"input_tokens": 11, "output_tokens": 7})
+    assert "cached=- output=7 reasoning=-" in logged[-1]
 
 
 # --------------------------------------------- card lifecycle on the job
@@ -598,7 +642,9 @@ async def test_card_posted_on_job_start_with_label(monkeypatch):
     assert text == rt._CARD_FALLBACK_TEXT                 # constant notification fallback
     assert username and username.startswith("Sol [research:")  # same label as findings
     assert blocks[0]["type"] == "section" and blocks[1]["type"] == "context"
-    assert blocks[1]["elements"][0]["text"].startswith("todos as of ")
+    # F38: the live line renders as its own plain_text element ahead of the static half.
+    assert blocks[1]["elements"][0]["type"] == "plain_text"
+    assert "todos as of " in " ".join(e["text"] for e in blocks[1]["elements"])
     # Final card update reads "Reported findings below." and lands BEFORE the report post.
     assert client.card_updates
     assert "Reported findings below." in _card_body(client.card_updates[-1])
@@ -682,31 +728,94 @@ def _todos(*pairs):
     return [{"text": t, "status": st} for t, st in pairs]
 
 
+def _context(update_or_post):
+    """The context block as one string. F38 renders the live line as its own `plain_text`
+    element beside the static mrkdwn half; Slack shows them as one line."""
+    return " ".join(e["text"] for e in update_or_post[3][1]["elements"])
+
+
 @pytest.mark.asyncio
-async def test_card_update_throttle_coalesces_with_trailing_flush():
+async def test_the_writer_coalesces_rapid_updates_into_one_write_of_the_latest_state():
+    """F38: producers never write. They mutate state and return; one writer renders whatever
+    is current when it gets its turn — so three updates a second apart cost ONE chat.update,
+    and that update shows the third one's state rather than the first one's."""
     clock = [0.0]
-    slept = []
-
-    async def _fake_sleep(d):
-        slept.append(d)
-
     client = _CardClient()
-    card = _bare_card(client, clock=lambda: clock[0], sleep=_fake_sleep)
+    card = _bare_card(client, clock=lambda: clock[0])
     card.ts = "CARD.1"
-    await card.set_todos(_todos(("first", "in_progress")))   # last_update None → flush (#1)
+
+    await card.set_todos(_todos(("first", "in_progress")))
+    await card.set_todos(_todos(("second", "in_progress")))
+    await card.note_mcp("srv")
+    assert client.card_updates == []          # nothing reached Slack from the event path
+
+    await card._writer_tick()
     assert len(client.card_updates) == 1
-    await card.set_todos(_todos(("second", "in_progress")))   # within window → ONE trailing flush
-    await card.note_mcp("srv")            # still within window → no extra task/update
+    assert "second" in _card_body(client.card_updates[-1])       # latest, not the first
+    assert "1 srv call" in _context(client.card_updates[-1])
+
+    # Paced, not throttled-per-event: state that moves inside the window waits for the window.
+    await card.note_web_search()
+    await card._writer_tick()
     assert len(client.card_updates) == 1
-    assert card._flush_task is not None
-    clock[0] = 100.0
-    await card._flush_task                # trailing flush → update #2 with the LATEST state
+    clock[0] = rt._CARD_WRITE_INTERVAL_S + 1.0
+    await card._writer_tick()
     assert len(client.card_updates) == 2
-    body = _card_body(client.card_updates[-1])
-    context = client.card_updates[-1][3][1]["elements"][0]["text"]
-    assert "second" in body and "1 srv call" in context   # coalesced, not stale
-    assert slept and slept[0] <= rt._card_throttle_s()
+    assert "1 web search" in _context(client.card_updates[-1])
     assert all(u[2] == rt._CARD_FALLBACK_TEXT for u in client.card_updates)
+
+
+@pytest.mark.asyncio
+async def test_the_writer_says_nothing_when_nothing_moved():
+    """A tick is not a write. The card only spends a chat.update when what it would render has
+    actually changed — otherwise a job that sits quietly rewrites the same message forever."""
+    clock = [0.0]
+    client = _CardClient()
+    card = _bare_card(client, clock=lambda: clock[0])
+    card.ts = "CARD.1"
+    await card.set_todos(_todos(("first", "in_progress")))
+    await card._writer_tick()
+    assert len(client.card_updates) == 1
+    clock[0] = 1000.0
+    await card._writer_tick()
+    assert len(client.card_updates) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_bump_landing_during_the_write_is_carried_by_the_next_tick():
+    """The revision check. The writer renders BEFORE it awaits Slack, so state arriving while
+    that call is in flight is not in the message going out. Clearing dirty on the way back
+    would strand it — with one writer and no queue, nobody else would ever look at it."""
+    clock = [0.0]
+
+    class _SlowCardClient(_CardClient):
+        def __init__(self):
+            super().__init__()
+            self.writing = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def update_status_card(self, channel_id, ts, text, blocks, receipts=None):
+            if not self.writing.is_set():
+                self.writing.set()
+                await self.release.wait()
+            return await super().update_status_card(channel_id, ts, text, blocks,
+                                                    receipts=receipts)
+
+    client = _SlowCardClient()
+    card = _bare_card(client, clock=lambda: clock[0])
+    card.ts = "CARD.1"
+    await card.note_web_search()
+    tick = asyncio.ensure_future(card._writer_tick())
+    await asyncio.wait_for(client.writing.wait(), timeout=2)
+
+    card.bump_steering(1)                 # lands while Slack is being called
+    client.release.set()
+    await asyncio.wait_for(tick, timeout=2)
+    assert "passed along" not in _context(client.card_updates[-1])
+
+    clock[0] = rt._CARD_WRITE_INTERVAL_S + 1.0
+    await card._writer_tick()
+    assert "1 update passed along" in _context(client.card_updates[-1])
 
 
 def test_the_card_is_four_lines_and_never_grows_an_expander():
@@ -812,25 +921,19 @@ async def test_card_counters_in_context_line_not_body():
     """F30.2: raw tool events bump the context-line counters (with pluralization); the
     body stays model-authored milestones only — never a per-search log."""
     client = _CardClient()
-    # Advancing clock so each note clears the throttle window and flushes immediately.
-    t = [0.0]
-
-    def _clk():
-        t[0] += rt._card_throttle_s() + 1.0
-        return t[0]
-
-    card = _bare_card(client, clock=_clk)
+    card = _bare_card(client)
     card.ts = "CARD.1"
     await card.note_web_search()
     await card.note_web_search()
     await card.note_mcp("acmedata")
     await card.note_mcp(None)  # unlabeled server → generic "MCP" bucket
     await card.set_todos(_todos(("Searched  regulatory\ndockets — found the rule", "done")))
+    await card._writer_tick()
     body = _card_body(client.card_updates[-1])
-    context = client.card_updates[-1][3][1]["elements"][0]["text"]
+    context = _context(client.card_updates[-1])
     assert "✓ Searched regulatory dockets — found the rule" in body   # whitespace collapsed
     assert "searched the web" not in body          # no mechanical body lines
-    assert context.startswith("todos as of ")
+    assert "todos as of " in context
     assert "2 web searches" in context
     assert "1 acmedata call" in context
     assert "1 MCP call" in context
@@ -844,6 +947,257 @@ def test_card_throttle_derives_from_streaming_min_interval(monkeypatch):
     assert rt._card_throttle_s() == 2.5
     monkeypatch.setattr(config, "streaming_min_interval", 0.2)  # below Slack's floor
     assert rt._card_throttle_s() == 1.0
+
+
+# --------------------------------------------- F38: the live activity line
+
+
+@pytest.mark.asyncio
+async def test_the_context_line_leads_with_what_is_happening_right_now():
+    """The card's live line. Between two milestones the checklist is frozen, so this is the
+    only thing on the card that can say the job is still moving."""
+    clock = [0.0]
+    card = _bare_card(_CardClient(), clock=lambda: clock[0])
+    card.note_activity("Searching…")
+    assert card._context_line().startswith("Searching… · todos as of ")
+
+    card.note_activity("Searched: 2024 unit margins by segment")
+    assert card._context_line().startswith("Searched: 2024 unit margins by segment · ")
+
+
+@pytest.mark.asyncio
+async def test_a_silent_stretch_keeps_its_text_and_gains_its_age():
+    """Summaries are not promised every ten seconds. A card still showing the last thing it
+    heard, as though it were happening now, claims movement it cannot see — so the text stays
+    and starts admitting how old it is."""
+    clock = [0.0]
+    card = _bare_card(_CardClient(), clock=lambda: clock[0])
+    card.note_activity("Running code…")
+    clock[0] = rt._ACTIVITY_AGE_AFTER_S - 0.1
+    assert card._context_line().startswith("Running code… · todos")
+    clock[0] = 45.0
+    assert card._context_line().startswith("Running code… · 45s ago · todos")
+    clock[0] = 150.0
+    assert card._context_line().startswith("Running code… · 2m ago · todos")
+
+
+@pytest.mark.asyncio
+async def test_the_phase_speaks_until_the_model_does():
+    """Before the first summary or hosted call there is nothing live to say, and a blank lead
+    would read as a card with nothing behind it."""
+    card = _bare_card(_CardClient())
+    assert card._context_line().startswith("Researching… · todos as of ")
+    card.note_activity("Searching…")
+    assert card._context_line().startswith("Searching… · todos as of ")
+
+
+@pytest.mark.asyncio
+async def test_the_same_sentence_reported_twice_does_not_look_like_new_movement():
+    """Deltas, a done event and the completed item can all carry one sentence. If a re-report
+    reset the age, a stalled job would keep looking fresh."""
+    clock = [0.0]
+    card = _bare_card(_CardClient(), clock=lambda: clock[0])
+    card.note_activity("Reading the 10-K.")
+    clock[0] = 40.0
+    card.note_activity("Reading the 10-K.")          # the same fact, arriving again
+    assert card._context_line().startswith("Reading the 10-K. · 40s ago")
+
+
+@pytest.mark.asyncio
+async def test_an_alert_outranks_the_activity_and_a_verdict_outranks_both():
+    card = _bare_card(_CardClient())
+    card.note_activity("Searching…")
+    await card.set_alert("Provider hiccup — retrying (2/3)…")
+    line = card._context_line()
+    assert line.startswith("Provider hiccup — retrying (2/3)… · todos")
+    assert "Searching" not in line          # the alert is the news, and it gets the slot
+
+    card.ts = "CARD.1"
+    await card.finalize_success("Reported findings below.")
+    # A terminal card narrating live work would be describing a job that has stopped.
+    assert card._context_line().startswith("todos as of ")
+
+
+@pytest.mark.asyncio
+async def test_a_phase_change_drops_the_activity_from_the_phase_that_ended():
+    """An old query must never describe a new build."""
+    card = _bare_card(_CardClient())
+    card.note_activity("Searched: 2024 unit margins")
+    await card.set_phase("Building the deck…")
+    assert "Searched" not in card._context_line()
+
+
+@pytest.mark.asyncio
+async def test_the_todo_timestamp_is_the_model_s_last_rewrite_not_the_last_render():
+    """Stored at the rewrite, never recomputed per render — a card that restamped the clock on
+    every write would show a five-minute-old checklist as current."""
+    stamps = iter(["3:00 PM", "3:05 PM", "3:10 PM"])
+    card = _bare_card(_CardClient(), now_label=lambda: next(stamps))
+    assert "todos as of 3:00 PM" in card._context_line()
+    await card.set_todos(_todos(("dig", "in_progress")))
+    assert "todos as of 3:05 PM" in card._context_line()
+    assert "todos as of 3:05 PM" in card._context_line()   # a render is not a rewrite
+
+
+def test_activity_text_cannot_carry_a_mention_or_reflow_the_line():
+    """The text is model- and web-authored. A query containing <!channel> would notify the room
+    from inside a status card."""
+    card = _bare_card(_CardClient())
+    card.note_activity("Searched: <!channel> *pricing*\nfor <@U123>")
+    line = card._context_line()
+    assert "<!channel>" not in line and "<@U123>" not in line
+    assert "*" not in line and "\n" not in line
+    assert "Searched:" in line and "pricing" in line
+
+
+def test_the_live_line_prefers_the_summary_heading_over_its_prose():
+    """The model titles each summary part with what it is doing. That title is the status; the
+    prose under it is working-out, and its LAST sentence is reliably filler — a live run put
+    "This way, I can make the most of the information while keeping it concise and relevant."
+    on the card as if it described the work."""
+    part = ("**Researching municipal composting programs**\n\n"
+            "I'm pulling city program pages. This way, I can keep it concise and relevant.")
+    assert rt._readable_summary(part) == "**Researching municipal composting programs**"
+
+    # No heading: the FIRST complete sentence, which says what the model set out to do.
+    assert rt._readable_summary(
+        "I opened the 10-K. This way, I can keep it concise and relevant.") \
+        == "I opened the 10-K."
+
+
+def test_the_live_line_waits_for_text_that_can_be_read():
+    """A fragment is not a status: shown, it would put half a title or half a sentence on the
+    card and rewrite it a second later. "" is the signal to keep whatever is already there."""
+    # The closing ** is the title's terminator, so a half-streamed one never flashes up.
+    assert rt._readable_summary("**Researching munic") == ""
+    assert rt._readable_summary("**Checking filings**\nI opened") == "**Checking filings**"
+    assert rt._readable_summary("Opening the 10-K") == ""       # still being written
+    assert rt._readable_summary("") == ""
+    # ...and the heading delimiters come off at render.
+    assert rt._sanitize_activity("**Checking filings**") == "Checking filings"
+    assert rt._sanitize_activity("## Reading") == "Reading"
+
+
+@pytest.mark.asyncio
+async def test_back_to_back_searches_still_say_what_was_just_searched():
+    """Live-observed: searches go out one after another, so the newest event at every writer
+    snapshot is the next search's START and the card showed nothing but "Searching…" for two
+    minutes while the counter climbed. The query that just completed is the concrete thing the
+    job can report, and it is still true."""
+    events = [
+        {"kind": "hosted", "state": "start", "tool": "web_search", "label": None,
+         "request_seq": 7, "item_id": "ws_1", "summary_index": None, "text": None},
+        {"kind": "hosted", "state": "complete", "tool": "web_search",
+         "label": "2024 composting participation rates", "request_seq": 7,
+         "item_id": "ws_1", "summary_index": None, "text": None},
+        {"kind": "hosted", "state": "start", "tool": "web_search", "label": None,
+         "request_seq": 7, "item_id": "ws_2", "summary_index": None, "text": None},
+    ]
+    seen = []
+
+    async def _stub(**kwargs):
+        for ev in events:
+            kwargs["progress_callback"](ev)
+            seen.append(card._activity)
+        return {"text": "report", "tools_used": [], "local_tool_calls": []}
+
+    proc = _FakeProcessor(openai_client=SimpleNamespace(
+        create_streaming_response_with_tool_loop=_stub))
+    proc.log_debug = lambda *a, **k: None
+    card = _bare_card(_CardClient())
+    await rt._consume_research_stream(
+        proc, messages=[], tools=[], registry=None, tool_context=None, model="gpt-5.6-sol",
+        system_prompt=None, effort="high", verbosity="medium", card=card)
+
+    assert seen == [
+        "Searching…",                                    # nothing has completed yet
+        "Searched: 2024 composting participation rates",
+        "Searched: 2024 composting participation rates · searching…",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_previous_rounds_query_never_describes_this_rounds_search():
+    """The carried query is scoped to ONE request. A round boundary is a new piece of work, and
+    the last thing the previous round looked up is not what this one is doing."""
+    events = [
+        {"kind": "hosted", "state": "complete", "tool": "web_search", "label": "old query",
+         "request_seq": 1, "item_id": "ws_1", "summary_index": None, "text": None},
+        {"kind": "hosted", "state": "start", "tool": "web_search", "label": None,
+         "request_seq": 2, "item_id": "ws_2", "summary_index": None, "text": None},
+    ]
+
+    async def _stub(**kwargs):
+        for ev in events:
+            kwargs["progress_callback"](ev)
+        return {"text": "report", "tools_used": [], "local_tool_calls": []}
+
+    proc = _FakeProcessor(openai_client=SimpleNamespace(
+        create_streaming_response_with_tool_loop=_stub))
+    proc.log_debug = lambda *a, **k: None
+    card = _bare_card(_CardClient())
+    await rt._consume_research_stream(
+        proc, messages=[], tools=[], registry=None, tool_context=None, model="gpt-5.6-sol",
+        system_prompt=None, effort="high", verbosity="medium", card=card)
+
+    assert card._activity == "Searching…"
+
+
+def test_a_long_query_is_trimmed_but_the_live_half_of_the_line_survives():
+    """Gisting the composed line would cut " · searching…" off the end and leave something that
+    reads as finished work."""
+    line = rt._sanitize_activity(rt._hosted_activity(
+        "web_search", "start", None, last_query="composting " * 30))
+    assert line.endswith("· searching…")
+    assert len(line) <= rt._PHASE_GIST_CHARS
+
+
+@pytest.mark.asyncio
+async def test_both_phases_ask_for_summaries_and_drive_the_same_card(monkeypatch):
+    """The research phase always had the card; the build phase was handed None, which left the
+    longest, quietest half of a job with no live line at all."""
+    calls = []
+
+    async def _stub(**kwargs):
+        calls.append(kwargs)
+        # The round starts: the previous round's last search must not describe this one.
+        await kwargs["pre_round_input_callback"]()
+        kwargs["progress_callback"]({"kind": "hosted", "state": "start", "request_seq": 1,
+                                     "item_id": "ws_1", "summary_index": None,
+                                     "tool": "web_search", "label": None, "text": None})
+        return {"text": "report", "tools_used": [], "local_tool_calls": []}
+
+    proc = _FakeProcessor(openai_client=SimpleNamespace(
+        create_streaming_response_with_tool_loop=_stub))
+    proc.log_debug = lambda *a, **k: None
+    card = _bare_card(_CardClient())
+    await rt._consume_research_stream(
+        proc, messages=[], tools=[], registry=None, tool_context=None, model="gpt-5.6-sol",
+        system_prompt=None, effort="high", verbosity="medium", card=card)
+
+    assert calls[0]["reasoning_summary"] == "auto"
+    assert card._activity == "Searching…"
+    assert callable(calls[0]["progress_callback"])
+    # ...and the build phase passes its card through the same door.
+    import inspect
+    source = inspect.getsource(rt._run_build_phase)
+    assert "card=card" in source and "card=None" not in source
+
+
+def test_base_wrapper_accepts_the_progress_callback_and_summary_request():
+    """Wrapper-drift guard, the twin of the tool_event_callback one below: the job calls
+    through OpenAIClient's wrapper, and a parameter the wrapper does not name is silently
+    dropped rather than rejected."""
+    import inspect
+    from openai_client.base import OpenAIClient, _build_request_params
+    params = inspect.signature(OpenAIClient.create_streaming_response_with_tools).parameters
+    assert "progress_callback" in params and "reasoning_summary" in params
+    # ...and the summary rides ALONGSIDE the effort, never in place of it.
+    built = _build_request_params(model="gpt-5.6-sol", input_items=[], reasoning_effort="high",
+                                  reasoning_summary="auto")
+    assert built["reasoning"] == {"effort": "high", "summary": "auto"}
+    assert "summary" not in _build_request_params(
+        model="gpt-5.6-sol", input_items=[], reasoning_effort="high")["reasoning"]
 
 
 def test_base_wrapper_accepts_tool_event_callback():
@@ -914,14 +1268,64 @@ def test_build_instruction_edits_the_prior_file_and_invents_nothing():
     assert "leave everything else exactly as it was" in rt._BUILD_JOB_INSTRUCTION
     assert "check each change against the source material" in rt._BUILD_JOB_INSTRUCTION
     assert "NO web access here" in rt._BUILD_JOB_INSTRUCTION
-    assert "mark it unverified" in rt._BUILD_JOB_INSTRUCTION
+    assert "never inside the file" in rt._BUILD_JOB_INSTRUCTION
+
+
+def test_the_build_brief_hands_over_the_sandbox_instead_of_making_it_look():
+    """Live: a 22-minute build spent ~15 of them on `which node`, `fc-list` and `find / -name
+    '*slides*'` before writing a slide. The container is known — describe it up front, and the
+    first round can build."""
+    body = rt._BUILD_JOB_INSTRUCTION.format(
+        task="t", deliverables="- d.pptx (pptx): a deck", findings="figures",
+        sandbox=rt._SANDBOX_ENVIRONMENT_BLOCK,
+        todos=rt._TodoState(["Build the deck"]).as_prompt_block())
+    assert "{sandbox}" not in body, "a call site forgot to fill the placeholder"
+    assert "SANDBOX ENVIRONMENT" in body
+    assert "python-pptx" in body
+    assert "do not probe for tools, fonts or libraries it already lists" in body
+
+
+def test_the_prompts_ask_for_honest_evidence_and_honest_checkmarks():
+    """Three live failures, one shape: a brief that made the model disqualify evidence it had,
+    a build brief that declared research steps done because the phase ended, and a delivery
+    model that withheld a built deck instead of shipping finished work."""
+    # Research: verification is proportionate — check, then move on.
+    assert "at most a couple of authoritative, reliable sources" in rt._RESEARCH_JOB_INSTRUCTION
+    assert "do not keep searching for additional confirmation" in rt._RESEARCH_JOB_INSTRUCTION
+    # The card is a milestone log, not a per-search ticker — and the brief says which of the
+    # two costs the model a continuation, because that is the reason it matters.
+    assert "never per search and never to restate an unchanged status" in \
+        rt._RESEARCH_JOB_INSTRUCTION
+    assert "a milestone call costs a continuation" in rt._RESEARCH_JOB_INSTRUCTION
+    assert "costs a continuation" in rt.get_update_todos_schema()["description"]
+    assert "milestone call costs a continuation" in rt._BUILD_JOB_INSTRUCTION
+    # The batching partner is a LOCAL call. A hosted one (a search, the sandbox) is not a
+    # boundary the model can ride, so naming it would ask for a call that cannot be batched.
+    for text in (rt._RESEARCH_JOB_INSTRUCTION, rt._BUILD_JOB_INSTRUCTION,
+                 rt.get_update_todos_schema()["description"]):
+        assert "LOCAL tool call" in text
+        assert "not a boundary you can ride" in text
+    # ...and a ✓ is never a claim that the work was delivered.
+    assert "never claims the work was delivered" in \
+        rt.get_update_todos_schema()["description"]
+    # A checkmark claims an OUTCOME, and entering the build phase is not one.
+    assert "Mark an item `done` only when its stated outcome was achieved" in \
+        rt.get_update_todos_schema()["description"]
+    assert "mark a research step done only if its outcome was achieved" in \
+        rt._BUILD_JOB_INSTRUCTION
+    # Delivery ships finished work and explains any omitted scope in the message.
+    assert "finished, client-ready work" in rt._DELIVERY_INSTRUCTION
+    assert "any later instruction withdrawing the deliverable" in rt._DELIVERY_INSTRUCTION
 
 
 def test_research_instruction_requires_a_source_opened_this_run():
-    """A claim inherited from the conversation is not a finding — the report has to open a source
-    for it, or it launders a guess into a sourced-looking document."""
-    assert "a source you actually opened THIS run supports it" in rt._RESEARCH_JOB_INSTRUCTION
-    assert "verified, not repeated" in rt._RESEARCH_JOB_INSTRUCTION
+    """A claim inherited from the conversation is not a finding — the report has to inspect it
+    this run, or it launders a guess into a sourced-looking document. The rule survived the
+    rewrite that made the verification standard proportionate."""
+    assert "Ground factual claims in evidence you inspected during this run" in \
+        rt._RESEARCH_JOB_INSTRUCTION
+    assert "must be checked before you repeat them as facts" in rt._RESEARCH_JOB_INSTRUCTION
+    assert "distinguish established facts from inference" in rt._RESEARCH_JOB_INSTRUCTION
 
 
 @pytest.mark.asyncio
@@ -1557,6 +1961,7 @@ async def test_a_build_only_job_is_not_handed_an_empty_findings_block(monkeypatc
     assert captured["findings"] == ""          # the phase is handed nothing...
     body = rt._BUILD_JOB_INSTRUCTION.format(
         task="t", deliverables="- c.png", findings=rt._BUILD_ONLY_SOURCES,
+        sandbox=rt._SANDBOX_ENVIRONMENT_BLOCK,
         todos=rt._TodoState(["Build the chart"]).as_prompt_block())
     assert "do NOT invent it" in body          # ...and the prompt says what to do about it
 

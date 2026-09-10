@@ -10,7 +10,6 @@ sink and its own delivery path". This is that sink. The properties worth defendi
 * files publish AFTER the report, so the thread reads card → report → deck;
 * the card's terminal state reflects what SHIPPED, never what the model claimed.
 """
-import asyncio
 import itertools
 from unittest.mock import AsyncMock, MagicMock
 
@@ -18,6 +17,7 @@ import openai
 import pytest
 
 from message_processor import research_tools as rt
+from slack_client.messaging import CardWriteResult
 
 
 @pytest.mark.unit
@@ -191,6 +191,29 @@ class TestBuildPhase:
 
         assert build is not None
         assert build["container_ids"] == ["cntr_job1"]
+
+    async def test_the_build_carries_no_ration_and_no_clock(self, monkeypatch):
+        # A build is done when the files are built and verified — running out of rounds mid-build
+        # is the difference between a deck and an apology, and an elapsed-time wall cut a working
+        # build just as readily. Neither exists: nothing here hands the stream a deadline.
+        processor = _processor()
+        seen = {}
+
+        async def fake_stream(_proc, **kw):
+            seen.update(kw)
+            return {"text": "built", "tools_used": []}
+
+        monkeypatch.setattr(rt, "_consume_research_stream", fake_stream)
+
+        await rt._run_build_phase(
+            processor=processor, client=MagicMock(), channel_id="C1", thread_root="1.0",
+            thread_key="C1:1.0", job_id="j", task="t", findings="f",
+            deliverables=[{"type": "pdf", "description": "d", "filename": "d.pdf"}],
+            snapshot=[], thread_config={}, system_prompt=None, model="gpt-5.6-sol",
+            card=_card())
+
+        assert "max_rounds" not in seen, "the build phase must not carry a round ration"
+        assert not {"wrap_up_at", "wind_down_at"} & set(seen), "the build must carry no deadline"
 
     async def test_the_users_image_settings_reach_the_build(self, monkeypatch):
         # The image MODEL is a hard constraint from the user's prefs; a build phase that
@@ -439,10 +462,11 @@ class TestBuildPhaseRetry:
         assert len(resume) == 1
         assert "note 1" in resume[0]["content"] and "note 2" in resume[0]["content"]
 
-    async def test_a_timeout_with_budget_left_came_from_below_and_is_retried(self, monkeypatch):
-        # `_safe_api_call` re-raises openai.APITimeoutError as a BUILTIN TimeoutError, which is
-        # the same type our own wait_for raises. Only the clock can tell them apart: with most
-        # of the budget still on it, this one came from a single call underneath.
+    async def test_a_request_timeout_came_from_below_and_is_retried(self, monkeypatch):
+        # `_safe_api_call` re-raises openai.APITimeoutError as a BUILTIN TimeoutError. Nothing
+        # up here bounds the build by elapsed time any more, so every TimeoutError reaching this
+        # loop is the transport watchdog on ONE request — as transient as a dropped stream, and
+        # the container it was building in is still there.
         processor = _processor()
         card = _card()
         monkeypatch.setattr(rt.config, "deep_research_build_retries", 2)
@@ -461,13 +485,12 @@ class TestBuildPhaseRetry:
         assert len(calls) == 2 and build["notes"] == "deck built"
         assert card.set_alert.await_count == 1
 
-    async def test_a_spent_budget_is_still_the_terminal_timeout_path(self, monkeypatch):
-        # The other half of that split: when the deadline really is gone, ship what exists —
-        # unchanged behavior, and the "timed out after Ns" line log greps rely on.
+    async def test_a_timeout_on_the_last_attempt_ships_what_exists(self, monkeypatch):
+        # Retries are the only bound left. When they run out, ship whatever the container holds —
+        # and log it, because the "timed out" line is what log greps look for.
         processor = _processor()
         card = _card()
-        monkeypatch.setattr(rt.config, "deep_research_build_retries", 2)
-        monkeypatch.setattr(rt.config, "deep_research_build_timeout", 10.0)
+        monkeypatch.setattr(rt.config, "deep_research_build_retries", 1)
         calls = []
 
         async def timing_out(_proc, **kw):
@@ -478,34 +501,9 @@ class TestBuildPhaseRetry:
 
         build = await _build(processor, card)
 
-        assert len(calls) == 1 and build["notes"] == ""
-        card.set_alert.assert_not_awaited()
+        assert len(calls) == 2 and build["notes"] == ""
         assert any("timed out" in str(c.args[0])
                    for c in processor.log_warning.call_args_list)
-
-    async def test_no_retry_is_announced_that_cannot_actually_start(self, monkeypatch):
-        # Retries SHARE the one wall clock; they do not extend it. A build handed seconds to
-        # re-orient in its own container produces nothing and bills for it anyway — and telling
-        # the user "retrying" and then not retrying is worse than saying nothing.
-        processor = _processor()
-        card = _card()
-        monkeypatch.setattr(rt.config, "deep_research_build_retries", 2)
-        monkeypatch.setattr(rt.config, "deep_research_build_timeout", 10.0)
-        calls = []
-
-        async def always_flaky(_proc, **kw):
-            calls.append(kw["messages"])
-            raise _transient_stream_error()
-
-        monkeypatch.setattr(rt, "_consume_research_stream", always_flaky)
-
-        await _build(processor, card)
-
-        assert len(calls) == 1
-        card.set_alert.assert_not_awaited()
-        warnings = " ".join(str(c.args[0]) for c in processor.log_warning.call_args_list)
-        assert "retrying" not in warnings
-        assert any("failed" in str(c.args[0]) for c in processor.log_error.call_args_list)
 
     async def test_a_demoted_container_makes_the_failure_terminal(self, monkeypatch):
         # R4 leak: if the recovery layer underneath swapped this call onto a throwaway `auto`
@@ -539,10 +537,14 @@ class _FakeCardClient:
 
     async def update_status_card(self, _channel, _ts, _text, blocks):
         self.blocks.append(blocks)
+        # Same return type as the transport (F38).
+        return CardWriteResult(ok=True)
 
 
 def _context_text(blocks):
-    return blocks[1]["elements"][0]["text"]
+    """The context block as one string: F38 renders the live line as its own `plain_text`
+    element beside the static mrkdwn half, and Slack shows them as one line."""
+    return " ".join(e["text"] for e in blocks[1]["elements"])
 
 
 @pytest.mark.unit
@@ -552,7 +554,7 @@ class TestCardAlert:
         # IS "what I'm doing now") — which is exactly the state a mid-build retry happens in.
         # The alert rides the context block instead, which renders unconditionally.
         client = _FakeCardClient()
-        clock = itertools.count(0, 10).__next__       # every op past the throttle window
+        clock = itertools.count(0, 20).__next__       # every tick past the pacing window
         card = rt._ResearchCard(processor=MagicMock(), client=client, channel_id="C1",
                                 thread_root="1.0", task="t", label=None,
                                 todos=rt._TodoState(["Build the deck"]), clock=clock)
@@ -562,56 +564,80 @@ class TestCardAlert:
         assert not any("Building the deck" in line for line in card._visible_lines())
 
         await card.set_alert("Provider hiccup — retrying (2/3)…")
+        await card._writer_tick()
         assert "Provider hiccup — retrying (2/3)…" in _context_text(client.blocks[-1])
 
         # The model driving the card again IS the "moving again" signal — nothing has to
         # remember to take the alert down.
         await card.set_todos([{"text": "Build the deck", "status": "done"}])
+        await card._writer_tick()
         assert "retrying" not in _context_text(client.blocks[-1])
 
-    async def test_the_alert_reaches_slack_even_when_the_clear_lands_inside_the_throttle_window(
-            self):
-        # The failure this guards: raise and clear are barely a second apart, the throttle
-        # coalesces them into ONE render, and that render shows the state AFTER the clear — so
-        # the user is never told the thing the alert exists to tell them.
+    async def test_a_writer_tick_never_takes_the_alert_down_by_itself(self):
+        # The card talking to itself is not the job moving again. A tick that rendered the
+        # alert, or a write that succeeded, must leave it standing — only the model producing
+        # something takes it down, because only that is evidence the hiccup is over.
         client = _FakeCardClient()
-        card = rt._ResearchCard(processor=MagicMock(), client=client, channel_id="C1",
-                                thread_root="1.0", task="t", label=None,
-                                todos=rt._TodoState(["Build the deck"]),
-                                clock=lambda: 0.0, sleep=AsyncMock())
-        await card.start()
-        await card.set_alert("Provider hiccup — retrying (2/3)…")
-        await card.set_todos([{"text": "Build the deck", "status": "in_progress"}])
-        for _ in range(3):
-            await asyncio.sleep(0)      # let the trailing flush run
-
-        rendered = [_context_text(b) for b in client.blocks]
-        assert any("retrying" in text for text in rendered)
-        assert "retrying" not in rendered[-1]
-
-    async def test_a_steering_bump_also_clears_it(self):
-        # Inside a build phase, steering is the ONLY activity counter — no web_search or MCP
-        # event ever reaches this card.
-        client = _FakeCardClient()
-        clock = itertools.count(0, 10).__next__
+        clock = itertools.count(0, 20).__next__
         card = rt._ResearchCard(processor=MagicMock(), client=client, channel_id="C1",
                                 thread_root="1.0", task="t", label=None,
                                 todos=rt._TodoState(["Build the deck"]), clock=clock)
         await card.start()
         await card.set_alert("Provider hiccup — retrying (2/3)…")
-        await card.note_steering(1)
-        assert "retrying" not in _context_text(client.blocks[-1])
-        assert "1 update passed along" in _context_text(client.blocks[-1])
+        for _ in range(3):
+            await card._writer_tick()
+        assert "retrying" in _context_text(client.blocks[-1])
 
-    async def test_an_activity_counter_bump_also_clears_it(self):
+    async def test_an_alert_does_not_wait_the_full_pacing_interval(self):
+        # Ordinary state is paced at 15s; an alert is news, and news 15 seconds late is not
+        # news. It buys the Slack floor instead — prompt, never unpaced.
         client = _FakeCardClient()
-        clock = itertools.count(0, 10).__next__
+        clock = [0.0]
+        card = rt._ResearchCard(processor=MagicMock(), client=client, channel_id="C1",
+                                thread_root="1.0", task="t", label=None,
+                                todos=rt._TodoState(["Build the deck"]),
+                                clock=lambda: clock[0])
+        await card.start()
+        await card.set_todos([{"text": "Build the deck", "status": "in_progress"}])
+        clock[0] = rt._card_throttle_s() + 0.1
+        await card._writer_tick()
+        assert client.blocks == []          # ordinary state waits for the pacing window
+
+        await card.set_alert("Provider hiccup — retrying (2/3)…")
+        await card._writer_tick()
+        assert "retrying" in _context_text(client.blocks[-1])
+
+    async def test_a_steering_bump_clears_it_once_it_has_been_seen(self):
+        # The LATCH. An alert raised and answered inside one pacing window would otherwise be
+        # coalesced out of existence, and the user would be left with an unexplained pause. So
+        # the clear waits until a write has actually carried the alert.
+        client = _FakeCardClient()
+        clock = itertools.count(0, 20).__next__
+        card = rt._ResearchCard(processor=MagicMock(), client=client, channel_id="C1",
+                                thread_root="1.0", task="t", label=None,
+                                todos=rt._TodoState(["Build the deck"]), clock=clock)
+        await card.start()
+        await card.set_alert("Provider hiccup — retrying (2/3)…")
+        await card.note_steering(1)                  # the answer arrives before the render
+        await card._writer_tick()
+        assert "retrying" in _context_text(client.blocks[-1])     # ...and is still shown
+
+        await card.note_steering(1)                  # now that it has been seen, it comes down
+        await card._writer_tick()
+        assert "retrying" not in _context_text(client.blocks[-1])
+        assert "2 updates passed along" in _context_text(client.blocks[-1])
+
+    async def test_an_activity_counter_bump_clears_it_once_it_has_been_seen(self):
+        client = _FakeCardClient()
+        clock = itertools.count(0, 20).__next__
         card = rt._ResearchCard(processor=MagicMock(), client=client, channel_id="C1",
                                 thread_root="1.0", task="t", label=None,
                                 todos=rt._TodoState(["Dig"]), clock=clock)
         await card.start()
         await card.set_alert("Provider hiccup — retrying (2/3)…")
+        await card._writer_tick()                    # the alert is on the card
         await card.note_web_search()
+        await card._writer_tick()
         assert "retrying" not in _context_text(client.blocks[-1])
         assert "1 web search" in _context_text(client.blocks[-1])
 

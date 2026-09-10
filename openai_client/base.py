@@ -114,6 +114,7 @@ def _build_request_params(
     max_output_tokens: Optional[int] = None,
     reasoning_effort: Optional[str] = None,
     effort_override: Optional[str] = None,
+    reasoning_summary: Optional[str] = None,
     verbosity: Optional[str] = None,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
@@ -151,6 +152,11 @@ def _build_request_params(
     ``configuration_update`` input item, because a changed top-level effort is a full prompt-cache
     miss there while the item preserves the cache (measured 2026-09-08: 4016 cached tokens kept).
     On every other family it simply replaces the top-level effort, which is today's behaviour.
+
+    ``reasoning_summary`` ("auto") asks the model to narrate its own reasoning as summary parts
+    alongside the answer. It is MERGED into the same ``reasoning`` dict as the effort — the two
+    are one object to the API — and only the background job asks for it, because it is the one
+    caller with a surface (the live status card) that has something to do with the narration.
     """
     model = model or config.gpt_model
     temperature = temperature if temperature is not None else config.default_temperature
@@ -207,6 +213,12 @@ def _build_request_params(
         params["instructions"] = system_prompt
 
     params["reasoning"] = {"effort": effort}
+    if reasoning_summary:
+        # MERGED, never a replacement: the effort above is the whole reason this dict exists,
+        # and a summary that dropped it would silently move every job to the model's default
+        # effort. Only a caller that asks gets the key, so every shipped request shape — whose
+        # serialized bytes tests pin — is unchanged by this parameter's existence.
+        params["reasoning"]["summary"] = reasoning_summary
     params["text"] = {"verbosity": verbosity or config.default_verbosity}
 
     # gpt-5.5 and the 5.6 family allow temperature/top_p when reasoning=none
@@ -600,6 +612,7 @@ class OpenAIClient(LoggerMixin):
         top_p: Optional[float] = None,
         system_prompt: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
+        reasoning_summary: Optional[str] = None,
         verbosity: Optional[str] = None,
         store: bool = False,
         tool_callback: Optional[Callable[[str, str], Any]] = None,
@@ -612,6 +625,7 @@ class OpenAIClient(LoggerMixin):
         # this on the no-tool-loop branch and it was never accepted here.
         mcp_results_sink: Optional[List[Dict[str, Any]]] = None,
         tool_event_callback: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         artifacts_sink: Optional[List[Dict[str, Any]]] = None,
         container_gone_sink: Optional[List[str]] = None,
         layout: str = "legacy",
@@ -629,6 +643,7 @@ class OpenAIClient(LoggerMixin):
             top_p=top_p,
             system_prompt=system_prompt,
             reasoning_effort=reasoning_effort,
+            reasoning_summary=reasoning_summary,
             verbosity=verbosity,
             store=store,
             tool_callback=tool_callback,
@@ -639,6 +654,7 @@ class OpenAIClient(LoggerMixin):
             mcp_tools_sink=mcp_tools_sink,
             mcp_results_sink=mcp_results_sink,
             tool_event_callback=tool_event_callback,
+            progress_callback=progress_callback,
             artifacts_sink=artifacts_sink,
             container_gone_sink=container_gone_sink,
             layout=layout,
