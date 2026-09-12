@@ -190,6 +190,9 @@ _BUILD_JOB_INSTRUCTION = (
     "about your own process or research limitations.\n"
     "- Need an illustration, a cover image, a diagram? Call create_image_asset — it puts the "
     "image INTO the sandbox for you to embed. Do not call it for charts.\n"
+    "- Need to CHANGE an image that already exists? Call the image edit tool. Never reproduce "
+    "an edit with code — drawing over, masking or tinting a source image is not an edit, and "
+    "what comes back is indistinguishable from the original.\n"
     "- Need a file the user shared, or one you produced earlier in this thread? Call mount_file "
     "to bring its real bytes into the sandbox.\n"
     "- Revising or correcting a file this thread already produced? If its content is provided "
@@ -2867,14 +2870,57 @@ def _is_retryable_build_error(e: BaseException) -> bool:
         return False
 
 
-def _native_file_bounds(items: List[Dict[str, Any]]) -> List[int]:
+async def _thread_document_bounds(processor, thread_key: str
+                                  ) -> Dict[str, Tuple[Optional[int], Optional[int]]]:
+    """filename → (size_bytes, total_pages) for this thread's documents.
+
+    The metadata `_native_file_bounds` needs to price a native part properly, read once per
+    build. Rows come back oldest-first, so a filename written twice keeps the NEWEST row —
+    the one carrying whatever richer metadata arrived later, same rule as the file catalog's
+    dedupe. Never raises: a lookup failure costs the better estimate, not the build.
+    """
+    db = getattr(processor, "db", None)
+    if db is None:
+        return {}
+    try:
+        rows = await db.get_thread_documents_async(thread_key)
+    except Exception as e:  # noqa: BLE001
+        processor.log_warning(f"Document metadata lookup failed for {thread_key}: {e}")
+        return {}
+    bounds: Dict[str, Tuple[Optional[int], Optional[int]]] = {}
+    for row in rows or []:
+        filename = row.get("filename")
+        if filename:
+            bounds[str(filename)] = (row.get("size_bytes"), row.get("total_pages"))
+    return bounds
+
+
+def _native_file_bounds(items: List[Dict[str, Any]],
+                        doc_bounds: Optional[Dict[str, Tuple[Optional[int], Optional[int]]]] = None
+                        ) -> List[int]:
     """Worst-case token bound per native file part actually present in the candidate input.
 
-    A base64 `file_data` string is at least as long as the bytes it encodes, and one token per
-    byte is the same worst case `native_file_token_bound` uses — so the length of the string we
-    can already see is a legitimate bound, and no new plumbing has to carry page counts down
-    the dispatch path to get one.
+    Priced off the thread's DOCUMENT METADATA, through the same `native_file_token_bound` the
+    interactive path uses — never reimplemented here. Charging one token per base64 character
+    prices a PDF's container bytes (mostly compressed images, fonts and object tables) as text
+    the API will read, and the API never reads them: live, a 24-page PDF converted from a 76MB
+    pptx scored ~2.27M tokens inside a 2,287-token thread, so the 2,867-character revision
+    master the job had been asked to edit was dropped for want of room nothing was occupying.
+
+    An `input_file` part legally carries `filename` (`utilities._API_PART_KEYS`), which is what
+    matches it to a row. A part with no matching row falls back to the base64 length exactly as
+    before — no new failure mode — and a matched row with no page count resolves to its byte
+    count, which is that same behaviour and is the right bound for a CSV/XLSX.
+
+    The extracted text is deliberately NOT part of the charge: raw document text is never
+    persisted (CLAUDE.md pitfall 4), so a paged file is charged its pages leg alone. That is a
+    SMALLER ceiling than the interactive path's, and accepted — it is still a ceiling on the
+    render leg, admission keeps `_REVISION_ADMISSION_HEADROOM` under the model's limit, and the
+    alternative it replaces was a ~1000x over-estimate that silently discarded the master.
     """
+    from message_processor.channel_request import native_file_token_bound
+
+    known = doc_bounds or {}
     bounds: List[int] = []
     for item in items:
         content = item.get("content")
@@ -2882,7 +2928,12 @@ def _native_file_bounds(items: List[Dict[str, Any]]) -> List[int]:
             continue
         for part in content:
             if isinstance(part, dict) and part.get("type") == "input_file":
-                bounds.append(len(part.get("file_data") or ""))
+                metadata = known.get(str(part.get("filename") or ""))
+                if metadata is None:
+                    bounds.append(len(part.get("file_data") or ""))
+                else:
+                    size_bytes, total_pages = metadata
+                    bounds.append(native_file_token_bound(size_bytes, total_pages))
     return bounds
 
 
@@ -2918,7 +2969,7 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
     Never raises: a build failure costs the file, not the research report.
     """
     from message_processor import (channel_request, export_tool, fetch_to_sandbox, file_mount,
-                                   image_tools)
+                                   image_catalog, image_tools)
     from message_processor.artifacts import collect_container_ids
     from message_processor.containers import AUTO_CONTAINER
 
@@ -2955,12 +3006,25 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
     build_config = dict(thread_config)
     build_config["enable_code_interpreter"] = True
     build_config[image_tools.CI_CONTAINER_KEY] = container
-    build_config[image_tools.CATALOG_KEY] = []          # no Slack-posting edit tool in a build
+    # The thread's real image catalog, NOT an empty list. The Slack-posting `edit_image` is
+    # still absent from the registry below — what the catalog turns on here is `edit_image_asset`,
+    # whose result lands in the container. Empty, the build had no way to MODIFY an image at all,
+    # and a job asked to edit one did the only thing on the table: pixel work in the sandbox,
+    # which came back an effective copy. `build_catalog`'s own docstring records the same failure
+    # on the interactive path. It never raises and returns [] when the thread has no images,
+    # which keeps the no-catalog-no-tool rule intact.
+    #
+    # Built ONCE and shared with the ToolContext below: the executor resolves ids against
+    # `ToolContext.image_catalog`, so a populated config with an empty context would advertise
+    # ids that every call then failed to resolve.
+    image_entries = await image_catalog.build_catalog(getattr(processor, "db", None), thread_key)
+    build_config[image_tools.CATALOG_KEY] = image_entries
     build_config[file_mount.FILES_KEY] = await _thread_file_catalog(processor, thread_key)
 
-    # create_image_asset + mount_file only. generate_image is DETACHED and posts straight to
+    # The sandbox image tools + mount_file only. generate_image is DETACHED and posts straight to
     # Slack — inside a build that is wrong twice: the image lands loose in the thread instead of
-    # in the deck, and the job can finish before it even arrives. edit_image posts to Slack too.
+    # in the deck, and the job can finish before it even arrives. edit_image posts to Slack too;
+    # edit_image_asset is its build-shaped twin, same sources, result into the container.
     # A build phase may only produce INGREDIENTS; the publisher decides what the user sees.
     registry = ToolRegistry()
     registry.register(get_update_todos_schema(), _make_update_todos(card))
@@ -2969,6 +3033,10 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
     registry.register(image_tools.get_create_image_asset_schema,
                       image_tools.execute_create_image_asset,
                       name="create_image_asset", dynamic=True,
+                      timeout=float(config.api_timeout_image) + 60.0)
+    registry.register(image_tools.get_edit_image_asset_schema,
+                      image_tools.execute_edit_image_asset,
+                      name="edit_image_asset", dynamic=True,
                       timeout=float(config.api_timeout_image) + 60.0)
     file_mount.register_file_mount_tools(registry)
     # A build is exactly where full-coverage collection belongs — nobody is watching a blank
@@ -2992,7 +3060,7 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
         channel_id=channel_id, thread_ts=thread_root, trigger_ts=thread_root,
         client=client, processor=processor, db=getattr(processor, "db", None),
         thread_config=build_config, container_id=container,
-        image_catalog=[], sandbox_image_assets=[],
+        image_catalog=image_entries, sandbox_image_assets=[],
         thread_files=build_config[file_mount.FILES_KEY], mounted_files=[],
         user_id=requester_user_id, requester_is_human=requester_is_human,
         is_dm=requester_is_dm,
@@ -3041,11 +3109,17 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
         # tools list and the instruction text are both built by now. A master that would push
         # the build over the window is replaced by the unavailable item rather than truncated:
         # the build then knows to mount the file, instead of editing half of it.
+        #
+        # The thread's document metadata is read ONCE here, and only where there is an admission
+        # check to spend it on: it is what prices a native file part by its pages rather than by
+        # the length of its base64 blob (see _native_file_bounds).
+        doc_bounds = await _thread_document_bounds(processor, thread_key)
+
         def _fits(candidate: List[Dict[str, Any]]) -> Tuple[bool, Any]:
             est = channel_request.estimate_admission(
                 instructions=system_prompt or "", input_items=candidate, tools=tools,
                 raw_document_texts=[],
-                native_file_bounds=_native_file_bounds(candidate),
+                native_file_bounds=_native_file_bounds(candidate, doc_bounds),
                 model=model)
             return (est.total_tokens + _REVISION_ADMISSION_HEADROOM <= est.limit_tokens), est
         admitted, estimate = _fits(build_input)

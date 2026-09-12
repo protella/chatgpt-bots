@@ -277,6 +277,46 @@ class TestBuildPhase:
 
         assert build["notes"] == ""
 
+    async def test_the_build_can_edit_an_image_but_not_post_one(self, monkeypatch):
+        # A build with no way to MODIFY an image does the only thing left to it: live, a job
+        # asked to edit a thread image drew tinted polygons over the source in the sandbox and
+        # shipped what was, measurably, a copy. edit_image_asset is the route — same sources as
+        # edit_image, result into the container instead of into Slack.
+        processor = _processor()
+        processor.db.find_thread_images_async = AsyncMock(return_value=[
+            {"id": 7, "url": "https://files.slack.com/pizza.png", "image_type": "generated",
+             "prompt": "an enhanced prompt", "analysis": "A pizza on a wooden board",
+             "created_at": "2026-09-10T09:20:00"}])
+        captured = {}
+
+        async def fake_stream(_proc, **kw):
+            captured["tools"] = kw["tools"]
+            captured["ctx"] = kw["tool_context"]
+            return {"text": "", "tools_used": []}
+
+        monkeypatch.setattr(rt, "_consume_research_stream", fake_stream)
+
+        await rt._run_build_phase(
+            processor=processor, client=MagicMock(), channel_id="C1", thread_root="1.0",
+            thread_key="C1:1.0", job_id="j", task="t", findings="f",
+            deliverables=[{"type": "pdf", "description": "d", "filename": "d.pdf"}],
+            snapshot=[], thread_config={}, system_prompt=None, model="gpt-5.6-sol",
+            card=_card())
+
+        names = {t.get("name") for t in captured["tools"] if t.get("type") == "function"}
+        assert "edit_image_asset" in names
+        assert "create_image_asset" in names
+        assert "generate_image" not in names     # detached, posts straight to Slack
+        assert "edit_image" not in names         # posts straight to Slack
+
+        # The EXECUTOR resolves ids against the context, not against thread_config. Advertise
+        # an id in the schema and leave the context empty and every call comes back
+        # unknown_image_id — a tool that is offered and cannot work.
+        advertised = next(t["parameters"]["properties"]["source_image_ids"]["items"]["enum"]
+                          for t in captured["tools"] if t.get("name") == "edit_image_asset")
+        assert advertised == ["img_7"]
+        assert [e["image_id"] for e in captured["ctx"].image_catalog] == advertised
+
 
 def _transient_stream_error(message="An error occurred while processing your request."):
     """The live failure (job 5e58a49b615f): a Responses SSE stream that died 281s into a build
@@ -658,3 +698,96 @@ class TestResearchInstruction:
         assert "attached" in text.lower()  # never claim a file was attached
         # Describing the deck instead of building it is THE failure mode.
         assert "describ" in text.lower()
+
+
+# --------------------------------------------------------- native-file admission pricing
+#
+# The live failure (job 25cc4feb4bfc): a 2,287-token thread holding a 24-page PDF converted
+# from a 76MB pptx. The PDF's base64 blob was charged one token per CHARACTER, the build was
+# estimated at 2.27M tokens against a 919,800 limit, and the 2,867-character revision master
+# the job had been asked to edit was dropped for want of room nothing was occupying. The
+# request then succeeded — which is the proof the number was fiction.
+
+_MASTER_NAME = "report.docx"
+
+
+def _doc_row(filename, *, size_bytes=None, total_pages=None):
+    return {"id": 1, "created_at": "2026-09-10T20:50:00", "filename": filename,
+            "mime_type": "application/pdf" if filename.endswith(".pdf") else
+                         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "file_id": f"F_{filename}", "url_private": f"https://files.slack.com/{filename}",
+            "size_bytes": size_bytes, "total_pages": total_pages}
+
+
+def _native_pdf_snapshot(filename="deck.pdf", b64_chars=2_200_000):
+    """A turn carrying a native PDF part, as the dispatch path assembles one."""
+    return [{"role": "user", "content": [
+        {"type": "input_text", "text": "revise the report"},
+        {"type": "input_file", "filename": filename, "file_data": "B" * b64_chars}]}]
+
+
+async def _run_revision_build(monkeypatch, *, doc_rows, snapshot, master_text="THE OLD BODY"):
+    """Drive the real build phase on a REVISION, capturing what the model would receive."""
+    processor = _processor()
+    processor.db.get_thread_documents_async = AsyncMock(return_value=doc_rows)
+    captured = {}
+
+    async def fake_load(_client, _row, **_kw):
+        return {"content": master_text, "cached": False}
+
+    async def fake_stream(_proc, **kw):
+        captured["messages"] = kw["messages"]
+        return {"text": "built", "tools_used": []}
+
+    monkeypatch.setattr(rt.document_tools, "load_document_text", fake_load)
+    monkeypatch.setattr(rt, "_consume_research_stream", fake_stream)
+
+    await rt._run_build_phase(
+        processor=processor, client=MagicMock(), channel_id="C1", thread_root="1.0",
+        thread_key="C1:1.0", job_id="j", task="revise the totals", findings="f",
+        deliverables=[{"type": "document", "description": "the doc",
+                       "filename": _MASTER_NAME}],
+        snapshot=snapshot, thread_config={}, system_prompt="SYS", model="gpt-5.6-sol",
+        card=_card(), revises=[_MASTER_NAME])
+    captured["warnings"] = [c.args[0] for c in processor.log_warning.call_args_list]
+    return captured
+
+
+@pytest.mark.unit
+class TestNativeFileAdmission:
+    async def test_a_paged_native_file_is_priced_by_its_pages_not_its_base64_length(
+            self, monkeypatch):
+        captured = await _run_revision_build(
+            monkeypatch,
+            doc_rows=[_doc_row(_MASTER_NAME),
+                      _doc_row("deck.pdf", size_bytes=76_000_000, total_pages=24)],
+            snapshot=_native_pdf_snapshot())
+
+        joined = "\n".join(str(m.get("content")) for m in captured["messages"])
+        assert "THE OLD BODY" in joined          # the master the job was asked to edit
+        assert not any("does not fit" in w for w in captured["warnings"])
+
+    def test_an_unmatched_part_still_prices_at_its_base64_length(self):
+        # No plumbing carries metadata for a part the documents table has never heard of, so
+        # the blob's length stays the bound there — today's behaviour, no new failure mode.
+        items = _native_pdf_snapshot(b64_chars=4096)
+        assert rt._native_file_bounds(items, {}) == [4096]
+        assert rt._native_file_bounds(items, {"other.pdf": (1, 1)}) == [4096]
+        # Matched but with no page count (a CSV/XLSX) is the byte count, which is that same
+        # behaviour and the right bound for a file the API reads as text.
+        assert rt._native_file_bounds(items, {"deck.pdf": (900, None)}) == [900]
+
+    async def test_a_genuinely_oversized_master_still_drops_out(self, monkeypatch):
+        # The gate is CORRECTED, not disabled. Priced honestly, a 320-page PDF plus a 140k-char
+        # master really does not fit — and the master is the part that gives way.
+        captured = await _run_revision_build(
+            monkeypatch,
+            doc_rows=[_doc_row(_MASTER_NAME),
+                      _doc_row("deck.pdf", size_bytes=76_000_000, total_pages=320)],
+            snapshot=_native_pdf_snapshot(b64_chars=1000),
+            master_text="X" * 140_000)
+
+        joined = "\n".join(str(m.get("content")) for m in captured["messages"])
+        assert "X" * 140_000 not in joined
+        assert "could not be loaded for this revision (too large to inline)" in joined
+        assert any("does not fit" in w for w in captured["warnings"])

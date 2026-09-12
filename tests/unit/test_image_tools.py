@@ -1074,6 +1074,94 @@ async def test_create_asset_reservation_is_released_on_generation_failure():
     assert ctx.sandbox_image_assets == []          # slot released
 
 
+# ====================================================================== edit_image_asset
+#
+# The build phase's edit route: edit_image's source resolution, create_image_asset's output.
+# It exists because a build with no way to MODIFY an image does the only thing left to it —
+# live, a job asked to edit a thread image opened the source with PIL and drew tinted polygons
+# over it, and delivered a file 0.8% of whose pixels differed from the input at all.
+
+
+def test_edit_image_asset_appears_only_with_a_catalog():
+    assert it.get_edit_image_asset_schema(_cfg()) is None
+    schema = it.get_edit_image_asset_schema(_cfg(**{it.CATALOG_KEY: CATALOG}))
+    assert schema["name"] == "edit_image_asset"
+    assert schema["parameters"]["properties"]["source_image_ids"]["items"]["enum"] == [
+        "img_7", "img_3"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.critical
+async def test_edit_asset_with_an_unresolvable_id_touches_nothing():
+    # The same rule as edit_image: a syntactically valid id is not authorization, and there is
+    # no "did you mean the most recent one" fallback.
+    oc = _openai()
+    client = _FakeClient()
+    ctx = _ctx(_FakeProcessor(openai_client=oc), client, container_id="cntr_abc123",
+               catalog=CATALOG)
+
+    res = await it.execute_edit_image_asset(
+        ctx, {"source_image_ids": ["img_999"], "prompt": "make it blue",
+              "filename": "edited.png"})
+
+    assert res == {"ok": False, "error": "unknown_image_id",
+                   "message": "No image 'img_999' in this thread.",
+                   "valid_image_ids": ["img_7", "img_3"]}
+    oc.edit_image.assert_not_awaited()                  # no spend
+    client.download_file.assert_not_awaited()           # not even a source fetch
+    oc.client.containers.files.create.assert_not_awaited()
+    assert ctx.sandbox_image_assets == []               # no slot reserved
+
+
+@pytest.mark.asyncio
+@pytest.mark.critical
+async def test_edit_asset_mounts_the_edited_bytes_and_posts_nothing():
+    oc = _openai(create_path="/mnt/data/edited.png")
+    proc = _FakeProcessor(openai_client=oc)
+    client = _FakeClient()
+    ctx = _ctx(proc, client, container_id="cntr_abc123", catalog=CATALOG)
+
+    res = await it.execute_edit_image_asset(
+        ctx, {"source_image_ids": ["img_3"], "prompt": "make the bars green",
+              "filename": "edited.png"})
+
+    assert res["ok"] is True and res["path"] == "/mnt/data/edited.png"
+    assert res["sources"] == ["img_3"]
+    assert "NOT been posted" in res["message"]
+
+    # An image MODEL did the edit — not code, and not a fresh generation from a prompt.
+    oc.edit_image.assert_awaited_once()
+    oc.generate_image.assert_not_awaited()
+    assert oc.edit_image.await_args.kwargs["input_images"] == [
+        base64.b64encode(_SOURCE_PNG).decode()]
+
+    # The bytes went INTO the container the build is running code in.
+    create = oc.client.containers.files.create
+    assert create.await_args.kwargs["container_id"] == "cntr_abc123"
+    assert create.await_args.kwargs["file"].name == "edited.png"
+
+    # The reservation is FILLED, so a build that publishes nothing can still rescue the image.
+    assert [a["path"] for a in ctx.sandbox_image_assets] == ["/mnt/data/edited.png"]
+    assert ctx.sandbox_image_assets[0]["image_data"] is not None
+
+    # An INGREDIENT is not a deliverable: nothing reaches Slack from this tool.
+    client.send_image.assert_not_awaited()
+    client.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_edit_asset_reports_a_failed_mount_and_leaves_no_orphan_slot():
+    oc = _openai(create_error=Exception("container is gone"))
+    ctx = _ctx(_FakeProcessor(openai_client=oc), container_id="cntr_dead", catalog=CATALOG)
+
+    res = await it.execute_edit_image_asset(
+        ctx, {"source_image_ids": ["img_7"], "prompt": "make it blue",
+              "filename": "edited.png"})
+
+    assert res["ok"] is False and res["error"] == "mount_failed"
+    assert ctx.sandbox_image_assets == []     # nothing to rescue: there is no file
+
+
 # ============================================================ F8: ENABLE_IMAGE_TOOLS rollback switch
 
 

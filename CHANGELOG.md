@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.2.5] - 2026-09-12
+
+### 🐛 Fixed
+
+- **A background job can edit an image again.** A job asked to change a picture and put it in a
+  document had no image-editing tool at all, so it did the only thing available to it: it opened
+  the picture in the code sandbox and painted over it. What came back was indistinguishable from
+  the original — in the case that found this, 0.8% of pixels differed at all. Jobs now have an
+  edit tool whose result lands in the sandbox as an ingredient, so the image model does the edit
+  and the job builds the deliverable around it. Nothing is posted to the thread on its own; the
+  file you asked for still decides what you see.
+- **A revision keeps the file it is revising when the conversation holds a large PDF.** The
+  check that decides whether a document fits alongside the request was charging a PDF for every
+  byte of its container — compressed images, fonts and all — instead of for what the model
+  actually reads. A six-megabyte attachment scored millions of tokens, so the file under revision
+  was dropped for want of room nothing was occupying, and the job rebuilt the document from
+  scratch instead of editing it. Attachments are now priced by their pages, the same way the
+  rest of the bot prices them.
+
 ## [3.2.4] - 2026-09-09
 
 ### ✨ Added

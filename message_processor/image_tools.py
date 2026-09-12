@@ -256,6 +256,62 @@ def get_edit_image_schema(thread_config: Dict[str, Any]) -> Optional[Dict[str, A
     }
 
 
+def get_edit_image_asset_schema(thread_config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """``edit_image``'s source resolution with ``create_image_asset``'s output: the BUILD
+    phase's route to changing an existing image.
+
+    Built from THIS TURN's catalog exactly as ``get_edit_image_schema`` is — the ids are a
+    literal enum, and no catalog means no tool, because there is nothing to edit.
+    """
+    entries = (thread_config or {}).get(CATALOG_KEY) or []
+    ids = image_catalog.valid_ids(entries)
+    if not ids:
+        return None
+    return {
+        "type": "function",
+        "name": "edit_image_asset",
+        "description": (
+            "Edit, restyle, or combine image(s) already in this thread and place the RESULT in "
+            "the code sandbox at /mnt/data so code_interpreter can USE it. Give the id(s) of "
+            "the image(s) to work from; pass several ids to combine them into one image.\n\n"
+            "The result is NOT posted to Slack. It reaches the user through whatever you build "
+            "with it (a .pptx, a .docx, a composite .png).\n\n"
+            "This is the ONLY way to change an existing image. Never reproduce an edit with "
+            "code — drawing, masking or tinting a source image in the sandbox is not an edit "
+            "and gives back something indistinguishable from the original.\n\n"
+            "This BLOCKS until the image exists, which takes a while. Call it BEFORE the "
+            "code_interpreter call that consumes it and WAIT for the path it returns — tool "
+            "calls made in the same round cannot see each other's results.\n\n"
+            "Images available in this thread:\n"
+            f"{image_catalog.catalog_lines(entries)}"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "source_image_ids": {
+                    "type": "array",
+                    "description": "The image(s) to edit, by id, from the list above.",
+                    "items": {"type": "string", "enum": ids},
+                    "minItems": 1,
+                    "maxItems": 8,
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "The change to make, in the user's terms.",
+                },
+                "filename": {
+                    "type": "string",
+                    "description": ("Filename to save the edited image under in /mnt/data, "
+                                    "e.g. 'cover_edited.png'. Use something your code can "
+                                    "refer to."),
+                },
+            },
+            "required": ["source_image_ids", "prompt", "filename"],
+            "additionalProperties": False,
+        },
+    }
+
+
 # --- static channel-surface schemas ------------------------------------------------------
 #
 # The channel surface trades per-turn precision for a prefix the cache can keep: these carry no
@@ -1099,6 +1155,231 @@ async def _download_edit_source(client, url: str) -> Tuple[Optional[str], Option
             f"Edit source too large after conversion ({url}): {len(api_bytes)} bytes")
         return None, TOO_LARGE_AFTER_CONVERSION
     return base64.b64encode(api_bytes).decode("utf-8"), verdict
+
+
+# --- edit_image_asset (synchronous, into the sandbox) ------------------------------------
+
+async def execute_edit_image_asset(ctx, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Edit thread images by catalog id and push the result into the container.
+
+    ``execute_edit_image``'s source resolution — same catalog, same "a syntactically valid id
+    is not authorization" rule, no "most recent" fallback — bolted onto
+    ``execute_create_image_asset``'s output path. Nothing is posted and no progress checklist
+    is shown: a build phase produces INGREDIENTS, and the publisher decides what the user sees.
+
+    It exists because a build with no way to MODIFY an image does the only thing left to it.
+    Live: asked to edit a picture from the thread, a build job opened the source with PIL and
+    drew tinted polygons over it, and delivered a file 0.8% of whose pixels differed from the
+    input at all. An image edit is the image model's job, the same way a chart is the
+    sandbox's.
+    """
+    ids = args.get("source_image_ids") or []
+    prompt = (args.get("prompt") or "").strip()
+    if not isinstance(ids, list) or not ids:
+        return _err("bad_arguments", "At least one source_image_id is required.")
+    if not prompt:
+        return _err("bad_arguments", "A prompt describing the edit is required.")
+
+    processor = getattr(ctx, "processor", None)
+    client = getattr(ctx, "client", None)
+    if processor is None or client is None:
+        return _err("unavailable", "Image editing is not available in this context.")
+
+    entries = ctx.image_catalog or []
+    resolved = []
+    for image_id in ids[:8]:
+        entry = image_catalog.resolve(entries, str(image_id))
+        if entry is None:
+            return _err("unknown_image_id",
+                        f"No image {image_id!r} in this thread.",
+                        valid_image_ids=image_catalog.valid_ids(entries))
+        resolved.append(entry)
+
+    # W3: mint the container if this turn started on `auto`, so the bytes land somewhere the
+    # model's code can open them.
+    container_id = await ctx.ensure_sandbox()
+    if not container_id:
+        return _err(
+            "sandbox_unavailable",
+            "There is no code sandbox for this thread right now, so an edited image cannot be "
+            "placed in it.")
+
+    # F15: the id above may point at a corpse — a persistent container can idle-expire between
+    # rounds. Mounting into it is a dead drop the model cannot read back.
+    if ctx.container_recycled():
+        return _err(
+            "container_recycled",
+            "The code sandbox was recycled mid-turn, so an edited image can't be placed in it.")
+
+    # Reserved SYNCHRONOUSLY, before any await, for create_image_asset's reason: dispatch_all
+    # runs a round's calls concurrently, so two siblings would otherwise read the same sub-cap
+    # length and both append past _MAX_ASSETS_PER_TURN. image_data=None until the mount lands.
+    if ctx.sandbox_image_assets is None:
+        ctx.sandbox_image_assets = []
+    assets = ctx.sandbox_image_assets
+    if len(assets) >= _MAX_ASSETS_PER_TURN:
+        return _err("at_capacity",
+                    f"Already created {len(assets)} sandbox images this turn (limit "
+                    f"{_MAX_ASSETS_PER_TURN}). Work with the ones you have.")
+    reservation: Dict[str, Any] = {"_reservation_id": uuid4().hex, "image_data": None}
+    assets.append(reservation)
+
+    thread_key = _thread_key(ctx)
+    # No aspect: an edit keeps its source's shape, so there is nothing for the model to choose.
+    settings, _ = _effective_config(ctx.thread_config)
+    filename = _safe_filename(args.get("filename") or "image", settings["format"])
+
+    # T2-28: the `finally` releases the slot on EVERY non-success exit, a CancelledError
+    # included — the `except Exception` guards below cannot catch that one.
+    committed = False
+    # Set when the leased mount body takes the reservation over; after that it fills or releases
+    # it and this function's `finally` must keep its hands off.
+    effect_owns_reservation = False
+    try:
+        # F38: every id resolved and the slot is reserved — downloads and an image-model edit
+        # are about to run. Best-effort: losing the 👀 must never fail a reserved edit.
+        turn = getattr(ctx, "turn", None)
+        if turn is not None:
+            try:
+                await turn.claim_work(client, getattr(ctx, "message", None))
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"claim_work failed: {e}")
+
+        if _revoked(turn):
+            return _err("turn_cancelled", _REVOKED_MESSAGE)
+
+        # Download the sources from Slack, in memory. Each is validated/transcoded to a format
+        # the edit endpoint accepts and its ACTUAL mimetype is propagated, so the upload part is
+        # never a blanket .png over bytes that are not one.
+        b64_images: List[str] = []
+        input_mimetypes: List[str] = []
+        for entry in resolved:
+            b64, meta = await _download_edit_source(client, entry["url"])
+            if b64 is None:
+                if meta is None:
+                    return _err("source_unavailable",
+                                f"Could not fetch {entry['image_id']} from Slack.")
+                return _err("unreadable_source",
+                            f"The source image ({entry['image_id']}) {rejection_text(meta)}")
+            b64_images.append(b64)
+            input_mimetypes.append(cast(str, meta))  # bytes present ⇒ mimetype present
+
+        # The catalog already carries the stored analysis, so the edit-prompt enhancer needs no
+        # extra vision round-trip to know what it is editing.
+        description = next((e.get("analysis") for e in resolved if e.get("analysis")), None)
+
+        try:
+            async with _semaphore():
+                # RECHECKED INSIDE the semaphore: waiting for it is an unbounded await, and a
+                # job that gave up while queued must not have paid for an edit.
+                if _revoked(turn):
+                    return _err("turn_cancelled", _REVOKED_MESSAGE)
+                # LAUNCH BOUNDARY: the image API request. The mount is downstream of it, so a
+                # duplicate dispatch of this call id must not pay for a second edit. No await
+                # between this and the request.
+                try:
+                    _mark_launched(ctx)
+                except LaunchNotRecorded as e:
+                    logger.error(f"edit_image_asset: launch not recorded for {thread_key}: {e}")
+                    return _err("launch_not_recorded", _LAUNCH_FAILED_MESSAGE)
+                image_data = await processor.openai_client.edit_image(
+                    input_images=b64_images,
+                    input_mimetypes=input_mimetypes,
+                    prompt=prompt,
+                    model=settings["model"],
+                    image_description=description,
+                    input_fidelity=settings["input_fidelity"],
+                    quality=settings["quality"],
+                    background=settings["background"],
+                    output_format=settings["format"],
+                    output_compression=settings["compression"],
+                    enhance_prompt=True,
+                    conversation_history=None,
+                )
+        except Exception as e:  # noqa: BLE001 — a tool must never raise into the loop
+            if _moderation_blocked(e):
+                return _err("moderation_blocked", _MODERATION_MESSAGE)
+            logger.error(f"edit_image_asset failed for {thread_key}: {e}", exc_info=True)
+            return _err("edit_failed", "The image could not be edited.")
+
+        def _release_reservation() -> None:
+            try:
+                assets.remove(reservation)
+            except ValueError:
+                pass
+
+        async def _mount_and_account():
+            """The mount AND the accounting for it, as one body — create_image_asset's rule:
+            mounted and reserved, or neither. A cancellation between the two leaves bytes in a
+            container the turn's own accounting denies."""
+            nonlocal committed
+            try:
+                mounted = await mount_image_in_container(
+                    processor.openai_client, container_id, filename, image_data)
+                if not mounted:
+                    _release_reservation()
+                    return None
+                # Filled IN PLACE, keeping its slot in the list (a fresh append could race a
+                # sibling's reservation ordering; mutating the placeholder cannot).
+                reservation.update({
+                    "path": mounted,
+                    "filename": filename,
+                    "prompt": prompt,
+                    "enhanced_prompt": getattr(image_data, "prompt", "") or prompt,
+                    "image_data": image_data,
+                })
+            except BaseException:
+                _release_reservation()
+                raise
+            committed = True
+            return mounted
+
+        effect_owns_reservation = True
+        try:
+            path = await _run_effect(turn, "edit_image_asset.mount", _mount_and_account)
+        except EffectRevoked:
+            effect_owns_reservation = False
+            return _err("turn_cancelled",
+                        "This turn was cut short, so the edited image was not placed in the "
+                        "sandbox.")
+        if not path:
+            return _err("mount_failed",
+                        "The image was edited but could not be placed in the sandbox.")
+    finally:
+        if not committed and not effect_owns_reservation:
+            try:
+                assets.remove(reservation)   # release on an error return OR a cancellation
+            except ValueError:
+                pass
+
+    logger.info(f"Mounted edited image at {path} in {container_id} for {thread_key} "
+                f"from {[e['image_id'] for e in resolved]}")
+    # Show it to the model too: it is about to BUILD with this asset, and it cannot judge from a
+    # path string whether the edit actually did what was asked.
+    from message_processor.image_view import stage_produced_image
+    # An explicit `intro`, because the default one says the picture is "now posted in the
+    # thread" — true for the tools that post, false here. This image is an INGREDIENT sitting in
+    # the sandbox, and a build model told delivery already happened can stop before it produces
+    # the deliverable that was actually asked for.
+    shown = stage_produced_image(
+        ctx, image_data, label="The edit you just made",
+        intro=("this is the edited image, and it exists ONLY in the sandbox at the path above. "
+               "It has NOT been posted to the user and nothing will post it: build it into the "
+               "deliverable that was asked for, or nobody ever sees it. Check it actually "
+               "matches what was asked first."))
+
+    return {
+        "ok": True,
+        "path": path,
+        "format": settings["format"],
+        "sources": [e["image_id"] for e in resolved],
+        "message": ("The edited image is now at this path inside the sandbox. Open it from "
+                    "there in your next code_interpreter call. It has NOT been posted to the "
+                    "user."
+                    + (" It is also attached below so you can see what you got — if the edit "
+                       "did not do what was asked, fix it before building it into anything."
+                       if shown else "")),
+    }
 
 
 # --- registration ------------------------------------------------------------------------
