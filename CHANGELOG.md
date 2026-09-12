@@ -22,6 +22,10 @@ All notable changes to this project will be documented in this file.
   was dropped for want of room nothing was occupying, and the job rebuilt the document from
   scratch instead of editing it. Attachments are now priced by their pages, the same way the
   rest of the bot prices them.
+- **A job no longer thinks an image it made has already been delivered.** When a job generated or
+  edited a picture for a document, the note attached to it said the picture was "now posted in the
+  thread". It was not — it was sitting in the sandbox waiting to be built into the file that was
+  asked for, and a job that believes delivery already happened can stop before producing it.
 
 ## [3.2.4] - 2026-09-09
 

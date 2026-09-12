@@ -880,7 +880,16 @@ async def execute_create_image_asset(ctx, args: Dict[str, Any]) -> Dict[str, Any
     # Show it to the model too: it is about to USE this asset (place it in a deck, composite it),
     # and it cannot judge whether the generation actually came out right from a path string.
     from message_processor.image_view import stage_produced_image
-    shown = stage_produced_image(ctx, image_data, label="The asset you just generated")
+    # An explicit `intro`, for edit_image_asset's reason: the default one says the picture is
+    # "now posted in the thread", which is true only for the tools that post. This one is an
+    # INGREDIENT in the sandbox, and a model told delivery already happened can stop before it
+    # produces the deliverable that was actually asked for.
+    shown = stage_produced_image(
+        ctx, image_data, label="The asset you just generated",
+        intro=("this is the image you just made, and it exists ONLY in the sandbox at the path "
+               "above. It has NOT been posted to the user and nothing will post it: build it "
+               "into the deliverable that was asked for, or nobody ever sees it. Check it "
+               "actually came out as intended first."))
 
     result = {
         "ok": True,
