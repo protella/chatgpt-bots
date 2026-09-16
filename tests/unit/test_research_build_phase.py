@@ -10,13 +10,19 @@ sink and its own delivery path". This is that sink. The properties worth defendi
 * files publish AFTER the report, so the thread reads card → report → deck;
 * the card's terminal state reflects what SHIPPED, never what the model claimed.
 """
+import hashlib
+import io
 import itertools
+import zipfile
 from unittest.mock import AsyncMock, MagicMock
 
 import openai
 import pytest
 
+from message_processor import artifacts as artifacts_mod
+from message_processor import containers as containers_mod
 from message_processor import research_tools as rt
+from message_processor.artifacts import StagedArtifact
 from slack_client.messaging import CardWriteResult
 
 
@@ -791,3 +797,384 @@ class TestNativeFileAdmission:
         assert "X" * 140_000 not in joined
         assert "could not be loaded for this revision (too large to inline)" in joined
         assert any("does not fit" in w for w in captured["warnings"])
+
+
+# ------------------------------------------------- a sandbox that can no longer run code
+#
+# Live 2026-09-14 (jobs d8b2126e527f and bc9fce24794d): an OOM killed the sandbox kernel, the
+# container went on reporting `running`, and the retry loop burned the remaining attempts against
+# the corpse in seconds — then one of the jobs published a stale intermediate. Files survive a
+# dead kernel, so they are banked out before the sandbox is abandoned.
+
+_WEDGED_MESSAGE = "There was an issue with your request. Please check your inputs and try again"
+
+
+def _wedged_stream_error():
+    """The measured shape: a status-less APIError carrying the API's generic body."""
+    return openai.APIError(_WEDGED_MESSAGE, request=None,
+                           body={"type": "invalid_request_error", "code": None,
+                                 "message": _WEDGED_MESSAGE, "param": None})
+
+
+def _staged(filename, *, idx=1, tag="new"):
+    """A StagedArtifact as stage_artifacts issues them — every pass numbers from art_1."""
+    return StagedArtifact(artifact_id=f"art_{idx}", filename=filename,
+                          ext=filename.rsplit(".", 1)[-1], size_bytes=10,
+                          candidate={"filename": filename, "generation": tag})
+
+
+class _Staging:
+    """Answers stage_artifacts calls in order and records what each one was asked for."""
+
+    def __init__(self, *responses, order=None):
+        self.calls = []
+        self._responses = list(responses)
+        self._order = order
+
+    async def __call__(self, **kw):
+        self.calls.append(kw)
+        if self._order is not None:
+            self._order.append("stage")
+        reply = self._responses.pop(0) if self._responses else {}
+        for name in reply.get("suppressed", ()):
+            kw["suppressed_inputs_out"].append(name)
+        for pair in reply.get("embedded", ()):
+            kw["embedded_out"].append(pair)
+        # Everything the generation PRODUCED, as the real one fills it: pre-selection, so the
+        # accepted files plus everything a selection rule held back.
+        produced = list(reply.get("produced", ())) or [
+            *reply.get("files", ()), *reply.get("suppressed", ()),
+            *(n for n, _o in reply.get("embedded", ()))]
+        for name in produced:
+            if name not in kw["produced_out"]:
+                kw["produced_out"].append(name)
+        return [_staged(n, idx=i, tag=reply.get("tag", "new"))
+                for i, n in enumerate(reply.get("files", ()), start=1)]
+
+
+def _wedge_harness(monkeypatch, *, retries=2, replacement="cntr_new", responses=(), order=None):
+    """The two collaborators a replacement needs: staging, and the container swap itself."""
+    monkeypatch.setattr(rt.config, "deep_research_build_retries", retries)
+    staging = _Staging(*responses, order=order)
+    monkeypatch.setattr(artifacts_mod, "stage_artifacts", staging)
+
+    async def _replace(_manager, _ledger_key, _old_id):
+        if order is not None:
+            order.append("replace")
+        return replacement
+
+    replace = AsyncMock(side_effect=_replace)
+    monkeypatch.setattr(containers_mod, "replace_wedged_container", replace)
+    return staging, replace
+
+
+def _ci_container(tools):
+    return next(t["container"] for t in tools if t.get("type") == "code_interpreter")
+
+
+def _resume_content(messages):
+    """The ONE resume item an attempt carried, or None. Both variants open the same way."""
+    found = [str(m.get("content")) for m in messages
+             if str(m.get("content")).startswith("[Your previous stream")]
+    assert len(found) <= 1
+    return found[0] if found else None
+
+
+def _wedge_then_ok(seen):
+    """A stream that dies wedged on its first attempt and succeeds on the next."""
+    async def stream(_proc, **kw):
+        ctx = kw["tool_context"]
+        seen.append({"tools": [dict(t) for t in kw["tools"]], "messages": kw["messages"],
+                     "assets": list(ctx.sandbox_image_assets or []), "ctx": ctx})
+        kw["artifacts_sink"].append({"container_id": ctx.container_id})
+        if len(seen) == 1:
+            # What a dead attempt leaves behind: ingredients that only existed in that sandbox.
+            ctx.sandbox_image_assets.append({"filename": "spent.png", "asset_id": "a1"})
+            raise _wedged_stream_error()
+        return {"text": "deck built", "tools_used": []}
+    return stream
+
+
+@pytest.mark.unit
+class TestWedgedSandboxReplacement:
+    async def test_the_abandoned_sandbox_is_banked_then_replaced_everywhere(self, monkeypatch):
+        processor = _processor()
+        card = _card()
+        order = []
+        staging, replace = _wedge_harness(
+            monkeypatch, order=order,
+            responses=[{"files": ["chart.png"], "tag": "old"}])
+        seen = []
+        monkeypatch.setattr(rt, "_consume_research_stream", _wedge_then_ok(seen))
+
+        build = await _build(processor, card)
+
+        # Banked BEFORE the swap: the old container's files die with it, and a build has no
+        # clock that guarantees final staging reaches it before its idle cap.
+        assert order == ["stage", "replace"]
+        assert staging.calls[0]["container_ids"] == ["cntr_job1"]
+        assert staging.calls[0]["ledger_key"] == "C1:1.0#job:j"
+        assert staging.calls[0]["expect_filenames"] == ["d.pdf"]
+        replace.assert_awaited_once_with(processor.container_manager, "C1:1.0#job:j", "cntr_job1")
+        # Every name for the old id now says the replacement.
+        assert len(seen) == 2 and build["notes"] == "deck built"
+        assert _ci_container(seen[0]["tools"]) == "cntr_job1"
+        assert _ci_container(seen[1]["tools"]) == "cntr_new"
+        assert seen[1]["ctx"].container_id == "cntr_new"
+        # Spent ingredients cleared — left behind, the image tools refuse to remake them.
+        assert seen[1]["assets"] == [] and seen[1]["ctx"].sandbox_image_assets == []
+        assert build["banked_container_ids"] == ["cntr_job1"]
+        # Resumed honestly: the note says the sandbox is empty, and names the banked file so the
+        # model neither rebuilds it nor assumes the rest survived.
+        note = _resume_content(seen[1]["messages"])
+        assert "REPLACED" in note and rt._BUILD_RESUME_NOTE not in note
+        assert "chart.png" in note
+
+    async def test_a_second_wedge_is_terminal(self, monkeypatch):
+        # Not a second dead sandbox — a request the API keeps refusing.
+        processor = _processor()
+        _, replace = _wedge_harness(monkeypatch)
+        calls = []
+
+        async def always_wedged(_proc, **kw):
+            calls.append(kw["messages"])
+            kw["artifacts_sink"].append({"container_id": kw["tool_context"].container_id})
+            raise _wedged_stream_error()
+
+        monkeypatch.setattr(rt, "_consume_research_stream", always_wedged)
+
+        build = await _build(processor, _card())
+
+        assert len(calls) == 2
+        replace.assert_awaited_once()
+        assert build is not None and build["notes"] == ""
+
+    async def test_a_failed_replacement_is_terminal_and_never_retries_the_old_sandbox(
+            self, monkeypatch):
+        processor = _processor()
+        staging, replace = _wedge_harness(
+            monkeypatch, replacement=None,
+            responses=[{"files": ["chart.png"], "tag": "old"}])
+        seen = []
+        monkeypatch.setattr(rt, "_consume_research_stream", _wedge_then_ok(seen))
+
+        build = await _build(processor, _card())
+
+        assert len(seen) == 1
+        replace.assert_awaited_once()
+        # Banked anyway: those files are in hand, so the abandoned container must not be read
+        # again — and what it held still reaches the publisher.
+        assert build["banked_container_ids"] == ["cntr_job1"]
+        assert [s.filename for s in build["banked_staged"]] == ["chart.png"]
+
+# ---------------------------------------------- the merge against REAL selection
+#
+# Substituting staging proves the control flow and nothing about the merge: a fake hands back
+# names that are already selected, while the real pass drops a document's ingredients, superseded
+# drafts and duplicate content and records those names NOWHERE. So these run the real
+# gather + select, with only the container listing and the downloads faked.
+
+_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+_PDF = b"%PDF-1.7\n" + b"x" * 32
+_PPTX_MAIN = ("application/vnd.openxmlformats-officedocument."
+              "presentationml.presentation.main+xml")
+
+
+def _pptx(members=()):
+    """A structurally valid .pptx — the zip entries are what make an embedded member findable."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("[Content_Types].xml",
+                    '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/'
+                    'package/2006/content-types"><Override PartName="/ppt/presentation.xml" '
+                    f'ContentType="{_PPTX_MAIN}"/></Types>')
+        zf.writestr("ppt/presentation.xml", "<presentation/>")
+        for name, data in members:
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+
+class _Pager:
+    """containers.files.list() returns an async-iterable paginator, not a coroutine."""
+
+    def __init__(self, files):
+        self._files = files
+
+    def __aiter__(self):
+        async def gen():
+            for f in self._files:
+                yield f
+        return gen()
+
+
+class _Body:
+    """content.with_streaming_response.retrieve(...) is an async context manager read in chunks."""
+
+    def __init__(self, payload):
+        self._payload = payload
+        self.headers = {}
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+    async def iter_bytes(self):
+        yield self._payload
+
+
+def _openai_container(files):
+    """files: {file_id: (filename, bytes)} — one container's worth of assistant-written files."""
+    oc = MagicMock()
+    listed = [MagicMock(id=fid, source="assistant", path=f"/mnt/data/{name}", bytes=len(data))
+              for fid, (name, data) in files.items()]
+    oc.client.containers.files.list = MagicMock(return_value=_Pager(listed))
+    oc.client.containers.files.content.with_streaming_response.retrieve = MagicMock(
+        side_effect=lambda fid, container_id=None: _Body(files[fid][1]))
+    return oc
+
+
+@pytest.mark.unit
+class TestMergeAgainstRealSelection:
+    async def test_a_fresh_ingredient_keeps_the_stale_copy_out(self):
+        # The replacement built deck.pdf AND chart.png; real selection suppresses the chart as an
+        # ingredient of the document going out, recording the name nowhere. Reading only the
+        # accepted list, the merge published the BANKED chart.png beside the fresh deck.
+        processor = _processor()
+        processor.openai_client = _openai_container(
+            {"f1": ("chart.png", _PNG), "f2": ("deck.pdf", _PDF)})
+        build = {"ledger_key": "C1:1.0#job:j", "container_ids": ["cntr_new"],
+                 "suppress_digests": [], "expect_filenames": ["deck.pdf"],
+                 "banked_container_ids": ["cntr_job1"],
+                 "banked_staged": [_staged("chart.png", tag="old")],
+                 "banked_suppressed_inputs": [], "banked_embedded": [], "banked_produced": []}
+
+        staged = await rt._stage_build(processor, job_id="j", build=build)
+
+        assert [s.filename for s in staged] == ["deck.pdf"]
+
+    async def test_an_unchanged_document_does_not_discard_the_banked_member(self):
+        # The replacement only re-made the deck the user had already given us: real selection
+        # holds it back as an unchanged input AND records photo.png as embedded in it. Crediting
+        # that pair before checking whether the deck ships left an empty manifest and an empty
+        # embedded record — the banked photo dropped for a document that never went out.
+        processor = _processor()
+        deck = _pptx([("ppt/media/image1.png", _PNG)])
+        processor.openai_client = _openai_container(
+            {"f1": ("deck.pptx", deck), "f2": ("photo.png", _PNG)})
+        build = {"ledger_key": "C1:1.0#job:j", "container_ids": ["cntr_new"],
+                 # The deck is byte-identical to what we mounted in.
+                 "suppress_digests": [hashlib.sha256(deck).hexdigest()],
+                 "expect_filenames": ["deck.pptx"],
+                 "banked_container_ids": ["cntr_job1"],
+                 "banked_staged": [_staged("photo.png", tag="old")],
+                 "banked_suppressed_inputs": [], "banked_embedded": [], "banked_produced": []}
+
+        staged = await rt._stage_build(processor, job_id="j", build=build)
+
+        assert [(s.filename, s.candidate["generation"]) for s in staged] == [("photo.png", "old")]
+        # And no contradictory metadata: nothing claims the photo shipped inside a deck that did
+        # not ship, and nothing calls a delivered filename an unchanged input.
+        assert not build.get("embedded_ingredients")
+        assert build.get("suppressed_inputs") == ["deck.pptx"]
+
+    async def test_a_delivered_name_is_never_also_reported_as_an_unchanged_input(self):
+        # The abandoned pass held photo.png back as unchanged; the replacement transformed it and
+        # folded it into the deck that ships. Keeping both records had the delivery prompt call one
+        # filename byte-identical AND freshly built.
+        processor = _processor()
+        deck = _pptx([("ppt/media/image1.png", _PNG)])
+        processor.openai_client = _openai_container(
+            {"f1": ("deck.pptx", deck), "f2": ("photo.png", _PNG)})
+        build = {"ledger_key": "C1:1.0#job:j", "container_ids": ["cntr_new"],
+                 "suppress_digests": [], "expect_filenames": ["deck.pptx"],
+                 "banked_container_ids": ["cntr_job1"], "banked_staged": [],
+                 "banked_suppressed_inputs": ["photo.png"], "banked_embedded": [],
+                 "banked_produced": []}
+
+        staged = await rt._stage_build(processor, job_id="j", build=build)
+
+        assert [s.filename for s in staged] == ["deck.pptx"]
+        assert build["embedded_ingredients"] == [("photo.png", "deck.pptx")]
+        assert not build.get("suppressed_inputs")
+
+
+# ------------------------------------------------------- the wedge that raises nothing
+#
+# Measured 2026-09-15 against a deliberately wedged container: the `code_interpreter_call` finishes
+# with a terminal status and `outputs=[]`, and the response then completes with `error=null`. No
+# exception reaches the build at all, so a recovery hanging off the exception never fires and the
+# job keeps taking rounds in a sandbox that cannot run a line. The detector records the container
+# in the artifacts sink; the build reads it there.
+
+
+def _mark_wedged(sink, *ids):
+    """What the detector writes — mark_container_wedged's entry shape."""
+    from openai_client.container_errors import mark_container_wedged
+    mark_container_wedged(sink, list(ids))
+
+
+@pytest.mark.unit
+class TestSilentWedge:
+    async def test_a_marked_container_is_banked_and_replaced_with_no_exception(self,
+                                                                              monkeypatch):
+        processor = _processor()
+        card = _card()
+        order = []
+        staging, replace = _wedge_harness(
+            monkeypatch, order=order, responses=[{"files": ["chart.png"], "tag": "old"}])
+        seen = []
+
+        async def quietly_wedged(_proc, **kw):
+            ctx = kw["tool_context"]
+            seen.append({"tools": [dict(t) for t in kw["tools"]], "messages": kw["messages"],
+                         "ctx": ctx})
+            if len(seen) == 1:
+                ctx.sandbox_image_assets.append({"filename": "spent.png", "asset_id": "a1"})
+                # The whole point: it RETURNS. Cleanly, with the model's own account of a build
+                # that never happened.
+                _mark_wedged(kw["artifacts_sink"], ctx.container_id)
+                kw["container_gone_sink"].append(ctx.container_id)
+                return {"text": "the sandbox errored", "tools_used": []}
+            return {"text": "deck built", "tools_used": []}
+
+        monkeypatch.setattr(rt, "_consume_research_stream", quietly_wedged)
+
+        build = await _build(processor, card)
+
+        assert order == ["stage", "replace"]
+        assert len(seen) == 2
+        assert _ci_container(seen[1]["tools"]) == "cntr_new"
+        assert seen[1]["ctx"].container_id == "cntr_new"
+        assert seen[1]["ctx"].sandbox_image_assets == []
+        assert build["banked_container_ids"] == ["cntr_job1"]
+        # The narration of a build that never ran does not survive into delivery.
+        assert build["notes"] == "deck built"
+        note = _resume_content(seen[1]["messages"])
+        assert "REPLACED" in note and "chart.png" in note
+        # The gone-record for the abandoned sandbox is cleared, or the replacement would inherit
+        # the bridge tools' refusal and its own transport hiccups would go terminal.
+        assert seen[1]["ctx"].container_gone_sink == []
+
+    async def test_a_silent_wedge_then_an_exception_wedge_is_still_one_replacement(self,
+                                                                                  monkeypatch):
+        processor = _processor()
+        _, replace = _wedge_harness(monkeypatch)
+        seen = []
+
+        async def wedged_twice(_proc, **kw):
+            ctx = kw["tool_context"]
+            seen.append(kw["messages"])
+            if len(seen) == 1:
+                _mark_wedged(kw["artifacts_sink"], ctx.container_id)
+                return {"text": "the sandbox errored", "tools_used": []}
+            raise _wedged_stream_error()
+
+        monkeypatch.setattr(rt, "_consume_research_stream", wedged_twice)
+
+        build = await _build(processor, _card())
+
+        assert len(seen) == 2
+        replace.assert_awaited_once()
+        assert build is not None and build["notes"] == ""

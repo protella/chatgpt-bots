@@ -1088,6 +1088,7 @@ async def stage_artifacts(
     time_budget: Optional[float] = None,
     suppressed_inputs_out: Optional[List[str]] = None,
     embedded_out: Optional[List[Tuple[str, str]]] = None,
+    produced_out: Optional[List[str]] = None,
 ) -> List[StagedArtifact]:
     """Gather + select + hold in memory. Publishes NOTHING. Never raises.
 
@@ -1099,6 +1100,12 @@ async def stage_artifacts(
     inputs, and ``embedded_out`` with ``(filename, containing document)`` for the ones folded
     into a document that IS going out — so a caller whose next step is a MODEL can explain a
     short manifest instead of letting it read as a failed build (see ``_select_candidates``).
+
+    ``produced_out`` is filled with every gathered filename BEFORE selection ran. Selection drops
+    document ingredients, superseded drafts and duplicate content without recording those names
+    anywhere, so the accepted list cannot answer "did this generation make a file called X?" — and
+    a caller merging two generations has to know, or it republishes a stale copy of a name the
+    fresh pass really did produce.
     """
     lock = publication_lock(ledger_key)
     try:
@@ -1116,6 +1123,11 @@ async def stage_artifacts(
                 # missing from it is a file it cannot choose to publish.
                 logger.warning(f"Staging for {ledger_key} stopped at the download budget — "
                                f"{skipped} container file(s) never examined")
+            if produced_out is not None:
+                for candidate in candidates:
+                    name = candidate.get("filename")
+                    if name and name not in produced_out:
+                        produced_out.append(name)
             if not candidates:
                 return []
             accepted = _select_candidates(

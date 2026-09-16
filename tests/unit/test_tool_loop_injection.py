@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from openai_client.api import tool_loop
+from openai_client.container_errors import auto_container
 from message_processor.tool_registry import ToolContext, ToolRegistry
 
 
@@ -261,7 +262,7 @@ class TestFiresOncePerRound:
         assert gone_sink == [_DEAD]
         assert adoption_blocked(artifacts) is True
         # Round 1 died and retried, round 2 went out clean: three wire requests, two rounds.
-        assert stream.sent == [_DEAD, {"type": "auto"}, _RECOVERY]
+        assert stream.sent == [_DEAD, auto_container(), _RECOVERY]
         assert len(fired) == 2
 
         # Round 1's two attempts carried the identical input, with the note on it exactly once,

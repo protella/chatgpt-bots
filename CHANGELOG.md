@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.2.6] - 2026-09-16
+
+### 🐛 Fixed
+
+- **The code sandbox has room to work.** Every sandbox was running with one gigabyte of memory,
+  the provider's default, which was never set deliberately. A job loading a real spreadsheet or
+  rendering a large chart could push past that, and when it did the sandbox was killed
+  mid-calculation — from the outside it looked like the request simply stopped, with nothing
+  delivered and no explanation. Sandboxes now get sixteen gigabytes, comfortably above the worst
+  case measured while tracking this down.
+- **A dead sandbox no longer takes the whole job with it.** Once a sandbox was killed it kept
+  reporting itself as healthy while refusing to run anything, so every later step failed and the
+  answer came back empty — or the model narrated that something had gone wrong and stopped. The
+  bot now recognizes a sandbox that can no longer run code, moves the conversation onto a fresh
+  one, and for a background job saves the files already produced, swaps in a new sandbox and
+  carries on to finish the deliverable.
+
+### ✨ Added
+
+- **`CODE_INTERPRETER_MEMORY_LIMIT`** sets how much memory the code sandbox gets — `1g`, `4g`,
+  `16g` or `64g`, defaulting to `16g`.
+
 ## [3.2.5] - 2026-09-12
 
 ### 🐛 Fixed

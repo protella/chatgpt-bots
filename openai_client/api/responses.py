@@ -9,7 +9,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from config import config, clamp_effort
 from openai_client.container_errors import (demote_container_tools, is_container_gone,
-                                            mark_adoption_blocked, persistent_container_ids)
+                                            mark_adoption_blocked, mark_container_wedged,
+                                            persistent_container_ids)
 from message_processor.prompts import (MEMORY_EXTRACTION_SYSTEM_PROMPT, TOOL_RESULT_SUMMARIZE_PROMPT,
                                        WAKE_CLASSIFIER_SYSTEM_PROMPT)
 
@@ -705,7 +706,23 @@ def _capture_web_search(mcp_results_sink: Optional[List[Dict[str, Any]]], item: 
         pass
 
 
-def _note_container(artifacts_sink, item):
+def _response_finished_cleanly(response: Any) -> bool:
+    """Did this response run to the end, rather than being cut short?
+
+    Only the wedge check needs this. A response truncated by `max_output_tokens` or a content
+    filter can carry a `code_interpreter_call` that was still IN FLIGHT when the cut came, and its
+    non-terminal status says nothing about the container's health — marking it would drop the
+    thread's binding and cost the conversation its sandbox continuity for no reason, which is the
+    kind of loss that gets reported months later as "it forgot my file".
+
+    A response that does not state a status is read as finished, the same silence the rest of this
+    module trusts: the alternative is treating every healthy call as suspect.
+    """
+    status = getattr(response, "status", None)
+    return not (isinstance(status, str) and status and status.lower() != "completed")
+
+
+def _note_container(artifacts_sink, item, response_finished: bool = True):
     """F32: record the code-interpreter container so the caller can LIST the files it wrote.
 
     The container listing is the only artifact source. We deliberately do NOT harvest
@@ -713,6 +730,26 @@ def _note_container(artifacts_sink, item):
     `sandbox:` link (which we forbid — dead in Slack), the listing is a strict superset of
     them anyway, and a citation could name the USER'S OWN mounted attachment, which the
     listing's `source == "assistant"` filter would otherwise have excluded.
+
+    ALSO the third wedge channel, and the only one that catches the interactive shape. Measured
+    live 2026-09-15 against a container whose kernel had been OOM-killed out of band: the turn
+    raises NOTHING. The `code_interpreter_call` item arrives terminal with `status="interpreting"`
+    and `outputs=[]`, then `response.completed` with `error=null` — the model narrates "the
+    sandbox errored" and the id would be adopted again, leaving the thread bound to a sandbox that
+    cannot run code. A healthy call ends `status="completed"`, so a terminal status that is
+    anything else means the container could not run the code, and the id is marked: the guards
+    already built off the marker do the rest (no adoption, no pinning, the binding dropped).
+
+    Every caller is a TERMINAL point — `response.output_item.done`, or iterating `response.output`
+    on a finished response — which is what makes the status safe to read this way. A status the
+    item does not state is read as fine, the same silence `_hosted_status` trusts: guessing wedged
+    from a missing field would unbind every healthy container in the deployment.
+
+    `response_finished` is the one thing an item cannot tell us: the non-streaming callers pass
+    their response's own status through it, because a TRUNCATED response carries calls that never
+    got to finish and whose status is therefore not evidence about the container. The streaming
+    caller leaves it at the default — `response.output_item.done` is terminal for that item by
+    definition, and it is the shape the live evidence came from.
 
     Never raises: losing a container costs files, not the response.
     """
@@ -722,6 +759,10 @@ def _note_container(artifacts_sink, item):
         container_id = getattr(item, "container_id", None)
         if container_id:
             artifacts_sink.append({"container_id": container_id})
+            status = getattr(item, "status", None)
+            if (response_finished and isinstance(status, str) and status
+                    and status.lower() != "completed"):
+                mark_container_wedged(artifacts_sink, [container_id])
     except Exception:
         pass
 
@@ -963,7 +1004,10 @@ async def create_text_response_with_tools(
                     # annotations are a bonus when the model happens to cite.
                     if "code_interpreter" not in tools_actually_used:
                         tools_actually_used.append("code_interpreter")
-                    _note_container(artifacts_sink, item)
+                    # The response's own status rides along: a truncated response's in-flight
+                    # call must not be read as a wedged container.
+                    _note_container(artifacts_sink, item,
+                                    response_finished=_response_finished_cleanly(response))
                 elif item_type == "function_call" and function_call_sink is not None:
                     # Local function call — collected for the tool loop, not part of the text
                     function_call_sink.append({
@@ -2613,7 +2657,10 @@ async def _create_text_response_with_tools_with_timeout(
                     # annotations are a bonus when the model happens to cite.
                     if "code_interpreter" not in tools_actually_used:
                         tools_actually_used.append("code_interpreter")
-                    _note_container(artifacts_sink, item)
+                    # The response's own status rides along: a truncated response's in-flight
+                    # call must not be read as a wedged container.
+                    _note_container(artifacts_sink, item,
+                                    response_finished=_response_finished_cleanly(response))
                 elif item_type == "function_call" and function_call_sink is not None:
                     # Local function call — collected for the tool loop, not part of the text
                     function_call_sink.append({

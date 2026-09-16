@@ -32,7 +32,7 @@ from PIL import Image
 
 from config import config
 from message_processor import image_delivery, image_service as svc, image_tools as it
-from openai_client.container_errors import AUTO_CONTAINER
+from openai_client.container_errors import auto_container
 from openai_client.utilities import ImageData
 from message_processor.thread_manager import AsyncThreadStateManager
 from message_processor.tool_registry import ToolContext, ToolRegistry
@@ -406,7 +406,7 @@ def test_create_image_asset_does_not_need_an_addressable_container():
     # ToolContext.ensure_sandbox and gets a container made for it.
     assert "create_image_asset" in _registry_names(_cfg())
     assert "create_image_asset" in _registry_names(
-        _cfg(**{it.CI_CONTAINER_KEY: AUTO_CONTAINER}))
+        _cfg(**{it.CI_CONTAINER_KEY: auto_container()}))
     assert "create_image_asset" in _registry_names(_cfg(**{it.CI_CONTAINER_KEY: "cntr_abc123"}))
 
 

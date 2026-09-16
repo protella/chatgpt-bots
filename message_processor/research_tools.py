@@ -45,7 +45,7 @@ import re
 import time
 import unicodedata
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple, cast
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Set, Tuple, cast
 from uuid import uuid4
 
 import openai
@@ -271,6 +271,49 @@ _BUILD_RESUME_NOTE = (
 # silently reinstates whatever the user asked to have dropped.
 _BUILD_RESUME_STEERING = (
     "\n\nMid-run updates you already received and must still honor:\n{notes}"
+)
+# The same moment, but the sandbox itself had to be REPLACED (a container whose kernel died stays
+# alive and keeps reporting `running`, and every later exec in it fails the same generic way).
+# Everything the note above promises — same container, nothing lost — is false then, so this is a
+# separate text rather than a qualifier on that one. It never states WHY the sandbox stopped
+# running code: the detection is a suspicion, not a diagnosis, and the API's message is generic.
+_BUILD_RESUME_REPLACED_NOTE = (
+    "[Your previous stream ended, and the sandbox it was running in stopped being able to run "
+    "code at all. It has been REPLACED with a clean, empty one. Nothing from the old sandbox is "
+    "in the new one — not the files you mounted, not the files you wrote, not the images you "
+    "staged, not your scripts — so re-mount or rebuild whatever you still need.\n\n"
+    "{banked}\n\n"
+    "A sandbox that stops responding this way is usually one that was asked to hold too much at "
+    "once, so work in smaller pieces from here: read images at reduced size, handle one file at a "
+    "time, and write each result out before starting the next rather than loading everything "
+    "together. Keep the todo card true with update_todos as you go.]"
+)
+# Named, not promised: staging can return a PARTIAL list (artifacts.py:1114), so the note lists
+# what was actually saved instead of telling the model everything it finished is safe.
+_BUILD_RESUME_BANKED = (
+    "These files were saved out of the old sandbox before it was replaced and will still be "
+    "delivered, so do not rebuild them:\n{files}\n"
+    "Anything else, finished or not, went with that sandbox and has to be rebuilt."
+)
+_BUILD_RESUME_BANKED_NONE = (
+    "Nothing could be saved out of the old sandbox, so everything it held has to be rebuilt."
+)
+# A LATER attempt, after a replacement that already happened: an ordinary cut-off stream, but the
+# history still matters. The replacement note would be a lie here on both counts — the sandbox the
+# model is in now is intact, and the work it did since the swap is still sitting in it, so reading
+# "replaced with an empty one" invites rebuilding files that are already there.
+_BUILD_RESUME_AFTER_REPLACEMENT_NOTE = (
+    "[Your previous stream was cut off by a provider error partway through the work. The sandbox "
+    "itself is fine: it is the same one that attempt was working in, and everything you did in it "
+    "is still there — files you mounted, files you staged, images you created, scripts you "
+    "wrote.\n\n"
+    "EARLIER in this job a different sandbox stopped being able to run code and was replaced with "
+    "the one you are in now. {banked}\n\n"
+    "Before doing anything else, INSPECT the sandbox: list the working directory and read back "
+    "your own build script. Then CONTINUE from where that leaves off. Do not redo completed steps, "
+    "do not rebuild a file that is already there, and do not re-run export_conversation or "
+    "fetch_url_to_sandbox for content that is already present. Keep the todo card true with "
+    "update_todos as you go.]"
 )
 # --- Revision grounding: the file a revision job starts FROM -------------------------------
 #
@@ -2780,13 +2823,27 @@ def _revision_master_items(master: Optional[Dict[str, str]]) -> List[Dict[str, A
                  reason=master.get("reason") or _REVISION_REASON_FALLBACK)}]
 
 
-def _build_resume_text(applied_notes: Optional[List[str]]) -> str:
+def _build_resume_text(applied_notes: Optional[List[str]], *, replaced: str = "",
+                       banked_filenames: Optional[List[str]] = None) -> str:
     """The body of the ONE user-role message a retried build attempt gets on top of its input.
 
     Rebuilt before EVERY retry, not frozen at the first one: `applied_notes` keeps growing while
     the job runs (the pre-round drain appends to it), so a note the SECOND attempt drained and
-    then lost with its own stream would never reach the third. One item, current contents."""
-    text = _BUILD_RESUME_NOTE
+    then lost with its own stream would never reach the third. One item, current contents.
+
+    `replaced` is the sandbox's history, and all three states say different true things:
+    `""` the model is still in the container it started in; `"now"` this attempt is the first one
+    in a replacement sandbox, which is empty; `"earlier"` a replacement happened further back and
+    the attempts since have put real work in the sandbox the model is looking at. Telling it
+    "replaced with an empty one" then would invite rebuilding files that are already there."""
+    if replaced:
+        banked = (_BUILD_RESUME_BANKED.format(files="\n".join(f"- {n}" for n in banked_filenames))
+                  if banked_filenames else _BUILD_RESUME_BANKED_NONE)
+        template = (_BUILD_RESUME_REPLACED_NOTE if replaced == "now"
+                    else _BUILD_RESUME_AFTER_REPLACEMENT_NOTE)
+        text = template.format(banked=banked)
+    else:
+        text = _BUILD_RESUME_NOTE
     if applied_notes:
         text += _BUILD_RESUME_STEERING.format(
             notes="\n".join(f"{i}. {n}" for i, n in enumerate(applied_notes, 1)))
@@ -2937,6 +2994,54 @@ def _native_file_bounds(items: List[Dict[str, Any]],
     return bounds
 
 
+async def _bank_wedged_container(processor, *, job_id: str, ledger_key: str,
+                                 container_ids: List[str], suppress_digests: List[str],
+                                 expect_filenames: List[str],
+                                 ) -> Tuple[List[Any], List[str], List[Tuple[str, str]], List[str]]:
+    """Pull the files OUT of the sandboxes the build is abandoning, before it abandons them.
+
+    A container's files do not outlive the container, and a build has no elapsed-time bound — an
+    abandoned one can reach its 20-minute idle cap long before the build ends, so waiting until
+    final staging to read it loses everything it held. Same `stage_artifacts` call `_stage_build`
+    makes, mid-build: it takes and releases the publication lock, writes no receipt and no
+    published-file record, so reusing the ledger key here does not suppress the replacement
+    sandbox's own files later.
+
+    EVERY container the build is known to have used, in one call. The local `container` variable is
+    not the whole story: the recovery layer underneath can have run a call in an `auto` container
+    of its own, and that is the one the model was writing in when it wedged. Banking only the
+    declared id leaves the other generation live for final gathering to read beside the fresh one.
+
+    All three out-lists come back with the banked generation. Without the first two a carried deck
+    loses the record that a declared photo shipped INSIDE it, and `_undelivered_deliverables` then
+    reports that photo missing on a card the user is looking at.
+
+    Never raises: failing to bank costs the old files, not the replacement.
+    """
+    from message_processor.artifacts import stage_artifacts
+
+    suppressed: List[str] = []
+    embedded: List[Tuple[str, str]] = []
+    produced: List[str] = []
+    try:
+        staged = await stage_artifacts(
+            openai_client=processor.openai_client,
+            ledger_key=ledger_key,
+            container_ids=list(container_ids),
+            container_manager=getattr(processor, "container_manager", None),
+            suppress_digests=suppress_digests,
+            expect_filenames=expect_filenames,
+            time_budget=config.artifact_publish_timeout,
+            suppressed_inputs_out=suppressed,
+            embedded_out=embedded,
+            produced_out=produced)
+    except Exception as e:  # noqa: BLE001 — the build still has a replacement to run
+        processor.log_error(f"Build phase {job_id}: could not bank {container_ids}: {e}",
+                            exc_info=True)
+        return [], [], [], produced
+    return list(staged), suppressed, embedded, produced
+
+
 async def _run_build_phase(*, processor, client, channel_id: str, thread_root: str,
                            thread_key: str, job_id: str, task: str, findings: str,
                            deliverables: List[Dict[str, str]], snapshot: List[Dict[str, Any]],
@@ -2971,7 +3076,9 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
     from message_processor import (channel_request, export_tool, fetch_to_sandbox, file_mount,
                                    image_catalog, image_tools)
     from message_processor.artifacts import collect_container_ids
-    from message_processor.containers import AUTO_CONTAINER
+    from message_processor.containers import auto_container, replace_wedged_container
+    from openai_client.container_errors import (is_container_wedged, persistent_container_ids,
+                                                pin_container_tools, wedged_container_ids)
 
     # FIRST, before any I/O. Acquiring the container and reading the thread's file catalog are
     # both round-trips, and until the build model's first update_todos lands there is nothing
@@ -2994,14 +3101,17 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
     # adopt whatever it lands in, but a build has files to mount in and a listing to read back
     # out, and neither works without an addressable id. This is the caller that genuinely needs
     # the blocking create.
-    container = (await manager.create_explicit(ledger_key) if manager is not None
-                 else AUTO_CONTAINER)
-    if not isinstance(container, str):
+    resolved = (await manager.create_explicit(ledger_key) if manager is not None
+                else auto_container())
+    if not isinstance(resolved, str):
         # An `auto` container has no addressable id, so nothing can be mounted into it and its
         # listing cannot be read back. A build phase without those is not a degraded build —
         # it is a lie. Fail honestly instead.
         processor.log_error(f"Build phase {job_id}: no addressable container for {thread_key}")
         return None
+    # Annotated off the narrowed value, because the wedge recovery below reads and REBINDS it from
+    # a closure, where the `auto` half of the union is not narrowed away by the check above.
+    container: str = resolved
 
     build_config = dict(thread_config)
     build_config["enable_code_interpreter"] = True
@@ -3165,7 +3275,111 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
     resume_item: Optional[Dict[str, Any]] = None
     attempt_input = build_input
 
-    for attempt in range(1, total_attempts + 1):
+    # Fix 2: a sandbox whose kernel died stays alive and keeps answering `running`, so the retry
+    # above re-entered the corpse and burned every remaining attempt against it in seconds (live
+    # 2026-09-14, jobs d8b2126e527f and bc9fce24794d). Such a sandbox is replaced instead — once
+    # per build — and what it had already built is banked out of it first, because its files die
+    # with it and a build has no clock that guarantees final staging gets there in time.
+    replaced_sandbox = False
+    banked_container_ids: List[str] = []
+    banked_staged: List[Any] = []
+    banked_suppressed: List[str] = []
+    banked_embedded: List[Tuple[str, str]] = []
+    banked_produced: List[str] = []
+
+    def _arm_resume(*, just_replaced: bool = False) -> None:
+        """One resume item for the whole build, its TEXT rewritten before each attempt."""
+        nonlocal resume_item, attempt_input
+        if resume_item is None:
+            resume_item = {"role": "user", "content": ""}
+            attempt_input = build_input + [resume_item]
+        # Rewritten, not re-appended: steering the DYING attempt drained is in `applied_notes`
+        # now and would otherwise be lost with its stream.
+        resume_item["content"] = _build_resume_text(
+            applied_notes,
+            replaced=("now" if just_replaced else "earlier" if replaced_sandbox else ""),
+            banked_filenames=[getattr(s, "filename", "") for s in banked_staged])
+
+    async def _replace_wedged_sandbox(*, reason: str) -> bool:
+        """Bank what the abandoned sandbox built, swap in a fresh one, repoint every name.
+
+        ONE path, TWO triggers. A wedge usually surfaces as a status-less generic error, but it can
+        also raise nothing at all: a `code_interpreter_call` finishes with a terminal status and no
+        outputs while the response completes with `error=null`, so the build comes back "successful"
+        from a sandbox that never ran a line (measured 2026-09-15). Both arrive here.
+
+        Returns True when the build may take another attempt in the replacement, False when it is
+        terminal — a failed swap must never fall through to a retry that re-enters the corpse.
+        """
+        nonlocal container, replaced_sandbox, total_attempts, tools
+        old_id = container
+        # EVERY container this build is known to have used, not just the declared one: when the
+        # recovery layer has run a call in an `auto` container of its own, that is where the model
+        # was writing when it wedged, and the detector marks whichever one it caught. Bank and
+        # abandon all of them, so the replacement is the only generation final gathering reaches.
+        abandoned = list(dict.fromkeys([old_id, *collect_container_ids(artifacts),
+                                        *wedged_container_ids(artifacts)]))
+        # Bank FIRST. The old sandboxes are still listable and their bytes are intact (probed:
+        # files survive a dead kernel), but only until their idle cap — and the replacement cannot
+        # be handed the files back, because an upload lands as source="user" and staging only
+        # accepts source="assistant".
+        staged_old, suppressed_old, embedded_old, produced_old = await _bank_wedged_container(
+            processor, job_id=job_id, ledger_key=ledger_key, container_ids=abandoned,
+            suppress_digests=file_mount.mounted_digests(build_ctx),
+            expect_filenames=[d["filename"] for d in deliverables])
+        # Recorded before the replacement is even attempted: these files are in hand now, so final
+        # staging must never read those containers again and ship them twice.
+        banked_container_ids.extend(cid for cid in abandoned
+                                    if cid not in banked_container_ids)
+        banked_staged.extend(staged_old)
+        banked_suppressed.extend(suppressed_old)
+        banked_embedded.extend(embedded_old)
+        banked_produced.extend(produced_old)
+        # `manager` cannot be None here: a build with no manager never got an addressable
+        # container and returned above.
+        new_id = await replace_wedged_container(manager, ledger_key, old_id)
+        if new_id is None:
+            processor.log_error(
+                f"Build phase {job_id}: sandbox {old_id} {reason} and could not be replaced; "
+                f"{len(staged_old)} file(s) banked out of {abandoned}")
+            return False
+        processor.log_warning(
+            f"Build phase {job_id}: sandbox {old_id} {reason} — replaced with {new_id}, "
+            f"{len(staged_old)} file(s) banked out of {abandoned}")
+        replaced_sandbox = True
+        container = new_id
+        # Every name for the old id, repointed. The build's ToolContext deliberately has no
+        # SandboxHolder (that would newly enable reset_sandbox inside builds), so `container_id`
+        # is the one both accessors read.
+        build_ctx.container_id = new_id
+        build_config[image_tools.CI_CONTAINER_KEY] = new_id
+        tools = pin_container_tools(tools, new_id) or tools
+        # Those ingredients only ever existed in the abandoned sandbox. Left behind, ten spent
+        # entries have the image tools refuse to make their replacements with "Work with the ones
+        # you have". Mount DIGESTS are kept: the mount cache is keyed by container id, so inputs
+        # re-mount while the digests keep suppressing them.
+        spent_assets = build_ctx.sandbox_image_assets
+        if spent_assets is not None:
+            spent_assets.clear()
+        # A dead-container record for a sandbox this build has ABANDONED no longer describes it.
+        # Left in the sink it makes `retryable` False for the rest of the build — a transport
+        # hiccup in a healthy replacement would go terminal with attempts left — and
+        # `container_recycled()` would refuse the bridge tools in a container that is fine. The
+        # silent wedge lands here too, so the replacement inherits the refusal without this. The
+        # sink is shared by reference, so filter in place.
+        containers_gone[:] = [cid for cid in containers_gone if cid not in abandoned]
+        # The wedge burned an attempt the build never got to use, so the replacement earns one —
+        # otherwise a deployment with retries off would swap the sandbox and never run in it.
+        # Once: a second suspected wedge is the API refusing the request, not a second dead
+        # sandbox.
+        total_attempts += 1
+        with contextlib.suppress(Exception):
+            await card.set_alert(f"Sandbox stopped responding — restarting it "
+                                 f"({attempt + 1}/{total_attempts})…")
+        return True
+
+    attempt = 1
+    while attempt <= total_attempts:
         try:
             result = await _consume_research_stream(
                 processor, messages=attempt_input, tools=tools, registry=registry,
@@ -3182,6 +3396,28 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
                 # and running out of rounds mid-build is the difference between a deck and an
                 # apology.
                 job_id=job_id)
+            # The wedge that raises NOTHING. A sandbox that can no longer run code can also let
+            # the response complete cleanly, so "the stream finished" is not "the build ran": the
+            # detector marks the container in this same artifacts sink, and this is the only place
+            # the build can read that verdict.
+            silently_wedged = bool(set(wedged_container_ids(artifacts))
+                                   & {container, *collect_container_ids(artifacts)})
+            if silently_wedged and replaced_sandbox:
+                # One replacement per build, on this trigger too.
+                processor.log_error(
+                    f"Build phase {job_id}: replacement sandbox {container} ran no code either — "
+                    f"not replacing it again")
+                break
+            if silently_wedged:
+                # Deliberately NOT adopting this attempt's text: a model that has been told its
+                # sandbox errored narrates a build that did not happen, and that account riding to
+                # the delivery phase is how a job came to claim work it never did. The banked
+                # manifest is the truthful record.
+                if not await _replace_wedged_sandbox(reason="ran no code"):
+                    break
+                _arm_resume(just_replaced=True)
+                attempt += 1
+                continue
             # Only the LAST attempt's text survives; the earlier streams took theirs with them.
             # Acceptable: the container listing, not the model's account, is what the publisher
             # actually ships from.
@@ -3200,6 +3436,27 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
             # note promising the model everything is still there. Terminal instead.
             retryable = (not containers_gone
                          and (timed_out or _is_retryable_build_error(e)))
+            # Checked BEFORE the ordinary retry, which would resume in the wedged container. The
+            # gate is the UNION of what the tools declare and what the turn was observed in: the
+            # error itself cannot name a container, and treating a status-less generic error on a
+            # build with no sandbox as a wedge would replace nothing and hide a real bad request.
+            wedged = (isinstance(e, Exception) and is_container_wedged(e)
+                      and bool(persistent_container_ids(tools)
+                               or collect_container_ids(artifacts)))
+            if wedged and replaced_sandbox:
+                # One replacement per build. A fresh sandbox that stops running code the same way
+                # is not a second dead sandbox — it is a request the API keeps refusing, and
+                # another swap would just buy another few seconds of the same failure.
+                processor.log_error(
+                    f"Build phase {job_id}: replacement sandbox {container} can no longer run "
+                    f"code either — not replacing it again")
+                break
+            if wedged:
+                if not await _replace_wedged_sandbox(reason="can no longer run code"):
+                    break
+                _arm_resume(just_replaced=True)
+                attempt += 1
+                continue
             if retryable and attempt < total_attempts:
                 processor.log_warning(
                     f"Build phase {job_id} attempt {attempt}/{total_attempts} failed "
@@ -3210,12 +3467,8 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
                 with contextlib.suppress(Exception):
                     await card.set_alert(
                         f"Provider hiccup — retrying ({attempt + 1}/{total_attempts})…")
-                if resume_item is None:
-                    resume_item = {"role": "user", "content": ""}
-                    attempt_input = build_input + [resume_item]
-                # Rewritten, not re-appended: steering the DYING attempt drained is in
-                # `applied_notes` now and would otherwise be lost with its stream.
-                resume_item["content"] = _build_resume_text(applied_notes)
+                _arm_resume()
+                attempt += 1
                 continue
             if timed_out:
                 processor.log_warning(
@@ -3227,10 +3480,23 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
     # Hand back what the publisher needs even after a failed attempt: a deck the model finished
     # before its stream died is still a deck. The container LISTING is the only source of truth
     # about what exists — the model's word for it is not.
+    observed_containers = collect_container_ids(artifacts) or [container]
+    if banked_container_ids and container not in observed_containers:
+        # The replacement never got far enough to be observed in an annotation, but mounts and
+        # staged images can still be sitting in it and the listing is the only way to know.
+        observed_containers.append(container)
     return {
         "ledger_key": ledger_key,
         "notes": notes,
-        "container_ids": collect_container_ids(artifacts) or [container],
+        "container_ids": observed_containers,
+        # What was pulled out of a sandbox that had to be abandoned, kept whole: the files, plus
+        # the two records staging writes about them. `_stage_build` excludes these container ids
+        # from final gathering and merges the files back in behind the replacement's own.
+        "banked_container_ids": banked_container_ids,
+        "banked_staged": banked_staged,
+        "banked_suppressed_inputs": banked_suppressed,
+        "banked_embedded": banked_embedded,
+        "banked_produced": banked_produced,
         "suppress_digests": file_mount.mounted_digests(build_ctx),
         # The manifest the model itself declared. The user asked for a PDF; the charts and cover
         # images that went into it are working material, and posting them beside it is exactly
@@ -3254,6 +3520,10 @@ async def _stage_build(processor, *, job_id: str, build: Dict[str, Any]) -> List
     delivery model has to be told WHY its manifest is short: left to infer it, it reads an empty
     manifest as a build that lost its output, which is exactly what happened live.
 
+    When the build had to abandon a wedged sandbox, the files banked out of it are merged in
+    behind this pass's — the REPLACEMENT wins every filename it accounted for, and the banked
+    container is never listed again (its files are already in hand).
+
     Never raises: a staging failure costs the files, not the report.
     """
     from message_processor.artifacts import stage_artifacts
@@ -3261,6 +3531,13 @@ async def _stage_build(processor, *, job_id: str, build: Dict[str, Any]) -> List
     manager = getattr(processor, "container_manager", None)
     suppressed_inputs: List[str] = []
     embedded: List[Tuple[str, str]] = []
+    # Everything this pass PRODUCED, before selection — what the banked-file merge accounts against.
+    produced: List[str] = []
+    banked_ids = set(build.get("banked_container_ids") or ())
+    # An abandoned container's ids survive in the observed list, and gathering it again would
+    # read a stale generation alongside the fresh one — too late for the file_id de-duplication
+    # and the selection that decide what ships.
+    container_ids = [cid for cid in (build.get("container_ids") or []) if cid not in banked_ids]
     try:
         # The time budget lives INSIDE stage_artifacts (per-file, deadline-bounded) rather than
         # as an outer wait_for: a wrap-and-cancel discarded a deck that had already been staged
@@ -3270,30 +3547,98 @@ async def _stage_build(processor, *, job_id: str, build: Dict[str, Any]) -> List
         staged = await stage_artifacts(
             openai_client=processor.openai_client,
             ledger_key=build["ledger_key"],
-            container_ids=build["container_ids"],
+            container_ids=container_ids,
             container_manager=manager,
             suppress_digests=build["suppress_digests"],
             expect_filenames=build["expect_filenames"],
             time_budget=config.artifact_publish_timeout,
             suppressed_inputs_out=suppressed_inputs,
-            embedded_out=embedded)
+            embedded_out=embedded,
+            produced_out=produced)
     except Exception as e:  # noqa: BLE001
         processor.log_error(f"Build phase {job_id} staging failed: {e}", exc_info=True)
         staged = []
 
-    if suppressed_inputs:
-        build["suppressed_inputs"] = list(dict.fromkeys(suppressed_inputs))
-        processor.log_info(f"Build phase {job_id} held back {len(suppressed_inputs)} unchanged "
+    carried = _merge_banked_artifacts(processor, job_id=job_id, build=build, staged=staged,
+                                      produced=produced, suppressed_inputs=suppressed_inputs,
+                                      embedded=embedded)
+    processor.log_info(f"Build phase {job_id} staged {len(staged) + len(carried)} file(s)")
+    return staged + carried
+
+
+def _names(items: Iterable[Any]) -> set:
+    """Lowercased filenames of staged artifacts — the unit every merge comparison below uses."""
+    return {(getattr(i, "filename", "") or "").lower() for i in items}
+
+
+def _merge_banked_artifacts(processor, *, job_id: str, build: Dict[str, Any], staged: List[Any],
+                            produced: List[str], suppressed_inputs: List[str],
+                            embedded: List[Tuple[str, str]]) -> List[Any]:
+    """Fold a banked generation in behind this staging pass, and write both records onto ``build``.
+
+    The replacement wins every filename it ACCOUNTED for, and that is read from what it PRODUCED —
+    the pre-selection listing — not from what it staged. Selection silently drops a document's
+    ingredients, superseded drafts and duplicate content, so a fresh `chart.png` that went into a
+    fresh `deck.pdf` leaves no trace in the accepted list, and reading only that list published the
+    stale banked chart beside the new deck.
+
+    One subtraction from that: a name the replacement only produced as an EMBEDDED member does not
+    count until the document containing it is actually going out. An unchanged deck still declares
+    its members embedded, and crediting them there dropped the banked copy for a document that
+    never shipped — the manifest and the embedded record both came back empty.
+
+    Carried entries are RENUMBERED. Both passes number from `art_1` and publication keys a dict
+    by artifact id, so appending them raw would silently overwrite a replacement file.
+    """
+    banked: List[Any] = list(build.get("banked_staged") or ())
+    own_names = _names(staged)
+    # Owner survival is decided FIRST — everything below asks whether a pair still means anything.
+    surviving_embedded = [(n, o) for n, o in embedded if (o or "").lower() in own_names]
+    accounted = ({(n or "").lower() for n in produced}
+                 - {(n or "").lower() for n, _o in embedded}
+                 | {(n or "").lower() for n, _o in surviving_embedded}
+                 | own_names)
+
+    carried: List[Any] = []
+    if banked:
+        for item in banked:
+            name = (getattr(item, "filename", "") or "").lower()
+            if not name or name in accounted:
+                continue
+            accounted.add(name)     # two banked copies of one name still ship once
+            item.artifact_id = f"art_{len(staged) + len(carried) + 1}"
+            carried.append(item)
+        processor.log_info(
+            f"Build phase {job_id} carried {len(carried)} of "
+            f"{len(build.get('banked_produced') or ()) or len(banked)} file(s) out of a replaced "
+            f"sandbox: {[getattr(c, 'filename', '') for c in carried]}")
+
+    carried_names = _names(carried)
+    all_embedded = surviving_embedded + [
+        (n, o) for n, o in (build.get("banked_embedded") or ())
+        if (o or "").lower() in carried_names]
+    # A file cannot be both something the user already has and something this build is delivering,
+    # loose or inside a document. Without this an abandoned unchanged `photo.png` and the
+    # replacement's transformed one, folded into the surviving deck, both got recorded — and the
+    # delivery prompt then called one filename byte-identical AND freshly built.
+    shipped_names = own_names | carried_names | {(n or "").lower() for n, _o in all_embedded}
+    all_suppressed = [n for n in (suppressed_inputs
+                                  + list(build.get("banked_suppressed_inputs") or ()))
+                      if (n or "").lower() not in shipped_names]
+
+    if all_suppressed:
+        build["suppressed_inputs"] = list(dict.fromkeys(all_suppressed))
+        processor.log_info(f"Build phase {job_id} held back "
+                           f"{len(build['suppressed_inputs'])} unchanged "
                            f"input(s): {build['suppressed_inputs']}")
-    if embedded:
+    if all_embedded:
         # Deduped on the pair: the same photo can legitimately sit in two documents.
-        build["embedded_ingredients"] = list(dict.fromkeys(embedded))
+        build["embedded_ingredients"] = list(dict.fromkeys(all_embedded))
         processor.log_info(
             f"Build phase {job_id} folded {len(build['embedded_ingredients'])} file(s) into a "
             f"document instead of posting them loose: "
             f"{[f'{n} (inside {o})' for n, o in build['embedded_ingredients']]}")
-    processor.log_info(f"Build phase {job_id} staged {len(staged)} file(s)")
-    return staged
+    return carried
 
 
 def _build_ledger_key(thread_key: str, job_id: str) -> str:

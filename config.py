@@ -279,6 +279,32 @@ DEV_EPOCH_FENCE_ENV = "DEV_EPOCH_FENCE_ENABLE"
 _DEV_EPOCH_FENCE_OFF = ("", "0", "false", "no", "off")
 
 
+# The four sizes the containers API accepts for `memory_limit`. Anything else is a 400, so a
+# typo in the env var must not reach the API.
+_CONTAINER_MEMORY_LIMITS = ("1g", "4g", "16g", "64g")
+_DEFAULT_CONTAINER_MEMORY_LIMIT = "16g"
+
+
+def resolve_container_memory_limit() -> str:
+    """The `memory_limit` every code sandbox is created with.
+
+    Probed 2026-09-14: the API default is `1g`, and a kernel there dies at ~768 MB of Python
+    heap — which looks like nothing but a generic "issue with your request" on every later exec.
+    An unset var is not a mistake and says nothing; a value the API would reject is, and gets
+    named so whoever set it can see why it was ignored.
+    """
+    raw = os.getenv("CODE_INTERPRETER_MEMORY_LIMIT")
+    if raw is None:
+        return _DEFAULT_CONTAINER_MEMORY_LIMIT
+    value = raw.strip().lower()
+    if value in _CONTAINER_MEMORY_LIMITS:
+        return value
+    logging.getLogger("bot.config").warning(
+        f"CODE_INTERPRETER_MEMORY_LIMIT={raw!r} is not one of "
+        f"{'|'.join(_CONTAINER_MEMORY_LIMITS)} — using {_DEFAULT_CONTAINER_MEMORY_LIMIT}")
+    return _DEFAULT_CONTAINER_MEMORY_LIMIT
+
+
 def dev_epoch_fence_requested() -> bool:
     """True when DEV_EPOCH_FENCE_ENABLE asks for a fence.
 
@@ -1088,6 +1114,11 @@ class BotConfig:
     # when the container was last active (an API call that failed never touched it).
     code_interpreter_container_reuse_minutes: int = field(
         default_factory=lambda: max(1, int(os.getenv("CODE_INTERPRETER_CONTAINER_REUSE_MINUTES", "15"))))
+    # Memory every container gets. The API defaults to `1g`, where the kernel dies around 768 MB
+    # and the sandbox is then WEDGED — still "running", but every exec fails generically (probed
+    # 2026-09-14; the largest real workload measured peaked at 5.6 GB). So we ask for the size
+    # that fits the work instead of the smallest one offered. Legal: 1g|4g|16g|64g.
+    code_interpreter_memory_limit: str = field(default_factory=resolve_container_memory_limit)
     # --- F32: outbound artifacts ---
     # Max artifacts published per turn. The model can write many intermediate files; only the
     # ones it cites get published, and this bounds a runaway loop from flooding the thread.

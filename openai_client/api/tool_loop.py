@@ -23,7 +23,7 @@ from config import config
 from logger import setup_logger
 from message_processor.message_markers import join_segments
 from openai_client.container_errors import (adoption_blocked, demote_container_tools,
-                                            pin_container_tools)
+                                            pin_container_tools, wedged_container_ids)
 from message_processor.tool_registry import ToolContext, ToolRegistry, serialize_tool_result
 
 from . import responses as responses_api
@@ -228,10 +228,14 @@ def _observed_container(tool_context: Any, artifacts_sink: Any) -> Optional[str]
     mid-turn container death the sink holds both the corpse and the ephemeral sandbox the
     recovery retry ran in. The corpse is in `container_gone_sink`; naming it again would 404 the
     next request. Of what survives, the FIRST id wins: it is where the earliest files are.
+
+    A WEDGED container is skipped on the same footing. It never 404s — it answers `running` and
+    fails every exec generically — so nothing else here would rule it out.
     """
     from message_processor.artifacts import collect_container_ids
-    gone = set(getattr(tool_context, "container_gone_sink", None) or ())
-    return next((cid for cid in collect_container_ids(artifacts_sink) if cid not in gone), None)
+    unusable = set(getattr(tool_context, "container_gone_sink", None) or ())
+    unusable.update(wedged_container_ids(artifacts_sink))
+    return next((cid for cid in collect_container_ids(artifacts_sink) if cid not in unusable), None)
 
 
 async def _adopt_and_pin(tool_context: Any, artifacts_sink: Any,
@@ -277,6 +281,13 @@ async def _adopt_and_pin(tool_context: Any, artifacts_sink: Any,
         current = holder.container_id
         if isinstance(current, str) and current and tool_context.container_recycled():
             logger.info(f"Container {current} died mid-turn — this turn moves off it")
+            holder.container_id = None
+            tools = demote_container_tools(tools)[0] or tools
+        elif isinstance(current, str) and current and current in wedged_container_ids(
+                artifacts_sink):
+            # Same move, different corpse: this one is still "running" and still refuses to run
+            # code, so pinning it again would fail every remaining round identically.
+            logger.info(f"Container {current} can no longer run code — this turn moves off it")
             holder.container_id = None
             tools = demote_container_tools(tools)[0] or tools
         if not holder.container_id:

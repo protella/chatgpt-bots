@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from message_processor import file_mount
-from message_processor.containers import AUTO_CONTAINER
+from message_processor.containers import auto_container
 from message_processor.tool_registry import SURFACE_CHANNEL, SandboxHolder, ToolContext, ToolRegistry
 
 
@@ -67,7 +67,7 @@ def _manager(created="cntr_new", calls=None):
 
     async def _get_or_create(thread_key):
         log.append(("get_or_create", thread_key))
-        return AUTO_CONTAINER
+        return auto_container()
 
     return MagicMock(invalidate=AsyncMock(side_effect=_invalidate),
                      create_explicit=AsyncMock(side_effect=_create_explicit),
@@ -260,11 +260,11 @@ class TestResetSandbox:
         assert calls[0] == ("invalidate", "C1:123.45", None)
 
     async def test_an_auto_container_answer_is_not_a_reset(self):
-        """AUTO_CONTAINER is a dict — a throwaway the API may put the model in, but not an
+        """An `auto` declaration is a dict — a throwaway the API may put the model in, but not an
         addressable id we can hand back or push bytes into. The holder must not be repointed at
         it, or the turn would believe it had a sandbox it cannot name."""
         manager, _calls = _manager()
-        manager.create_explicit = AsyncMock(return_value=AUTO_CONTAINER)
+        manager.create_explicit = AsyncMock(return_value=auto_container())
         ctx, _raw = _ctx(container="cntr_old", manager=manager)
 
         result = await file_mount.execute_reset_sandbox(ctx, {})

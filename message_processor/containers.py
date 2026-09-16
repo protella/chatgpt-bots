@@ -37,10 +37,12 @@ from config import config
 from logger import setup_logger
 # Canonical home is openai_client (message_processor imports it, so the reverse would cycle).
 # Re-exported here because this is where callers naturally look for it.
-from openai_client.container_errors import AUTO_CONTAINER, adoption_blocked, is_container_gone
+from openai_client.container_errors import (adoption_blocked, auto_container, is_container_gone,
+                                            is_container_wedged)
 
-__all__ = ["AUTO_CONTAINER", "ContainerManager", "adoption_blocked", "is_container_gone",
-           "publication_lock", "wait_for_publication"]
+__all__ = ["ContainerManager", "adoption_blocked", "auto_container", "is_container_gone",
+           "is_container_wedged", "publication_lock", "replace_wedged_container",
+           "wait_for_publication"]
 
 # Must go through setup_logger: the app attaches handlers to `slack_bot.*` loggers and sets
 # propagate=False, so a bare getLogger(__name__) writes to NOWHERE. Every warning in this
@@ -125,6 +127,9 @@ class ContainerManager:
                         "anchor": "last_active_at",
                         "minutes": config.code_interpreter_container_ttl_minutes,
                     },
+                    # Unset, this is the API's `1g`, where the kernel dies around 768 MB and
+                    # leaves the container wedged — "running" but unable to run a line of code.
+                    memory_limit=config.code_interpreter_memory_limit,
                 ),
                 timeout=_API_TIMEOUT,
             )
@@ -250,21 +255,21 @@ class ContainerManager:
         Callers that genuinely need an addressable sandbox up front — a research job with files
         to mount — want `create_explicit`, not this.
         """
-        return await self._live_binding(thread_key) or AUTO_CONTAINER
+        return await self._live_binding(thread_key) or auto_container()
 
     async def create_explicit(self, thread_key: str) -> Union[str, Dict[str, str]]:
         """Reuse this thread's container, or MINT one now — the pre-W3 `get_or_create`.
 
         Blocking and worth it only where the caller cannot proceed without an addressable id:
         a build phase has files to mount into the sandbox and a listing to read back out of it,
-        and `auto` gives it neither. Still degrades to `AUTO_CONTAINER` rather than raising —
+        and `auto` gives it neither. Still degrades to an `auto` declaration rather than raising —
         losing sandbox continuity is a bad turn, losing the sandbox is a broken feature.
         """
         bound = await self._live_binding(thread_key)
         if bound:
             return bound
         created = await self._create(thread_key or "")
-        return created if created else AUTO_CONTAINER
+        return created if created else auto_container()
 
     # --- W3 adoption ----------------------------------------------------------------------
     #
@@ -444,3 +449,44 @@ class ContainerManager:
         if reaped:
             logger.info(f"Reaped {reaped} expired code-interpreter container(s)")
         return reaped
+
+
+async def replace_wedged_container(manager: Any, ledger_key: str,
+                                   old_container_id: Optional[str]) -> Optional[str]:
+    """Abandon a sandbox that can no longer run code and mint a fresh one under the same key.
+
+    The wedge (see `is_container_wedged`) is invisible to the API: the container answers
+    `running`, so the binding has to be dropped from OUR side before `create_explicit` will make
+    anything — it reuses a live binding when it finds one, and the "replacement" would be the very
+    corpse being replaced.
+
+    `ledger_key`, never the thread key. A build binds under `thread#job:id`, so passing the thread
+    key would leave the job's binding wedged and could hand back the interactive thread's live
+    container as the "replacement".
+
+    Returns the new id, or None when nothing was actually replaced — the two failures
+    `execute_reset_sandbox` already knows about: a non-`str` result (the `auto` dict, which is not
+    addressable) and an id identical to the old one, which means `invalidate` lost its write and
+    the binding outlived it.
+    """
+    if manager is None or not ledger_key:
+        return None
+    try:
+        await manager.invalidate(ledger_key, old_container_id)
+        created = await manager.create_explicit(ledger_key)
+    except Exception as e:  # noqa: BLE001 — a failed replacement is terminal, never a crash
+        logger.error(f"Could not replace wedged container for {ledger_key}: {e}")
+        return None
+
+    if not isinstance(created, str) or not created:
+        logger.warning(f"Replacing the wedged container for {ledger_key} produced no "
+                       f"addressable container")
+        return None
+    if old_container_id and created == old_container_id:
+        logger.warning(f"Replacing the wedged container for {ledger_key} came back with the same "
+                       f"id {created} — the binding outlived its invalidation")
+        return None
+
+    logger.warning(f"Replaced wedged container for {ledger_key}: "
+                   f"{old_container_id or 'none'} -> {created}")
+    return created

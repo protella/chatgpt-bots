@@ -1594,6 +1594,68 @@ class TestContainerAdoptionAtRoundBoundaries:
 
 
 @pytest.mark.asyncio
+class TestWedgedContainerIsNotAdopted:
+    """A container whose kernel died still answers `running` and still fails every exec, so
+    nothing the adoption path asks the API would rule it out — only the turn's wedge marker
+    does. Left unfiltered, the loop would pin the corpse and every remaining round would fail
+    in seconds, which is the prod build failure."""
+
+    async def test_a_marked_id_is_neither_adopted_nor_pinned(self, monkeypatch):
+        from openai_client.container_errors import mark_container_wedged
+
+        manager = MagicMock(adopt=AsyncMock())
+        ctx = _holder_ctx(manager)
+        fake = _ContainerRounds([("", [_call()]), ("done", [])], {0: "cntr_wedged"})
+        monkeypatch.setattr(tool_loop.responses_api, "create_text_response_with_tools", fake)
+        artifacts: list = []
+        mark_container_wedged(artifacts, ["cntr_wedged"])
+
+        await tool_loop.create_text_response_with_tool_loop(
+            _Client(), messages=[], tools=_auto_tools(), registry=_registry_with(),
+            tool_context=ctx, artifacts_sink=artifacts)
+
+        manager.adopt.assert_not_awaited()
+        assert _ci_container(fake.tools_seen[1]) == {"type": "auto"}
+        assert ctx.sandbox.container_id is None
+
+    async def test_a_holder_pointing_at_a_marked_id_comes_back_on_auto(self, monkeypatch):
+        from openai_client.container_errors import auto_container, mark_container_wedged
+
+        ctx = _holder_ctx(MagicMock(adopt=AsyncMock()), container_id="cntr_wedged")
+        fake = _ContainerRounds([("", [_call()]), ("done", [])])
+        monkeypatch.setattr(tool_loop.responses_api, "create_text_response_with_tools", fake)
+        artifacts: list = []
+        mark_container_wedged(artifacts, ["cntr_wedged"])
+
+        await tool_loop.create_text_response_with_tool_loop(
+            _Client(), messages=[], tools=_explicit_tools("cntr_wedged"),
+            registry=_registry_with(), tool_context=ctx, artifacts_sink=artifacts)
+
+        assert _ci_container(fake.tools_seen[1]) == auto_container()
+        assert ctx.sandbox.container_id is None
+
+    async def test_a_healthy_observed_id_is_still_selected(self, monkeypatch):
+        """The marker rules out one sandbox, not the feature: a turn that moved into a live
+        replacement must still name and bind it."""
+        from openai_client.container_errors import mark_container_wedged
+
+        manager = MagicMock(adopt=AsyncMock(return_value="cntr_b"))
+        ctx = _holder_ctx(manager)
+        fake = _ContainerRounds([("", [_call()]), ("done", [])],
+                                {0: "cntr_a"})
+        monkeypatch.setattr(tool_loop.responses_api, "create_text_response_with_tools", fake)
+        artifacts: list = [{"container_id": "cntr_b"}]
+        mark_container_wedged(artifacts, ["cntr_a"])
+
+        await tool_loop.create_text_response_with_tool_loop(
+            _Client(), messages=[], tools=_auto_tools(), registry=_registry_with(),
+            tool_context=ctx, artifacts_sink=artifacts)
+
+        assert _ci_container(fake.tools_seen[1]) == "cntr_b"
+        manager.adopt.assert_awaited_once_with("C1:1.1", "cntr_b")
+
+
+@pytest.mark.asyncio
 class TestStreamingLoopAdoptsToo:
     """Same checkpoint, same place, on the path real chat turns actually take."""
 
@@ -1731,13 +1793,13 @@ class TestRecoveryDoesNotReForkEveryRound:
         fake, manager, gone_sink, artifacts, ctx = await self._drive(
             monkeypatch, streaming, dies_on)
 
-        from openai_client.container_errors import adoption_blocked
+        from openai_client.container_errors import adoption_blocked, auto_container
         assert gone_sink == ["cntr_dead"], "the real recovery ran"
         assert adoption_blocked(artifacts) is True
 
         # The death round sends the dead id, then the demoted retry; everything after it names
         # the recovery sandbox.
-        assert fake.sent[dies_on:] == ["cntr_dead", {"type": "auto"}, "cntr_recovery"]
+        assert fake.sent[dies_on:] == ["cntr_dead", auto_container(), "cntr_recovery"]
         assert _ci_container(fake.tools_seen[-1]) == "cntr_recovery"
 
     @pytest.mark.parametrize("streaming", [False, True])
@@ -1747,10 +1809,12 @@ class TestRecoveryDoesNotReForkEveryRound:
         recovery mints a SECOND ephemeral sandbox — repeatable for every round the turn has
         left. With `dies_on=1` the corpse is also the FIRST id in the artifacts sink, so this
         covers the observation filter too."""
+        from openai_client.container_errors import auto_container
+
         fake, _, _, _, _ = await self._drive(monkeypatch, streaming, dies_on)
 
         assert fake.sent.count("cntr_dead") == dies_on + 1, "never named after it died"
-        assert fake.sent.count({"type": "auto"}) == 1, "only ONE recovery sandbox this turn"
+        assert fake.sent.count(auto_container()) == 1, "only ONE recovery sandbox this turn"
 
     @pytest.mark.parametrize("streaming", [False, True])
     @pytest.mark.parametrize("dies_on", [0, 1])

@@ -9,7 +9,7 @@ from openai import AsyncOpenAI
 from config import (FAST_SERVICE_TIER_MODELS, clamp_effort, config,
                     supports_cache_breakpoints, supports_sampling)
 from logger import LoggerMixin, setup_logger
-from openai_client.container_errors import is_container_gone
+from openai_client.container_errors import is_container_gone, is_container_wedged
 
 from .api import images as image_api
 from .api import responses as responses_api
@@ -463,6 +463,13 @@ class OpenAIClient(LoggerMixin):
                     # look like a crash in production.
                     self.log_warning(
                         f"Code-interpreter container expired mid-stream after {elapsed:.2f}s: {error_msg}")
+                elif is_container_wedged(e):
+                    # A sandbox whose kernel died: alive to the API, unable to run code. Handled
+                    # by the caller too (it unbinds and replaces), so same treatment — this used
+                    # to be the ERROR-with-traceback that made the prod failure look unhandled.
+                    self.log_warning(
+                        f"Code-interpreter container can no longer run code after {elapsed:.2f}s: "
+                        f"{error_msg}")
                 else:
                     # Unexpected errors - log as ERROR with stack trace
                     self.log_error(f"Stream error after {elapsed:.2f}s: {e}")

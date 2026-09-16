@@ -938,3 +938,27 @@ class TestChannelEffortAcrossFamilies:
             {"model": model, "reasoning_effort": stored}, "C_TEST")
         assert profile["reasoning_effort"] == clamp_effort(
             model, config.default_reasoning_effort)
+
+
+# ============================================================== sandbox memory size
+
+class TestContainerMemoryLimit:
+    """The API's default is the smallest size it offers, 1g, where the Python kernel dies around
+    768 MB — and a dead kernel leaves the container "running" while every later exec fails
+    generically, so the symptom never names the cause (probed 2026-09-14; the largest real
+    workload measured peaked at 5.6 GB)."""
+
+    def test_default_is_16g(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CODE_INTERPRETER_MEMORY_LIMIT", None)
+            assert BotConfig().code_interpreter_memory_limit == "16g"
+
+    @patch.dict(os.environ, {"CODE_INTERPRETER_MEMORY_LIMIT": " 4G "})
+    def test_a_legal_size_is_honoured(self):
+        assert BotConfig().code_interpreter_memory_limit == "4g"
+
+    @patch.dict(os.environ, {"CODE_INTERPRETER_MEMORY_LIMIT": "8g"})
+    def test_a_size_the_api_would_reject_falls_back(self):
+        """`8g` is not one of the four the API accepts, so sending it would 400 every create —
+        every container, for the life of the deployment."""
+        assert BotConfig().code_interpreter_memory_limit == "16g"

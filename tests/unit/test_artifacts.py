@@ -30,6 +30,7 @@ from message_processor.artifacts import (
 )
 from message_processor.handlers.text import TextHandlerMixin
 from message_processor.utilities import MessageUtilitiesMixin
+from openai_client.container_errors import auto_container
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
 PDF = b"%PDF-1.7\n" + b"x" * 32
@@ -201,6 +202,29 @@ class TestNoteContainerSink:
         sink = []
         _note_container(sink, broken)
         assert sink == []
+
+    def test_a_terminal_status_that_is_not_completed_marks_the_container_wedged(self):
+        """Measured 2026-09-15: a container whose kernel had been OOM-killed raises NOTHING. The
+        item arrives terminal with `status="interpreting"` and no outputs, then the response
+        completes with `error=null` — so this is the only channel that sees the interactive shape.
+        """
+        from openai_client.api.responses import _note_container
+        from openai_client.container_errors import wedged_container_ids
+
+        sink: list = []
+        _note_container(sink, MagicMock(container_id="cntr_x", status="interpreting", outputs=[]))
+
+        assert collect_container_ids(sink) == ["cntr_x"], "still listed — its files are real"
+        assert wedged_container_ids(sink) == ["cntr_x"]
+
+    def test_a_completed_call_marks_nothing(self):
+        from openai_client.api.responses import _note_container
+        from openai_client.container_errors import wedged_container_ids
+
+        sink: list = []
+        _note_container(sink, MagicMock(container_id="cntr_x", status="completed"))
+
+        assert wedged_container_ids(sink) == []
 
 
 @pytest.mark.asyncio
@@ -586,7 +610,7 @@ class TestToolsArray:
             cfg.mcp_enabled_default = False
             tools = TextHandlerMixin._build_tools_array(
                 self._mixin(), {"enable_web_search": False, "enable_mcp": False}, "gpt-5.6-sol")
-        assert tools == [{"type": "code_interpreter", "container": {"type": "auto"}}]
+        assert tools == [{"type": "code_interpreter", "container": auto_container()}]
 
     def test_absent_when_globally_disabled(self):
         with patch("message_processor.handlers.text.config") as cfg:
@@ -763,7 +787,7 @@ class TestPersistentContainerWiring:
             tools = TextHandlerMixin._build_tools_array(
                 self._mixin(), {"enable_web_search": False, "enable_mcp": False},
                 "gpt-5.6-sol", ci_container=None)
-        assert self._ci_tool(tools)["container"] == {"type": "auto"}
+        assert self._ci_tool(tools)["container"] == auto_container()
 
     @pytest.mark.asyncio
     async def test_resolver_returns_none_when_ci_disabled(self):
@@ -818,6 +842,39 @@ class TestPersistentContainerWiring:
         h.container_manager.adopt.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_a_wedged_id_is_never_the_threads_new_binding(self):
+        """The abandoned container is the FIRST id in the sink — it is where the earliest files
+        are — so taking `observed[0]` would bind the thread to a sandbox that cannot run code and
+        hand the same corpse to every later turn in it."""
+        from message_processor.handlers.text import _adopt_turn_container
+        from openai_client.container_errors import mark_container_wedged
+
+        artifacts: list = [{"container_id": "cntr_old"}]
+        mark_container_wedged(artifacts, ["cntr_old"])
+        h = MagicMock()
+        h.container_manager = MagicMock(adopt=AsyncMock())
+
+        await _adopt_turn_container(h, artifacts, "C1:99.9")
+
+        h.container_manager.adopt.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_healthy_replacement_behind_it_is_still_bound(self):
+        """A skip, not a refusal: the turn moved into a live sandbox and that one is worth
+        keeping — continuity is the whole point of the binding."""
+        from message_processor.handlers.text import _adopt_turn_container
+        from openai_client.container_errors import mark_container_wedged
+
+        artifacts: list = [{"container_id": "cntr_old"}, {"container_id": "cntr_new"}]
+        mark_container_wedged(artifacts, ["cntr_old"])
+        h = MagicMock()
+        h.container_manager = MagicMock(adopt=AsyncMock(return_value="cntr_new"))
+
+        await _adopt_turn_container(h, artifacts, "C1:99.9")
+
+        h.container_manager.adopt.assert_awaited_once_with("C1:99.9", "cntr_new")
+
+    @pytest.mark.asyncio
     async def test_nothing_observed_means_nothing_to_bind(self):
         from message_processor.handlers.text import _adopt_turn_container
 
@@ -861,7 +918,30 @@ class TestPersistentContainerWiring:
         with patch("message_processor.handlers.text.config") as cfg:
             cfg.enable_code_interpreter = True
             got = await TextHandlerMixin._resolve_ci_container(h, {}, "C1:1.1")
-        assert got == {"type": "auto"}
+        assert got == auto_container()
+
+    @pytest.mark.asyncio
+    async def test_resolver_refuses_an_id_the_turn_marked_wedged(self):
+        """`get_or_create` proves liveness with `retrieve()`, and a wedged container answers
+        `running` — so when the streaming attempt's unbind silently failed, the binding is still
+        there and this would hand the retry the very sandbox that stopped executing."""
+        h = MagicMock()
+        h.container_manager = MagicMock(get_or_create=AsyncMock(return_value="cntr_wedged"))
+        with patch("message_processor.handlers.text.config") as cfg:
+            cfg.enable_code_interpreter = True
+            got = await TextHandlerMixin._resolve_ci_container(
+                h, {}, "C1:1.1", wedged_ids=["cntr_wedged"])
+        assert got == auto_container()
+        h.log_warning.assert_called()
+
+    def test_the_non_streaming_path_hands_the_resolver_the_wedge_marker(self):
+        """The hole this closes is the WIRING, not the helper. The streaming recovery calls this
+        path with `retry_count=1`, which disables the local registry — so it never reaches the
+        tool loop's adoption checks or `container_recycled()`, and the resolver's veto is the
+        only thing standing between the retry and the container it just abandoned."""
+        import inspect
+        src = inspect.getsource(TextHandlerMixin._handle_text_response)
+        assert "wedged_ids=wedged_container_ids(artifacts_acc)" in src
 
 
 @pytest.mark.asyncio
@@ -1067,7 +1147,9 @@ class TestContainerGoneRecovery:
         ])
         assert changed is True
         assert tools[0] == {"type": "web_search"}          # untouched
-        assert tools[1]["container"] == {"type": "auto"}
+        # `auto` plus the configured memory size — a demoted retry must not drop back to the
+        # API's 1g default, which is where the wedge came from.
+        assert tools[1]["container"] == auto_container()
 
     def test_demote_reports_nothing_to_do_for_an_auto_container(self):
         """Then the 404 was not about a container we chose, and a retry would fail identically."""
@@ -1110,7 +1192,7 @@ class TestContainerGoneRecovery:
             "text_normal", container_gone_sink=sink)
 
         assert len(calls) == 2, "must retry once rather than fail the turn"
-        assert calls[1][0]["container"] == {"type": "auto"}
+        assert calls[1][0]["container"] == auto_container()
         assert sink == ["cntr_dead"], "the caller needs the dead id to drop its DB binding"
 
     @pytest.mark.asyncio
@@ -1283,10 +1365,12 @@ class TestDeadContainerBindingIsDropped:
         await TextHandlerMixin._drop_dead_containers(h, ["cntr_dead"], "C1:1.1")  # must not raise
 
     def test_both_handler_paths_consume_the_sink(self):
+        """…and both unbind the WEDGE marker alongside it. A wedge found off the tool events
+        raises nothing, so the success path is the only place its binding can be dropped."""
         import inspect
         src = inspect.getsource(TextHandlerMixin)
         assert src.count("container_gone_sink=containers_gone") >= 5
-        assert src.count("await self._drop_dead_containers(containers_gone") == 2
+        assert src.count("containers_gone + wedged_container_ids(artifacts), thread_key)") == 2
 
 
 class TestAttributionHidesInternalProcessing:

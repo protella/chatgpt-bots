@@ -568,8 +568,8 @@ async def execute_reset_sandbox(ctx: ToolContext, args: Dict[str, Any]) -> Dict[
         return _err("reset_failed", "Could not replace the code sandbox.")
 
     if not isinstance(created, str) or not created:
-        # AUTO_CONTAINER is a dict — a fresh throwaway the model may end up in, but not an
-        # addressable one we can hand back or push bytes into.
+        # `auto_container()` answers a dict — a fresh throwaway the model may end up in, but not
+        # an addressable one we can hand back or push bytes into.
         logger.warning(f"Sandbox reset for {thread_key} produced no addressable container")
         return _err("reset_failed", "Could not replace the code sandbox.")
 

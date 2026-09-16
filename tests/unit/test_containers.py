@@ -15,8 +15,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from config import config
 from database import DatabaseManager
-from message_processor.containers import AUTO_CONTAINER, ContainerManager, is_container_gone
+from message_processor.containers import (ContainerManager, auto_container,
+                                         is_container_gone, replace_wedged_container)
 
 
 def _api_error(status: int, message: str) -> Exception:
@@ -85,7 +87,7 @@ class TestGetOrCreate:
 
         got = await cm.get_or_create("C1:111.1")
 
-        assert got == AUTO_CONTAINER
+        assert got == auto_container()
         raw.containers.create.assert_not_awaited()      # the whole point: no blocking create
         assert temp_db.get_thread_container("C1:111.1") is None   # and nothing bound yet
 
@@ -109,7 +111,7 @@ class TestGetOrCreate:
 
         got = await cm.get_or_create("C1:111.1")
 
-        assert got == AUTO_CONTAINER
+        assert got == auto_container()
         raw.containers.create.assert_not_awaited()
         assert temp_db.get_thread_container("C1:111.1") is None
 
@@ -131,14 +133,14 @@ class TestGetOrCreate:
         temp_db.save_thread_container("C1:111.1", "cntr_unknown")
         cm = ContainerManager(client, db=temp_db)
 
-        assert await cm.get_or_create("C1:111.1") == AUTO_CONTAINER
+        assert await cm.get_or_create("C1:111.1") == auto_container()
 
     async def test_non_running_status_is_not_reused(self, temp_db):
         client, _ = _openai("cntr_fresh", status="expired")
         temp_db.save_thread_container("C1:111.1", "cntr_stopped")
         cm = ContainerManager(client, db=temp_db)
 
-        assert await cm.get_or_create("C1:111.1") == AUTO_CONTAINER
+        assert await cm.get_or_create("C1:111.1") == auto_container()
 
     async def test_stale_row_outside_reuse_window_is_not_reused(self, temp_db):
         """Row exists but we last used it too long ago — the DB won't even hand it back."""
@@ -149,14 +151,14 @@ class TestGetOrCreate:
         client, raw = _openai("cntr_fresh")
         cm = ContainerManager(client, db=temp_db)
 
-        assert await cm.get_or_create("C1:111.1") == AUTO_CONTAINER
+        assert await cm.get_or_create("C1:111.1") == auto_container()
         raw.containers.retrieve.assert_not_awaited()   # never even asked about the dead one
 
     async def test_no_db_yields_auto(self):
         client, raw = _openai("cntr_a")
         cm = ContainerManager(client, db=None)
 
-        assert await cm.get_or_create("C1:111.1") == AUTO_CONTAINER
+        assert await cm.get_or_create("C1:111.1") == auto_container()
         raw.containers.create.assert_not_awaited()
 
 
@@ -198,7 +200,7 @@ class TestCreateExplicit:
         client, _ = _openai(create_error=_api_error(500, "no capacity"))
         cm = ContainerManager(client, db=temp_db)
 
-        assert await cm.create_explicit("C1:111.1") == AUTO_CONTAINER
+        assert await cm.create_explicit("C1:111.1") == auto_container()
 
     async def test_no_db_still_yields_a_working_container(self):
         client, raw = _openai("cntr_a")
@@ -217,6 +219,20 @@ class TestCreateExplicit:
         expires = raw.containers.create.await_args.kwargs["expires_after"]
         assert expires["anchor"] == "last_active_at"
         assert 1 <= expires["minutes"] <= 20
+
+    async def test_create_asks_for_the_configured_memory_limit(self, temp_db, monkeypatch):
+        """Unset, the API gives every sandbox 1g — where the kernel dies around 768 MB and the
+        container is then wedged for the rest of its life (probed 2026-09-14).
+
+        Configured to `4g`, not the 16g default, so this proves the value PROPAGATES rather than
+        matching a constant that happens to agree with it."""
+        monkeypatch.setattr(config, "code_interpreter_memory_limit", "4g")
+        client, raw = _openai("cntr_a")
+        cm = ContainerManager(client, db=temp_db)
+
+        await cm.create_explicit("C1:111.1")
+
+        assert raw.containers.create.await_args.kwargs["memory_limit"] == "4g"
 
     async def test_container_name_is_traceable_to_the_thread(self, temp_db):
         client, raw = _openai("cntr_a")
@@ -773,3 +789,34 @@ class TestStreamingContainerDeath:
     def test_unrelated_not_found_is_not_a_container_death(self):
         # Must not unbind a healthy container just because something else 404'd.
         assert is_container_gone(Exception("Model with id 'gpt-nope' not found.")) is False
+
+
+@pytest.mark.asyncio
+class TestReplaceWedgedContainer:
+    """A sandbox whose kernel died still reports `running`, so only we can retire it. And the
+    replacement has to be REAL: handing back the same id, or the `auto` dict, means the caller
+    would walk straight back into the corpse believing it had escaped."""
+
+    async def test_the_thread_gets_the_replacement_under_the_key_it_was_given(self):
+        manager = MagicMock(invalidate=AsyncMock(),
+                            create_explicit=AsyncMock(return_value="cntr_fresh"))
+
+        # A build binds under `thread#job:id`, never the bare thread key — the thread key would
+        # leave the job's binding wedged and could hand back the thread's own container.
+        got = await replace_wedged_container(manager, "C1:111.1#job:abc", "cntr_wedged")
+
+        assert got == "cntr_fresh"
+        manager.invalidate.assert_awaited_once_with("C1:111.1#job:abc", "cntr_wedged")
+        manager.create_explicit.assert_awaited_once_with("C1:111.1#job:abc")
+
+    async def test_the_same_id_coming_back_is_not_a_replacement(self):
+        manager = MagicMock(invalidate=AsyncMock(),
+                            create_explicit=AsyncMock(return_value="cntr_wedged"))
+
+        assert await replace_wedged_container(manager, "k", "cntr_wedged") is None
+
+    async def test_an_auto_answer_is_not_a_replacement(self):
+        manager = MagicMock(invalidate=AsyncMock(),
+                            create_explicit=AsyncMock(return_value=auto_container()))
+
+        assert await replace_wedged_container(manager, "k", "cntr_wedged") is None

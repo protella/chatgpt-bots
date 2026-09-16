@@ -38,10 +38,12 @@ from message_processor import (canvas_tools, file_mount, image_catalog, image_se
                                image_tools, thread_files)
 from message_processor.artifacts import (collect_container_ids, stream_safe_text, strip_citation_markers,
                                          strip_sandbox_links)
-from message_processor.containers import AUTO_CONTAINER, adoption_blocked
+from message_processor.containers import adoption_blocked, auto_container
 from message_processor.tool_provenance import (strip_provenance_echo,
                                                visible_attribution_tools)
-from openai_client.container_errors import is_container_gone, persistent_container_ids
+from openai_client.container_errors import (is_container_gone, is_container_wedged,
+                                            mark_container_wedged, persistent_container_ids,
+                                            wedged_container_ids)
 from message_processor.tool_provenance import (
     build_provenance,
     build_result_digests,
@@ -457,6 +459,12 @@ async def _adopt_turn_container(processor: Any, artifacts: list, thread_key: str
     the API minted for one retried call, and binding one would leave the thread pointing at
     something that expires in minutes.
 
+    Skips an id marked WEDGED for the same reason, and it matters more here: the abandoned
+    container is the FIRST id in the sink (it is where the earliest files are), so taking
+    `observed[0]` blindly would bind the thread to a sandbox that cannot run a line of code and
+    hand every later turn in it the same corpse — the failure this whole round exists to stop.
+    A healthy replacement sits behind it in the sink, so it is a skip, not a refusal.
+
     A module-level helper, not a handler method, for the same reason `_settle_tool_flights` is:
     the handlers are driven against stand-in hosts, and a step whose whole contract is "this
     always runs before publication" must not be silently absent because a stand-in did not
@@ -468,7 +476,8 @@ async def _adopt_turn_container(processor: Any, artifacts: list, thread_key: str
     if adoption_blocked(artifacts):
         processor.log_debug("Container recovery ran this turn — not adopting an observed id")
         return
-    observed = collect_container_ids(artifacts)
+    wedged = set(wedged_container_ids(artifacts))
+    observed = [cid for cid in collect_container_ids(artifacts) if cid not in wedged]
     if not observed:
         return
     try:
@@ -1335,7 +1344,11 @@ class TextHandlerMixin(_Host):
         # AFTER the status update, where it has always been on the DM path — a channel turn's
         # tools came from the assembler, which needed them before the request could be measured.
         if not channel_turn:
-            ci_container = await self._resolve_ci_container(request_config, thread_key)
+            # The marker rides on the accumulator the streaming attempt handed us. This is the
+            # fallback's only guard: `retry_count=1` disables the local registry, so this path
+            # never reaches the tool loop's adoption checks or `container_recycled()`.
+            ci_container = await self._resolve_ci_container(
+                request_config, thread_key, wedged_ids=wedged_container_ids(artifacts_acc))
             await self._prepare_sandbox_tools(request_config, thread_key, ci_container, client)
             tools = self._build_tools_array(request_config, model,
                                             exclude_mcp_server=failed_mcp_server, registry=registry,
@@ -1374,7 +1387,13 @@ class TextHandlerMixin(_Host):
         # F32: a container that died mid-turn lands here. The API layer already recovered the
         # call (it retried with an ephemeral sandbox); this is so we drop the stale DB binding
         # instead of offering the same dead id to the next turn.
-        containers_gone: List[str] = []
+        #
+        # SEEDED from the turn's wedge marker. When the streaming attempt abandoned a container
+        # that can no longer run code, this list is the only thing that stops us walking back
+        # into it: `invalidate` swallows a failed durable delete by contract, and a wedged
+        # container still answers `running`, so `ensure_sandbox()` would happily be handed the
+        # same id back. With it, `container_recycled()` fails the bridge tools fast instead.
+        containers_gone: List[str] = list(wedged_container_ids(artifacts))
         try:
             if tools and registry is not None:
                 # Local tools present — run the function-call loop (composes with
@@ -1587,7 +1606,11 @@ class TextHandlerMixin(_Host):
         # F32: the model links its artifacts with `sandbox:/mnt/data/...` URIs, which are dead
         # to the user — the real file arrives as a Slack upload. Strip them before the text is
         # stored, attributed, or posted, so the dead link never reaches anyone.
-        await self._drop_dead_containers(containers_gone, thread_key)
+        # Plus anything marked WEDGED. That channel raises nothing — the turn completes, the
+        # model narrates the failure, and without this the binding survives and every later turn
+        # in the thread gets the same sandbox that cannot run code.
+        await self._drop_dead_containers(
+            containers_gone + wedged_container_ids(artifacts), thread_key)
         # W3: bind what the model ran in, before the publisher goes looking for the dedupe record.
         await _adopt_turn_container(self, artifacts, thread_key)
         artifact_containers = collect_container_ids(artifacts)
@@ -3344,7 +3367,10 @@ class TextHandlerMixin(_Host):
             # finalized. A streamed link may flash on screen mid-stream; the finalize below
             # rewrites the message with the clean text, and the system prompt tells the model
             # not to emit them in the first place.
-            await self._drop_dead_containers(containers_gone, thread_key)
+            # Plus anything marked WEDGED — see the non-streaming twin: a wedge detected off the
+            # tool events raises nothing, so the binding has to be dropped on the SUCCESS path.
+            await self._drop_dead_containers(
+                containers_gone + wedged_container_ids(artifacts), thread_key)
             # W3: bind what the model ran in, before the publisher looks for the dedupe record.
             await _adopt_turn_container(self, artifacts, thread_key)
             artifact_containers = collect_container_ids(artifacts)
@@ -4161,17 +4187,35 @@ class TextHandlerMixin(_Host):
                 else:
                     # Log MCP failures at INFO level - they're handled gracefully
                     self.log_info(f"MCP server '{failed_mcp_server}' unavailable - retrying request without it")
-            elif is_container_gone(e):
+            elif is_container_gone(e) or self._suspected_wedge(e, tools, artifacts):
                 # The container died mid-STREAM. `_create_with_container_recovery` cannot catch
                 # this: responses.create(stream=True) returns immediately and the 404 only
                 # surfaces seconds later, out of the SSE iterator. Unbind it here so the
                 # non-streaming fallback below re-resolves onto a fresh container instead of
                 # replaying the dead id. Handled, not exceptional — logging it as an ERROR with a
                 # traceback (which is what happened before) reads like a bug in production.
-                self.log_warning(
-                    f"Code-interpreter container expired mid-stream; recreating and continuing "
-                    f"without it: {e}")
-                await self._drop_dead_containers(persistent_container_ids(tools), thread_key)
+                #
+                # A WEDGED container arrives here too, and the difference matters to whoever
+                # reads the log: it did not expire, it stopped being able to run code while
+                # still reporting `running`. Unbinding is the same move either way.
+                dead_ids = list(dict.fromkeys(
+                    persistent_container_ids(tools) + collect_container_ids(artifacts)))
+                if is_container_gone(e):
+                    self.log_warning(
+                        f"Code-interpreter container expired mid-stream; recreating and continuing "
+                        f"without it: {e}")
+                else:
+                    self.log_warning(
+                        f"Code-interpreter container can no longer run code; replacing it and "
+                        f"continuing without it: {e}")
+                    # The fallback and the adoption checkpoints both need this: nothing they can
+                    # ask the API would tell them the id is unusable.
+                    mark_container_wedged(artifacts, dead_ids)
+                # The union, not the declaration alone. A turn that started on `auto` and ADOPTED
+                # a container mid-turn reaches here with `tools` still saying `auto` (the tool
+                # loop rebinds only its own local list), which is exactly the case that has to be
+                # unbound.
+                await self._drop_dead_containers(dead_ids, thread_key)
             else:
                 # Unexpected errors - log as ERROR
                 self.log_error(f"Error in streaming response generation: {e}")
@@ -4441,23 +4485,50 @@ class TextHandlerMixin(_Host):
             self.log_warning("MCP failure (HTTP 424) without a recoverable server label")
         return None
 
-    async def _resolve_ci_container(self, thread_config: dict, thread_key: str):
+    async def _resolve_ci_container(self, thread_config: dict, thread_key: str,
+                                    wedged_ids: Optional[List[str]] = None):
         """The container to give code_interpreter this turn (id, or `auto` as fallback).
 
         Resolved here rather than in `_build_tools_array` because binding a thread to a
         container needs I/O (a DB read, sometimes a create + liveness check) and that builder
         is synchronous and called from several paths.
+
+        `wedged_ids` is the veto a RETRY brings with it. `get_or_create` proves liveness with
+        `containers.retrieve()`, and a wedged container answers `running` — so when the streaming
+        attempt's `invalidate` silently failed (it swallows a durable-delete failure by contract)
+        this would hand the fallback the very sandbox that just stopped executing, and the retry
+        would send it straight back. The marker is the only thing that knows, so it is checked
+        here, at the one place an id enters the turn.
         """
         if not thread_config.get('enable_code_interpreter', config.enable_code_interpreter):
             return None
         manager = getattr(self, "container_manager", None)
         if manager is None:
-            return AUTO_CONTAINER
+            return auto_container()
         try:
-            return await manager.get_or_create(thread_key)
+            resolved = await manager.get_or_create(thread_key)
         except Exception as e:  # noqa: BLE001 — a container problem must never cost the tool
             self.log_warning(f"Container resolution failed, using an ephemeral one: {e}")
-            return AUTO_CONTAINER
+            return auto_container()
+        if isinstance(resolved, str) and resolved in (wedged_ids or ()):
+            self.log_warning(
+                f"Container {resolved} can no longer run code — this attempt takes an ephemeral "
+                f"sandbox instead")
+            return auto_container()
+        return resolved
+
+    def _suspected_wedge(self, exc: Exception, tools: Optional[List[dict]],
+                         artifacts: Optional[List[dict]]) -> bool:
+        """Does this failure look like a sandbox that can no longer run code?
+
+        Two questions, and the second one is what keeps a false positive from costing anything.
+        The API's message is generic, so recovery engages only when the turn actually HAD an
+        addressable sandbox to blame — an explicit id in the declaration, or one observed
+        mid-turn. A status-less generic error on a turn with no sandbox at all is just an error.
+        """
+        if not is_container_wedged(exc):
+            return False
+        return bool(persistent_container_ids(tools) or collect_container_ids(artifacts))
 
     async def _drop_dead_containers(self, containers_gone: list, thread_key: str) -> None:
         """Forget a container that died mid-turn.
@@ -4526,7 +4597,7 @@ class TextHandlerMixin(_Host):
         code_interpreter_enabled = thread_config.get('enable_code_interpreter',
                                                      config.enable_code_interpreter)
         if code_interpreter_enabled:
-            container = ci_container or AUTO_CONTAINER
+            container = ci_container or auto_container()
             tools.append({"type": "code_interpreter", "container": container})
             self.log_debug(
                 f"Added code_interpreter to tools array (container="
