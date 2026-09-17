@@ -222,6 +222,9 @@ async def execute_mount_file(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str
         # built from it. On the channel surface there is no enum to fall back on, so an empty
         # catalog arrives here and is answered as the empty catalog it is.
         valid = thread_files.valid_ids(ctx.thread_files)
+        # The id is our own opaque handle, not content, and which id was refused against which
+        # catalog is the only thing that tells a rejection apart from a stale snapshot.
+        logger.warning(f"mount_file refused {file_id!r}; this turn offers {valid or 'nothing'}")
         return _err("unknown_file_id",
                     (f"{file_id} is not a file in this thread."
                      if valid else "There are no files in this thread to mount."),

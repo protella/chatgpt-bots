@@ -431,9 +431,20 @@ async def catalog_unattended(processor, client, message) -> None:
 
 def resolve(entries: Optional[List[Dict[str, Any]]], file_id: str) -> Optional[Dict[str, Any]]:
     """Resolve an id against THIS TURN's snapshot. Only ids we put in front of the model
-    resolve — a valid-looking id is not permission to read the bytes behind it."""
+    resolve — a valid-looking id is not permission to read the bytes behind it.
+
+    Slack's own `F…` id for the same entry resolves too. On the channel surface `mount_file`
+    is the static schema, which cannot carry a per-thread enum, and the `F…` id is sitting
+    right there in the message the file arrived on — so the first mount of a channel turn was
+    reliably spent being refused and retried. This is not a widening: the alias matches the
+    SAME entries this turn already offered, so an id from another thread still resolves to
+    nothing. Catalog handles are matched first, so a shadowed id keeps its own entry.
+    """
     for entry in entries or []:
         if entry.get("file_id") == file_id:
+            return entry
+    for entry in entries or []:
+        if entry.get("slack_file_id") and entry.get("slack_file_id") == file_id:
             return entry
     return None
 

@@ -43,6 +43,17 @@ def _call_ok(result: Any) -> bool:
     return not (isinstance(result, dict) and result.get("ok") is False)
 
 
+def _err_code(result: Any) -> str:
+    """The failing tool's own error code, for the log line. `error` is a short slug by
+    convention (`unknown_file_id`, `sandbox_unavailable`); without it "-> error" says a tool
+    failed and nothing about why, which is a dead end when triaging from logs alone."""
+    if isinstance(result, dict):
+        code = result.get("error")
+        if isinstance(code, str) and code:
+            return code
+    return "unspecified"
+
+
 def _function_calls(sink: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """The dispatchable function_call entries of a round's sink (reasoning items excluded)."""
     return [e for e in sink if e.get("type", "function_call") == "function_call"]
@@ -120,7 +131,8 @@ async def _run_tool_round(
                   "gist": gist_from_arguments(call.get("arguments"))}
         local_tool_calls.append(record)
         _note_turn_tool_call(tool_context, record)
-        self.log_info(f"Local tool '{call.get('name')}' -> {'ok' if ok else 'error'}")
+        self.log_info(f"Local tool '{call.get('name')}' -> "
+                      f"{'ok' if ok else 'error: ' + _err_code(result)}")
         result_by_id[id(call)] = result
         await _notify(f"local:{call.get('name')}", "completed")
 
@@ -708,7 +720,8 @@ async def _handle_no_reply_terminal(
                       "gist": gist_from_arguments(call.get("arguments"))}
             local_tool_calls.append(record)
             _note_turn_tool_call(tool_context, record)
-            self.log_info(f"Local tool '{call.get('name')}' -> {'ok' if ok else 'error'}")
+            self.log_info(f"Local tool '{call.get('name')}' -> "
+                          f"{'ok' if ok else 'error: ' + _err_code(result)}")
         await _notify(f"local:{call.get('name')}", "completed")
     _merge_used(tools_used_all, [c.get("name") for c in exec_calls if c.get("name")],
                 tool_context)

@@ -113,6 +113,17 @@ class TestResolve:
         assert thread_files.resolve(entries, "file_img_1") is None
         assert thread_files.resolve(None, "file_doc_1") is None
 
+    def test_an_entrys_slack_id_resolves_to_that_entry(self):
+        """The channel surface has no id enum, so the model reaches for the F… id it can see
+        on the message. That names a file this turn already offered."""
+        entries = [{"file_id": "file_doc_1", "slack_file_id": "F123"}]
+        assert thread_files.resolve(entries, "F123")["file_id"] == "file_doc_1"
+        # Still only THIS turn's entries: another thread's Slack id resolves to nothing, and a
+        # catalog with no Slack ref cannot be matched by a None.
+        assert thread_files.resolve(entries, "F999") is None
+        assert thread_files.resolve([{"file_id": "file_img_1", "slack_file_id": None}],
+                                    None) is None
+
 
 @pytest.mark.unit
 class TestCatalogLines:

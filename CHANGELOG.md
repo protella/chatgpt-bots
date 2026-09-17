@@ -39,6 +39,9 @@ All notable changes to this project will be documented in this file.
   real content. The file is now reported as unreadable, with the offer to mount it in the sandbox,
   the same as any other file that can't be parsed. Genuine spreadsheets exported as CSV or as web
   tables under a spreadsheet name still open normally.
+- **Analyzing a file in a channel no longer wastes a step.** The first attempt to open an
+  uploaded file in the sandbox was rejected and silently retried, adding several seconds to every
+  channel request that worked with a file. The file opens on the first try now.
 - **Three limits that fired on ordinary work are gone.** The bot could look back at only two
   earlier images in a turn, see only two of the images it had just made, and its image
   descriptions were cut at 120 words. So "compare these three charts" failed on the third,
