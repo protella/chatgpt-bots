@@ -230,14 +230,18 @@ def test_fork_four_the_model_fallback_changes_the_mcp_eligibility(monkeypatch):
 # ------------------------------------------------------------- the DM surface is untouched
 
 def test_the_dm_surface_is_still_dynamic():
-    """The factories still fire there, and the ids still ride as enums — the whole point of
-    keeping two surfaces is that DM turns are byte-identical to before."""
+    """The factories still fire there and the per-turn ids still ride in the descriptions — the
+    point of keeping two surfaces is that a DM turn's schemas are shaped by that turn.
+
+    The edit ENUM is gone on both surfaces now [OWNER 2026-09-16, ruling 15]: edit_image also
+    accepts an id a search_stored_knowledge hit returns mid-turn, which no enum built before the
+    turn could contain. mount_file still enums, and is the control here."""
     registry = _registry()
     cfg = _channel_config(catalogs=True)
     dm = {s["name"]: s for s in registry.schemas(cfg, surface=SURFACE_DM)}
     assert "edit_image" in dm
-    enum = dm["edit_image"]["parameters"]["properties"]["source_image_ids"]["items"]["enum"]
-    assert enum == ["img_1"]
+    assert "img_1" in dm["edit_image"]["description"]
+    assert "enum" not in dm["edit_image"]["parameters"]["properties"]["source_image_ids"]["items"]
     assert dm["mount_file"]["parameters"]["properties"]["file_id"]["enum"] == ["fil_1"]
 
     channel = {s["name"]: s for s in registry.schemas(cfg, surface=SURFACE_CHANNEL)}
@@ -251,9 +255,14 @@ def test_an_empty_catalog_removes_a_dm_tool_but_never_a_channel_one():
     a tool set that changes mid-conversation."""
     registry = _registry()
     empty = _channel_config(catalogs=False)
-    assert "edit_image" not in _names(registry.schemas(empty, surface=SURFACE_DM))
-    assert "view_image" not in _names(registry.schemas(empty, surface=SURFACE_DM))
-    assert "mount_file" not in _names(registry.schemas(empty, surface=SURFACE_DM))
+    # The two IMAGE tools are exceptions on both surfaces [OWNER 2026-09-16, rulings 12 and 16]:
+    # their catalog is a recent shortlist, while search_stored_knowledge can hand back the id of
+    # any image in the channel — and the tools array is built ONCE, before any search runs, so
+    # hiding them for want of a shortlist made that id unusable for the whole turn. mount_file is
+    # the control: no index stands behind it, so it still hides.
+    dm = _names(registry.schemas(empty, surface=SURFACE_DM))
+    assert "mount_file" not in dm
+    assert "edit_image" in dm and "view_image" in dm
     channel = _names(registry.schemas(empty, surface=SURFACE_CHANNEL))
     assert {"edit_image", "view_image", "mount_file"} <= set(channel)
 

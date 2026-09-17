@@ -125,6 +125,14 @@ class ToolContext:
     # extra plumbing between rounds.
     container_gone_sink: Optional[List[str]] = None
     image_catalog: Optional[List[Dict[str, Any]]] = None
+    # Ruling 15: the image ids a `search_stored_knowledge` result put IN FRONT of the model this
+    # turn. The edit path accepts an id from here as well as from `image_catalog` — ids the model
+    # READ, never ones it guessed — and still resolves each one through the channel-bounded DB
+    # lookup rather than trusting the string. Deliberately NOT the unrestricted channel-wide
+    # resolution `view_image` has: a wrong view costs a round, a wrong edit posts a wrong picture
+    # publicly and irreversibly. A shared container (below), so a search in one round authorizes
+    # an edit in the next without extra plumbing, and so two siblings cannot each install a list.
+    searched_image_ids: Optional[List[str]] = None
     # `view_image` stages re-attached EARLIER images here; the tool loop drains them into a
     # user-role message so the model actually sees the pixels on the next round. Shared by
     # reference (like container_gone_sink) so no extra plumbing is needed between rounds.
@@ -280,7 +288,8 @@ Executor = Callable[[ToolContext, Dict[str, Any]], Awaitable[Dict[str, Any]]]
 # exist, so no executor ever has to install one — an assign-if-None inside an executor would write
 # into its own copy, and two siblings that each installed a list would keep one of them.
 _SHARED_CONTAINERS = (("pending_vision_parts", list), ("sandbox_image_assets", list),
-                      ("mounted_files", list), ("channel_access_memo", dict))
+                      ("mounted_files", list), ("channel_access_memo", dict),
+                      ("searched_image_ids", list))
 
 # Monotonic flags an executor sets to tell the HANDLER what happened (the ack reply it must drop,
 # the surface a detached producer owns). They are set on the per-call copy, so they are adopted

@@ -20,6 +20,23 @@ All notable changes to this project will be documented in this file.
   bot now recognizes a sandbox that can no longer run code, moves the conversation onto a fresh
   one, and for a background job saves the files already produced, swaps in a new sandbox and
   carries on to finish the deliverable.
+- **The bot can look at a picture someone posted anywhere in the channel.** An image shared in one
+  message was only reachable from that message's own thread, so asking about it from a different
+  thread got "I can't reopen that here" — even though the bot had already looked at the image and
+  knew it existed. Any image the channel has seen can now be opened, and older ones are found by
+  searching for what they showed. Editing reaches them too: a chart a colleague posted last month
+  can be revised without re-uploading it.
+- **A screenshot is read, not just described.** The description kept for every shared image covered
+  the layout — the colors, the panels, the typography — and skipped the words. Since most images
+  pasted into a channel are screenshots, the useful part was the part being thrown away. Text is
+  now transcribed first and kept whole, so a question about what a screenshot actually said gets
+  answered from the screenshot. Text found inside an image is treated as quoted content and never
+  as an instruction to the bot.
+- **Three limits that fired on ordinary work are gone.** The bot could look back at only two
+  earlier images in a turn, see only two of the images it had just made, and its image
+  descriptions were cut at 120 words. So "compare these three charts" failed on the third,
+  "generate five variants and pick the best" hid the last three, and a long transcription was
+  truncated mid-sentence. None of them had a reason a user would recognize.
 
 ### ✨ Added
 

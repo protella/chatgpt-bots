@@ -2,10 +2,10 @@
 
 The properties under test are the ones that decide whether a hit can be trusted and acted on:
 the canonical authorization gate runs before any stored text leaves, channel scope comes from
-the ``channel:thread`` key prefix (colons and all), document handles are the ones read_document
-genuinely resolves while image hits carry no viewing id at all, an empty result says out loud
-that it is not proof of absence, and a store that failed is named rather than folded into a
-confident zero.
+the ``channel:thread`` key prefix (colons and all), handles are ones that genuinely resolve —
+read_document's file_id, and the image_id view_image opens and edit_image accepts for the rest of
+the turn — an empty result says out loud that it is not proof of absence, and a store that failed
+is named rather than folded into a confident zero.
 """
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
@@ -95,8 +95,8 @@ def _ctx(client, db, channel_id: str = CHANNEL, is_dm: bool = False) -> ToolCont
 
 
 async def _run(client, db, args: Optional[Dict[str, Any]] = None,
-               channel_id: str = CHANNEL) -> Dict[str, Any]:
-    ctx = _ctx(client, db, channel_id=channel_id)
+               channel_id: str = CHANNEL, ctx=None) -> Dict[str, Any]:
+    ctx = ctx if ctx is not None else _ctx(client, db, channel_id=channel_id)
     return await knowledge_tools.execute_search_stored_knowledge(
         ctx, args if args is not None else {"query": "pricing"})
 
@@ -196,16 +196,28 @@ class TestResultContract:
         # Mislabelling it as this channel's thread would be worse than omitting the field.
         assert "thread_ts" not in result["results"][0]
 
-    async def test_an_image_hit_is_informational_with_no_viewing_id(self):
+    async def test_an_image_hit_carries_the_id_view_image_opens(self):
         result = await _run(_client(), _DB(images=[_img()]), {"query": "500 error"})
         hit = result["results"][0]
         assert hit["kind"] == "image"
         assert "500 error" in hit["analysis_snippet"]
         assert hit["permalink"] == "https://slack.test/archives/p1"
-        # view_image resolves only this turn's catalog ids, so a synthesised one would always
-        # break. No id field may appear on an image hit at all.
-        assert not any(key in hit for key in ("image_id", "id", "file_id"))
-        assert "no id" in result["how_to_use"]
+        # [OWNER 2026-09-16] The id used to be withheld because view_image resolved only this
+        # turn's catalog, which made a synthesised one a handle that always breaks. view_image
+        # now falls back to a channel-scoped lookup, so the handle is real and it ships.
+        assert hit["image_id"] == "img_7"
+        assert "view_image" in result["how_to_use"]
+        assert "file_id" not in hit, "that is the document handle, and it opens nothing here"
+
+    async def test_the_ids_a_result_returns_are_recorded_for_the_edit_path(self):
+        """Ruling 15: edit_image accepts an id a search SHOWED the model. This is the link that
+        records it — and it records from the returned hits, so a row trimmed off by `limit` is
+        not authorized by a search the model never read the answer to."""
+        ctx = _ctx(_client(), _DB(images=[_img(), _img(id=8, url="https://f/other.png")]))
+        result = await _run(None, None, {"query": "500 error", "limit": 1}, ctx=ctx)
+
+        assert [h["image_id"] for h in result["results"]] == ["img_7"]
+        assert ctx.searched_image_ids == ["img_7"], "the trimmed hit is NOT authorized"
 
     async def test_the_snippet_comes_from_the_column_that_actually_matched(self):
         # The SQL matches analysis OR original_analysis. When the PRE-EDIT text is what matched,

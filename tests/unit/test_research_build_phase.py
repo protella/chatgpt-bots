@@ -317,11 +317,13 @@ class TestBuildPhase:
 
         # The EXECUTOR resolves ids against the context, not against thread_config. Advertise
         # an id in the schema and leave the context empty and every call comes back
-        # unknown_image_id — a tool that is offered and cannot work.
-        advertised = next(t["parameters"]["properties"]["source_image_ids"]["items"]["enum"]
-                          for t in captured["tools"] if t.get("name") == "edit_image_asset")
-        assert advertised == ["img_7"]
-        assert [e["image_id"] for e in captured["ctx"].image_catalog] == advertised
+        # unknown_image_id — a tool that is offered and cannot work. (The schema LISTS the ids in
+        # its description rather than enumerating them since ruling 15, so the listing is what is
+        # checked here; the context is what has to agree with it.)
+        advertised = next(t["description"] for t in captured["tools"]
+                          if t.get("name") == "edit_image_asset")
+        assert "img_7" in advertised
+        assert [e["image_id"] for e in captured["ctx"].image_catalog] == ["img_7"]
 
 
 def _transient_stream_error(message="An error occurred while processing your request."):

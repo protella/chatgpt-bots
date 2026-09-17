@@ -217,22 +217,39 @@ def get_create_image_asset_schema(thread_config: Dict[str, Any]) -> Dict[str, An
 
 
 def get_edit_image_schema(thread_config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Built from THIS TURN's catalog: the ids are a literal enum, so the model cannot name
-    an image that does not exist. No catalog → no tool (there is nothing to edit)."""
+    """Built from THIS TURN's catalog, which it LISTS rather than fences. Always offered.
+
+    Every entry is nameable, including one widened in from another root in this channel: a channel
+    is a shared workspace, and editing a colleague's chart is ordinary use of one
+    [OWNER 2026-09-16].
+
+    The ids used to ride as a literal ``enum``. They no longer do, because ruling 15 also accepts
+    an id a ``search_stored_knowledge`` hit returned this turn — which is found mid-turn, long
+    after this schema was built, so an enum would make it unemittable. The anti-invention guard
+    the enum provided did not disappear: it moved to ``_resolve_edit_sources``, which accepts only
+    ids the model has actually seen and resolves each through the channel-bounded lookup.
+
+    For the same reason it no longer returns None on an empty catalog [OWNER 2026-09-16]. The tools
+    array is built ONCE, before any search runs, so a tool hidden at turn start cannot come back
+    mid-turn — and the empty-catalog turn is exactly the one where a search is how the model finds
+    an image. It costs an occasional call that ``generate_image`` should have taken, answered by an
+    honest refusal; a capability that is absent when it is needed costs more. The channel surface
+    (static schema) already worked this way.
+    """
     entries = (thread_config or {}).get(CATALOG_KEY) or []
-    ids = image_catalog.valid_ids(entries)
-    if not ids:
-        return None
     return {
         "type": "function",
         "name": "edit_image",
         "description": (
-            "Edit, restyle, or combine image(s) already in this thread, and post the result "
-            "into the thread. Give the id(s) of the image(s) to work from; pass several ids "
-            "to combine them into one image.\n\n"
-            "Images available in this thread:\n"
-            f"{image_catalog.catalog_lines(entries)}\n\n"
-            "If the user's reference is ambiguous and picking wrong would waste real work, "
+            "Edit, restyle, or combine image(s) already in this conversation, and post the "
+            "result into the thread. Give the id(s) of the image(s) to work from; pass several "
+            "ids to combine them into one image.\n\n"
+            + (f"Images available:\n{image_catalog.catalog_lines(entries)}\n\n" if entries
+               else "No image has been shared here recently.\n\n")
+            # Carried even with an empty list, because THAT is the turn where the model has to know
+            # ids come from somewhere other than a listing (ruling 16).
+            + f"{image_catalog.INDEX_NOTE}\n\n"
+            + "If the user's reference is ambiguous and picking wrong would waste real work, "
             "ask them which one rather than guessing."
         ),
         "parameters": {
@@ -240,8 +257,9 @@ def get_edit_image_schema(thread_config: Dict[str, Any]) -> Optional[Dict[str, A
             "properties": {
                 "source_image_ids": {
                     "type": "array",
-                    "description": "The image(s) to edit, by id, from the list above.",
-                    "items": {"type": "string", "enum": ids},
+                    "description": ("The image(s) to edit — ids from the list above, or ones a "
+                                    "search_stored_knowledge hit gave you this turn."),
+                    "items": {"type": "string"},
                     "minItems": 1,
                     "maxItems": 8,
                 },
@@ -260,19 +278,19 @@ def get_edit_image_asset_schema(thread_config: Dict[str, Any]) -> Optional[Dict[
     """``edit_image``'s source resolution with ``create_image_asset``'s output: the BUILD
     phase's route to changing an existing image.
 
-    Built from THIS TURN's catalog exactly as ``get_edit_image_schema`` is — the ids are a
-    literal enum, and no catalog means no tool, because there is nothing to edit.
+    Built from THIS TURN's catalog exactly as ``get_edit_image_schema`` is — the ids are listed
+    and not enumerated (see there), and no catalog means no tool, because there is nothing to
+    edit. Both share ``_resolve_edit_sources``, so they authorize identically.
     """
     entries = (thread_config or {}).get(CATALOG_KEY) or []
-    ids = image_catalog.valid_ids(entries)
-    if not ids:
+    if not image_catalog.valid_ids(entries):
         return None
     return {
         "type": "function",
         "name": "edit_image_asset",
         "description": (
-            "Edit, restyle, or combine image(s) already in this thread and place the RESULT in "
-            "the code sandbox at /mnt/data so code_interpreter can USE it. Give the id(s) of "
+            "Edit, restyle, or combine image(s) already in this conversation and place the "
+            "RESULT in the code sandbox at /mnt/data so code_interpreter can USE it. Give the id(s) of "
             "the image(s) to work from; pass several ids to combine them into one image.\n\n"
             "The result is NOT posted to Slack. It reaches the user through whatever you build "
             "with it (a .pptx, a .docx, a composite .png).\n\n"
@@ -282,16 +300,18 @@ def get_edit_image_asset_schema(thread_config: Dict[str, Any]) -> Optional[Dict[
             "This BLOCKS until the image exists, which takes a while. Call it BEFORE the "
             "code_interpreter call that consumes it and WAIT for the path it returns — tool "
             "calls made in the same round cannot see each other's results.\n\n"
-            "Images available in this thread:\n"
-            f"{image_catalog.catalog_lines(entries)}"
+            "Images available:\n"
+            f"{image_catalog.catalog_lines(entries)}\n\n"
+            f"{image_catalog.INDEX_NOTE}"
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "source_image_ids": {
                     "type": "array",
-                    "description": "The image(s) to edit, by id, from the list above.",
-                    "items": {"type": "string", "enum": ids},
+                    "description": ("The image(s) to edit — ids from the list above, or ones a "
+                                    "search_stored_knowledge hit gave you this turn."),
+                    "items": {"type": "string"},
                     "minItems": 1,
                     "maxItems": 8,
                 },
@@ -412,10 +432,11 @@ def get_edit_image_schema_static(thread_config: Optional[Dict[str, Any]] = None
         "type": "function",
         "name": "edit_image",
         "description": (
-            "Edit, restyle, or combine image(s) already in this thread, and post the result "
-            "into the thread. Give the id(s) of the image(s) to work from; pass several ids "
-            "to combine them into one image.\n\n"
-            + _STATIC_CATALOG_POINTER + " If the user's reference is ambiguous and picking "
+            "Edit, restyle, or combine image(s) already in this conversation, and post the "
+            "result into the thread. Give the id(s) of the image(s) to work from; pass several "
+            "ids to combine them into one image.\n\n"
+            + _STATIC_CATALOG_POINTER + " " + image_catalog.INDEX_NOTE
+            + " If the user's reference is ambiguous and picking "
             "wrong would waste real work, ask them which one rather than guessing."
         ),
         "parameters": {
@@ -489,6 +510,55 @@ def _err(error: str, message: str, **extra) -> Dict[str, Any]:
     out = {"ok": False, "error": error, "message": message}
     out.update(extra)
     return out
+
+
+async def _resolve_edit_sources(ctx: Any, ids: List[Any]
+                                ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Ids the model has SEEN this turn → entries, or the refusal to hand back.
+
+    THE authorization point for both edit tools, which call nothing else — so ``edit_image`` and
+    ``edit_image_asset`` cannot drift onto different rules, and the channel surface's static
+    schema (no enum at all) is guarded by the same code as the DM surface's.
+
+    Two ways an id is one the model has seen (ruling 15):
+
+    * it is in this turn's advertised catalog, or
+    * a ``search_stored_knowledge`` result earlier in this turn returned it.
+
+    And one way it is not: any other ``img_N``. That refusal is the whole point of the enum this
+    replaces — an invented id that happened to resolve would post a wrong edited picture into a
+    channel, publicly and irreversibly. So the edit path deliberately does NOT get the
+    unrestricted channel-wide resolution ``view_image`` has; a searched id is still looked up
+    through the channel-bounded query rather than trusted as a string, and a row that is not in
+    this channel resolves nowhere.
+
+    A search and an edit dispatched in the SAME round (``dispatch_all`` gathers them) may reach
+    here before the search has recorded anything. That is an honest refusal, not a race to fix:
+    the message says the id has not been seen yet rather than implying the image does not exist,
+    and the model can call again next round. No waiting, no retry.
+    """
+    entries = list(getattr(ctx, "image_catalog", None) or [])
+    resolved: List[Dict[str, Any]] = []
+    for image_id in ids[:8]:
+        key = str(image_id)
+        entry = image_catalog.resolve(entries, key)
+        if entry is None and image_catalog.seen_in_search(ctx, key):
+            entry = await image_catalog.resolve_in_channel(ctx, key)
+            if entry is None:
+                return [], _err(
+                    "unknown_image_id",
+                    f"{key} came back from a search but no longer resolves in this channel.",
+                    valid_image_ids=image_catalog.valid_ids(entries))
+        if entry is None:
+            return [], _err(
+                "unknown_image_id",
+                (f"No image {key!r} among the ones you can see this turn. Images listed for this "
+                 "conversation can be edited, and so can one a search_stored_knowledge hit gave "
+                 "you — search for it first if that is where you got this id, and edit it once "
+                 "the hit comes back."),
+                valid_image_ids=image_catalog.valid_ids(entries))
+        resolved.append(entry)
+    return resolved, None
 
 
 def _revoked(turn: Any) -> bool:
@@ -952,15 +1022,9 @@ async def execute_edit_image(ctx, args: Dict[str, Any]) -> Dict[str, Any]:
     if processor is None or client is None:
         return _err("unavailable", "Image editing is not available in this context.")
 
-    entries = ctx.image_catalog or []
-    resolved = []
-    for image_id in ids[:8]:
-        entry = image_catalog.resolve(entries, str(image_id))
-        if entry is None:
-            return _err("unknown_image_id",
-                        f"No image {image_id!r} in this thread.",
-                        valid_image_ids=image_catalog.valid_ids(entries))
-        resolved.append(entry)
+    resolved, refusal = await _resolve_edit_sources(ctx, ids)
+    if refusal is not None:
+        return refusal
 
     thread_key = _thread_key(ctx)
     settings, _ = _effective_config(ctx.thread_config)
@@ -1171,8 +1235,9 @@ async def _download_edit_source(client, url: str) -> Tuple[Optional[str], Option
 async def execute_edit_image_asset(ctx, args: Dict[str, Any]) -> Dict[str, Any]:
     """Edit thread images by catalog id and push the result into the container.
 
-    ``execute_edit_image``'s source resolution — same catalog, same "a syntactically valid id
-    is not authorization" rule, no "most recent" fallback — bolted onto
+    ``execute_edit_image``'s source resolution — literally the same helper, so the same catalog,
+    the same "a syntactically valid id is not authorization" rule and no "most recent"
+    fallback — bolted onto
     ``execute_create_image_asset``'s output path. Nothing is posted and no progress checklist
     is shown: a build phase produces INGREDIENTS, and the publisher decides what the user sees.
 
@@ -1194,15 +1259,9 @@ async def execute_edit_image_asset(ctx, args: Dict[str, Any]) -> Dict[str, Any]:
     if processor is None or client is None:
         return _err("unavailable", "Image editing is not available in this context.")
 
-    entries = ctx.image_catalog or []
-    resolved = []
-    for image_id in ids[:8]:
-        entry = image_catalog.resolve(entries, str(image_id))
-        if entry is None:
-            return _err("unknown_image_id",
-                        f"No image {image_id!r} in this thread.",
-                        valid_image_ids=image_catalog.valid_ids(entries))
-        resolved.append(entry)
+    resolved, refusal = await _resolve_edit_sources(ctx, ids)
+    if refusal is not None:
+        return refusal
 
     # W3: mint the container if this turn started on `auto`, so the bytes land somewhere the
     # model's code can open them.

@@ -1,4 +1,4 @@
-"""``view_image`` — put an EARLIER thread image back in front of the model's eyes.
+"""``view_image`` — put an EARLIER image from this conversation back in front of the model's eyes.
 
 Only the message being answered rides as real pixels: ``_process_attachments`` turns THIS turn's
 attachments into ``input_image`` parts. Every earlier image reaches the model as TEXT — a stored
@@ -18,12 +18,17 @@ So: re-viewing is NOT sandbox work. This tool re-attaches the ORIGINAL bytes as 
 the next round and posts nothing. The sandbox stays for genuine work ON an image — cropping,
 reading numbers off it into a chart, embedding it in a document — via ``mount_file``.
 
-Safety and cost, both of which fail closed:
-* The ids come from ``image_catalog``, built per-thread from ``find_thread_images_async``. An
-  invented id, or one belonging to another thread, does not resolve. The executor re-validates
-  against THIS turn's catalog rather than trusting the argument.
+Scope fails closed; volume does not:
+* The ids come from ``image_catalog`` — this turn's list — or from ``search_stored_knowledge``,
+  which indexes every image description in the channel. An id absent from the list is resolved
+  against this channel's image rows (``image_catalog.resolve_in_channel``), so the list bounds
+  convenience and not reach; an invented id, or one belonging to another channel or DM, still does
+  not resolve. The executor re-validates rather than trusting the argument.
 * Re-attached pixels ride EVERY later round of the turn (``store=False``, full history resent),
-  so the payload is paid repeatedly. Hence a per-turn ceiling and a hard dedupe.
+  so the payload is paid repeatedly. That buys a hard dedupe — the same image is never staged
+  twice — and NOT a ceiling on how many different images a turn may open [OWNER 2026-09-16]:
+  "compare these three charts" is work, and the request's own admission bound is what prices the
+  payload, honestly and out loud.
 
 Executors never raise: every failure is an ``{"ok": False, …}`` result.
 """
@@ -42,11 +47,12 @@ logger = setup_logger(name="slack_bot.ImageView")
 # never drift onto different keys and silently offer different id sets.
 from message_processor.image_tools import CATALOG_KEY  # noqa: E402
 
-# How many earlier images one turn may pull back into vision. Each one is full-resolution base64
-# repeated in every subsequent round, so this is the real token lever — not a safety rail. Two
-# covers the honest cases ("compare these two", "look at that again"); a model that wants five
-# earlier screenshots is rummaging, which is the behavior this tool replaces.
-MAX_VIEWS_PER_TURN = 2
+# There is NO per-turn ceiling on how many earlier images one turn may pull back into vision
+# [OWNER 2026-09-16]. There was one (two), justified as a token lever plus a guess that a model
+# asking for five screenshots is rummaging. Cost is not a decision input here, and "compare these
+# three charts" is real work that the limit refused. Repeated full-resolution base64 is already
+# priced by the request's admission bound, which refuses honestly and visibly; a silent tool-level
+# refusal on work the user asked for is the worse failure.
 
 # Ceiling on the bytes we will inline. Mirrors the default in image_url_handler (20MB) — the
 # vision endpoint is the same one, so the limit is the same.
@@ -54,11 +60,23 @@ _MAX_BYTES = 20 * 1024 * 1024
 
 
 def get_view_image_schema(thread_config: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-    """Offered only when the thread HAS earlier images. No catalog → no tool."""
+    """The DM surface's view_image: it LISTS the turn's catalog but is not bounded by it.
+
+    Two things used to make the list the boundary, and ruling 12 retires both. It returned None
+    on an empty catalog, and it pinned the ids as a literal ``enum``. A DM catalog reaches one
+    week back and at most ``MAX_CATALOG`` images, while ``search_stored_knowledge`` indexes every
+    image description in the conversation with no time bound at all — so a three-week-old
+    screenshot was findable, came back with an ``img_*`` id, and then could not be emitted (no
+    enum member) or even attempted (no tool). The handle broke exactly where it was needed.
+
+    So the listing is advice and the executor is the gate, which is what the channel surface
+    already decided for the same reason: an empty catalog is an honest refusal rather than a
+    missing tool. Authorization is unchanged — ``execute_view_image`` resolves against this turn's
+    catalog and then against THIS CHANNEL's image rows, and an id that is in neither still fails.
+    ``edit_image`` keeps its enum: a wrong edit posts a wrong picture, while a wrong view spends a
+    round on "that isn't an image here".
+    """
     entries = (thread_config or {}).get(CATALOG_KEY) or []
-    ids = image_catalog.valid_ids(entries)
-    if not ids:
-        return None
     return {
         "type": "function",
         "name": "view_image",
@@ -75,16 +93,17 @@ def get_view_image_schema(thread_config: Optional[Dict[str, Any]] = None) -> Opt
             "restyle, combine) use edit_image, and to use one as an ingredient in computed work "
             "(charting numbers out of it, embedding it in a document) mount_file it into the "
             "sandbox. Never render an image in the sandbox merely to see it.\n\n"
-            f"You may look at up to {MAX_VIEWS_PER_TURN} earlier images per turn.\n\n"
-            "Images in this thread:\n" + image_catalog.catalog_lines(entries)
+            + ("Images available:\n" + image_catalog.catalog_lines(entries) + "\n\n"
+               if entries else "No image has been shared here recently.\n\n")
+            + image_catalog.INDEX_NOTE
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "image_id": {
                     "type": "string",
-                    "enum": ids,
-                    "description": "Which earlier image to look at, from the list above.",
+                    "description": ("Which earlier image to look at — an id from the list above, "
+                                    "or one a search_stored_knowledge hit gave you."),
                 },
             },
             "required": ["image_id"],
@@ -116,9 +135,8 @@ def get_view_image_schema_static(thread_config: Optional[Dict[str, Any]] = None)
             "restyle, combine) use edit_image, and to use one as an ingredient in computed work "
             "(charting numbers out of it, embedding it in a document) mount_file it into the "
             "sandbox. Never render an image in the sandbox merely to see it.\n\n"
-            f"You may look at up to {MAX_VIEWS_PER_TURN} earlier images per turn.\n\n"
-            "Ids come from the image catalog in this turn's evidence; an id that is not listed "
-            "there does not resolve."
+            "Ids come from the image catalog in this turn's evidence, or from a "
+            "search_stored_knowledge hit. " + image_catalog.INDEX_NOTE
         ),
         "parameters": {
             "type": "object",
@@ -138,13 +156,6 @@ def _err(error: str, message: str, **extra: Any) -> Dict[str, Any]:
     return {"ok": False, "error": error, "message": message, **extra}
 
 
-# A produced image (one the bot just generated or edited) does NOT spend the view budget above:
-# that budget rations LOOKING BACK at things already in the thread, while this is the thing the
-# model just made and is about to talk about. It gets its own small ceiling so a turn that
-# produces a whole batch can't bury the context in pixels.
-MAX_PRODUCED_PER_TURN = 2
-
-
 def stage_produced_image(ctx: Any, image_data: Any, *, label: str,
                          intro: Optional[str] = None) -> bool:
     """Put an image the bot JUST created in front of the model, before it writes its reply.
@@ -161,6 +172,13 @@ def stage_produced_image(ctx: Any, image_data: Any, *, label: str,
     the legacy sentence, so a caller that deliberately passes "" gets no sentence rather than
     silently getting the generated-image wording back.
 
+    EVERY image the turn produces is staged — there is no ceiling [OWNER 2026-09-16]. There used
+    to be one (two), and it failed silently: the third picture the model had just made was never
+    shown to it and nothing said why, so "generate five variants and pick the best" could not work
+    at all. Its justification was that a batch "can't bury the context in pixels", which is the
+    same cost reasoning the owner rejected for the look-back ceiling. The number of images shown
+    is the number of images made.
+
     Reuses the same staging the tool loop already drains, so the pixels arrive as a user-role
     message on the next round. Returns True when staged. Never raises: failing to show the model
     its own image must not fail the turn that already posted it.
@@ -173,9 +191,10 @@ def stage_produced_image(ctx: Any, image_data: Any, *, label: str,
         if staged is None:
             staged = []
             ctx.pending_vision_parts = staged
+        # The `produced:` prefix is the id CONVENTION, not a budget: it numbers this turn's own
+        # output so each staged picture is labelled distinctly, and keeps those ids from colliding
+        # with the `img_<row id>` handles a look-back stages.
         produced = [r for r in staged if str(r.get("_image_id", "")).startswith("produced:")]
-        if len(produced) >= MAX_PRODUCED_PER_TURN:
-            return False
         fmt = (getattr(image_data, "format", None) or "png").lower()
         mimetype = "image/jpeg" if fmt in ("jpg", "jpeg") else f"image/{fmt}"
         staged.append({
@@ -209,7 +228,8 @@ def _already_visible(ctx: ToolContext, url: str) -> bool:
 
 
 async def execute_view_image(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
-    """Resolve the id against THIS turn's catalog → fetch safely → stage for vision."""
+    """Resolve the id against THIS turn's catalog, then this channel's rows → fetch safely →
+    stage for vision."""
     image_id = (args.get("image_id") or "").strip()
     if not image_id:
         return _err("missing_image_id", "Name which image to look at.")
@@ -217,9 +237,16 @@ async def execute_view_image(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str
     entries = getattr(ctx, "image_catalog", None) or []
     entry = image_catalog.resolve(entries, image_id)
     if not entry:
-        # Covers an invented id AND one from another thread: the catalog is thread-scoped, so
-        # anything outside it simply has no entry here. On the channel surface the tool is
-        # offered with no enum, so an empty catalog reaches here too and must say so plainly.
+        # Not in the advertised list — which is a CAP, not the boundary. Try the channel's rows
+        # before refusing, so an id `search_stored_knowledge` handed back opens regardless of the
+        # image's age or which thread it was posted in. ANY id is tried here: looking costs a
+        # round, so there is nothing to protect by making the model prove where it read this one
+        # (the edit path, where a wrong guess posts a picture, does make it prove that).
+        entry = await image_catalog.resolve_in_channel(ctx, image_id)
+    if not entry:
+        # Now it is genuinely unresolvable: an invented id, or one from another channel or DM.
+        # On the channel surface the tool is offered with no enum, so an empty catalog reaches
+        # here too and must say so plainly.
         valid = image_catalog.valid_ids(entries)
         return _err("unknown_image",
                     (f"{image_id} is not an image in this conversation."
@@ -245,20 +272,18 @@ async def execute_view_image(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str
 
     # --- reserve BEFORE the first await ---------------------------------------------------
     # A round's calls are dispatched with asyncio.gather (tool_registry.dispatch_all), so two
-    # sibling view_image calls interleave at every await. Checking the cap and appending only
-    # after the download would let both pass the check and both append — over the cap, and two
-    # downloads of the same picture. Reserving synchronously (no await between the check and the
-    # append) is atomic under asyncio; the reservation is filled in place or removed on failure,
-    # the same shape create_image_asset uses.
+    # sibling view_image calls for the SAME image interleave at every await. Checking what is
+    # already staged and appending only after the download would let both pass the check and both
+    # append — two downloads of one picture, and its pixels paid for twice in every later round.
+    # Reserving synchronously (no await between the check and the append) is atomic under asyncio;
+    # the reservation is filled in place or removed on failure, the same shape
+    # create_image_asset uses. This is the dedupe, not a cap: there is no ceiling on how many
+    # DIFFERENT images a turn may pull up.
     for res in staged:
         if res.get("_image_id") == image_id:
             return {"ok": True, "image_id": image_id, "already_visible": True,
                     "message": ("You already pulled this one up — it is attached below. Answer "
                                 "from what you can see.")}
-    if len(staged) >= MAX_VIEWS_PER_TURN:
-        return _err("limit_reached",
-                    (f"You've already pulled up {MAX_VIEWS_PER_TURN} earlier images this turn. "
-                     "Answer from those, or ask for the one you need to be posted again."))
     reservation: Dict[str, Any] = {"_image_id": image_id, "_ready": False, "parts": []}
     staged.append(reservation)
 
@@ -316,7 +341,7 @@ async def execute_view_image(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str
 
 
 def register_image_view_tools(registry: ToolRegistry) -> None:
-    """Register view_image. A schema FACTORY (the legal ids depend on the thread), so it needs
-    an explicit name."""
+    """Register view_image. A schema FACTORY (the LISTING depends on the thread), so it needs
+    an explicit name. It no longer returns None for want of a catalog — see the factory."""
     registry.register(get_view_image_schema, execute_view_image, name="view_image",
                       dynamic=True, channel_schema=get_view_image_schema_static)

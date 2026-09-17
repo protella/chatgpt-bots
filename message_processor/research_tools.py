@@ -55,7 +55,8 @@ from config import clamp_effort, config
 from message_processor import document_tools, outbound_receipts
 from message_processor.artifacts import strip_citation_markers, strip_sandbox_links
 from message_processor.destination_tools import parse_destination_marker
-from message_processor.tool_registry import ToolContext, ToolRegistry
+from message_processor.tool_registry import (SURFACE_CHANNEL, SURFACE_DM, ToolContext,
+                                             ToolRegistry)
 from openai_client.api.tool_loop import NO_CAP
 
 # Process-lifetime flag: set once a labelled findings post fails (likely a missing
@@ -3127,7 +3128,14 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
     # Built ONCE and shared with the ToolContext below: the executor resolves ids against
     # `ToolContext.image_catalog`, so a populated config with an empty context would advertise
     # ids that every call then failed to resolve.
-    image_entries = await image_catalog.build_catalog(getattr(processor, "db", None), thread_key)
+    #
+    # The surface is PASSED, not inferred from the key (image_catalog ruling 2), and this caller
+    # has it first-hand: `requester_is_dm` is the dispatching turn's own `ToolContext.is_dm`. It
+    # genuinely changes the query — a channel widens with no time bound, a DM with its own
+    # lookback — so a build that asks under the wrong one gets the wrong sources.
+    image_entries = await image_catalog.build_catalog(
+        getattr(processor, "db", None), thread_key,
+        surface=SURFACE_DM if requester_is_dm else SURFACE_CHANNEL)
     build_config[image_tools.CATALOG_KEY] = image_entries
     build_config[file_mount.FILES_KEY] = await _thread_file_catalog(processor, thread_key)
 

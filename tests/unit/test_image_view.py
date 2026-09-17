@@ -6,10 +6,11 @@ messages earlier was genuine, the model had no pixels, went hunting in the code-
 sandbox (thread attachments auto-mount there and the container persists), rendered a matplotlib
 contact sheet to pull them into its own vision — and that debug figure auto-published.
 
-Covered here: the schema (offered only with a catalog; ids as a literal enum), the executor
-(scope guard, download, transcode, dedupe, per-turn cap, honest failures), and the tool-loop
-drain (a USER-role message, `_`-prefixed bookkeeping stripped, placed after the call/output
-pairs, replayed exactly once).
+Covered here: the schema (always offered, listing the turn's catalog without being bounded by
+it), the executor (the turn's catalog then a channel-scoped lookup, the channel boundary,
+download, transcode, dedupe, per-turn cap, honest failures), and the tool-loop drain (a USER-role
+message, `_`-prefixed bookkeeping stripped, placed after the call/output pairs, replayed exactly
+once).
 
 Real decision code, stubbed I/O — no network, no DB, no container.
 """
@@ -19,10 +20,11 @@ import base64
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
+
 
 from message_processor.image_view import (
     CATALOG_KEY,
-    MAX_VIEWS_PER_TURN,
     execute_view_image,
     get_view_image_schema,
 )
@@ -66,18 +68,48 @@ def _ctx(*, catalog=None, download=_PNG, current_urls=None, handler=None):
 
 # ------------------------------------------------------------------ schema
 
-def test_schema_absent_without_catalog():
-    """No earlier images → no tool. Offering it would guarantee a failed call."""
-    assert get_view_image_schema({}) is None
-    assert get_view_image_schema({CATALOG_KEY: []}) is None
+def test_schema_is_offered_even_with_no_catalog():
+    """[OWNER 2026-09-16] The turn's catalog is a shortlist, not the boundary. It used to return
+    None here — and a DM whose images are all older than the catalog's reach could then be
+    SEARCHED for a screenshot and handed an id with no tool to open it with."""
+    for cfg in (None, {}, {CATALOG_KEY: []}):
+        assert get_view_image_schema(cfg)["name"] == "view_image"
 
 
-def test_schema_pins_ids_as_enum_and_lists_them():
+def test_schema_lists_the_catalog_but_does_not_enum_it():
     schema = get_view_image_schema({CATALOG_KEY: _catalog()})
     assert schema["name"] == "view_image"
-    assert schema["parameters"]["properties"]["image_id"]["enum"] == ["img_9", "img_8", "img_7"]
-    # The descriptions ride along so the model can pick the right one.
+    # The descriptions ride along so the model can pick the right one…
     assert "a model pricing table" in schema["description"]
+    assert "img_9" in schema["description"]
+    # …but they do not BOUND it: an id from a search_stored_knowledge hit has to be emittable,
+    # and the executor is what authorizes any of them.
+    assert "enum" not in schema["parameters"]["properties"]["image_id"]
+    assert "search_stored_knowledge" in schema["description"]
+
+
+def test_every_schema_that_shows_the_list_says_it_is_only_the_recent_ones():
+    """[OWNER 2026-09-16] A list presented as complete is how a model decides an unlisted image
+    does not exist — and then web-searches for a screenshot sitting in the channel. MAX_CATALOG
+    may bound the advertised list only on the condition that the list says so, everywhere it is
+    shown."""
+    from message_processor import image_catalog, image_tools
+    from message_processor.image_view import get_view_image_schema_static
+
+    cfg = {CATALOG_KEY: _catalog()}
+    showing_the_list = (
+        get_view_image_schema(cfg),
+        get_view_image_schema_static(cfg),
+        image_tools.get_edit_image_schema(cfg),
+        image_tools.get_edit_image_asset_schema(cfg),
+        image_tools.get_edit_image_schema_static(cfg),
+    )
+    for schema in showing_the_list:
+        assert image_catalog.INDEX_NOTE in schema["description"], schema["name"]
+    # And the evidence block, which is where the channel surface's ids actually live.
+    assert image_catalog.INDEX_NOTE in image_catalog.catalog_evidence_lines(_catalog())
+    assert image_catalog.INDEX_NOTE in image_catalog.catalog_evidence_lines([]), (
+        "an empty shortlist is exactly when 'search for older ones' matters most")
 
 
 def test_schema_routes_other_intents_elsewhere():
@@ -102,6 +134,105 @@ async def test_unknown_id_is_refused():
 async def test_missing_id_is_refused():
     res = await execute_view_image(_ctx(), {"image_id": "  "})
     assert res["ok"] is False and res["error"] == "missing_image_id"
+
+
+# ------------------------------------------------- executor: reach past the turn's catalog
+#
+# [OWNER 2026-09-16] MAX_CATALOG bounds the ADVERTISED list, never what is reachable.
+# search_stored_knowledge indexes every image description in the channel with no time bound, so
+# the id it hands back has to open regardless of the picture's age or which thread it was in —
+# otherwise it is a handle that always breaks, which is why it used to be withheld entirely.
+
+
+class _ChannelDB:
+    """Records how it was asked, so the privacy boundary can be asserted rather than assumed."""
+
+    def __init__(self, rows=None):
+        self.rows = dict(rows or {})
+        self.calls = []
+
+    async def get_channel_image_by_id_async(self, channel_id, image_id):
+        self.calls.append((channel_id, image_id))
+        return self.rows.get((channel_id, image_id))
+
+
+def _channel_ctx(db, *, channel_id="C0BKX77NU66", catalog=None, download=_PNG):
+    h = SimpleNamespace(download_image=AsyncMock(return_value=_img(download)))
+    return SimpleNamespace(
+        image_catalog=_catalog() if catalog is None else catalog,
+        pending_vision_parts=[],
+        current_image_urls=[],
+        channel_id=channel_id,
+        processor=SimpleNamespace(image_url_handler=h, db=db),
+    )
+
+
+async def test_an_id_outside_the_turns_catalog_resolves_through_the_channel():
+    """The live case: a three-week-old screenshot found by search, in another thread entirely."""
+    row = {"id": 500, "url": "https://files.slack.com/old-screenshot.png",
+           "image_type": "uploaded", "prompt": "",
+           "analysis": "a devtools panel showing a 500 on checkout",
+           "created_at": "2026-07-01 09:00:00"}
+    db = _ChannelDB({("C0BKX77NU66", 500): row})
+    ctx = _channel_ctx(db)
+
+    assert "img_500" not in [e["image_id"] for e in ctx.image_catalog], "not in the shortlist"
+
+    res = await execute_view_image(ctx, {"image_id": "img_500"})
+
+    assert res["ok"] is True
+    assert db.calls == [("C0BKX77NU66", 500)], "looked up by row id, inside this channel"
+    ctx.processor.image_url_handler.download_image.assert_awaited_once()
+    assert ctx.processor.image_url_handler.download_image.await_args[0][0] == row["url"]
+    staged = ctx.pending_vision_parts[0]
+    assert staged["_image_id"] == "img_500" and staged["_ready"] is True
+
+
+async def test_the_fallback_works_with_no_advertised_catalog_at_all():
+    row = {"id": 500, "url": "https://files.slack.com/old.png", "image_type": "uploaded",
+           "prompt": "", "analysis": "an old chart", "created_at": "2026-07-01 09:00:00"}
+    ctx = _channel_ctx(_ChannelDB({("C0BKX77NU66", 500): row}), catalog=[])
+
+    res = await execute_view_image(ctx, {"image_id": "img_500"})
+
+    assert res["ok"] is True, "an empty shortlist is not an empty channel"
+
+
+async def test_an_id_in_another_channel_stays_unresolvable():
+    """The boundary is unchanged: the DB lookup is scoped to THIS channel, so a row that exists
+    but lives elsewhere is the same answer as one that never existed."""
+    row = {"id": 500, "url": "https://files.slack.com/theirs.png", "image_type": "uploaded",
+           "prompt": "", "analysis": "someone else's channel", "created_at": "2026-07-01 09:00:00"}
+    db = _ChannelDB({("C0ELSEWHERE", 500): row})
+    ctx = _channel_ctx(db)
+
+    res = await execute_view_image(ctx, {"image_id": "img_500"})
+
+    assert res["ok"] is False and res["error"] == "unknown_image"
+    assert db.calls == [("C0BKX77NU66", 500)], "asked about THIS channel and got nothing"
+    ctx.processor.image_url_handler.download_image.assert_not_called()
+
+
+@pytest.mark.parametrize("bad_id", ["img_3x", "IMG_500", "../img_500", "img_", "img_-1"])
+async def test_a_malformed_id_never_reaches_the_database(bad_id):
+    # The handle is parsed strictly before it becomes a lookup: anything that is not
+    # `img_<digits>` is refused without a query.
+    db = _ChannelDB()
+    ctx = _channel_ctx(db)
+
+    res = await execute_view_image(ctx, {"image_id": bad_id})
+
+    assert res["ok"] is False and res["error"] == "unknown_image"
+    assert db.calls == []
+
+
+async def test_a_failed_channel_lookup_is_an_unresolved_id_not_a_failed_turn():
+    class _Broken(_ChannelDB):
+        async def get_channel_image_by_id_async(self, channel_id, image_id):
+            raise RuntimeError("database is locked")
+
+    res = await execute_view_image(_channel_ctx(_Broken()), {"image_id": "img_500"})
+    assert res["ok"] is False and res["error"] == "unknown_image"
 
 
 async def test_does_not_download_for_unknown_id():
@@ -149,13 +280,15 @@ async def test_second_call_for_same_image_does_not_refetch():
     assert ctx.processor.image_url_handler.download_image.await_count == 1
 
 
-async def test_per_turn_cap_is_enforced():
+async def test_there_is_no_per_turn_ceiling():
+    """[OWNER 2026-09-16] A two-image cap used to refuse the third call. It was a token lever
+    plus a guess that a model wanting several screenshots is rummaging — and "compare these three
+    charts" is work, not rummaging. The dedupe above is what survives."""
     ctx = _ctx()
-    for img in ("img_9", "img_8"):
+    for img in ("img_9", "img_8", "img_7"):
         assert (await execute_view_image(ctx, {"image_id": img}))["ok"] is True
-    res = await execute_view_image(ctx, {"image_id": "img_7"})
-    assert res["ok"] is False and res["error"] == "limit_reached"
-    assert len(ctx.pending_vision_parts) == MAX_VIEWS_PER_TURN
+    assert [r["_image_id"] for r in ctx.pending_vision_parts] == ["img_9", "img_8", "img_7"]
+    assert ctx.processor.image_url_handler.download_image.await_count == 3
 
 
 # ------------------------------------------------------------------ executor: honest failures
@@ -281,26 +414,45 @@ async def test_fetches_through_the_guarded_handler_not_the_slack_downloader():
 
 # ------------------------------------------------ codex review: parallel dispatch race
 
-async def test_concurrent_siblings_cannot_exceed_the_cap():
-    """A round's calls run under asyncio.gather (tool_registry.dispatch_all), so siblings
-    interleave at every await. Reserving the slot BEFORE the fetch is what keeps three
-    simultaneous calls from all passing the cap check and all appending."""
+def _slow_handler():
+    """A downloader every concurrent call parks inside, so siblings genuinely interleave."""
     import asyncio
 
-    started = asyncio.Event()
-
     async def _slow(url, auth_token=None):
-        started.set()
-        await asyncio.sleep(0.01)      # every call parks here at the same time
+        await asyncio.sleep(0.01)
         return _img()
 
-    ctx = _ctx(handler=SimpleNamespace(download_image=AsyncMock(side_effect=_slow)))
+    return SimpleNamespace(download_image=AsyncMock(side_effect=_slow))
+
+
+async def test_concurrent_siblings_on_one_image_stage_and_download_it_once():
+    """A round's calls run under asyncio.gather (tool_registry.dispatch_all), so siblings
+    interleave at every await. Reserving the slot BEFORE the fetch is what stops three
+    simultaneous calls for one picture from all seeing an empty list and all appending — which
+    would download it three times and repeat its pixels three times in every later round.
+
+    This is the half of that block that is NOT a cap, and it has to keep working now the cap is
+    gone."""
+    import asyncio
+
+    ctx = _ctx(handler=_slow_handler())
+    results = await asyncio.gather(*[
+        execute_view_image(ctx, {"image_id": "img_9"}) for _ in range(3)
+    ])
+    assert all(r["ok"] for r in results)
+    assert len(ctx.pending_vision_parts) == 1
+    assert ctx.processor.image_url_handler.download_image.await_count == 1
+
+
+async def test_concurrent_siblings_on_different_images_all_succeed():
+    import asyncio
+
+    ctx = _ctx(handler=_slow_handler())
     results = await asyncio.gather(*[
         execute_view_image(ctx, {"image_id": i}) for i in ("img_9", "img_8", "img_7")
     ])
-    assert sum(1 for r in results if r["ok"]) == MAX_VIEWS_PER_TURN
-    assert sum(1 for r in results if r.get("error") == "limit_reached") == 1
-    assert len(ctx.pending_vision_parts) == MAX_VIEWS_PER_TURN
+    assert all(r["ok"] for r in results), "no sibling is refused for the others' sake"
+    assert len(ctx.pending_vision_parts) == 3
 
 
 async def test_failed_fetch_frees_its_slot_for_a_retry():
@@ -359,22 +511,29 @@ def test_produced_jpeg_gets_the_right_mimetype():
     assert ctx.pending_vision_parts[0]["parts"][1]["image_url"].startswith("data:image/jpeg;base64,")
 
 
-def test_produced_images_do_not_spend_the_view_budget():
-    """Looking BACK at thread images is rationed; seeing what you just MADE is not the same
-    thing and must not be starved by it."""
+def test_viewed_images_do_not_spend_the_produced_ceiling():
+    """The produced ceiling counts `produced:` entries only, so images the turn looked BACK at
+    share the staging list without eating into it."""
     from message_processor.image_view import stage_produced_image
     ctx = _ctx()
-    for _ in range(MAX_VIEWS_PER_TURN):
-        ctx.pending_vision_parts.append({"_image_id": "img_x", "_ready": True, "parts": []})
+    for i in range(5):
+        ctx.pending_vision_parts.append({"_image_id": f"img_{i}", "_ready": True, "parts": []})
     assert stage_produced_image(ctx, _produced(), label="y") is True
 
 
-def test_produced_images_have_their_own_ceiling():
-    from message_processor.image_view import MAX_PRODUCED_PER_TURN, stage_produced_image
+def test_every_produced_image_is_staged_however_many_there_are():
+    """[OWNER 2026-09-16] There was a ceiling of two, and it failed SILENTLY — the third picture
+    the model had just made was never shown to it and nothing said why, so "generate five variants
+    and pick the best" could not work. The count shown is the count made."""
+    from message_processor.image_view import stage_produced_image
     ctx = _ctx()
-    for _ in range(MAX_PRODUCED_PER_TURN):
+    for _ in range(5):
         assert stage_produced_image(ctx, _produced(), label="y") is True
-    assert stage_produced_image(ctx, _produced(), label="y") is False
+    produced = [r for r in ctx.pending_vision_parts
+                if str(r["_image_id"]).startswith("produced:")]
+    assert len(produced) == 5
+    # The ids stay distinct, so five pictures are five labelled things and not one overwritten.
+    assert [r["_image_id"] for r in produced] == [f"produced:{i}" for i in range(1, 6)]
 
 
 def test_staging_never_raises_on_a_junk_image_object():
@@ -431,11 +590,10 @@ def test_static_schema_is_never_hidden():
         assert get_view_image_schema_static(cfg)["name"] == "view_image"
 
 
-def test_the_dynamic_factory_is_untouched():
-    assert get_view_image_schema({CATALOG_KEY: []}) is None
-    assert get_view_image_schema(
-        {CATALOG_KEY: _catalog()})["parameters"]["properties"]["image_id"]["enum"] == [
-            "img_9", "img_8", "img_7"]
+def test_both_factories_now_agree_that_the_catalog_is_not_the_boundary():
+    assert get_view_image_schema({CATALOG_KEY: []})["name"] == "view_image"
+    assert "enum" not in get_view_image_schema(
+        {CATALOG_KEY: _catalog()})["parameters"]["properties"]["image_id"]
 
 
 # ------------------------------------------------------------------ executor: honest empty

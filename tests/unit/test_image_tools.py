@@ -31,7 +31,7 @@ import pytest
 from PIL import Image
 
 from config import config
-from message_processor import image_delivery, image_service as svc, image_tools as it
+from message_processor import image_catalog, image_delivery, image_service as svc, image_tools as it
 from openai_client.container_errors import auto_container
 from openai_client.utilities import ImageData
 from message_processor.thread_manager import AsyncThreadStateManager
@@ -371,19 +371,33 @@ def test_schema_description_names_the_users_saved_defaults():
     assert "quality=high" in schema["description"]
 
 
-def test_edit_schema_is_hidden_without_a_catalog():
-    # Nothing to edit → no tool. (An empty enum would be an unusable schema.)
-    assert it.get_edit_image_schema(_cfg()) is None
-    assert it.get_edit_image_schema(_cfg(**{it.CATALOG_KEY: []})) is None
+def test_edit_schema_is_offered_even_without_a_catalog():
+    """[OWNER 2026-09-16, ruling 16] It used to return None here, back when the catalog was the
+    only source of ids. The tools array is built ONCE before any search runs, so a tool hidden at
+    turn start cannot come back mid-turn — and an empty catalog is exactly the turn where a
+    search_stored_knowledge hit is how the model gets an id. The executor refuses honestly
+    instead."""
+    for cfg in (_cfg(), _cfg(**{it.CATALOG_KEY: []})):
+        schema = it.get_edit_image_schema(cfg)
+        assert schema["name"] == "edit_image"
+        # …and it still says where ids come from when there is no list to read them off.
+        assert image_catalog.INDEX_NOTE in schema["description"]
+
+    # The BUILD phase twin stays hidden: it runs in a registry with no search tool at all
+    # (research_tools), so there an empty catalog really does mean nothing is editable.
+    assert it.get_edit_image_asset_schema(_cfg()) is None
 
 
-def test_edit_schema_pins_the_ids_to_a_literal_enum():
+def test_edit_schema_lists_the_ids_without_fencing_them():
     schema = it.get_edit_image_schema(_cfg(**{it.CATALOG_KEY: CATALOG}))
-    ids = schema["parameters"]["properties"]["source_image_ids"]["items"]["enum"]
 
-    # The ids the model may name are exactly this turn's catalog — it cannot emit another.
-    assert ids == ["img_7", "img_3"]
-    # …and the description says what each id IS, so the choice is informed.
+    # The ids used to ride as a literal enum. They cannot any more: ruling 15 also accepts an id
+    # a search_stored_knowledge hit returns MID-TURN, long after this schema was built, and an
+    # enum would make that id unemittable. The guard moved to the executor, which is asserted
+    # directly below.
+    assert "enum" not in schema["parameters"]["properties"]["source_image_ids"]["items"]
+    # The description still says what each id IS, so the choice is informed.
+    assert "img_7" in schema["description"]
     assert "A red cat on a blue sofa" in schema["description"]
     assert "(most recent)" in schema["description"]
 
@@ -444,8 +458,8 @@ def test_the_channel_surface_gates_on_the_same_switch(monkeypatch):
     assert "create_image_asset" in on
 
 
-def test_edit_image_appears_only_with_a_catalog():
-    assert "edit_image" not in _registry_names(_cfg())
+def test_edit_image_is_registered_on_the_dm_surface_either_way():
+    assert "edit_image" in _registry_names(_cfg())
     assert "edit_image" in _registry_names(_cfg(**{it.CATALOG_KEY: CATALOG}))
 
 
@@ -466,12 +480,126 @@ async def test_edit_with_an_unresolvable_id_touches_nothing(bad_id):
         _ctx(proc, client, catalog=CATALOG),
         {"source_image_ids": [bad_id], "prompt": "make it blue"})
 
-    assert res == {"ok": False, "error": "unknown_image_id",
-                   "message": f"No image {bad_id!r} in this thread.",
-                   "valid_image_ids": ["img_7", "img_3"]}
+    assert res["ok"] is False and res["error"] == "unknown_image_id"
+    assert bad_id in res["message"] and "you can see this turn" in res["message"]
+    assert res["valid_image_ids"] == ["img_7", "img_3"]
     oc.edit_image.assert_not_awaited()      # no spend
     client.download_file.assert_not_awaited()   # not even a source fetch
     client.send_image.assert_not_awaited()      # nothing posted
+
+
+# ------------------------------------------------- ruling 15: ids the model has SEEN this turn
+
+
+class _SearchableDB:
+    """`get_channel_image_by_id_async` with this channel's rows, and a call log."""
+
+    def __init__(self, rows=None):
+        self.rows = dict(rows or {})
+        self.calls = []
+
+    async def get_channel_image_by_id_async(self, channel_id, image_id):
+        self.calls.append((channel_id, image_id))
+        return self.rows.get((channel_id, image_id))
+
+
+_OLD_ROW = {"id": 500, "url": "https://files.slack.com/old-chart.png", "image_type": "uploaded",
+            "prompt": "", "analysis": "last quarter's revenue chart",
+            "created_at": "2026-07-01 09:00:00"}
+
+
+def _searchable_ctx(proc, client=None, *, searched=(), rows=None):
+    """A turn whose catalog does NOT carry img_500, with a channel that does."""
+    ctx = _ctx(proc, client, catalog=CATALOG)
+    ctx.processor.db = _SearchableDB(
+        {("C1", 500): _OLD_ROW} if rows is None else rows)
+    ctx.searched_image_ids = list(searched)
+    return ctx
+
+
+@pytest.mark.asyncio
+@pytest.mark.critical
+async def test_an_id_a_search_returned_this_turn_becomes_editable(monkeypatch):
+    """Ruling 15. Ruling 12 let the model OPEN an image found by search and not edit it, which
+    left "edit that chart someone posted last month" half-working."""
+    publish = AsyncMock(return_value="https://files.slack.com/edited.png")
+    monkeypatch.setattr(image_delivery, "publish_image", publish)
+    oc = _openai()
+    client = _FakeClient()
+    ctx = _searchable_ctx(_FakeProcessor(openai_client=oc), client, searched=["img_500"])
+
+    res = await it.execute_edit_image(
+        ctx, {"source_image_ids": ["img_500"], "prompt": "make the bars blue"})
+
+    assert res["ok"] is True, res
+    assert ctx.processor.db.calls == [("C1", 500)], (
+        "a recorded id is still RESOLVED through the channel-bounded query, never trusted")
+    assert client.download_file.await_args[0][0] == _OLD_ROW["url"]
+    oc.edit_image.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.critical
+async def test_an_unseen_channel_id_is_refused_by_edit_though_view_image_accepts_it():
+    """The asymmetry IS the ruling: view_image resolves any id in this channel, because a wrong
+    view costs a round, while an invented img_N that happened to resolve would post a wrong
+    edited picture publicly and irreversibly."""
+    from message_processor.image_view import execute_view_image
+
+    oc = _openai()
+    client = _FakeClient()
+    ctx = _searchable_ctx(_FakeProcessor(openai_client=oc), client, searched=[])
+
+    res = await it.execute_edit_image(
+        ctx, {"source_image_ids": ["img_500"], "prompt": "make the bars blue"})
+
+    assert res["ok"] is False and res["error"] == "unknown_image_id"
+    assert ctx.processor.db.calls == [], "not even looked up — the model never saw this id"
+    oc.edit_image.assert_not_awaited()
+    client.download_file.assert_not_awaited()
+
+    # The very same id, on the very same context, opens for LOOKING.
+    ctx.pending_vision_parts = []
+    ctx.current_image_urls = []
+    ctx.processor.image_url_handler = SimpleNamespace(download_image=AsyncMock(return_value={
+        "url": "u", "mimetype": "image/png", "size": 4, "base64_data": "aGVsbG8=",
+        "data": b"hello"}))
+    viewed = await execute_view_image(ctx, {"image_id": "img_500"})
+    assert viewed["ok"] is True, viewed
+    assert ctx.processor.db.calls == [("C1", 500)]
+
+
+@pytest.mark.asyncio
+async def test_a_search_and_an_edit_in_one_round_refuse_honestly_rather_than_waiting():
+    """dispatch_all gathers a round's calls, so an edit can reach the executor before the search
+    that would authorize it has recorded anything. That is a legitimate refusal — the message says
+    the id has not been seen YET rather than that the image does not exist, and there is no wait
+    or retry to paper over it."""
+    oc = _openai()
+    ctx = _searchable_ctx(_FakeProcessor(openai_client=oc), _FakeClient(), searched=[])
+
+    res = await it.execute_edit_image(
+        ctx, {"source_image_ids": ["img_500"], "prompt": "make the bars blue"})
+
+    assert res["error"] == "unknown_image_id"
+    assert "search_stored_knowledge" in res["message"], "it names the route, not a dead end"
+    assert "does not exist" not in res["message"]
+    oc.edit_image.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_edit_asset_shares_the_same_widened_authorization():
+    oc = _openai()
+    ctx = _searchable_ctx(_FakeProcessor(openai_client=oc), _FakeClient(),
+                          searched=["img_500"])
+    ctx.container_id = "cntr_abc123"
+
+    res = await it.execute_edit_image_asset(
+        ctx, {"source_image_ids": ["img_500"], "prompt": "make the bars blue",
+              "filename": "edited.png"})
+
+    assert res["ok"] is True, res
+    assert ctx.processor.db.calls == [("C1", 500)]
 
 
 @pytest.mark.asyncio
@@ -1086,8 +1214,8 @@ def test_edit_image_asset_appears_only_with_a_catalog():
     assert it.get_edit_image_asset_schema(_cfg()) is None
     schema = it.get_edit_image_asset_schema(_cfg(**{it.CATALOG_KEY: CATALOG}))
     assert schema["name"] == "edit_image_asset"
-    assert schema["parameters"]["properties"]["source_image_ids"]["items"]["enum"] == [
-        "img_7", "img_3"]
+    assert "enum" not in schema["parameters"]["properties"]["source_image_ids"]["items"]
+    assert "img_7" in schema["description"] and "img_3" in schema["description"]
 
 
 @pytest.mark.asyncio
@@ -1104,9 +1232,9 @@ async def test_edit_asset_with_an_unresolvable_id_touches_nothing():
         ctx, {"source_image_ids": ["img_999"], "prompt": "make it blue",
               "filename": "edited.png"})
 
-    assert res == {"ok": False, "error": "unknown_image_id",
-                   "message": "No image 'img_999' in this thread.",
-                   "valid_image_ids": ["img_7", "img_3"]}
+    assert res["ok"] is False and res["error"] == "unknown_image_id"
+    assert "img_999" in res["message"]
+    assert res["valid_image_ids"] == ["img_7", "img_3"]
     oc.edit_image.assert_not_awaited()                  # no spend
     client.download_file.assert_not_awaited()           # not even a source fetch
     oc.client.containers.files.create.assert_not_awaited()
@@ -1279,11 +1407,12 @@ class TestStaticChannelSchemas:
                 assert schema is not None and schema["name"] == name
 
     def test_the_dynamic_factories_are_untouched(self):
-        # DM turns keep the enum and the saved-defaults sentence, verbatim.
+        # DM turns keep the per-turn listing and the saved-defaults sentence. The edit enum is
+        # gone on BOTH surfaces now (ruling 15) — the executor authorizes instead, so there is no
+        # longer an enum the two surfaces could differ on.
         cfg = _cfg(**{it.CATALOG_KEY: CATALOG})
-        assert it.get_edit_image_schema(cfg)["parameters"]["properties"][
-            "source_image_ids"]["items"]["enum"] == ["img_7", "img_3"]
-        assert it.get_edit_image_schema(_cfg()) is None
+        assert "img_7" in it.get_edit_image_schema(cfg)["description"]
+        assert "img_7" not in it.get_edit_image_schema(_cfg())["description"]
         assert "size=" in it.get_generate_image_schema(cfg)["description"]
 
     def test_a_returned_schema_is_not_shared_mutable_state(self):
@@ -1334,8 +1463,10 @@ class TestEvidenceHelpers:
         lines = image_catalog.catalog_evidence_lines(CATALOG)
 
         assert lines[0] == image_catalog.EVIDENCE_HEADER
-        assert len(lines) == 1 + len(CATALOG)
+        # Header, one line per image, then the note saying the list is the recent ones only.
+        assert len(lines) == 1 + len(CATALOG) + 1
         assert "img_7" in lines[1] and "A red cat on a blue sofa" in lines[1]
+        assert lines[-1] == image_catalog.INDEX_NOTE
         assert all("\n" not in line for line in lines)
 
     def test_an_empty_image_catalog_is_stated_not_omitted(self):

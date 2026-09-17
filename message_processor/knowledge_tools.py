@@ -12,10 +12,12 @@ Three properties make the results honest rather than merely present:
   ref and never the file's content (CLAUDE.md pitfall 6a), so a miss here does NOT prove the
   document never said it. The description says so in as many words, and `read_document` is the
   tool that re-derives real content.
-* **Handles are actionable or they are labelled.** A document hit carries the Slack file id and
-  filename `read_document` genuinely resolves. An image hit carries its analysis and a permalink
-  and NO viewing id: `view_image` resolves only ids from this turn's own catalog, so a synthesised
-  `img_*` would be a handle that always breaks.
+* **Handles are actionable.** A document hit carries the Slack file id and filename
+  `read_document` genuinely resolves. An image hit carries its analysis, a permalink AND the
+  `img_*` id `view_image` opens: that id used to be omitted because `view_image` resolved only
+  this turn's thread-scoped catalog, which made a synthesised one a handle that always breaks.
+  It now falls back to a channel-scoped lookup (`image_view._resolve_in_channel`), so the id is
+  as real as the document's file id and the picture found here can actually be looked at.
 * **The canonical read gate runs first.** Not "the requester is in this channel by construction" —
   that holds for a live message event and fails for the synthetic, replayed and detached contexts
   the registry also serves (tool_registry.py:164).
@@ -27,6 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from config import config
 from logger import setup_logger
+from message_processor import image_catalog
 from message_processor.document_tools import QUERY_WINDOW_CHARS
 from message_processor.tool_registry import ToolContext, ToolRegistry
 
@@ -144,6 +147,13 @@ def _image_hit(row: Dict[str, Any], query: str, channel_id: str) -> Dict[str, An
         "matched_in": matched_in,
         "shared_at": row.get("created_at"),
     }
+    # THE actionable handle, and the reason this tool can now answer "what did that screenshot
+    # say?" rather than only "one existed": view_image resolves an id absent from the turn's own
+    # catalog against this channel's image rows, so a hit of any age opens. Omitted rather than
+    # synthesised from a missing row id — a handle that breaks is worse than no handle, which is
+    # the rule that used to keep the id off every image hit.
+    if row.get("id") is not None:
+        hit["image_id"] = image_catalog.image_id_for(row["id"])
     thread_ts = _thread_ts_of(row.get("thread_id"), channel_id)
     if thread_ts:
         hit["thread_ts"] = thread_ts
@@ -205,10 +215,11 @@ def get_search_stored_knowledge_schema() -> Dict[str, Any]:
             "of concluding from an empty result here.\n\n"
             "Document hits return a file_id and filename you can pass straight to read_document — "
             "that one tool, not any other file tool: the sandbox mounts work off handles offered "
-            "on the turn itself, so what you get back here will not open one. Image hits are "
-            "INFORMATIONAL: they give you the stored description "
-            "and a link to the message, and there is no id to view the picture with, so answer "
-            "from the description or point the person at the link."
+            "on the turn itself, so what you get back here will not open one. Image hits return "
+            "the stored description, a link to the message, and an image_id you can pass straight "
+            "to view_image to LOOK at the picture — however old it is and whichever thread it was "
+            "posted in. When the question turns on what the image actually shows, open it instead "
+            "of answering from the description."
         ),
         "parameters": {
             "type": "object",
@@ -285,6 +296,13 @@ async def _search(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     hits.sort(key=lambda h: str(h.get("shared_at") or ""), reverse=True)
     hits = hits[:limit]
 
+    # Ruling 15: remember the image ids this result puts in front of the model, so the edit path
+    # will accept one. Recorded from the FINAL hits, after the sort and the `limit` trim — a row
+    # this search found but did not return is a row the model never read, and authorizing it would
+    # turn "the search touched it" into permission to edit it.
+    image_catalog.record_searched_ids(
+        ctx, [h["image_id"] for h in hits if h.get("kind") == "image" and h.get("image_id")])
+
     result: Dict[str, Any] = {
         "ok": True,
         "query": query,
@@ -306,8 +324,9 @@ async def _search(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     else:
         result["how_to_use"] = (
             "Document hits: pass file_id or filename to read_document for the real content. "
-            "Image hits: the description and permalink are all there is — there is no id that "
-            "will open the picture, so answer from the description or share the link.")
+            "Image hits: pass image_id to view_image to see the picture itself — do that when the "
+            "answer turns on what it shows, rather than reasoning from the description. The same "
+            "image_id also works as an edit_image source, for the rest of this turn.")
     return result
 
 

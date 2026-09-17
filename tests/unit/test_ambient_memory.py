@@ -318,6 +318,27 @@ async def test_image_worker_ready_and_dual_writes_catalog(db):
     assert imgs and imgs[0]["analysis"]
 
 
+async def test_image_dual_write_keeps_the_whole_description(db):
+    """The artifact `summary` is a render and keeps its 600-char budget; the images row is the
+    DURABLE record and gets the description whole. The analysis now leads with transcribed text,
+    so truncating it here would drop exactly the words the image showed."""
+    long_desc = "VISIBLE TEXT\nQ3 revenue 4,182,000 for order ID [AB-99]. " + "detail. " * 199 + "end."
+
+    class _LongVision(FakeOpenAI):
+        async def analyze_images(self, images, question, enhance_prompt=False, **kw):
+            self.vision_calls += 1
+            return long_desc
+
+    s = _svc(db, openai=_LongVision())
+    await s._process(_Job(kind="image", channel_id="C1", source_ts="1.1", conversation_ts="1.1",
+                          ref="F1", url="https://files/f1", filename="shot.png",
+                          mimetype="image/png"))
+    art = (await db.get_ambient_artifacts_for_messages("C1", ["1.1"]))["1.1"][0]
+    assert 500 < len(art["summary"]) <= 600 < len(long_desc)
+    imgs = await db.get_images_by_message_async("C1:1.1", "1.1")
+    assert imgs[0]["analysis"] == long_desc
+
+
 async def test_image_per_ref_distinct_rows(db):
     s = _svc(db)
     for fid in ("F1", "F2"):

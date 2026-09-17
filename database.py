@@ -6131,7 +6131,12 @@ class DatabaseManager(LoggerMixin):
                 return {}
 
     async def find_thread_images_async(self, thread_id: str, image_type: Optional[str] = None) -> List[Dict]:
-        """Async version of find_thread_images."""
+        """Async version of find_thread_images.
+
+        Oldest first, with an `id` tie-break: `created_at` has SECOND precision, so two images
+        saved in the same second would otherwise come back in an arbitrary order — and the image
+        catalog merges these rows with a channel-wide query to decide which one is "the last one".
+        """
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             await db.execute("PRAGMA journal_mode=WAL")
@@ -6139,10 +6144,10 @@ class DatabaseManager(LoggerMixin):
             params: Tuple[Any, ...]
             if image_type:
                 query = ("SELECT * FROM images WHERE thread_id = ? AND image_type = ? "
-                         "ORDER BY created_at ASC")
+                         "ORDER BY created_at ASC, id ASC")
                 params = (thread_id, image_type)
             else:
-                query = "SELECT * FROM images WHERE thread_id = ? ORDER BY created_at ASC"
+                query = "SELECT * FROM images WHERE thread_id = ? ORDER BY created_at ASC, id ASC"
                 params = (thread_id,)
 
             async with db.execute(query, params) as cursor:
@@ -6465,10 +6470,15 @@ class DatabaseManager(LoggerMixin):
 
         Same privacy boundary as the document lookup: a prefix LIKE on ``channel_id + ':'``, and
         channel ids are alphanumeric (no LIKE metacharacters), so this cannot escape the channel.
-        `within_hours` bounds it in time; None means no bound.
+        `within_hours` bounds it in time; None means no bound — which is what a CHANNEL catalog
+        asks for, since a quiet channel's three-week-old screenshot is still the one being asked
+        about. The `id` tie-break matters for the same reason it does in the thread lookup:
+        `created_at` is second-precision, and these rows get merged with it into one recency
+        order whose first entry is advertised as "the most recent".
         """
-        params: List[Any] = [f"{channel_id}:%"]
-        where = "thread_id LIKE ?"
+        low, high = self._channel_thread_range(channel_id)
+        params: List[Any] = [low, high]
+        where = "thread_id >= ? AND thread_id < ?"
         if within_hours is not None:
             where += " AND created_at >= datetime('now', ?)"
             params.append(f"-{int(within_hours)} hours")
@@ -6478,7 +6488,7 @@ class DatabaseManager(LoggerMixin):
             db.row_factory = aiosqlite.Row
             await db.execute("PRAGMA journal_mode=WAL")
             async with db.execute(
-                f"SELECT * FROM images WHERE {where} ORDER BY created_at DESC LIMIT ?",
+                f"SELECT * FROM images WHERE {where} ORDER BY created_at DESC, id DESC LIMIT ?",
                 tuple(params),
             ) as cursor:
                 images = []
@@ -6502,8 +6512,9 @@ class DatabaseManager(LoggerMixin):
             db.row_factory = aiosqlite.Row
             await db.execute("PRAGMA journal_mode=WAL")
             async with db.execute(
-                "SELECT * FROM documents WHERE thread_id LIKE ? ORDER BY created_at ASC",
-                (f"{channel_id}:%",),
+                "SELECT * FROM documents WHERE thread_id >= ? AND thread_id < ? "
+                "ORDER BY created_at ASC",
+                self._channel_thread_range(channel_id),
             ) as cursor:
                 documents = []
                 async for row in cursor:
@@ -6515,6 +6526,30 @@ class DatabaseManager(LoggerMixin):
                         del doc["metadata_json"]
                     documents.append(doc)
                 return documents
+
+    @staticmethod
+    def _channel_thread_range(channel_id: str) -> Tuple[str, str]:
+        """Half-open `thread_id` bounds covering every thread in ONE channel.
+
+        The channel-wide lookups used to say ``thread_id LIKE 'C123:%'``. SQLite cannot use an
+        index for a LIKE pattern, so every one of them was ``SCAN images`` plus a temp B-tree for
+        the ORDER BY — and `LIMIT` bounds the rows RETURNED, not the scan or the sort. That was
+        survivable while only DMs widened; the channel image catalog made it a table scan on every
+        channel turn, on a table that only grows. As a range it is
+        ``SEARCH ... USING INDEX idx_thread_images (thread_id>? AND thread_id<?)``.
+
+        ``;`` is the byte immediately after ``:``, so ``< channel_id + ';'`` is an exclusive upper
+        bound on ``channel_id + ':' + anything`` and cannot include a different channel: a longer
+        id like "C123X:…" sorts after "C123;" and is excluded, exactly as the LIKE excluded it.
+        The privacy boundary is therefore unchanged — same-channel-only, and channel ids are
+        alphanumeric so neither form can escape it.
+
+        One deliberate difference: LIKE is ASCII-case-INSENSITIVE in SQLite while a range compare
+        is binary, so this is very slightly STRICTER. Slack ids are case-stable and every caller
+        passes one straight through from Slack, so nothing that used to match stops matching —
+        and a narrower scope is the safe direction for this to err in.
+        """
+        return (f"{channel_id}:", f"{channel_id};")
 
     @staticmethod
     def _like_contains(term: str) -> str:
@@ -6548,10 +6583,11 @@ class DatabaseManager(LoggerMixin):
             await db.execute("PRAGMA journal_mode=WAL")
             async with db.execute(
                 r"""SELECT * FROM documents
-                    WHERE thread_id LIKE ?
+                    WHERE thread_id >= ? AND thread_id < ?
                       AND (filename LIKE ? ESCAPE '\' OR summary LIKE ? ESCAPE '\')
                     ORDER BY created_at DESC, id DESC LIMIT ?""",
-                (f"{channel_id}:%", pattern, pattern, max(1, int(limit))),
+                (*self._channel_thread_range(channel_id), pattern, pattern,
+                 max(1, int(limit))),
             ) as cursor:
                 documents = []
                 async for row in cursor:
@@ -6563,6 +6599,46 @@ class DatabaseManager(LoggerMixin):
                         del doc["metadata_json"]
                     documents.append(doc)
                 return documents
+
+    async def get_channel_image_by_id_async(self, channel_id: str,
+                                            image_id: int) -> Optional[Dict]:
+        """ONE image row by its primary key, provided it lives in this channel.
+
+        The exact-lookup twin of find_channel_images_async, and it carries that function's
+        privacy boundary verbatim: the row's thread_id must start with ``channel_id + ':'``, and
+        channel ids are alphanumeric (no LIKE metacharacters), so this cannot escape the channel.
+        A row in another channel or another DM returns None exactly as a nonexistent one does.
+
+        It exists because a per-turn catalog CAP must not bound what is reachable
+        [OWNER 2026-09-16]. `search_stored_knowledge` indexes every image description in the
+        channel and hands back an `img_<id>` handle; `view_image` resolves that handle through
+        here when the turn's own catalog does not carry it. Deliberately takes no `limit` — an
+        exact primary-key lookup has nothing to bound, and a number here would quietly become a
+        reachability ceiling.
+        """
+        if not channel_id:
+            return None
+        try:
+            row_id = int(image_id)
+        except (TypeError, ValueError):
+            return None
+
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            low, high = self._channel_thread_range(channel_id)
+            async with db.execute(
+                "SELECT * FROM images WHERE id = ? AND thread_id >= ? AND thread_id < ?",
+                (row_id, low, high),
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row is None:
+                    return None
+                img = dict(row)
+                if img.get("metadata_json"):
+                    img["metadata"] = json.loads(img["metadata_json"])
+                    del img["metadata_json"]
+                return img
 
     async def search_channel_image_analyses_async(self, channel_id: str, query: str,
                                                   limit: int = 10) -> List[Dict]:
@@ -6584,10 +6660,11 @@ class DatabaseManager(LoggerMixin):
             await db.execute("PRAGMA journal_mode=WAL")
             async with db.execute(
                 r"""SELECT * FROM images
-                    WHERE thread_id LIKE ?
+                    WHERE thread_id >= ? AND thread_id < ?
                       AND (analysis LIKE ? ESCAPE '\' OR original_analysis LIKE ? ESCAPE '\')
                     ORDER BY created_at DESC, id DESC LIMIT ?""",
-                (f"{channel_id}:%", pattern, pattern, max(1, int(limit))),
+                (*self._channel_thread_range(channel_id), pattern, pattern,
+                 max(1, int(limit))),
             ) as cursor:
                 images = []
                 async for row in cursor:
@@ -8035,7 +8112,7 @@ class DatabaseManager(LoggerMixin):
                 payload["receipt_feature_epoch_ts"] = row["value"] if row else None
 
                 if ids:
-                    thread_prefix = f"{channel_id}:%"
+                    thread_low, thread_high = self._channel_thread_range(channel_id)
                     receipts: List[Dict] = []
                     images: List[Dict] = []
                     documents: List[Dict] = []
@@ -8057,9 +8134,10 @@ class DatabaseManager(LoggerMixin):
                             f"SELECT id, thread_id, message_ts, url, image_type, analysis, "
                             f"       metadata_json "
                             f"FROM images "
-                            f"WHERE thread_id LIKE ? AND message_ts IN ({marks}) "
+                            f"WHERE thread_id >= ? AND thread_id < ? "
+                            f"AND message_ts IN ({marks}) "
                             f"ORDER BY CAST(message_ts AS REAL), id",
-                            (thread_prefix, *chunk)
+                            (thread_low, thread_high, *chunk)
                         ) as cursor:
                             for r in await cursor.fetchall():
                                 row_dict = dict(r)
@@ -8074,9 +8152,10 @@ class DatabaseManager(LoggerMixin):
                             f"SELECT id, thread_id, message_ts, filename, mime_type, file_id, "
                             f"       summary "
                             f"FROM documents "
-                            f"WHERE thread_id LIKE ? AND message_ts IN ({marks}) "
+                            f"WHERE thread_id >= ? AND thread_id < ? "
+                            f"AND message_ts IN ({marks}) "
                             f"ORDER BY CAST(message_ts AS REAL), id",
-                            (thread_prefix, *chunk)
+                            (thread_low, thread_high, *chunk)
                         ) as cursor:
                             documents.extend(dict(r) for r in await cursor.fetchall())
 

@@ -589,7 +589,12 @@ class AmbientArtifactService:
         if reuse and reuse.get("summary"):
             await self._ready(job, KIND_IMAGE, title=job.filename, summary=reuse["summary"],
                               model=reuse.get("model"), derivation_source="vision_worker",
-                              content_type=job.mimetype)
+                              content_type=job.mimetype,
+                              # Catalog reuse hands back a full addressed-turn analysis; artifact
+                              # reuse can only hand back its own 600-char summary. Either way this
+                              # is the longest text that exists for the image, so it is what the
+                              # durable row gets.
+                              catalog_analysis=reuse["summary"])
             return
         # Declared-size pre-gate (parity with the file worker): reject an honestly-oversized image
         # BEFORE downloading. Missing/dishonest sizes fall through to the streamed download cap.
@@ -671,7 +676,7 @@ class AmbientArtifactService:
         summary = sanitize_summary(description, max_chars=int(self.config.ambient_summary_max_chars))
         await self._ready(job, kind, title=job.filename, summary=summary,
                           model=model, derivation_source=derivation_source,
-                          content_type=mime)
+                          content_type=mime, catalog_analysis=description)
 
     # -- file ----------------------------------------------------------------
 
@@ -785,7 +790,14 @@ class AmbientArtifactService:
         return sanitize_summary(out, max_chars=int(self.config.ambient_summary_max_chars)) or None
 
     async def _ready(self, job: _Job, kind: str, *, title, summary, model,
-                     derivation_source: str, content_type=None) -> None:
+                     derivation_source: str, content_type=None,
+                     catalog_analysis: Optional[str] = None) -> None:
+        # `summary` is a RENDER and keeps its 600-char budget. `catalog_analysis` is the durable
+        # record for the images table, and it is stored whole: a text-first analysis of a screenshot
+        # spends its first paragraphs on the transcript, so a rendering budget applied here would
+        # cut the words the image actually showed. Every display of it is already bounded
+        # (`image_catalog._describe` at 110 chars, the stream's IMAGE_GIST_CHARS at 200).
+        analysis = (catalog_analysis or summary or "").strip() or None
         summary = sanitize_summary(summary, max_chars=int(self.config.ambient_summary_max_chars))
         title = sanitize_summary(title, max_chars=200) or None
         await self.db.set_ambient_artifact_ready(
@@ -801,7 +813,7 @@ class AmbientArtifactService:
                 thread_key = f"{job.channel_id}:{job.conversation_ts}"
                 await self.db.save_image_metadata_async(
                     thread_id=thread_key, url=job.url, image_type="uploaded",
-                    prompt="", analysis=summary,
+                    prompt="", analysis=analysis,
                     metadata={"ambient": True, "file_id": job.ref, "channel_id": job.channel_id},
                     message_ts=job.source_ts)
             except Exception as e:  # noqa: BLE001

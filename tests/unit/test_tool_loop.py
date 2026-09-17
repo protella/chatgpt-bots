@@ -1276,12 +1276,15 @@ class TestProcessorGlue:
                 "read_document", "lookup_user", "list_channel_members",
                 "start_background_job"} <= names
         # …and the per-request gates still hide what this request doesn't qualify for:
-        # no_response_needed needs an unprompted turn (F2), search_slack needs the event's
-        # action_token (BF1), and edit_image needs a non-empty image catalog (F34).
+        # no_response_needed needs an unprompted turn (F2) and search_slack needs the event's
+        # action_token (BF1).
         # create_image_asset is NOT in this list: W3 starts every turn on an `auto` container,
         # so gating it on an addressable id would have retired it from ordinary conversation.
-        assert names.isdisjoint({"no_response_needed", "search_slack", "edit_image"})
-        assert "create_image_asset" in names
+        # edit_image left this list [OWNER 2026-09-16, ruling 16]: it used to need a non-empty
+        # image catalog, but the tools array is built once before any search runs, so a tool
+        # hidden at turn start could not come back when search_stored_knowledge found an id.
+        assert names.isdisjoint({"no_response_needed", "search_slack"})
+        assert {"create_image_asset", "edit_image", "view_image"} <= names
         # BF1: search_slack reappears the moment the request carries an action_token.
         with_token = {t["name"] for t in registry.schemas({"_slack_search_available": True})}
         assert "search_slack" in with_token

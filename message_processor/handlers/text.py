@@ -872,13 +872,18 @@ class TextHandlerMixin(_Host):
         )
 
     async def _prepare_sandbox_tools(self, request_config: dict, thread_key: str,
-                                     ci_container, client=None) -> None:
+                                     ci_container, client=None, *, surface: str) -> None:
         """Shape the sandbox-facing tools to THIS turn (F34 images, F35 mount_file).
 
         Their schemas are factories, and a factory only ever sees thread_config — so the
         turn-specific facts they need get stashed there: the catalog of images edit_image may
         name, and the catalog of files mount_file may pull in. Both become literal enums, so an
         invented id cannot even be emitted.
+
+        ``surface`` is passed, never inferred (spec ruling 2): the image catalog widens past the
+        current root differently on a channel than in a DM, and this caller already knows which
+        one it is. Deriving it from the key's first letter inside the catalog is what left a
+        channel screenshot unreachable in the first place.
 
         The container id is recorded alongside them as the turn's declared sandbox. It no longer
         GATES either tool: W3 starts every turn on `auto`, so hiding them for want of an id would
@@ -888,7 +893,7 @@ class TextHandlerMixin(_Host):
         request_config[image_tools.CI_CONTAINER_KEY] = (
             ci_container if isinstance(ci_container, str) else None)
         request_config[image_tools.CATALOG_KEY] = await image_catalog.build_catalog(
-            self.db, thread_key)
+            self.db, thread_key, surface=surface)
         request_config[file_mount.FILES_KEY] = await thread_files.build_catalog(
             self.db, thread_key)
         # F36: the channel's canvases, so the model knows they EXIST. Without this the only clue
@@ -919,7 +924,8 @@ class TextHandlerMixin(_Host):
                                             tools_disabled=tools_disabled, turn=turn,
                                             surface=SURFACE_CHANNEL))
         ci_container = await self._resolve_ci_container(request_config, thread_key)
-        await self._prepare_sandbox_tools(request_config, thread_key, ci_container, client)
+        await self._prepare_sandbox_tools(request_config, thread_key, ci_container, client,
+                                          surface=SURFACE_CHANNEL)
         return registry, request_config, no_reply_available, contract_suffix, ci_container
 
     async def _channel_prepared_tools(self, client: BaseClient, thread_config: dict,
@@ -1349,7 +1355,8 @@ class TextHandlerMixin(_Host):
             # never reaches the tool loop's adoption checks or `container_recycled()`.
             ci_container = await self._resolve_ci_container(
                 request_config, thread_key, wedged_ids=wedged_container_ids(artifacts_acc))
-            await self._prepare_sandbox_tools(request_config, thread_key, ci_container, client)
+            await self._prepare_sandbox_tools(request_config, thread_key, ci_container, client,
+                                              surface=surface)
             tools = self._build_tools_array(request_config, model,
                                             exclude_mcp_server=failed_mcp_server, registry=registry,
                                             ci_container=ci_container, surface=surface)
@@ -2084,7 +2091,8 @@ class TextHandlerMixin(_Host):
             pin_dm_turn_context(turn, message, thread_config=thread_config,
                                 instructions=system_prompt, prompt_cache_key=cache_key)
             ci_container = await self._resolve_ci_container(request_config, thread_key)
-            await self._prepare_sandbox_tools(request_config, thread_key, ci_container, client)
+            await self._prepare_sandbox_tools(request_config, thread_key, ci_container, client,
+                                              surface=surface)
             tools = self._build_tools_array(request_config, model,
                                             exclude_mcp_server=exclude_mcp_server,
                                             registry=registry, ci_container=ci_container,
