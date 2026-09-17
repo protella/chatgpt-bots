@@ -32,6 +32,13 @@ All notable changes to this project will be documented in this file.
   now transcribed first and kept whole, so a question about what a screenshot actually said gets
   answered from the screenshot. Text found inside an image is treated as quoted content and never
   as an instruction to the bot.
+- **A spreadsheet that isn't one says so, instead of returning gibberish.** A file arriving under
+  a `.xlsx` or `.xls` name is sometimes something else — most often a web error page saved by a
+  failed download. When one of those began with a `<`, the bot tried it as a web table, and when
+  that failed it fell back to reading the raw bytes as text and treated the resulting garbage as
+  real content. The file is now reported as unreadable, with the offer to mount it in the sandbox,
+  the same as any other file that can't be parsed. Genuine spreadsheets exported as CSV or as web
+  tables under a spreadsheet name still open normally.
 - **Three limits that fired on ordinary work are gone.** The bot could look back at only two
   earlier images in a turn, see only two of the images it had just made, and its image
   descriptions were cut at 120 words. So "compare these three charts" failed on the third,

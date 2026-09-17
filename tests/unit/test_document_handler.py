@@ -479,12 +479,15 @@ class TestDocumentHandlerSpreadsheets:
             mock_parse.assert_called_once()
     
     def test_parse_excel_with_fallback(self, handler_with_pandas):
-        """Test Excel parsing with CSV fallback"""
+        """Test Excel parsing with CSV fallback.
+
+        Text bytes and a recovery that found rows — both conditions the fallback requires,
+        since a row-less parse of unreadable bytes is mojibake, not data."""
         excel_data = b'corrupt excel data'
         
         with patch.object(handler_with_pandas, '_parse_excel_with_pandas', side_effect=Exception("Excel parse failed")):
             with patch.object(handler_with_pandas, '_parse_csv_with_pandas') as mock_csv:
-                mock_csv.return_value = {'content': 'fallback csv', 'format': 'csv'}
+                mock_csv.return_value = {'content': 'fallback csv', 'format': 'csv', 'rows': 1}
                 
                 result = handler_with_pandas.parse_excel_adaptive(excel_data, 'test.xlsx')
                 assert result['format'] == 'csv'

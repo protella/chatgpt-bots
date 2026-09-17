@@ -979,27 +979,38 @@ class DocumentHandler(LoggerMixin):
             else:
                 return self._parse_excel_with_pandas(file_data, filename, pd)
         except SpreadsheetFormatMismatch as mismatch:
-            # A genuine CSV under a spreadsheet name still parses — BI tools rename constantly —
-            # so the fallback keeps its turn. But an empty parse is not data: pandas will decode
-            # arbitrary bytes into mojibake or into no columns at all, and returning that as
-            # content is how unreadable bytes came to read as a successful extraction (and were
-            # then shipped to the API as an input_file).
-            if looks_binary(file_data[:8192]):
-                raise mismatch from None
-            try:
-                recovered = self._parse_csv_with_pandas(file_data, filename, pd)
-            except Exception:
-                raise mismatch from None
-            if not recovered.get('rows'):
-                raise mismatch from None
-            return recovered
+            return self._csv_recovery(file_data, filename, mismatch)
         except Exception as e:
-            # Try CSV interpretation as fallback
-            try:
-                self.log_warning(f"Excel parsing failed for {filename}, trying CSV fallback: {e}")
-                return self._parse_csv_with_pandas(file_data, filename, pd)
-            except Exception as csv_error:
-                raise Exception(f"Spreadsheet parsing failed: {e}, CSV fallback: {csv_error}")
+            # A reader that BLEW UP (rather than declining the bytes) gets the same CSV
+            # recovery under the same conditions. It used to get an unguarded one, and that
+            # was a hole in the mismatch branch's rule: bytes leading with '<' route to the
+            # HTML reader, a failure there lands here, and a CSV re-read of binary renders
+            # mojibake that reads as a successful extraction. An HTML error page saved under
+            # an .xlsx name is the everyday version of that.
+            self.log_warning(f"Excel parsing failed for {filename}, trying CSV fallback: {e}")
+            return self._csv_recovery(
+                file_data, filename,
+                SpreadsheetFormatMismatch(f"Spreadsheet parsing failed for {filename}: {e}"))
+
+    def _csv_recovery(self, file_data: bytes, filename: str,
+                      mismatch: SpreadsheetFormatMismatch) -> Dict[str, Any]:
+        """A CSV re-read of bytes a spreadsheet reader would not take, or `mismatch`.
+
+        A genuine CSV under a spreadsheet name still parses — BI tools rename constantly — so
+        the fallback keeps its turn. But an empty parse is not data: pandas will decode
+        arbitrary bytes into mojibake or into no columns at all, and returning that as content
+        is how unreadable bytes came to read as a successful extraction (and were then shipped
+        to the API as an input_file).
+        """
+        if looks_binary(file_data[:8192]):
+            raise mismatch from None
+        try:
+            recovered = self._parse_csv_with_pandas(file_data, filename, pd)
+        except Exception:
+            raise mismatch from None
+        if not recovered.get('rows'):
+            raise mismatch from None
+        return recovered
     def _parse_excel_with_pandas(self, file_data: bytes, filename: str, pd) -> Dict[str, Any]:
         """Parse Excel file using pandas, choosing the engine by magic bytes.
 

@@ -8,8 +8,11 @@ description: Run this repo's pytest suite safely. Use for ANY pytest invocation 
 Every `pytest` invocation gets a virtual-memory cap. No exceptions, including single-test runs.
 
 ```bash
-(ulimit -v 4194304; timeout 600 python3 -m pytest tests/unit -q -p no:cacheprovider --tb=no -p no:logging)
+(ulimit -v 4194304; timeout 1800 python3 -m pytest tests/unit -q -p no:cacheprovider --tb=short)
 ```
+
+Do **not** add `-p no:logging`: it disables the plugin that provides `caplog`, and the suite has
+77 tests that take that fixture. They all ERROR, which reads exactly like a real breakage.
 
 `make test` (coverage) and `make test-fast` are fine to reach for, but wrap them the same way.
 

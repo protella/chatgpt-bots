@@ -14,7 +14,7 @@ The contract this file pins:
   5. a failed document keeps a metadata-only row, so it still has a mount id
   6. both failure renderers say what happened instead of "unsupported file type"
 """
-import os
+import random
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
@@ -28,6 +28,12 @@ from message_processor.thread_management import ThreadManagementMixin
 from message_processor.thread_manager import AsyncThreadStateManager
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+# Fixed-seed entropy, never os.urandom: a random tail can land an unbalanced quote that makes
+# pandas raise where the test wants it to parse, and can lead with '<' where the test wants
+# binary — both of which made this file flake. Same bytes every run.
+def _noise(n: int, seed: int = 20260917) -> bytes:
+    return random.Random(seed).randbytes(n)
 
 
 # --------------------------------------------------------------------------- harness
@@ -89,9 +95,15 @@ async def _run(proc, payload, message=None):
 # ------------------------------------------------- 1. unreadable bytes are a failure
 
 @pytest.mark.parametrize("label,payload", [
-    ("high-entropy binary", os.urandom(2048)),
-    ("a compressed blob", b"\x1f\x8b\x08\x00" + os.urandom(512)),
-    ("an image renamed .xlsx", b"\xff\xd8\xff\xe0\x00\x10JFIF" + os.urandom(512)),
+    ("high-entropy binary", _noise(2048)),
+    ("a compressed blob", b"\x1f\x8b\x08\x00" + _noise(512)),
+    ("an image renamed .xlsx", b"\xff\xd8\xff\xe0\x00\x10JFIF" + _noise(512)),
+    # '<' routes to the HTML reader, and a failure THERE used to land in an unguarded CSV
+    # re-read that rendered the bytes as mojibake and called it a successful extraction.
+    ("binary behind an angle bracket", b"<" + _noise(2047)),
+    ("an HTML error page under a spreadsheet name",
+     b"<!DOCTYPE html><html><head><title>502 Bad Gateway</title></head>"
+     b"<body><h1>502</h1><p>upstream did not answer</p></body></html>"),
     ("a ZIP that is not a workbook", b"PK\x03\x04" + b"\x00" * 256),
     ("an OLE2 file that is not a workbook", b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 256),
 ])
@@ -128,7 +140,7 @@ async def test_a_failed_document_is_routed_to_unsupported_and_never_base64d(temp
     """The incident in one assertion: no document input, no base64 payload, and a named
     failure the turn can talk about instead of a 400."""
     proc = _Proc(db=temp_db)
-    _images, documents, unsupported = await _run(proc, os.urandom(2048))
+    _images, documents, unsupported = await _run(proc, _noise(2048))
 
     assert documents == []
     assert [f["name"] for f in unsupported] == ["quarterly-figures.xlsx"]
@@ -198,7 +210,9 @@ async def test_a_workbook_mimetype_that_is_not_a_workbook_is_never_uploaded(temp
     proc = _Proc(db=temp_db)
     prefix = b"region,units\n" + b"".join(b"North,%d\n" % i for i in range(1200))
     assert len(prefix) > 8192  # past any bounded head-scan
-    payload = prefix + b"\x00\x01\x02" + os.urandom(2048)
+    # Every byte except the double quote, whose unbalanced appearance is a pandas parse
+    # error rather than the successful-extraction-of-binary this test is about.
+    payload = prefix + b"\x00\x01\x02" + bytes(b for b in range(256) if b != 0x22) * 8
 
     extracted = proc.document_handler.safe_extract_content(payload, XLSX_MIME, "quarterly.xlsx")
     assert extracted["format"] == "csv" and extracted["content"]  # extraction "succeeds"
@@ -278,7 +292,7 @@ async def test_a_failed_document_keeps_a_metadata_only_row_the_catalog_can_offer
     """"Mount it and convert it in the sandbox" is advice the model needs an id to act on.
     The row carries the failure reason and the Slack ref — never bytes, never content."""
     proc = _Proc(db=temp_db)
-    await _run(proc, os.urandom(2048))
+    await _run(proc, _noise(2048))
 
     rows = await temp_db.get_thread_documents_async("D1:100.0")
     assert [r["filename"] for r in rows] == ["quarterly-figures.xlsx"]

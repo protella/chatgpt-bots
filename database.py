@@ -6468,8 +6468,8 @@ class DatabaseManager(LoggerMixin):
         send a picture, then ask about it in the next message, and the picture is in another
         "thread".
 
-        Same privacy boundary as the document lookup: a prefix LIKE on ``channel_id + ':'``, and
-        channel ids are alphanumeric (no LIKE metacharacters), so this cannot escape the channel.
+        Same privacy boundary as the document lookup: the half-open `thread_id` range from
+        _channel_thread_range, which admits exactly the threads of ONE channel and nothing else.
         `within_hours` bounds it in time; None means no bound — which is what a CHANNEL catalog
         asks for, since a quiet channel's three-week-old screenshot is still the one being asked
         about. The `id` tie-break matters for the same reason it does in the thread lookup:
@@ -6504,10 +6504,9 @@ class DatabaseManager(LoggerMixin):
         """All documents shared anywhere in a channel (F22 channel-wide access).
 
         thread_id is stored as "channel:thread"; a channel's documents are every row
-        whose thread_id starts with ``channel_id + ':'``. Channel ids are alphanumeric
-        (no LIKE metacharacters), so a plain prefix LIKE is safe and cannot escape the
-        channel — the privacy boundary is same-channel-only. Same row shape and
-        created_at ASC ordering as get_thread_documents_async."""
+        whose thread_id falls in the half-open range from _channel_thread_range, so the
+        privacy boundary is same-channel-only. Same row shape and created_at ASC
+        ordering as get_thread_documents_async."""
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             await db.execute("PRAGMA journal_mode=WAL")
@@ -6548,6 +6547,14 @@ class DatabaseManager(LoggerMixin):
         is binary, so this is very slightly STRICTER. Slack ids are case-stable and every caller
         passes one straight through from Slack, so nothing that used to match stops matching —
         and a narrower scope is the safe direction for this to err in.
+
+        The ORDER BY still builds a temp B-tree, and that is settled, not pending: the range is
+        over the LEADING index column, so no index on this table can order the result by
+        created_at across a whole channel — only a channel_id column could, and that is a
+        migration plus a widened ``SELECT *`` row shape. It sorts the channel's own rows, not the
+        table: measured on production data at the busiest bucket (383 images) the catalog query is
+        0.45 ms and the analysis search 0.27 ms, and a synthetic bucket of 40,000 images still
+        sorts in 4.9 ms. Do not trade a schema change for that.
         """
         return (f"{channel_id}:", f"{channel_id};")
 
@@ -6568,8 +6575,9 @@ class DatabaseManager(LoggerMixin):
 
         The search half of get_channel_documents_async, and it inherits that method's privacy
         boundary verbatim: thread_id is stored as "channel:thread", so a channel's rows are the
-        ones whose thread_id starts with ``channel_id + ':'``, and channel ids are alphanumeric
-        (no LIKE metacharacters) so the prefix match cannot escape the channel.
+        ones inside the half-open `thread_id` range from _channel_thread_range, which cannot
+        reach another channel. The LIKE here is the search term, not the channel bound, and it
+        runs through _like_contains so a term containing % or _ stays a literal.
 
         SUMMARY, not content: the documents table holds a summary + metadata + the Slack ref and
         never the body (CLAUDE.md pitfall 6a). A row that does not match here may still say the
@@ -6605,8 +6613,8 @@ class DatabaseManager(LoggerMixin):
         """ONE image row by its primary key, provided it lives in this channel.
 
         The exact-lookup twin of find_channel_images_async, and it carries that function's
-        privacy boundary verbatim: the row's thread_id must start with ``channel_id + ':'``, and
-        channel ids are alphanumeric (no LIKE metacharacters), so this cannot escape the channel.
+        privacy boundary verbatim: the row's thread_id must fall inside that function's
+        half-open channel range, so an id from another conversation cannot escape it.
         A row in another channel or another DM returns None exactly as a nonexistent one does.
 
         It exists because a per-turn catalog CAP must not bound what is reachable
