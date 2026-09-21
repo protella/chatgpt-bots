@@ -3,6 +3,7 @@ python-dotenv>=1.2.2
 openai>=3.9.0  # GPT-6 Astra (3.8.0) + prompt-cache diagnostics (3.9.0)
 slack_bolt>=1.30.0
 slack_sdk>=3.44.1  # imported directly (WebClient, SlackApiError); do not rely on slack_bolt's transitive pin
+httpx2>=2.12.0  # transitive via openai, floored here: releases below 2.12.0 carry the streaming-decompression memory advisory
 Pillow>=12.3.0
 croniter>=6.2.4
 pytz>=2026.3
