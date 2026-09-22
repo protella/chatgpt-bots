@@ -546,3 +546,88 @@ def test_a_small_image_passes_with_the_cap_set():
 def test_omitting_the_cap_leaves_existing_behavior_exactly_as_it_was():
     assert validate_image_bytes(_png()) == ("image/png", None)
     assert validate_image_bytes(b"\x89PNG\r\n\x1a\n" + b"junk" * 8) == (None, UNREADABLE)
+
+
+# ------------------------------------------------ over the vision patch budget: shrink, don't 400
+#
+# Reconstructed from a prod incident: a 6560x4928 phone photo is ceil(6560/32) * ceil(4928/32) =
+# 205 * 154 = 31570 patches, over the API's 30000, and the whole turn 400'd. Only a confirmed-
+# oversize image is touched, only on the vision path, and it keeps its orientation and format.
+
+_BUDGET = image_validation._VISION_MAX_PATCHES
+
+
+def _patches(width: int, height: int) -> int:
+    return image_validation._vision_patches(width, height)
+
+
+def _big_jpeg(width: int, height: int, orientation: int = 0) -> bytes:
+    buf = BytesIO()
+    kwargs = {}
+    if orientation:
+        exif = Image.Exif()
+        exif[0x0112] = orientation
+        kwargs["exif"] = exif.tobytes()
+    Image.new("RGB", (width, height), "navy").save(buf, format="JPEG", **kwargs)
+    return buf.getvalue()
+
+
+_INCIDENT_JPEG = None
+
+
+def _incident_jpeg() -> bytes:
+    # Built once and shared: decoding a 32 MP frame costs ~100 MB, so no more of them than needed.
+    global _INCIDENT_JPEG
+    if _INCIDENT_JPEG is None:
+        _INCIDENT_JPEG = _big_jpeg(6560, 4928)
+    return _INCIDENT_JPEG
+
+
+class TestPatchBudget:
+    def test_the_incident_photo_is_shrunk_to_the_largest_size_that_fits(self):
+        out, mime = ensure_api_compatible(_incident_jpeg())
+        assert mime == "image/jpeg" and out is not None
+        with Image.open(BytesIO(out)) as im:
+            assert im.format == "JPEG"
+            w, h = im.size
+        assert _patches(w, h) <= _BUDGET
+        assert abs(h - w * 4928 / 6560) < 1          # aspect kept within a pixel
+        # Maximal: one more pixel on the long edge (short edge re-derived) is over budget.
+        assert _patches(w + 1, (w + 1) * 4928 // 6560) > _BUDGET
+        assert (w, h) == (6390, 4800)
+
+    def test_exactly_on_budget_is_the_same_bytes_object(self):
+        raw = _big_jpeg(6400, 4800)                  # 200 * 150 = 30000 exactly
+        out, mime = ensure_api_compatible(raw)
+        assert out is raw and mime == "image/jpeg"
+
+    def test_one_row_over_budget_is_shrunk(self):
+        out, _ = ensure_api_compatible(_big_jpeg(6400, 4801))   # 200 * 151 = 30200
+        assert out is not None
+        with Image.open(BytesIO(out)) as im:
+            assert _patches(*im.size) <= _BUDGET
+
+    def test_an_oversize_png_stays_png_with_its_alpha(self):
+        # A 2-px-tall strip one patch column over budget: oversize without allocating 100 MB.
+        buf = BytesIO()
+        Image.new("RGBA", (32 * (_BUDGET + 1), 2), (255, 0, 0, 128)).save(buf, format="PNG")
+        out, mime = ensure_api_compatible(buf.getvalue())
+        assert mime == "image/png" and out is not None
+        with Image.open(BytesIO(out)) as im:
+            assert im.format == "PNG" and im.mode == "RGBA"
+            assert _patches(*im.size) <= _BUDGET
+            assert im.getchannel("A").getextrema()[0] < 255
+
+    def test_exif_orientation_survives_the_resize(self):
+        # Orientation 6 = stored landscape, displayed portrait. The re-encoded bytes carry no
+        # EXIF, so the pixels themselves must come back upright (portrait).
+        out, _ = ensure_api_compatible(_big_jpeg(6560, 4928, orientation=6))
+        assert out is not None
+        with Image.open(BytesIO(out)) as im:
+            w, h = im.size
+        assert h > w and _patches(w, h) <= _BUDGET
+
+    def test_the_edit_path_is_untouched(self):
+        raw = _incident_jpeg()
+        out, mime = ensure_compatible(raw, allowed=IMAGE_EDIT_MIMETYPES)
+        assert out is raw and mime == "image/jpeg"

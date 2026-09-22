@@ -407,3 +407,40 @@ class TestTurnEffectsUnsettledStreamingBoundary:
             "TurnEffectsUnsettled must be re-raised at the outer streaming boundary, "
             "before the generic except that launches the non-streaming fallback")
         assert "raise" in window[unsettled:generic]
+
+
+# ------------------------- the turn's error card says what happened (prod incident 2026-09-21)
+
+class TestTurnErrorMessage:
+    """A 6560x4928 photo 400'd with "...31570 patches after processing, exceeding the limit of
+    30000..." and the user was told OpenAI was busy — the bare "limit" substring. Waiting never
+    fixes an oversize image, and "rate" matches "generate", so throttling is read from the
+    exception itself now."""
+
+    _PATCH_400 = ("Error code: 400 - {'error': {'message': 'The image you provided requires "
+                  "31570 patches after processing, exceeding the limit of 30000. Please resize "
+                  "the image and try again.', 'type': 'invalid_request_error', 'param': 'input', "
+                  "'code': 'invalid_value'}}")
+
+    def test_the_patch_400_is_image_too_large(self):
+        text = MessageProcessor._turn_error_message(Exception(self._PATCH_400), _msg())
+        assert "Image Too Large" in text and "Too Many Requests" not in text
+
+    def test_a_real_rate_limit_error_is_too_many_requests(self):
+        import httpx
+        import openai
+
+        request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+        error = openai.RateLimitError("Rate limit reached", body=None,
+                                      response=httpx.Response(429, request=request))
+        assert "Too Many Requests" in MessageProcessor._turn_error_message(error, _msg())
+
+    def test_a_bare_429_status_is_too_many_requests(self):
+        error = Exception("slow down")
+        error.status_code = 429  # type: ignore[attr-defined]
+        assert "Too Many Requests" in MessageProcessor._turn_error_message(error, _msg())
+
+    def test_the_word_generate_is_not_throttling(self):
+        text = MessageProcessor._turn_error_message(
+            Exception("failed to generate a response"), _msg())
+        assert "Too Many Requests" not in text

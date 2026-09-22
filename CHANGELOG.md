@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.2.7] - 2026-09-22
+
+### 🐛 Fixed
+
+- **A full-resolution phone photo can be looked at.** OpenAI refuses an image whose pixel
+  dimensions are over its processing budget (about 30 megapixels), and the bot sent every photo
+  at the size it arrived. A modern phone camera shoots past that, so a picture straight off the
+  phone failed three times over — the reply, the stored description and any later look at it —
+  and the question about it went unanswered. An image confirmed to be over the budget is now
+  scaled down just enough to fit before the bot looks at it: upright, with its colours and
+  transparency intact. Anything within the budget is sent exactly as before, and the copy posted
+  to Slack is never changed.
+- **A picture that's too big says so, instead of "OpenAI is busy."** The error shown when a
+  request failed picked "Too Many Requests — please wait a minute" for any error containing the
+  word *limit* or *rate*, which caught an oversized image ("exceeding the limit") and anything
+  mentioning *generate*. Waiting never fixed either. An oversized image now gets its own message
+  saying what to do, and "Too Many Requests" appears only when OpenAI is actually throttling.
+
+### 🔧 Changed
+
+- **Dependencies updated**, including the OpenAI SDK (3.16.2) and `httpx2` (2.13.0), which
+  clears three open security advisories in the HTTP client.
+
 ## [3.2.6] - 2026-09-16
 
 ### 🐛 Fixed

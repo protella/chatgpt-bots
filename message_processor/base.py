@@ -6,6 +6,8 @@ import asyncio
 import logging
 import time
 from typing import Any, Optional, cast
+
+import openai
 from message_processor.client_contract import BaseClient, ChannelStreamError, HistoryFetchError, Message, Response
 from message_processor.thread_manager import AsyncThreadStateManager
 from openai_client import OpenAIClient
@@ -1094,36 +1096,7 @@ class MessageProcessor(ThreadManagementMixin,
                         pass  # Don't let update failure affect error handling
 
                 # Generic error message - keep it simple for users
-                # Log the actual error for debugging, but don't show technical details to user
-                error_details = str(e)
-
-                # Check for common error types and provide user-friendly messages
-                # IMPORTANT: Check MCP errors FIRST before generic "context" check (which would match "context7" server names)
-                if "mcp server" in error_details.lower() and ("404" in error_details or "424" in error_details):
-                    error_message = f"{config.error_emoji} **MCP Connection Failed**\n\nCouldn't connect to one or more MCP servers. Please check your MCP configuration or try again later."
-                elif "invalid_file" in error_details.lower():
-                    # A file the API refused to open. Naming it beats the generic card: the
-                    # bytes are still in Slack, so re-saving (or the sandbox) is a real fix.
-                    named = ", ".join(
-                        f"*{a.get('name')}*" for a in (message.attachments or [])
-                        if a.get("name"))
-                    which = f" ({named})" if named else ""
-                    error_message = (
-                        f"{config.error_emoji} **Couldn't Read That File**\n\n"
-                        f"One of the attached files{which} couldn't be opened — its contents "
-                        "don't match its file type. Re-saving it usually fixes it, or ask me "
-                        "to open it in the sandbox and convert it."
-                    )
-                elif "rate" in error_details.lower() or "limit" in error_details.lower():
-                    error_message = f"{config.error_emoji} **Too Many Requests**\n\nOpenAI is busy. Please wait a minute and try again."
-                elif "context_length_exceeded" in error_details.lower() or "maximum context length" in error_details.lower():
-                    # More specific context window check (avoid matching MCP server names like "context7")
-                    error_message = f"{config.error_emoji} **Message Too Long**\n\nYour message is too long. Please try a shorter request."
-                elif "api" in error_details.lower() or "openai" in error_details.lower():
-                    error_message = f"{config.error_emoji} **Service Issue**\n\nOpenAI is having problems. Please try again shortly."
-                else:
-                    # Generic fallback
-                    error_message = f"{config.error_emoji} **Something Went Wrong**\n\nPlease try again. If this keeps happening, try later."
+                error_message = self._turn_error_message(e, message)
 
             return Response(
                 type="error",
@@ -1148,6 +1121,53 @@ class MessageProcessor(ThreadManagementMixin,
             except Exception as lock_error:
                 # Even if release fails, log it but don't crash
                 self.log_error(f"Error releasing thread lock for {thread_key}: {lock_error}", exc_info=True)
+
+    @staticmethod
+    def _turn_error_message(e: BaseException, message: Message) -> str:
+        """The user-facing card for a turn that died with `e` (not a timeout).
+
+        Log the actual error for debugging, but don't show technical details to the user.
+        """
+        error_details = str(e)
+
+        # Check for common error types and provide user-friendly messages
+        # IMPORTANT: Check MCP errors FIRST before generic "context" check (which would match "context7" server names)
+        if "mcp server" in error_details.lower() and ("404" in error_details or "424" in error_details):
+            error_message = f"{config.error_emoji} **MCP Connection Failed**\n\nCouldn't connect to one or more MCP servers. Please check your MCP configuration or try again later."
+        elif "invalid_file" in error_details.lower():
+            # A file the API refused to open. Naming it beats the generic card: the
+            # bytes are still in Slack, so re-saving (or the sandbox) is a real fix.
+            named = ", ".join(
+                f"*{a.get('name')}*" for a in (message.attachments or [])
+                if a.get("name"))
+            which = f" ({named})" if named else ""
+            error_message = (
+                f"{config.error_emoji} **Couldn't Read That File**\n\n"
+                f"One of the attached files{which} couldn't be opened — its contents "
+                "don't match its file type. Re-saving it usually fixes it, or ask me "
+                "to open it in the sandbox and convert it."
+            )
+        elif "patches after processing" in error_details.lower():
+            # The vision API's own 400 for an image over its pixel budget ("requires N patches after
+            # processing, exceeding the limit of 30000"). It used to fall into the old bare "limit"
+            # substring test and tell the user OpenAI was busy — but waiting never fixes it.
+            error_message = (
+                f"{config.error_emoji} **Image Too Large**\n\nOne of the images is bigger than "
+                "OpenAI can process (its pixel dimensions are over the limit). Upload a smaller "
+                "version, or crop it into sections if the small text matters. Waiting won't fix this.")
+        elif isinstance(e, openai.RateLimitError) or getattr(e, "status_code", None) == 429:
+            # Real throttling, from the exception itself. Substrings lied both ways: "limit" caught
+            # the patch 400 above, and "rate" matches "generate".
+            error_message = f"{config.error_emoji} **Too Many Requests**\n\nOpenAI is busy. Please wait a minute and try again."
+        elif "context_length_exceeded" in error_details.lower() or "maximum context length" in error_details.lower():
+            # More specific context window check (avoid matching MCP server names like "context7")
+            error_message = f"{config.error_emoji} **Message Too Long**\n\nYour message is too long. Please try a shorter request."
+        elif "api" in error_details.lower() or "openai" in error_details.lower():
+            error_message = f"{config.error_emoji} **Service Issue**\n\nOpenAI is having problems. Please try again shortly."
+        else:
+            # Generic fallback
+            error_message = f"{config.error_emoji} **Something Went Wrong**\n\nPlease try again. If this keeps happening, try later."
+        return error_message
 
     @staticmethod
     def _fail_closed_notice_warranted(message: Message, channel_turn: bool) -> bool:

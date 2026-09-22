@@ -172,6 +172,7 @@ async def publish_image(
     filename: Optional[str] = None,
     caption: Optional[str] = None,
     receipts=None,
+    vision_image_data=None,
 ) -> Optional[str]:
     """Single owner of image delivery for both the background job and the sync path:
     checklist "Uploading…" transition, upload, falsey-URL = failure, persistence,
@@ -193,6 +194,11 @@ async def publish_image(
     an IMPORT has a real source filename and a caption someone actually wrote, where a generation
     has neither. Omitting both keeps the generated-image defaults (``generated_image.<fmt>`` and
     the enhanced-prompt caption) exactly as they were.
+
+    ``vision_image_data`` is the copy the detached description LOOKS at, when that must differ
+    from the bytes posted: an import can be a full-resolution photo over the vision API's patch
+    budget, so it is described from a downscaled copy while Slack gets the original. None (every
+    other caller) describes ``image_data`` itself.
 
     ``provenance_tool`` (F7) is the name of the tool that actually made this image, and is
     passed ONLY by callers that know it. The bot's text reply gets a provenance row keyed on
@@ -280,8 +286,8 @@ async def publish_image(
     if db and getattr(image_data, "base64_data", None):
         try:
             processor._schedule_async_call(
-                _describe_produced_image(processor, db, thread_key, file_url, image_data,
-                                         image_type))
+                _describe_produced_image(processor, db, thread_key, file_url,
+                                         vision_image_data or image_data, image_type))
         except Exception as e:  # noqa: BLE001
             processor.log_debug(f"produced-image description not scheduled: {e}")
 

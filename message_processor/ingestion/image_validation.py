@@ -29,8 +29,15 @@ here — nothing touches disk.
 
 from __future__ import annotations
 
+import math
 from io import BytesIO
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
+
+from logger import setup_logger
+
+# Under the app's `slack_bot.*` hierarchy so a resize actually reaches app.log; a bare
+# `getLogger(__name__)` has no handler there and its INFO line is silently dropped.
+logger = setup_logger(name="slack_bot.ImageValidation")
 
 # The mimetypes the API accepts, as DECLARED labels — for cheap pre-download screening only
 # (URL content-type checks and the like). `image/jpg` is not a real mimetype, but
@@ -81,6 +88,9 @@ ANIMATED_GIF = "animated_gif"
 # A source that decoded fine but ballooned past the byte ceiling once transcoded (e.g. a highly
 # compressed TIFF/GIF expanding into a huge PNG). Enforced by callers, not by ensure_compatible.
 TOO_LARGE_AFTER_CONVERSION = "too_large_after_conversion"
+# A vision image over the API's patch budget whose frame is ALSO past `_MAX_TRANSCODE_PIXELS`, so
+# it is refused from the header rather than decoded to be shrunk.
+TOO_LARGE_TO_RESIZE = "too_large_to_resize"
 
 _REJECTION_TEXT = {
     UNREADABLE: ("isn't in a format I can read — I can look at PNG, JPEG, GIF and WebP images. "
@@ -89,6 +99,8 @@ _REJECTION_TEXT = {
     ANIMATED_GIF: "is an animated GIF, which I can't look at — a static image works.",
     TOO_LARGE_AFTER_CONVERSION: ("is too large to edit once converted to a supported format — "
                                  "a smaller or already-PNG/JPEG image works."),
+    TOO_LARGE_TO_RESIZE: ("is too large for me to look at — its pixel dimensions are far over "
+                          "the limit. A smaller version works."),
 }
 
 
@@ -274,11 +286,139 @@ def ensure_compatible(
     return (png, "image/png") if png is not None else (None, UNREADABLE)
 
 
+# The vision API's own pixel budget, quoted from its 400: "The image you provided requires 31570
+# patches after processing, exceeding the limit of 30000. Please resize the image and try again."
+# A patch is a 32x32 tile, and at our detail setting (auto/omitted) the gpt-6/gpt-5.6 models keep an
+# image's pixel dimensions, so the count is ceil(w/32) * ceil(h/32) — the incident's 6560x4928
+# phone photo is 205 * 154 = 31570, exactly the number in that 400. These are the API's numbers,
+# not ours. (gpt-5.5 downscales on its own, so shrinking before it is harmless.)
+_VISION_PATCH_SIZE = 32
+_VISION_MAX_PATCHES = 30_000
+
+
+def _vision_patches(width: int, height: int) -> int:
+    """How many 32-px patches the vision API counts for a frame of this size."""
+    return math.ceil(width / _VISION_PATCH_SIZE) * math.ceil(height / _VISION_PATCH_SIZE)
+
+
+def _fit_to_patch_budget(width: int, height: int) -> Tuple[int, int]:
+    """The LARGEST aspect-preserving (w, h) whose patch count fits `_VISION_MAX_PATCHES`.
+
+    A plain sqrt-ratio scale is not enough: flooring 6560x4928 by sqrt(30000/31570) gives
+    6394x4803, which is 200 * 151 = 30200 patches — still over, because the ceilings round up. So
+    the sqrt scale is only the starting guess for the long edge; the short edge is always derived
+    from it (rounded down, so the aspect never drifts past a pixel) and the long edge then steps
+    until the integer check is exact. Patches never decrease as the long edge grows, so stepping
+    up while the next size fits and down while this one does not lands on the maximum.
+    """
+    long_edge, short_edge = max(width, height), min(width, height)
+
+    def dims(long_px: int) -> Tuple[int, int]:
+        return long_px, max(1, long_px * short_edge // long_edge)
+
+    def fits(long_px: int) -> bool:
+        return _vision_patches(*dims(long_px)) <= _VISION_MAX_PATCHES
+
+    scale = math.sqrt(_VISION_MAX_PATCHES / _vision_patches(width, height))
+    candidate = min(long_edge, max(1, int(long_edge * scale)))
+    while candidate + 1 <= long_edge and fits(candidate + 1):
+        candidate += 1
+    while candidate > 1 and not fits(candidate):
+        candidate -= 1
+    new_long, new_short = dims(candidate)
+    return (new_long, new_short) if width >= height else (new_short, new_long)
+
+
+def _shrink_to_patch_budget(raw: bytes,
+                            mime: str) -> Tuple[Optional[bytes], Optional[str]]:
+    """Downscale a decodable image that is over the patch budget, in memory. Never raises.
+
+    EXIF orientation is applied FIRST: the re-encoded bytes carry no EXIF, so a phone photo left
+    untransposed would reach the model lying on its side. A JPEG is re-encoded with the source's
+    own quantization tables and chroma subsampling — its own compression level, not a quality
+    number made up here; anything else (PNG, WebP, a BMP/TIFF already transcoded to PNG) is
+    encoded as PNG with the same mode rules as `_transcode_to_png`, so alpha survives.
+    """
+    try:
+        from PIL import Image, ImageOps, JpegImagePlugin
+
+        with Image.open(BytesIO(raw)) as im:
+            is_jpeg = mime == "image/jpeg"
+            qtables = getattr(im, "quantization", None) if is_jpeg else None
+            subsampling = JpegImagePlugin.get_sampling(im) if is_jpeg else -1
+            src_w, src_h = im.size
+            # Carried onto the output: dropping it re-reads a Display-P3 phone photo as sRGB.
+            icc_profile = im.info.get("icc_profile")
+            upright = ImageOps.exif_transpose(im)
+        width, height = upright.size
+        before = _vision_patches(width, height)
+        new_w, new_h = _fit_to_patch_budget(width, height)
+        after = _vision_patches(new_w, new_h)
+        if after > _VISION_MAX_PATCHES:  # the explicit integer check, before any encode
+            return None, UNREADABLE
+
+        if is_jpeg:
+            resized = upright.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            save_kwargs: Dict[str, Any] = {}
+            if qtables:
+                save_kwargs["qtables"] = qtables
+            if subsampling is not None and subsampling >= 0:
+                save_kwargs["subsampling"] = subsampling
+            if icc_profile:
+                save_kwargs["icc_profile"] = icc_profile
+            out = BytesIO()
+            resized.save(out, format="JPEG", **save_kwargs)
+            out_mime = "image/jpeg"
+        else:
+            mode = upright.mode
+            # Any `transparency` key counts, not just a palette one: an RGB/L PNG can carry a
+            # tRNS colour key, and resampling it without converting first bleeds the hidden
+            # colour into its opaque neighbours.
+            has_alpha = mode in ("RGBA", "LA", "PA") or "transparency" in upright.info
+            if has_alpha:
+                converted = upright.convert("RGBA")
+            elif mode == "RGB":
+                converted = upright
+            else:
+                converted = upright.convert("RGB")
+            resized = converted.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            png_kwargs: Dict[str, Any] = {"icc_profile": icc_profile} if icc_profile else {}
+            out = BytesIO()
+            resized.save(out, format="PNG", **png_kwargs)
+            out_mime = "image/png"
+        logger.info(f"Downscaled image over the vision patch budget: {src_w}x{src_h} -> "
+                    f"{new_w}x{new_h} ({before} -> {after} patches)")
+        return out.getvalue(), out_mime
+    except Exception:  # noqa: BLE001 — any decode/resize/encode failure is a graceful rejection
+        return None, UNREADABLE
+
+
 def ensure_api_compatible(raw: bytes) -> Tuple[Optional[bytes], Optional[str]]:
     """Bytes the Responses *vision* API will accept, transcoding in memory when it has to.
 
-    Thin wrapper over `ensure_compatible` pinned to `VISION_MIMETYPES` (jpeg/png/gif/webp).
-    Animated GIFs ride through unchanged — GIFs are never re-encoded here (see
-    REJECT_ANIMATED_GIFS). See `ensure_compatible` for the full contract.
+    `ensure_compatible` pinned to `VISION_MIMETYPES` (jpeg/png/gif/webp), plus one vision-only
+    rule: an image whose pixel dimensions are over the API's patch budget (`_VISION_MAX_PATCHES`)
+    comes back SMALLER — the largest aspect-preserving size that fits, upright per its EXIF
+    orientation, as JPEG for a JPEG source and PNG otherwise. Without that, a full-resolution phone
+    photo 400s the whole turn. Only a confirmed-oversize image is touched: the size is read from the
+    header, and anything within budget comes back exactly as `ensure_compatible` returned it (the
+    SAME bytes object for an already-compatible source). A frame past `_MAX_TRANSCODE_PIXELS` is
+    refused (TOO_LARGE_TO_RESIZE) rather than decoded. GIFs are never re-encoded here — not even an
+    oversize one (see REJECT_ANIMATED_GIFS). The Images edit endpoint does not go through this, so
+    edit sources keep their pixels. See `ensure_compatible` for the rest of the contract.
     """
-    return ensure_compatible(raw, allowed=VISION_MIMETYPES)
+    out, mime = ensure_compatible(raw, allowed=VISION_MIMETYPES)
+    if out is None or mime is None or mime == "image/gif":
+        return out, mime
+    try:
+        from PIL import Image
+
+        with Image.open(BytesIO(out)) as im:  # lazy: reads the header, decodes nothing
+            width, height = im.size
+    except Exception:  # noqa: BLE001 — ensure_compatible just parsed these bytes; be safe anyway
+        return None, UNREADABLE
+    if _vision_patches(width, height) <= _VISION_MAX_PATCHES:
+        return out, mime
+    if width * height > _MAX_TRANSCODE_PIXELS:
+        return None, TOO_LARGE_TO_RESIZE
+    return _shrink_to_patch_budget(out, mime)

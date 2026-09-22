@@ -43,6 +43,7 @@ from urllib.parse import urlsplit
 import message_processor.ingestion.ambient_fetch as ambient_fetch
 from config import clamp_effort, config
 from message_processor.ingestion.image_validation import (_MAX_TRANSCODE_PIXELS, _gif_is_animated,
+                                                          ensure_api_compatible,
                                                           validate_image_bytes)
 from logger import setup_logger
 from message_processor.turn_runtime import (EffectRevoked, LaunchNotRecorded,
@@ -312,12 +313,28 @@ async def execute_import_web_image(ctx: ToolContext, args: Dict[str, Any]) -> Di
 
         b64 = base64.b64encode(result.raw_bytes).decode("ascii")
         image_data = ImageData(base64_data=b64, format=ext, prompt=_IMPORT_PROMPT)
-        # The b64 string is the payload from here on; drop the second copy of the same picture.
+        # What the MODEL looks at (verify, description, staging) may have to differ from what
+        # Slack gets: a full-resolution web photo can be over the vision API's patch budget, and
+        # the first vision call would 400. The posted image stays the original; only this copy is
+        # downscaled. Any other outcome — within budget, or no copy could be made — looks at the
+        # original, exactly as before.
+        vision_bytes, vision_mime = await asyncio.to_thread(
+            ensure_api_compatible, result.raw_bytes)
+        vision_data = image_data
+        if (vision_bytes is not None and vision_mime is not None
+                and vision_bytes is not result.raw_bytes):
+            vision_data = ImageData(
+                base64_data=base64.b64encode(vision_bytes).decode("ascii"),
+                format=_EXT_BY_MIME.get(vision_mime, "png"), prompt=_IMPORT_PROMPT)
+        else:
+            vision_mime = mime
+        # The b64 strings are the payload from here on; drop the raw copies of the same picture.
         result.raw_bytes = None
+        vision_bytes = None
 
         # THE GATE. Nothing below this point can be taken back — an image in a channel stays
         # posted — so the pixels are judged here, while the only copy of them is in memory.
-        verdict, observed = await _verify_pixels(ctx, image_data, mime, expected)
+        verdict, observed = await _verify_pixels(ctx, vision_data, vision_mime, expected)
         if verdict == _VERIFY_MISMATCH:
             logger.info("import_web_image: pixels did not match what was expected — not posted")
             return {"ok": False, "error": "content_mismatch", "observed": observed,
@@ -347,7 +364,8 @@ async def execute_import_web_image(ctx: ToolContext, args: Dict[str, Any]) -> Di
                 message_ts=ctx.trigger_ts, image_type="imported",
                 provenance_tool="import_web_image",
                 filename=filename, caption=_escape_caption(caption),
-                receipts=getattr(turn, "receipt_ledger", None) if turn is not None else None)
+                receipts=getattr(turn, "receipt_ledger", None) if turn is not None else None,
+                vision_image_data=vision_data if vision_data is not image_data else None)
             if posted and turn is not None:
                 turn.visible_action_committed = True
             return posted
@@ -376,7 +394,7 @@ async def execute_import_web_image(ctx: ToolContext, args: Dict[str, Any]) -> Di
             logger.debug(f"import refresh mark failed for {thread_key}: {e}")
         try:
             from message_processor.image_view import stage_produced_image
-            staged = stage_produced_image(ctx, image_data, label="The imported image",
+            staged = stage_produced_image(ctx, vision_data, label="The imported image",
                                           intro=_STAGING_INTRO)
             if not staged:
                 logger.debug("import staging skipped (per-turn cap)")
