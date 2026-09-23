@@ -66,7 +66,8 @@ class TestDefaults:
         # Astra leads: the list order is the modal's display order, and the workspace default
         # belongs at the top of it.
         assert SUPPORTED_CHAT_MODELS == [
-            "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"
+            "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra",
+            "gpt-5.6-luna", "gpt-5.5"
         ]
 
     def test_ladders(self):
@@ -81,9 +82,8 @@ class TestDefaults:
         monkeypatch.delenv("UTILITY_REASONING_EFFORT", raising=False)
         fresh = BotConfig()
         assert fresh.gpt_model == "gpt-6-astra"
-        # The utility model stays on luna: `none` is legal there, and utility work whose whole
-        # point is being cheap does not move to a model an order of magnitude more expensive.
-        assert fresh.utility_model == "gpt-5.6-luna"
+        # The utility model is GPT-6 Luna: `none` is legal there, as it was on 5.6 Luna.
+        assert fresh.utility_model == "gpt-6-luna"
         assert fresh.utility_reasoning_effort == "none"
 
 
@@ -282,6 +282,43 @@ class TestGpt6RequestShape:
         assert "prompt_cache_key" not in params
         assert "prompt_cache_options" not in params
         assert "prompt_cache_retention" not in params
+
+
+class TestGpt6SolLunaRequestShape:
+    """Sol/Luna share Astra's cache shape but 5.6's sampling rule (probed 2026-09-23)."""
+
+    def test_sol_at_none_carries_temperature_and_top_p(self):
+        params = _build(model="gpt-6-sol", reasoning_effort="none", temperature=0.3, top_p=0.5)
+        assert params["reasoning"] == {"effort": "none"}
+        assert params["temperature"] == 0.3
+        assert params["top_p"] == 0.5
+
+    def test_sol_at_low_carries_neither(self):
+        params = _build(model="gpt-6-sol", reasoning_effort="low", temperature=0.3, top_p=0.5)
+        assert "temperature" not in params and "top_p" not in params
+
+    def test_sol_cache_shape(self):
+        params = _build(model="gpt-6-sol", reasoning_effort="medium",
+                        prompt_cache_key="thread-key", layout="channel")
+        assert params["prompt_cache_key"] == "thread-key"
+        assert params["prompt_cache_options"] == {"ttl": "30m"}
+        assert "prompt_cache_retention" not in params
+
+    def test_sampling_is_judged_against_the_overridden_effort(self):
+        # Base `none` + update->`high` is a 400 with temperature; base `high` + update->`none`
+        # is a 200. The API judges the EFFECTIVE effort, so the builder must too.
+        up = _build(model="gpt-6-sol", reasoning_effort="none", effort_override="high",
+                    temperature=0.3, top_p=0.5)
+        assert up["reasoning"] == {"effort": "none"}             # the baseline, untouched
+        assert up["input"][-1] == {"type": "configuration_update",
+                                   "reasoning": {"effort": "high"}}
+        assert "temperature" not in up and "top_p" not in up
+        down = _build(model="gpt-6-sol", reasoning_effort="high", effort_override="none",
+                      temperature=0.3, top_p=0.5)
+        assert down["reasoning"] == {"effort": "high"}           # the baseline, untouched
+        assert down["input"][-1] == {"type": "configuration_update",
+                                     "reasoning": {"effort": "none"}}
+        assert down["temperature"] == 0.3 and down["top_p"] == 0.5
 
 
 class TestEffortOverride:

@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.2.8] - 2026-09-23
+
+### ✨ Added
+
+- **GPT-6 Sol and GPT-6 Luna in the model picker.** OpenAI's two new GPT-6 models are now
+  selectable in settings, next to Astra: Sol for everyday professional work, Luna for fast
+  answers. Unlike Astra they offer a *None* reasoning level, and with it the Temperature and
+  Top P controls. Astra stays the default, and nobody's current choice changes.
+
+### 🔧 Changed
+
+- **The bot's behind-the-scenes work runs on GPT-6 Luna.** Deciding whether to join a channel
+  conversation, writing memory notes, summaries and image prompts all moved from GPT-5.6 Luna to
+  the newer GPT-6 Luna.
+- **The bot stays out of small talk more reliably.** When deciding whether to join a
+  conversation it now treats a question only the people present can answer — "is it just me or
+  is the VPN slow?" — as theirs, and leaves a "thanks everyone" or "morning all" to the people it
+  was meant for. Real questions, requests and feedback about the bot still bring it in.
+- **Dependencies updated:** the OpenAI SDK (3.19.0), which knows the new model names.
+
 ## [3.2.7] - 2026-09-22
 
 ### 🐛 Fixed

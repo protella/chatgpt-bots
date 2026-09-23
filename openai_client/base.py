@@ -162,13 +162,16 @@ def _build_request_params(
     temperature = temperature if temperature is not None else config.default_temperature
     max_output_tokens = max_output_tokens or config.default_max_tokens
     top_p = top_p if top_p is not None else config.default_top_p
-    # Clamp guards against stored/legacy efforts the model rejects (`minimal` on 5.6,
-    # `max` on 5.5, both `none` and `minimal` on GPT-6).
+    # Clamp guards against stored/legacy efforts the model rejects (`minimal` on 5.6 and
+    # GPT-6 Sol/Luna, `max` on 5.5, both `none` and `minimal` on Astra).
     gpt6 = model.startswith("gpt-6")
     effort = clamp_effort(model, reasoning_effort or config.default_reasoning_effort)
     config_update: Optional[Dict[str, Any]] = None
+    # The effort this call actually runs at: the baseline, or the override when there is one.
+    effective_effort = effort
     if effort_override:
         overridden = clamp_effort(model, effort_override)
+        effective_effort = overridden
         if gpt6:
             config_update = {"type": "configuration_update",
                              "reasoning": {"effort": overridden}}
@@ -197,7 +200,8 @@ def _build_request_params(
         params["tools"] = tools
     if not gpt6:
         # This slot, not the sampling branch below: the 5.5/5.6 request shape is shipped and
-        # must stay byte-identical, key order included. GPT-6 sends neither sampling key.
+        # must stay byte-identical, key order included. GPT-6 sends its sampling keys (if any)
+        # from the sampling branch below.
         params["temperature"] = temperature
     params["max_output_tokens"] = max_output_tokens
     params["store"] = store
@@ -221,10 +225,16 @@ def _build_request_params(
         params["reasoning"]["summary"] = reasoning_summary
     params["text"] = {"verbosity": verbosity or config.default_verbosity}
 
-    # gpt-5.5 and the 5.6 family allow temperature/top_p when reasoning=none
-    # (5.6 verified live 2026-07-09: effort=none + temperature/top_p -> 200).
-    # GPT-6 allows neither at any effort (verified live 2026-09-08), so it takes no branch here.
-    if supports_sampling(model, effort):
+    # gpt-5.5, the 5.6 family and GPT-6 Sol/Luna allow temperature/top_p when reasoning=none
+    # (5.6 verified live 2026-07-09, Sol/Luna 2026-09-23: effort=none + temperature/top_p -> 200).
+    # Astra allows neither at any effort (verified live 2026-09-08), so it takes no branch here.
+    # On a GPT-6 override the API judges sampling against the EFFECTIVE (post-update) effort
+    # (live-probed 2026-09-23: base `none` + temperature + update->`high` = 400), so that is the
+    # effort tested; everywhere else the override has already replaced `effort`.
+    if supports_sampling(model, effective_effort):
+        if gpt6:
+            # Sol/Luna reasoning `none`: neither key has a slot above, so both land here.
+            params["temperature"] = temperature
         params["top_p"] = top_p
     elif not gpt6:
         params["temperature"] = 1.0  # MUST be 1.0 for reasoning models

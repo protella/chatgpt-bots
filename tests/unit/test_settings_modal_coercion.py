@@ -248,6 +248,33 @@ class TestAstraModalLadder:
         assert block["accessory"]["initial_option"]["value"] == "low"
 
 
+class TestSolSamplingRoundTrip:
+    def test_sol_at_none_keeps_temperature_and_top_p(self):
+        """Render -> extract -> validate: Sol has `none`, so the sampling controls it renders
+        there must survive the submit instead of being stripped as on Astra."""
+        modal = SettingsModal(db=MagicMock())
+        blocks = modal._add_gpt55_settings(
+            {"reasoning_effort": "none", "temperature": 0.3, "top_p": 0.5}, "gpt-6-sol")
+        by_id = {b.get("block_id"): b for b in blocks}
+        reasoning = by_id["reasoning_block_gpt54"]["accessory"]["initial_option"]
+        temperature = by_id["temperature_block"]["element"]["initial_value"]
+        top_p = by_id["top_p_block"]["element"]["initial_value"]
+
+        # Submit exactly what was rendered, so a renderer that dropped the saved values
+        # (e.g. back to 1.0) fails here.
+        extracted = modal.extract_form_values({"values": {
+            "model_block": {"model_select": {"selected_option": {"value": "gpt-6-sol"}}},
+            "reasoning_block_gpt54": {"reasoning_level_gpt54": {
+                "selected_option": reasoning}},
+            "temperature_block": {"temperature": {"value": temperature}},
+            "top_p_block": {"top_p": {"value": top_p}},
+        }})
+        validated = modal.validate_settings(extracted)
+        assert validated["reasoning_effort"] == "none"
+        assert validated["temperature"] == 0.3
+        assert validated["top_p"] == 0.5
+
+
 class TestFastTierControl:
     """Slack has no disabled form control, so "greyed out" is rendered as no control at all."""
 

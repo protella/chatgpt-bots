@@ -847,7 +847,9 @@ class TestGpt6Astra:
         ("gpt-6-astra", "none", False),
         ("gpt-6-astra", "low", False),
         ("gpt-6-astra", "max", False),
-        # 5.5 and 5.6 accept both, but only on a non-reasoning turn.
+        # Sol/Luna, 5.5 and 5.6 accept both, but only on a non-reasoning turn.
+        ("gpt-6-sol", "none", True),
+        ("gpt-6-sol", "low", False),
         ("gpt-5.6-sol", "none", True),
         ("gpt-5.6-sol", "medium", False),
         ("gpt-5.5", "none", True),
@@ -857,6 +859,14 @@ class TestGpt6Astra:
     def test_supports_sampling_truth_table(self, model, effort, expected):
         from config import supports_sampling
         assert supports_sampling(model, effort) is expected
+
+    @pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna"])
+    def test_sol_and_luna_carry_the_full_ladder(self, model):
+        from config import GPT56_EFFORTS, clamp_effort, effort_ladder
+        assert effort_ladder(model) == GPT56_EFFORTS
+        assert clamp_effort(model, "none") == "none"
+        assert clamp_effort(model, "minimal") == "none"
+        assert clamp_effort(model, "max") == "max"
 
     def test_the_knowledge_cutoff_is_registered(self):
         from config import MODEL_KNOWLEDGE_CUTOFFS
@@ -876,7 +886,8 @@ class TestFastTierPreference:
 
     def test_both_eligible_models_are_in_the_set(self):
         from config import FAST_SERVICE_TIER_MODELS
-        assert FAST_SERVICE_TIER_MODELS == frozenset({"gpt-5.6-sol", "gpt-6-astra"})
+        assert FAST_SERVICE_TIER_MODELS == frozenset(
+            {"gpt-5.6-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"})
         assert "gpt-5.6-luna" not in FAST_SERVICE_TIER_MODELS
         assert "gpt-5.5" not in FAST_SERVICE_TIER_MODELS
 

@@ -199,14 +199,18 @@ All chat models share a 1.05M-token context window and prompt caching. Users pic
 
 | Model | Role |
 |---|---|
-| `gpt-5.6-sol` | Flagship reasoning model - **the default** |
-| `gpt-5.6-terra` | Balanced tier |
-| `gpt-5.6-luna` | Fast tier; also runs the bot's internal utility calls |
-| `gpt-5.5` | Previous flagship, still selectable |
+| `gpt-6-astra` | Most capable - **the default** |
+| `gpt-6-sol` | Everyday professional work |
+| `gpt-6-luna` | Fast and affordable; also runs the bot's internal utility calls |
+| `gpt-5.6-sol` | Previous-generation flagship, still selectable |
+| `gpt-5.6-terra` | Previous-generation balanced tier |
+| `gpt-5.6-luna` | Previous-generation fast tier |
+| `gpt-5.5` | Older flagship, still selectable |
 | `gpt-image-2` | Image generation and editing |
 
-Reasoning effort runs `none → low → medium → high → xhigh → max` on the 5.6 family (`max` is
-5.6-only; the settings modal adapts the list to the chosen model).
+Reasoning effort runs `none → low → medium → high → xhigh → max` on GPT-6 Sol/Luna and the 5.6
+family; GPT-6 Astra has no `none`, and gpt-5.5 has no `max` (the settings modal adapts the list
+to the chosen model).
 
 ### Token budget
 

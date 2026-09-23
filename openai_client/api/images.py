@@ -4,7 +4,7 @@ import base64
 from typing import Any, Callable, Dict, List, Optional
 
 import aiohttp
-from config import config
+from config import clamp_effort, config
 from message_processor.image_service import supports_input_fidelity
 from message_processor.prompts import IMAGE_EDIT_SYSTEM_PROMPT, IMAGE_GEN_SYSTEM_PROMPT
 
@@ -184,9 +184,10 @@ async def _enhance_image_edit_prompt(
             "store": False,
         }
 
-        # Utility model is a reasoning model (gpt-5.6-luna by default) — temperature fixed at 1.0
+        # Utility model is a reasoning model (gpt-6-luna by default) — temperature fixed at 1.0
         request_params["temperature"] = 1.0
-        request_params["reasoning"] = {"effort": config.utility_reasoning_effort}
+        request_params["reasoning"] = {
+            "effort": clamp_effort(config.utility_model, config.utility_reasoning_effort)}
         request_params["text"] = {"verbosity": config.utility_verbosity}
 
         # Check if streaming callback provided
@@ -328,7 +329,8 @@ async def _enhance_image_prompt(
 
             # Utility model is a GPT-5-series reasoning model (gpt-5-mini)
             request_params["temperature"] = 1.0
-            request_params["reasoning"] = {"effort": config.utility_reasoning_effort}
+            request_params["reasoning"] = {
+                "effort": clamp_effort(config.utility_model, config.utility_reasoning_effort)}
             request_params["text"] = {"verbosity": config.utility_verbosity}
 
             response = await self._safe_api_call(

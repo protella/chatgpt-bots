@@ -1,5 +1,5 @@
-"""Model lineup — gpt-6-astra, the GPT-5.6 family (sol/terra/luna) and gpt-5.5 are the
-selectable chat models; gpt-5.6-luna doubles as the utility model. Covers the supported-model
+"""Model lineup — gpt-6-astra/sol/luna, the GPT-5.6 family (sol/terra/luna) and gpt-5.5 are
+the selectable chat models; gpt-6-luna doubles as the utility model. Covers the supported-model
 surface (picker, validation, token limits) and the startup migrations/normalizers for
 stale user/thread model selections (one-time everyone->sol swap + every-startup clamp).
 
@@ -45,7 +45,8 @@ def modal():
 
 def test_knowledge_cutoffs_only_supported_models():
     assert set(MODEL_KNOWLEDGE_CUTOFFS) == {
-        "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "default"
+        "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra",
+        "gpt-5.6-luna", "gpt-5.5", "default"
     }
 
 
@@ -57,8 +58,8 @@ def test_model_picker_offers_supported_lineup(modal):
     model_block = next(b for b in blocks if b.get("block_id") == "model_block")
     options = [o["value"] for o in model_block["accessory"]["options"]]
     assert options == SUPPORTED_CHAT_MODELS
-    assert options == ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
-                       "gpt-5.5"]
+    assert options == ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol",
+                       "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"]
 
 
 def test_modal_keeps_gpt55_selectable(modal):
@@ -300,6 +301,32 @@ def test_the_normalizer_clamps_a_stored_none_effort_on_gpt6(temp_db):
     cfg = json.loads(temp_db.conn.execute(
         "SELECT config_json FROM threads WHERE thread_id = 'C2:1'").fetchone()["config_json"])
     assert cfg == {"model": "gpt-6-astra", "reasoning_effort": "low"}
+
+
+def test_the_normalizer_leaves_a_sol_none_alone(temp_db):
+    """Sol/Luna accept `none`, so the every-boot Astra clamp must not reach them — it would
+    rewrite a legitimate choice to `low` on each restart. `minimal` still lands on `none`."""
+    temp_db._run_migrations()
+    _insert_user(temp_db, "U1", "gpt-6-sol", "none")
+    _insert_user(temp_db, "U2", "gpt-6-luna", "minimal")
+    _insert_user(temp_db, "U3", "gpt-6-astra", "none")
+    temp_db.conn.execute(
+        "INSERT INTO threads (thread_id, channel_id, thread_ts, config_json) VALUES (?, ?, ?, ?)",
+        ("C3:1", "C3", "1", json.dumps({"model": "gpt-6-sol", "reasoning_effort": "none"})),
+    )
+    temp_db._run_migrations()
+
+    rows = {
+        r["slack_user_id"]: (r["model"], r["reasoning_effort"])
+        for r in temp_db.conn.execute(
+            "SELECT slack_user_id, model, reasoning_effort FROM user_preferences")
+    }
+    assert rows == {"U1": ("gpt-6-sol", "none"), "U2": ("gpt-6-luna", "none"),
+                    "U3": ("gpt-6-astra", "low")}
+
+    cfg = json.loads(temp_db.conn.execute(
+        "SELECT config_json FROM threads WHERE thread_id = 'C3:1'").fetchone()["config_json"])
+    assert cfg == {"model": "gpt-6-sol", "reasoning_effort": "none"}
 
 
 # --- one-time GPT-6 Astra migration (everyone -> astra, effort preserved) ---

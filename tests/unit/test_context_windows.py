@@ -45,10 +45,10 @@ class TestResolvedLimits:
             assert cfg.get_model_token_limit(model) == int(FULL_WINDOW * 0.876), model
 
     def test_utility_model_budgets_against_its_real_window(self, cfg):
-        # The utility model is gpt-5.6-luna (1.05M) — its budget must NOT be the
+        # The utility model is gpt-6-luna (1.05M) — its budget must NOT be the
         # old gpt-5-mini 400k fallback (threads budgeted at ~920k flow into
         # utility calls with full context).
-        assert cfg.utility_model == "gpt-5.6-luna"
+        assert cfg.utility_model == "gpt-6-luna"
         assert cfg.get_model_token_limit(cfg.utility_model) == int(FULL_WINDOW * 0.876)
 
 

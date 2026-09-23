@@ -40,8 +40,13 @@ Add a dep by editing `requirements.in`, running `make lock`, and committing both
 - System prompts ride as the `developer` role.
 
 ### Models
-Selectable: **gpt-5.6-sol** (default), **gpt-5.6-terra**, **gpt-5.6-luna** (also `UTILITY_MODEL`),
-and **gpt-5.5**. Everything else — GPT-4.x, gpt-5, nano/mini, gpt-5-chat, gpt-5.1–5.4 — is gone.
+Selectable: **gpt-6-astra** (default), **gpt-6-sol**, **gpt-6-luna** (also `UTILITY_MODEL`),
+**gpt-5.6-sol/terra/luna** and **gpt-5.5**. Everything else — GPT-4.x, gpt-5, nano/mini,
+gpt-5-chat, gpt-5.1–5.4 — is gone.
+
+- **GPT-6**: Astra has no `none` (ladder `low..max`) and never takes `temperature`/`top_p`;
+  Sol/Luna carry the full `none..max` ladder and take sampling only at `none`. All three cache
+  via `prompt_cache_options {"ttl":"30m"}` (never `prompt_cache_retention`).
 
 - **GPT-5.6 family** (1.05M context, Feb 2026 cutoff): hybrid — `temperature`/`top_p` are legal
   only when `reasoning_effort=none`, otherwise temperature is forced to 1.0. Effort ladder is

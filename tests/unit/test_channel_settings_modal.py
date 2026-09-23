@@ -433,7 +433,9 @@ async def test_an_old_modal_submission_preserves_the_new_fields(capability_db):
 # the measured cost multipliers) and the two 2.5 image-model rows ("(Best)" / "(Faster)"). The
 # tier-under-Auto work is invisible here: this fixture stores 1024x1536 on gpt-image-1, which
 # renders no tier select.
-_PERSONAL_MODAL_GOLDEN = "7f4622613e65101acec84bfeeb28571b3474cb9b7c729cfc29237509ef1bb528"
+# RE-PINNED 2026-09-23 (GPT-6 Sol + Luna). The delta is the two new model-picker rows only:
+# stripping the gpt-6-sol / gpt-6-luna options from the model select reproduces 7f462261…1bb528.
+_PERSONAL_MODAL_GOLDEN = "6db10da8f5591854cfee7db62aab98d4d5fe7aba9b342959af518bbf66ea6531"
 
 
 @pytest.mark.asyncio

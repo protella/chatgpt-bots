@@ -1193,9 +1193,9 @@ numpy==2.5.1 \
     # via
     #   pandas
     #   pandas-stubs
-openai==3.16.2 \
-    --hash=sha256:660a7f8307e6605342ae84ff4425412e7cd19e5e9b298f975502df2a1a9a5d5f \
-    --hash=sha256:e129455fc6a744276cda63a9e2f0759207bc0cf24afc4cf356bf5029e631e955
+openai==3.19.0 \
+    --hash=sha256:890174cae80a47357035477532b6eabbc3d31220f021896dcc2640943e87b78d \
+    --hash=sha256:eaa59585332e54abf71c8011d9bfdb3b4aecead73a0aad977e979756756d42df
     # via -r requirements.in
 openpyxl==3.1.5 \
     --hash=sha256:5282c12b107bffeef825f4617dc029afaf41d0ea60823bbb665ef3079dc79de2 \

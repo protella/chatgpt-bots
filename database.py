@@ -2094,8 +2094,10 @@ class DatabaseManager(LoggerMixin):
            `config.SUPPORTED_CHAT_MODELS` are selectable; any other stored
            model (user prefs or per-thread overrides) coerces to
            `config.gpt_model`, and stored reasoning efforts a model rejects are
-           clamped (`minimal` is a 400 on 5.6 -> none; `max` doesn't exist on
-           5.5 -> xhigh; gpt-6 rejects both `none` and `minimal` -> low).
+           clamped (`minimal` is a 400 on 5.6 and gpt-6-sol/luna -> none; `max`
+           doesn't exist on 5.5 -> xhigh; gpt-6-astra rejects both `none` and
+           `minimal` -> low). The Astra clamp is keyed on Astra alone: Sol/Luna
+           accept `none`, and a family-wide match would rewrite it on every boot.
            Guarantees the API layer never receives a dropped model name or an
            unsupported effort. The allowlist is read from config at RUN TIME,
            never hard-coded: this part runs on every migration pass, so a
@@ -2169,11 +2171,13 @@ class DatabaseManager(LoggerMixin):
             cursor = self.conn.execute("""
                 UPDATE user_preferences
                 SET reasoning_effort = 'none'
-                WHERE model LIKE 'gpt-5.6%' AND reasoning_effort = 'minimal'
+                WHERE (model LIKE 'gpt-5.6%' OR model IN ('gpt-6-sol', 'gpt-6-luna'))
+                  AND reasoning_effort = 'minimal'
             """)
             if cursor.rowcount:
                 self.log_info(
-                    f"DB: Clamped reasoning minimal->none for {cursor.rowcount} user(s) on 5.6 models"
+                    f"DB: Clamped reasoning minimal->none for {cursor.rowcount} user(s) on 5.6 "
+                    f"and gpt-6-sol/luna models"
                 )
             cursor = self.conn.execute("""
                 UPDATE user_preferences
@@ -2187,12 +2191,12 @@ class DatabaseManager(LoggerMixin):
             cursor = self.conn.execute("""
                 UPDATE user_preferences
                 SET reasoning_effort = 'low'
-                WHERE model LIKE 'gpt-6%' AND reasoning_effort IN ('none', 'minimal')
+                WHERE model = 'gpt-6-astra' AND reasoning_effort IN ('none', 'minimal')
             """)
             if cursor.rowcount:
                 self.log_info(
                     f"DB: Clamped reasoning none/minimal->low for {cursor.rowcount} "
-                    f"user(s) on gpt-6 models"
+                    f"user(s) on gpt-6-astra"
                 )
             cursor = self.conn.execute(
                 f"""
@@ -2212,12 +2216,14 @@ class DatabaseManager(LoggerMixin):
                 UPDATE threads
                 SET config_json = json_set(config_json, '$.reasoning_effort', 'none')
                 WHERE config_json IS NOT NULL
-                  AND json_extract(config_json, '$.model') LIKE 'gpt-5.6%'
+                  AND (json_extract(config_json, '$.model') LIKE 'gpt-5.6%'
+                       OR json_extract(config_json, '$.model') IN ('gpt-6-sol', 'gpt-6-luna'))
                   AND json_extract(config_json, '$.reasoning_effort') = 'minimal'
             """)
             if cursor.rowcount:
                 self.log_info(
-                    f"DB: Clamped {cursor.rowcount} thread override(s) minimal->none on 5.6 models"
+                    f"DB: Clamped {cursor.rowcount} thread override(s) minimal->none on 5.6 "
+                    f"and gpt-6-sol/luna models"
                 )
             cursor = self.conn.execute("""
                 UPDATE threads
@@ -2234,13 +2240,13 @@ class DatabaseManager(LoggerMixin):
                 UPDATE threads
                 SET config_json = json_set(config_json, '$.reasoning_effort', 'low')
                 WHERE config_json IS NOT NULL
-                  AND json_extract(config_json, '$.model') LIKE 'gpt-6%'
+                  AND json_extract(config_json, '$.model') = 'gpt-6-astra'
                   AND json_extract(config_json, '$.reasoning_effort') IN ('none', 'minimal')
             """)
             if cursor.rowcount:
                 self.log_info(
                     f"DB: Clamped {cursor.rowcount} thread override(s) none/minimal->low "
-                    f"on gpt-6 models"
+                    f"on gpt-6-astra"
                 )
             self.conn.commit()
 
