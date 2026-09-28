@@ -1267,9 +1267,9 @@ pandas==3.0.6 \
     --hash=sha256:fb625f426b375bcc96e3a04c5d5d266cd7be6ae5d6866e0e703382ab5164068c \
     --hash=sha256:ff51a4459ed036e93d1eb1bb5e6e7b28685d3cb6b7c12b91c05b31024e234729
     # via -r requirements.in
-pandas-stubs==3.0.5.260730 \
-    --hash=sha256:60e90e3e1eda6937e337e243cbe6217e151c11137cd7eddf832af537c7310bfd \
-    --hash=sha256:f70a232c57d93a5a2c81f8a53953e10891a5374bc92652277deb325e2e4d0ff3
+pandas-stubs==3.0.5.260914 \
+    --hash=sha256:39a1300c5c5c55fdf609e3476805decce5d5015539a4dcb683449f8feaeee2fb \
+    --hash=sha256:3f6fc1f147f68fd89c007105e7c94a948acb4ecd7eb20dc1c02e153c4ed5c250
     # via -r requirements.in
 pdf2image==1.17.0 \
     --hash=sha256:eaa959bc116b420dd7ec415fcae49b98100dda3dd18cd2fdfa86d09f112f6d57 \
