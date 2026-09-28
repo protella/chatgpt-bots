@@ -1193,9 +1193,9 @@ numpy==2.5.1 \
     # via
     #   pandas
     #   pandas-stubs
-openai==3.19.0 \
-    --hash=sha256:890174cae80a47357035477532b6eabbc3d31220f021896dcc2640943e87b78d \
-    --hash=sha256:eaa59585332e54abf71c8011d9bfdb3b4aecead73a0aad977e979756756d42df
+openai==3.19.2 \
+    --hash=sha256:66247fcd07266e72536e90656dc27f3b0bb1e9d8696d4013fc55402c0b96a5c2 \
+    --hash=sha256:de185f9834ad064d965ec42bd0766731cf66bceea16a7670294a835d207019e6
     # via -r requirements.in
 openpyxl==3.1.5 \
     --hash=sha256:5282c12b107bffeef825f4617dc029afaf41d0ea60823bbb665ef3079dc79de2 \
@@ -1723,9 +1723,9 @@ python-pptx==1.0.2 \
     --hash=sha256:160838e0b8565a8b1f67947675886e9fea18aa5e795db7ae531606d68e785cba \
     --hash=sha256:479a8af0eaf0f0d76b6f00b0887732874ad2e3188230315290cd1f9dd9cc7095
     # via -r requirements.in
-pytz==2026.3.post1 \
-    --hash=sha256:2211d3fcf9a797d3405cac96ac7f61d80e6a644f72a3309607282fe8a2010c5d \
-    --hash=sha256:dd95840dd199baea12d9cc096a1d452caa6596a1c1e4b5f3dbd1541855d5e815
+pytz==2026.4 \
+    --hash=sha256:464303645bafafd72418898368b2429458f709cf1eb6a15372fbcc396b64da63 \
+    --hash=sha256:9d514388fbc89ca0833203464272ac485b8828568ab73532f5020f17e892a0ff
     # via -r requirements.in
 regex==2026.7.19 \
     --hash=sha256:062f8cb7a9739c4835d22bd96f370c59aba89f257adcfa53be3cc209e08d3ae0 \
