@@ -14,13 +14,16 @@ never handed silence it will fill by rebuilding from scratch.
 import asyncio
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
+from unittest.mock import AsyncMock
 
 import pytest
 
 import message_processor.document_tools as dt
 import message_processor.research_tools as rt
 from config import config
+from message_processor.context_meter import usable_limit
 from message_processor.tool_registry import ToolContext
+from openai_client.api.token_count import CountResult
 
 
 # --------------------------------------------------------------------------- harness
@@ -79,7 +82,7 @@ class _Processor(_Log):
         self.db = db
         self.openai_client = SimpleNamespace()
         self.thread_manager = None
-        self.container_manager = None
+        self.container_manager: Any = None
         self.scheduled: List[Any] = []
 
     def _schedule_async_call(self, coro: Any) -> Any:
@@ -915,9 +918,21 @@ class _ContainerManager:
         return None
 
 
+def _counts(*results: CountResult) -> AsyncMock:
+    """OpenAI's input-token counter, answering `results` in order (the last one repeats)."""
+    queue = list(results)
+
+    async def _count(_kwargs: Dict[str, Any]) -> CountResult:
+        return queue.pop(0) if len(queue) > 1 else queue[0]
+
+    return AsyncMock(side_effect=_count)
+
+
 async def _run_build(monkeypatch, *, revises=None, snapshot=None, db=None,
-                     applied_notes=None, steering=None, deliverables=None):
-    """Drive the real `_run_build_phase`, capturing the input the model would receive."""
+                     applied_notes=None, steering=None, deliverables=None,
+                     count: Optional[AsyncMock] = None):
+    """Drive the real `_run_build_phase`, capturing the input the model would receive. `count`
+    replaces the official counter; by default every request counts small and complete."""
     captured: Dict[str, Any] = {}
 
     async def _fake_stream(processor, **kwargs):
@@ -929,7 +944,8 @@ async def _run_build(monkeypatch, *, revises=None, snapshot=None, db=None,
 
     proc = _Processor(db)
     proc.container_manager = _ContainerManager()
-    card = _Card()
+    proc.openai_client.count_input_tokens = count or _counts(CountResult(1_000, True))
+    card: Any = _Card()          # the slice of `_ResearchCard` the build phase touches
     steering_cb = None
     if steering is not None:
         async def steering_cb():  # noqa: F811 — the drain, as the loop would call it
@@ -1034,23 +1050,18 @@ class TestAdmission:
         """The headroom is what the build will ADD after this point — later rounds' notes, tool
         replay, function outputs. A master admitted with zero margin starves all of it."""
         _stub_loader(monkeypatch, _text_result("BODY THAT ONLY JUST FITS"))
-        from message_processor import channel_request
-        real = channel_request.estimate_admission
-
-        def _tight(**kw):
-            est = real(**kw)
-            # Limit sits just above the real total: fits on its own, fails once the headroom
-            # is added. Nothing about the master's own size is what decides it.
-            return SimpleNamespace(total_tokens=est.total_tokens,
-                                   limit_tokens=est.total_tokens + 10)
-
-        monkeypatch.setattr(channel_request, "estimate_admission", _tight)
+        # Under the model's usable limit on its own, over it once the headroom is reserved.
+        tight = usable_limit("gpt-5.6-sol") - rt._REVISION_ADMISSION_HEADROOM + 1
+        count = _counts(CountResult(tight, True), CountResult(1_000, True))
         proc, captured, _out = await _run_build(
-            monkeypatch, revises=["report.docx"], db=_Db([_row()]))
+            monkeypatch, revises=["report.docx"], db=_Db([_row()]), count=count)
         joined = "\n".join(str(m.get("content")) for m in captured["messages"])
         assert "BODY THAT ONLY JUST FITS" not in joined
         assert "could not be loaded for this revision (too large to inline)" in joined
         assert any("does not fit" in w for w in proc.warnings)
+        # The evicted variant is re-counted, only to log.
+        assert count.await_count == 2
+        assert not any("still over the limit" in w for w in proc.warnings)
 
     @pytest.mark.asyncio
     async def test_the_recheck_never_raises_and_the_build_proceeds(self, monkeypatch):
@@ -1058,67 +1069,52 @@ class TestAdmission:
         limit, the whole build was never going to be admitted, which is not this round's
         problem. Say so and carry on."""
         _stub_loader(monkeypatch, _text_result("BODY"))
-        from message_processor import channel_request
-
-        def _hopeless(**_kw):
-            return SimpleNamespace(total_tokens=10_000_000, limit_tokens=1)
-
-        monkeypatch.setattr(channel_request, "estimate_admission", _hopeless)
         proc, captured, out = await _run_build(
-            monkeypatch, revises=["report.docx"], db=_Db([_row()]))
+            monkeypatch, revises=["report.docx"], db=_Db([_row()]),
+            count=_counts(CountResult(10_000_000, True)))
         assert out is not None and captured["messages"]
         assert any("still over the limit" in w for w in proc.warnings)
 
     @pytest.mark.asyncio
-    async def test_a_native_file_part_is_charged_through_the_bounds(self, monkeypatch):
-        """An input_image or input_file charged as TEXT would report tens of millions of tokens
-        and refuse every revision that shared a thread with a PDF. The base64 length is the
-        bound instead."""
+    @pytest.mark.parametrize("result", [CountResult(None, False),
+                                        CountResult(10_000_000, False)])
+    async def test_an_unknown_or_incomplete_count_keeps_the_master(self, monkeypatch, result):
+        """A count that could not be taken, or one taken without the MCP tools, is not a reason
+        to drop the file the job was asked to edit: keep it and let the API judge."""
+        _stub_loader(monkeypatch, _text_result("THE BODY TO EDIT"))
+        count = _counts(result)
+        proc, captured, _out = await _run_build(
+            monkeypatch, revises=["report.docx"], db=_Db([_row()]), count=count)
+        joined = "\n".join(str(m.get("content")) for m in captured["messages"])
+        assert "THE BODY TO EDIT" in joined
+        assert "too large to inline" not in joined
+        assert count.await_count == 1
+        assert any("kept without a complete input count" in w for w in proc.warnings)
+
+    @pytest.mark.asyncio
+    async def test_the_count_is_of_the_request_the_build_would_send(self, monkeypatch):
+        """Native files, the tools list and the instructions are the counter's to price — so
+        they must all be IN the counted request, exactly as the build's first round sends them."""
         _stub_loader(monkeypatch, _text_result("BODY"))
-        from message_processor import channel_request
-        seen: Dict[str, Any] = {}
-        real = channel_request.estimate_admission
-
-        def _capture(**kw):
-            seen.setdefault("bounds", kw["native_file_bounds"])
-            seen["tools"] = kw["tools"]
-            seen["instructions"] = kw["instructions"]
-            return real(**kw)
-
-        monkeypatch.setattr(channel_request, "estimate_admission", _capture)
-        snapshot = [{"role": "user", "content": [
-            {"type": "input_text", "text": "here"},
-            {"type": "input_file", "filename": "a.pdf", "file_data": "B" * 4096}]}]
-        await _run_build(monkeypatch, revises=["report.docx"], db=_Db([_row()]),
-                         snapshot=snapshot)
-        assert seen["bounds"] == [4096]
-        # The tools list and the instruction text exist by assembly time — that is why the
-        # check happens here rather than earlier.
-        assert seen["tools"] and seen["instructions"] == "SYS"
-
-    def test_the_bounds_helper_ignores_everything_that_is_not_a_native_file(self):
-        assert rt._native_file_bounds([
-            {"role": "user", "content": "plain string"},
-            {"role": "user", "content": [{"type": "input_text", "text": "x"},
-                                         "not a dict",
-                                         {"type": "input_image", "image_url": "data:..."},
-                                         {"type": "input_file", "file_data": "abc"},
-                                         {"type": "input_file"}]},
-        ]) == [3, 0]
+        count = _counts(CountResult(1_000, True))
+        file_part = {"type": "input_file", "filename": "a.pdf", "file_data": "B" * 4096}
+        snapshot = [{"role": "user", "content": [{"type": "input_text", "text": "here"},
+                                                 file_part]}]
+        _proc, captured, _out = await _run_build(
+            monkeypatch, revises=["report.docx"], db=_Db([_row()]), snapshot=snapshot,
+            count=count)
+        kwargs = count.await_args.args[0]
+        assert kwargs["model"] == "gpt-5.6-sol" and kwargs["instructions"] == "SYS"
+        assert kwargs["tools"] == captured["tools"]
+        assert any(part == file_part for item in kwargs["input"]
+                   if isinstance(item.get("content"), list) for part in item["content"])
 
     @pytest.mark.asyncio
     async def test_a_build_with_no_master_pays_no_admission_call(self, monkeypatch):
         _stub_loader(monkeypatch)
-        from message_processor import channel_request
-        calls: List[int] = []
-
-        def _count(**kw):
-            calls.append(1)
-            return channel_request.estimate_admission(**kw)
-
-        monkeypatch.setattr(channel_request, "estimate_admission", _count)
-        await _run_build(monkeypatch, revises=[], db=_Db([_row()]))
-        assert calls == []
+        count = _counts(CountResult(1_000, True))
+        await _run_build(monkeypatch, revises=[], db=_Db([_row()]), count=count)
+        assert count.await_count == 0
 
 
 # --------------------------------------------------------------------------- executor

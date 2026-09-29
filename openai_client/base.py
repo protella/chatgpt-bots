@@ -13,6 +13,7 @@ from openai_client.container_errors import is_container_gone, is_container_wedge
 
 from .api import images as image_api
 from .api import responses as responses_api
+from .api import token_count as token_count_api
 from .api import tool_loop as tool_loop_api
 from .api import vision as vision_api
 from .api.responses import (STALE_RECONSIDERATION_DECISION_SCHEMA,
@@ -339,6 +340,7 @@ class OpenAIClient(LoggerMixin):
             "text_with_tools": config.api_timeout_streaming_chunk,      # Use configured timeout
             "text_normal": config.api_timeout_streaming_chunk,          # Use configured timeout
             "utility_call": config.api_timeout_streaming_chunk,          # Utility-model hops
+            "token_count": config.api_timeout_streaming_chunk,           # Context meter (same as utility)
             "prompt_enhancement": config.api_timeout_streaming_chunk,    # Use configured timeout
 
             # Streaming operations
@@ -502,6 +504,8 @@ class OpenAIClient(LoggerMixin):
         attempt_sink: Optional[Any] = None,
         layout: str = "legacy",
         service_tier_eligible: bool = False,
+        meter: Optional[Any] = None,
+        round_index: int = 0,
     ) -> str:
         return await responses_api.create_text_response(
             self,
@@ -520,6 +524,8 @@ class OpenAIClient(LoggerMixin):
             attempt_sink=attempt_sink,
             layout=layout,
             service_tier_eligible=service_tier_eligible,
+            meter=meter,
+            round_index=round_index,
         )
 
     async def create_text_response_with_tools(
@@ -549,6 +555,8 @@ class OpenAIClient(LoggerMixin):
         container_gone_sink: Optional[List[str]] = None,
         layout: str = "legacy",
         service_tier_eligible: bool = False,
+        meter: Optional[Any] = None,
+        round_index: int = 0,
     ) -> str:
         return await responses_api.create_text_response_with_tools(
             self,
@@ -573,6 +581,8 @@ class OpenAIClient(LoggerMixin):
             container_gone_sink=container_gone_sink,
             layout=layout,
             service_tier_eligible=service_tier_eligible,
+            meter=meter,
+            round_index=round_index,
         )
 
     async def create_streaming_response(
@@ -595,6 +605,8 @@ class OpenAIClient(LoggerMixin):
         layout: str = "legacy",
         service_tier_eligible: bool = False,
         hidden_suppression_sink: Optional[List[BaseException]] = None,
+        meter: Optional[Any] = None,
+        round_index: int = 0,
     ) -> str:
         return await responses_api.create_streaming_response(
             self,
@@ -616,6 +628,8 @@ class OpenAIClient(LoggerMixin):
             layout=layout,
             service_tier_eligible=service_tier_eligible,
             hidden_suppression_sink=hidden_suppression_sink,
+            meter=meter,
+            round_index=round_index,
         )
 
     async def create_streaming_response_with_tools(
@@ -648,6 +662,8 @@ class OpenAIClient(LoggerMixin):
         layout: str = "legacy",
         service_tier_eligible: bool = False,
         hidden_suppression_sink: Optional[List[BaseException]] = None,
+        meter: Optional[Any] = None,
+        round_index: int = 0,
     ) -> str:
         return await responses_api.create_streaming_response_with_tools(
             self,
@@ -677,6 +693,8 @@ class OpenAIClient(LoggerMixin):
             layout=layout,
             service_tier_eligible=service_tier_eligible,
             hidden_suppression_sink=hidden_suppression_sink,
+            meter=meter,
+            round_index=round_index,
         )
 
     async def create_text_response_with_tool_loop(
@@ -758,6 +776,12 @@ class OpenAIClient(LoggerMixin):
             on_attempt_open=on_attempt_open,
         )
 
+    async def count_input_tokens(
+            self, create_kwargs: Dict[str, Any]) -> token_count_api.CountResult:
+        """OpenAI's own input-token count for one `responses.create` body (CONTEXT_METER §3.1).
+        Never raises except on cancellation; an unavailable count is `CountResult(None, False)`."""
+        return await token_count_api.count_input_tokens(self, create_kwargs)
+
     async def classify_wake(
         self,
         *,
@@ -816,7 +840,9 @@ class OpenAIClient(LoggerMixin):
             )
             return result
         except asyncio.TimeoutError:
-            self.log_error(f"API call ({operation_type}) timed out after {timeout}s")
+            # A token count is a meter, not a turn: its failures are WARNINGs (CONTEXT_METER §3.1).
+            log_failure = self.log_warning if operation_type == "token_count" else self.log_error
+            log_failure(f"API call ({operation_type}) timed out after {timeout}s")
             # Create TimeoutError with operation_type attribute for smart retry logic
             timeout_error = TimeoutError(f"OpenAI API call timed out after {timeout} seconds")
             # Ad-hoc attribute the retry logic reads back off the exception.
@@ -825,7 +851,9 @@ class OpenAIClient(LoggerMixin):
         except Exception as e:
             error_msg = str(e).lower()
             if "timeout" in error_msg or "timed out" in error_msg or "read timeout" in error_msg:
-                self.log_error(f"API call ({operation_type}) timed out after {timeout}s: {e}")
+                log_timeout = (self.log_warning if operation_type == "token_count"
+                               else self.log_error)
+                log_timeout(f"API call ({operation_type}) timed out after {timeout}s: {e}")
                 # Create TimeoutError with operation_type attribute for smart retry logic
                 timeout_error = TimeoutError(f"OpenAI API call timed out after {timeout} seconds")
                 # Ad-hoc attribute the retry logic reads back off the exception.
@@ -970,6 +998,8 @@ class OpenAIClient(LoggerMixin):
         attempt_sink: Optional[Any] = None,
         layout: str = "legacy",
         service_tier_eligible: bool = False,
+        meter: Optional[Any] = None,
+        round_index: int = 0,
     ) -> str:
         return await responses_api._create_text_response_with_timeout(
             self,
@@ -988,6 +1018,8 @@ class OpenAIClient(LoggerMixin):
             attempt_sink=attempt_sink,
             layout=layout,
             service_tier_eligible=service_tier_eligible,
+            meter=meter,
+            round_index=round_index,
         )
 
     async def _create_text_response_with_tools_with_timeout(
@@ -1014,6 +1046,8 @@ class OpenAIClient(LoggerMixin):
         container_gone_sink: Optional[List[str]] = None,
         layout: str = "legacy",
         service_tier_eligible: bool = False,
+        meter: Optional[Any] = None,
+        round_index: int = 0,
     ) -> str:
         return await responses_api._create_text_response_with_tools_with_timeout(
             self,
@@ -1039,6 +1073,8 @@ class OpenAIClient(LoggerMixin):
             container_gone_sink=container_gone_sink,
             layout=layout,
             service_tier_eligible=service_tier_eligible,
+            meter=meter,
+            round_index=round_index,
         )
 
 

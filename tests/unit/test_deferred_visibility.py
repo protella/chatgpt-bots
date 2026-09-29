@@ -193,7 +193,6 @@ async def test_a_deferred_non_streaming_turn_sets_no_status(monkeypatch):
     host = MagicMock()
     host._update_status = MagicMock(side_effect=_record_then_stop)
     host._inject_image_analyses = AsyncMock(side_effect=lambda m, _ts: m)
-    host._pre_trim_messages_for_api = AsyncMock(side_effect=lambda m, **kw: m)
     host._build_channel_info = AsyncMock(return_value=None)
     # Awaited between the prompt build and the first status update. Channel memory is NOT
     # fetched here any more — base.py reads it once and passes it in.

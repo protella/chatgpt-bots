@@ -17,7 +17,7 @@ import message_processor.prompts as prompts
 from message_processor.client_contract import BaseClient, Message
 from message_processor.canvas_content import CANVAS_MIMETYPE
 from message_processor.ingestion.document_handler import container_magic_mismatch
-from config import config, pipeline_status
+from config import clamp_effort, config, pipeline_status
 from message_processor.ingestion.image_validation import ensure_api_compatible, TOO_LARGE_AFTER_CONVERSION
 from message_processor._host import _Host
 from message_processor.message_timestamps import stamp_content
@@ -430,6 +430,9 @@ class MessageUtilitiesMixin(_Host):
                 temperature=0.3,
                 max_tokens=800,
                 system_prompt=None,
+                reasoning_effort=clamp_effort(config.utility_model,
+                                              config.utility_reasoning_effort),
+                verbosity=config.utility_verbosity,
                 attempt_sink=attempt_sink,
             )
             if summary and summary.strip():
@@ -623,14 +626,8 @@ class MessageUtilitiesMixin(_Host):
 
     async def _finalize_document_summary(self, entry: Dict, client: BaseClient, message: Message,
                                          thinking_id: Optional[str] = None,
-                                         summary_token_reserve: Optional[int] = None,
                                          attempt_sink: Optional[Any] = None) -> None:
         """Summarize one staged document and persist its row. Idempotent.
-
-        ``summary_token_reserve`` is the room the admission estimate reserved for this document.
-        The rendered summary is capped to it, because the request was admitted having charged the
-        document's RAW text: a summary allowed to exceed that reserve would push a turn over a
-        budget that had already been checked, and the check would have been for nothing.
 
         ``attempt_sink`` records the summarizer's API call on the turn's CV8 ledger.
         """
@@ -648,9 +645,6 @@ class MessageUtilitiesMixin(_Host):
                 emoji=config.analyze_emoji, thread_id=message.thread_id)
         doc_summary = await self._summarize_document_for_attach(
             extracted, file_name, mimetype, attempt_sink=attempt_sink)
-        if summary_token_reserve is not None:
-            from message_processor.channel_request import cap_summary_to_reserve
-            doc_summary = cap_summary_to_reserve(doc_summary, summary_token_reserve)
         entry["summary"] = doc_summary
 
         # Store summary + metadata + Slack ref (never content)
@@ -673,19 +667,11 @@ class MessageUtilitiesMixin(_Host):
 
     async def finalize_deferred_documents(self, document_inputs: List[Dict], client: BaseClient,
                                           message: Message, thinking_id: Optional[str] = None,
-                                          reserves: Optional[Sequence[Tuple[str, int]]] = None,
                                           turn: Optional[Any] = None) -> None:
         """Run the deferred summary + persist step for a channel turn's documents.
 
-        Called only after the admission estimate has passed. ``reserves`` is the estimate's ordered
-        (key, charge) list — one entry per document, matching ChannelTurnContext.raw_document_texts,
-        which is what the estimate charged for.
-
-        MULTIPLICITY, not a lookup [r4-3]. Two attachments can produce the same key — the same
-        file_id posted twice, two files with neither id nor url — and admission charged each of them.
-        A key-to-reserve mapping granted that single charge to BOTH, so two summaries spent room
-        bought once and the request could exceed the budget it was admitted at. The charges are
-        queued per key here and taken one per document, in the order they were charged.
+        Called before the turn's request is assembled, so the summaries it carries already exist
+        (CONTEXT_METER C-30).
 
         ``turn`` carries the CV8 ledger these utility calls belong on. Every summary here is a
         Responses API attempt paid for by this turn, so each gets its own `model_response` row —
@@ -693,22 +679,11 @@ class MessageUtilitiesMixin(_Host):
         tells "this turn made four calls" from "this turn retried three times".
         """
         sink = attach_summary_attempt_sink(turn)
-        queued: Dict[str, List[int]] = {}
-        for key, charge in (reserves or ()):
-            queued.setdefault(str(key), []).append(int(charge))
-        for index, entry in enumerate(document_inputs or []):
-            key = str(entry.get("file_id") or entry.get("url") or entry.get("filename") or index)
-            pending = queued.get(key) or []
-            # Taken for an ALREADY-finalized document too: on a retry its reserve was spent on the
-            # earlier pass, and leaving the charge queued would pass it to the next same-key
-            # document — which has its own charge waiting behind it.
-            reserve = pending.pop(0) if pending else None
+        for entry in document_inputs or []:
             if "_persist" not in entry:
                 continue
             await self._finalize_document_summary(
-                entry, client, message, thinking_id,
-                summary_token_reserve=reserve,
-                attempt_sink=sink)
+                entry, client, message, thinking_id, attempt_sink=sink)
 
     async def _process_attachments(
         self,

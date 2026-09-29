@@ -256,7 +256,7 @@ def _thread_state(channel="C1", thread="10.0"):
         messages=[{"role": "user", "content": "hi"}],
         channel_id=channel, thread_ts=thread, current_model="gpt-5.6-sol",
         config_overrides={}, has_summary_head=False, channel_directives=None,
-        record_usage=MagicMock(), last_usage=None,
+        last_usage=None,
     )
 
 
@@ -272,7 +272,6 @@ def _processor(openai):
 
     p._add_message_with_token_management = MagicMock()
     p._inject_image_analyses = _passthru
-    p._pre_trim_messages_for_api = _passthru
     p._get_system_prompt = MagicMock(return_value="sys")
     p._build_participant_roster = MagicMock(return_value="")
     p._build_suffix_context = MagicMock(return_value="")

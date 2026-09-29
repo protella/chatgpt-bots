@@ -5,14 +5,10 @@ Manages conversation state, locks, and memory for each Slack thread
 import time
 import asyncio
 from collections import deque
-from typing import Any, Callable, Dict, List, Optional, Set, cast
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, cast
 from dataclasses import dataclass, field
 from logger import LoggerMixin
 from config import config
-from message_processor.token_counter import TokenCounter
-
-# Shared stateless estimator for incremental context-size tracking
-_ESTIMATOR = TokenCounter()
 
 # Mid-run steering (update_background_job). A LIFETIME cap, counted on the entry and never
 # decremented: capping the pending backlog instead would let a job absorb hundreds of notes
@@ -41,17 +37,35 @@ class ThreadState:
     # model can be told whether the current sender started the thread or joined it. Set on
     # thread creation / rebuild; None until known.
     root_author: Optional[tuple] = None
-    # Usage-driven budgeting: authoritative context size from the API's response.usage
-    # after each call, plus chars/4 estimates for messages added between calls.
-    context_tokens: int = 0
-    
-    def add_message(self, role: str, content: Any, db = None, thread_key: Optional[str] = None, message_ts: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, token_counter: Optional[TokenCounter] = None, max_tokens: Optional[int] = None):
-        """Add a message to the thread history with optional metadata and token management.
+    # THE CONTEXT METER (CONTEXT_METER_SPEC §3.3). The last accepted official measure of this
+    # thread's request — OpenAI's own count, or the input_tokens a response reported — and the
+    # bookkeeping that decides whether a late arrival may replace it. In memory only: a restart
+    # simply means "no measure yet", which is preflight's cue to count.
+    #
+    # `meter_generation` is bumped whenever the request the measure described stops existing
+    # (a summary committed or removed, a DM transcript rebuilt); a count or usage dispatched
+    # under an older generation describes a request nobody will send again and is dropped.
+    # `next_dispatch_seq` orders dispatches, so a slow count for round 1 cannot overwrite the
+    # usage of round 3.
+    meter_generation: int = 0
+    next_dispatch_seq: int = 0
+    measured_tokens: Optional[int] = None
+    measured_complete: bool = False
+    measured_seq: int = 0
+    measured_generation: int = 0
+    measured_model: Optional[str] = None
+
+    def add_message(self, role: str, content: Any, db = None, thread_key: Optional[str] = None, message_ts: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None):
+        """Add a message to the thread history with optional metadata.
 
         Phase S: messages are NOT persisted — Slack is the only transcript and state is
         rebuilt from conversations.replies on cold load. The db/thread_key params are kept
         for signature compatibility. message_ts is stamped into the message metadata so
         hidden-context injection (image analyses) and summary boundaries can key on it.
+
+        Nothing is trimmed here: the size of the request is the context meter's question, and it
+        is answered with the official count before the request goes out, not by a local guess
+        at append time.
         """
         msg = {
             "role": role,
@@ -67,64 +81,48 @@ class ThreadState:
         self.messages.append(msg)
         self.last_activity = time.time()
 
-        # Usage-driven budgeting: increment the tracked size with a cheap estimate;
-        # the next record_usage() replaces it with the API's authoritative number.
-        self.context_tokens += (token_counter or _ESTIMATOR).count_message_tokens(msg)
+    def allocate_dispatch_seq(self) -> int:
+        """The next dispatch sequence number for this thread's meter (1, 2, 3, ...)."""
+        self.next_dispatch_seq += 1
+        return self.next_dispatch_seq
 
-        # Check token limit and trim if necessary
-        if token_counter and max_tokens:
-            self._trim_to_token_limit(token_counter, max_tokens, db, thread_key)
-    
-    def _trim_to_token_limit(self, token_counter: TokenCounter, max_tokens: int, db = None, thread_key: Optional[str] = None):
-        """Trim messages to fit within token limit"""
-        import logging
-        logger = logging.getLogger(__name__)
-        
-        current_tokens = token_counter.count_thread_tokens(self.messages)
-        
-        if current_tokens <= max_tokens:
-            return
-        
-        logger.info(f"Thread exceeds token limit ({current_tokens} > {max_tokens}), trimming oldest messages")
-        
-        # Find first non-system message index
-        start_index = 0
-        for i, msg in enumerate(self.messages):
-            if msg.get("role") not in ["system", "developer"]:
-                start_index = i
-                break
-        
-        # Remove messages from the beginning (after system message)
-        removed_count = 0
-        messages_to_remove = []
-        
-        while current_tokens > max_tokens and len(self.messages) > start_index + 1:
-            if start_index < len(self.messages) - 1:
-                removed_msg = self.messages.pop(start_index)
-                messages_to_remove.append(removed_msg)
-                removed_count += 1
-                
-                current_tokens = token_counter.count_thread_tokens(self.messages)
-                logger.debug(f"Removed message {removed_count}, tokens now: {current_tokens}")
-            else:
-                logger.warning("Cannot trim further - would remove current message")
-                break
-        
-        if removed_count > 0:
-            logger.info(f"Trimmed {removed_count} messages to fit token limit")
-    
-    def record_usage(self, input_tokens: int = 0, output_tokens: int = 0):
-        """Record the API's authoritative usage for the last call. input+output is the
-        true size of the context that rides into the next turn — REPLACES the
-        accumulated estimates."""
-        total = (input_tokens or 0) + (output_tokens or 0)
-        if total > 0:
-            self.context_tokens = total
+    def record_measure(self, tokens: int, complete: bool, seq: int, generation: int,
+                       model: Optional[str], source: str) -> bool:
+        """Accept one measure, or refuse it as stale. Returns whether it was accepted.
 
-    def reset_context_estimate(self, token_counter: Optional[TokenCounter] = None):
-        """Re-estimate the tracked context size from current messages (after cold
-        rebuilds and compaction, when no fresh usage number exists yet)."""
-        self.context_tokens = (token_counter or _ESTIMATOR).count_thread_tokens(self.messages)
+        Accepted only for the CURRENT generation, and only when it is newer than what is stored —
+        or equally new and from the response's own usage, which is the request's real size and so
+        beats a count of the same dispatch."""
+        if generation != self.meter_generation:
+            return False
+        if seq < self.measured_seq:
+            return False
+        if seq == self.measured_seq and source != "usage":
+            return False
+        self.measured_tokens = int(tokens)
+        self.measured_complete = bool(complete)
+        self.measured_seq = seq
+        self.measured_generation = generation
+        self.measured_model = model
+        return True
+
+    def current_measure(self, model: Optional[str]) -> Optional[Tuple[int, bool]]:
+        """(tokens, complete) for `model`, or None. A measure taken against a different model
+        describes a different tokenizer and window, so it is not this model's measure."""
+        if self.measured_tokens is None or self.measured_model != model:
+            return None
+        if self.measured_generation != self.meter_generation:
+            return None
+        return self.measured_tokens, self.measured_complete
+
+    def invalidate_measure(self) -> None:
+        """The request the measure described no longer exists: bump the generation, clear it."""
+        self.meter_generation += 1
+        self.measured_tokens = None
+        self.measured_complete = False
+        self.measured_seq = 0
+        self.measured_generation = self.meter_generation
+        self.measured_model = None
 
     def get_recent_messages(self, count: int = 6) -> List[Dict[str, Any]]:
         """Get the most recent messages for context"""
@@ -332,7 +330,6 @@ class AsyncThreadStateManager(LoggerMixin):
 
         self._lock_manager = AsyncThreadLockManager()
         self._state_lock = asyncio.Lock()
-        self._token_counter = TokenCounter(config.gpt_model)
         self.db = db  # Optional database manager
         self._watchdog_task = None
         self._watchdog_started = False

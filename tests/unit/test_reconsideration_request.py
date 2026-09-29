@@ -23,7 +23,6 @@ from config import config
 from message_processor import channel_request, channel_stream
 from openai_client import base as openai_base
 from openai_client.api import responses as responses_api
-from message_processor.token_counter import admission_charge
 
 TEAM = "T1"
 CH = "C1"
@@ -182,34 +181,24 @@ def test_no_tools_assembly_equals_manual_normalization():
     assert via_mode.tools == manual.tools == []
 
 
-# ------------------------------------------------------------------ the estimator
+# ------------------------------------------------------------------ the counted body
 
 
-def test_estimator_charges_the_response_format_by_serialized_json_length():
-    fmt = responses_api.STALE_RECONSIDERATION_RESPONSE_FORMAT
-    kwargs = dict(instructions="hi", input_items=[{"role": "user", "content": "x"}],
-                  tools=None, raw_document_texts=(), native_file_bounds=(),
-                  model="gpt-5.6-sol")
-    without = channel_request.estimate_admission(**kwargs)
-    with_format = channel_request.estimate_admission(**kwargs, response_format=fmt)
+def test_the_counted_body_carries_the_response_format_the_call_sends():
+    """R3-6: the runner sizes a pass by counting `build_reconsideration_create_kwargs` — so the
+    structured-output format the decision call sends is part of what is counted, and survives
+    the counter's allowlist."""
+    from message_processor.reconsideration import PreparedDecision
+    from openai_client.api.token_count import count_body
 
-    charge = admission_charge(json.dumps(fmt, default=str))
-    assert charge > 0
-    assert with_format.breakdown["response_format"] == charge
-    assert with_format.total_tokens == without.total_tokens + charge
-    assert "response_format" not in without.breakdown
-
-
-def test_assembler_forwards_the_response_format_into_the_estimate():
-    ctx = _ctx(_everything_on_config())
-    request = channel_request.assemble_channel_request(
-        processor=_processor(), client=SimpleNamespace(bot_user_id="U_BOT"), ctx=ctx,
-        model="gpt-5.5", tools=None, request_config=None, contract_suffix=None,
-        no_tools=True, with_estimate=True,
-        response_format=responses_api.STALE_RECONSIDERATION_RESPONSE_FORMAT)
-    expected = admission_charge(
-        json.dumps(responses_api.STALE_RECONSIDERATION_RESPONSE_FORMAT, default=str))
-    assert request.estimate.breakdown["response_format"] == expected
+    prepared = PreparedDecision(
+        instructions="hi", api_items=[{"role": "user", "content": "x"}],
+        params={"reasoning_effort": "medium", "verbosity": "medium",
+                "max_output_tokens": 4000, "temperature": 1.0, "prompt_cache_key": "k"})
+    kwargs = responses_api.build_reconsideration_create_kwargs(prepared, model="gpt-5.6-sol")
+    assert kwargs["text"]["format"] == responses_api.STALE_RECONSIDERATION_RESPONSE_FORMAT
+    assert count_body(kwargs)["text"]["format"] == (
+        responses_api.STALE_RECONSIDERATION_RESPONSE_FORMAT)
 
 
 # ------------------------------------------------------------------ the wrapper

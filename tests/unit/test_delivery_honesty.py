@@ -494,7 +494,7 @@ async def _channel_turn_with_a_prior_timeout(*, admission_fails: bool, had_timeo
     from unittest.mock import patch
 
     from message_processor.base import MessageProcessor
-    from message_processor.channel_stream import StreamOverBudgetError
+    from message_processor.channel_stream import StreamTimestampError
 
     with patch("message_processor.base.AsyncThreadStateManager"), \
          patch("message_processor.base.OpenAIClient"):
@@ -530,7 +530,8 @@ async def _channel_turn_with_a_prior_timeout(*, admission_fails: bool, had_timeo
         seen["reply_destination"] = turn_arg.reply_destination
         seen["failed_attachments"] = k.get("failed_attachments")
         if admission_fails:
-            raise StreamOverBudgetError("C1: more than fits in one request")
+            # A fail-closed condition met while the turn's context is being pinned.
+            raise StreamTimestampError("C1: a record's timestamp does not parse")
 
     async def _send(**kwargs):
         text = kwargs.get("text") or ""
@@ -604,8 +605,8 @@ async def test_a_turn_that_cannot_see_the_room_never_promises_to_pick_up_from_he
     order, response, _ = await _channel_turn_with_a_prior_timeout(admission_fails=True)
     assert "notice" not in order, "the notice stood alone on a turn that could not answer"
     assert response.type == "error"
-    # The turn still says something honest — the over-budget notice, not the recovery promise.
-    assert "larger than I can send in one go" in response.content
+    # The turn still says something honest — its fail-closed notice, not the recovery promise.
+    assert "Can't Place This Channel's History" in response.content
 
 
 # ------------------- r3-3/r3-4: the notice settles the destination BEFORE the request is measured

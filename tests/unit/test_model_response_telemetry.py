@@ -512,7 +512,7 @@ async def test_an_attached_documents_summary_is_an_attempt_on_the_turn(rows):
                for i in range(3)]
     await host.finalize_deferred_documents(
         entries, MagicMock(), SimpleNamespace(channel_id="C1", thread_id="10.0"), None,
-        reserves=(), turn=turn)
+        turn=turn)
 
     written = rows()
     assert [r["attempt_seq"] for r in written] == [1, 2, 3]

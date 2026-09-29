@@ -23,6 +23,8 @@ from message_processor import artifacts as artifacts_mod
 from message_processor import containers as containers_mod
 from message_processor import research_tools as rt
 from message_processor.artifacts import StagedArtifact
+from message_processor.context_meter import usable_limit
+from openai_client.api.token_count import CountResult
 from slack_client.messaging import CardWriteResult
 
 
@@ -714,7 +716,8 @@ class TestResearchInstruction:
 # from a 76MB pptx. The PDF's base64 blob was charged one token per CHARACTER, the build was
 # estimated at 2.27M tokens against a 919,800 limit, and the 2,867-character revision master
 # the job had been asked to edit was dropped for want of room nothing was occupying. The
-# request then succeeded — which is the proof the number was fiction.
+# request then succeeded — which is the proof the number was fiction. Admission now decides on
+# OpenAI's own count of the build request, which prices the native part as the API reads it.
 
 _MASTER_NAME = "report.docx"
 
@@ -734,10 +737,14 @@ def _native_pdf_snapshot(filename="deck.pdf", b64_chars=2_200_000):
         {"type": "input_file", "filename": filename, "file_data": "B" * b64_chars}]}]
 
 
-async def _run_revision_build(monkeypatch, *, doc_rows, snapshot, master_text="THE OLD BODY"):
-    """Drive the real build phase on a REVISION, capturing what the model would receive."""
+async def _run_revision_build(monkeypatch, *, doc_rows, snapshot, count_tokens,
+                              master_text="THE OLD BODY"):
+    """Drive the real build phase on a REVISION, capturing what the model would receive.
+    `count_tokens` is what OpenAI's counter answers for every request (complete)."""
     processor = _processor()
     processor.db.get_thread_documents_async = AsyncMock(return_value=doc_rows)
+    processor.openai_client.count_input_tokens = AsyncMock(
+        return_value=CountResult(count_tokens, True))
     captured = {}
 
     async def fake_load(_client, _row, **_kw):
@@ -765,34 +772,27 @@ async def _run_revision_build(monkeypatch, *, doc_rows, snapshot, master_text="T
 class TestNativeFileAdmission:
     async def test_a_paged_native_file_is_priced_by_its_pages_not_its_base64_length(
             self, monkeypatch):
+        # 2.2M base64 characters, but the counter reads the PDF's pages: a small, complete count
+        # keeps the master the job was asked to edit.
         captured = await _run_revision_build(
             monkeypatch,
             doc_rows=[_doc_row(_MASTER_NAME),
                       _doc_row("deck.pdf", size_bytes=76_000_000, total_pages=24)],
-            snapshot=_native_pdf_snapshot())
+            snapshot=_native_pdf_snapshot(), count_tokens=40_000)
 
         joined = "\n".join(str(m.get("content")) for m in captured["messages"])
         assert "THE OLD BODY" in joined          # the master the job was asked to edit
         assert not any("does not fit" in w for w in captured["warnings"])
 
-    def test_an_unmatched_part_still_prices_at_its_base64_length(self):
-        # No plumbing carries metadata for a part the documents table has never heard of, so
-        # the blob's length stays the bound there — today's behaviour, no new failure mode.
-        items = _native_pdf_snapshot(b64_chars=4096)
-        assert rt._native_file_bounds(items, {}) == [4096]
-        assert rt._native_file_bounds(items, {"other.pdf": (1, 1)}) == [4096]
-        # Matched but with no page count (a CSV/XLSX) is the byte count, which is that same
-        # behaviour and the right bound for a file the API reads as text.
-        assert rt._native_file_bounds(items, {"deck.pdf": (900, None)}) == [900]
-
     async def test_a_genuinely_oversized_master_still_drops_out(self, monkeypatch):
-        # The gate is CORRECTED, not disabled. Priced honestly, a 320-page PDF plus a 140k-char
-        # master really does not fit — and the master is the part that gives way.
+        # The gate is CORRECTED, not disabled. Counted honestly, a request over the usable limit
+        # really does not fit — and the master is the part that gives way.
         captured = await _run_revision_build(
             monkeypatch,
             doc_rows=[_doc_row(_MASTER_NAME),
                       _doc_row("deck.pdf", size_bytes=76_000_000, total_pages=320)],
             snapshot=_native_pdf_snapshot(b64_chars=1000),
+            count_tokens=usable_limit("gpt-5.6-sol") + 1,
             master_text="X" * 140_000)
 
         joined = "\n".join(str(m.get("content")) for m in captured["messages"])

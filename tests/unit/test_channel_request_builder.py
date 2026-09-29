@@ -821,7 +821,6 @@ def _handler_host(streaming: bool) -> MagicMock:
         return ""
 
     host._inject_image_analyses = _passthru
-    host._pre_trim_messages_for_api = _passthru
     host._build_channel_info = _empty
     host._drop_dead_containers = _none
     host._resolve_ci_container = _none
@@ -864,7 +863,7 @@ async def _drive_handler(host, *, streaming: bool, channel_id: str = "C1",
         messages=[{"role": "user", "content": "hi"}], channel_id=channel_id,
         thread_ts="9000.0",
         current_model="gpt-5.6-sol", config_overrides={}, has_summary_head=False,
-        channel_directives=None, record_usage=MagicMock(), last_usage=None, participants={})
+        channel_directives=None, last_usage=None, participants={})
 
     async def fake_config(**kw):
         cfg = {"model": "gpt-5.6-sol", "temperature": 1.0, "max_tokens": 100,

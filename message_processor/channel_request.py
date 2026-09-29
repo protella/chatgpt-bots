@@ -20,29 +20,9 @@ THE SHAPE, and why it is this shape:
 Everything above the breakpoint is a function of (channel, window, H). Everything below varies
 with who asked — which is exactly why it is below.
 
-THE ADMISSION ESTIMATE runs before any API call, including the utility model that summarizes an
-attached document. A request that cannot fit has to be refused while refusing is still free: once
-summarization has run we have spent money on a turn that was never going to be sent. And each
-rendered summary is then capped to what the estimate reserved for that document's raw text, so a
-summary can never expand a request past the size it was admitted at.
-
-THE CHARGE IS A BOUND, NOT AN ESTIMATE. The guarantee it exists to make — an admitted request
-cannot fail inside the API for its size — is worth exactly as much as the worst case in every term.
-Text is charged one token per utf-8 byte (`token_counter.admission_charge`), which no byte-level BPE
-tokenizer can exceed and which needs no vocabulary to compute, so it holds for gpt-5.6's
-unpublished table too. Every item pays a structural overhead for the framing we cannot see, images
-and native files are charged their ceilings, and a document is charged its whole raw text even
-though only a summary will be sent — that summary is then capped, in the same byte currency, to the
-reserve the charge recorded, so bytes sent can never exceed bytes admitted.
-
-The price of a bound is capacity: English prose costs about 4.5 bytes per real token, so a channel
-whose window has grown past roughly the usable token figure in BYTES is refused while it would
-still fit. Refusing early is the intended trade — a shallower window is the answer to a room that
-big, not a hopeful multiplier.
-
-`handlers/text.py` still converts the API's own context-length 400 into an over-budget outcome.
-That is now residual defence rather than half the guarantee: nothing should reach it, and if
-anything does it is reported as too large rather than dying as an error.
+SIZE is not estimated here. There is no local estimate and no refusal card: the request wrappers
+measure each request with OpenAI's official input-token count (the context meter,
+message_processor/context_meter.py), and that number is the only one size decisions are made on.
 """
 from __future__ import annotations
 
@@ -53,8 +33,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from config import CHANNEL_CAPABILITY_KEYS, config
 from logger import setup_logger
-from message_processor.channel_stream import (ChannelStream, StreamOverBudgetError,
-                                              StreamTimestampError)
+from message_processor.channel_stream import ChannelStream, StreamTimestampError
 from message_processor.utilities import (StreamActor, TurnCoordinates, api_part,
                                         build_capability_state_suffix,
                                         build_channel_topic_evidence,
@@ -67,27 +46,12 @@ from message_processor.utilities import (StreamActor, TurnCoordinates, api_part,
                                         build_taggable_roster_evidence,
                                         effective_request_model)
 from slack_client.normalizer import FileRef, NormalizedMessage, TimestampError, ts_key
-from message_processor.token_counter import (ITEM_STRUCTURAL_OVERHEAD, admission_charge,
-                                             estimate_tokens_conservative)
 from message_processor.tool_registry import SURFACE_CHANNEL
 
 logger = setup_logger(name="slack_bot.ChannelRequest")
 
 ROLE_USER = "user"
 ROLE_DEVELOPER = "developer"
-
-# Every input_image part is charged this much, whatever it actually costs. The bound is above the
-# provider's maximum high-detail tile cost for the 5.5/5.6 models we support: those cap a single
-# image at 1536×1536 of tiles, which bills well under 2k tokens even at full detail. Charging the
-# ceiling means the estimate can never admit a request the image then pushes over — and an image
-# is the one input whose real cost we cannot compute locally, because we would have to tile it
-# ourselves to find out.
-IMAGE_TOKEN_BOUND = 2000
-
-# Per rendered page of a native PDF. The API renders pages to images and reads their text, so a
-# page costs roughly an image plus its transcription; 2500 is above what a dense page has cost in
-# practice on 5.6.
-PDF_PAGE_TOKEN_BOUND = 2500
 
 # The per-turn image slot count, the same number _process_attachments enforces.
 BATCHED_IMAGE_CAP = 10
@@ -238,10 +202,9 @@ class ChannelTurnContext:
     def job_state_notes(self, processor: Any) -> Tuple[Optional[str], ...]:
         """The in-flight image/background-job lines, PINNED at first use [r3-11].
 
-        Both read the live ThreadManager, so a job that started between the admission estimate and
-        the request it admitted added bytes nothing had charged, and a job that finished in that
-        window changed the evidence under the responder. A retry could see a third state again.
-        Whatever was true when the turn was admitted is what the turn answers with.
+        Both read the live ThreadManager, so a job that started or finished between one assembly
+        and the next changed the evidence under the responder, and a retry could see a third state
+        again. Whatever was true when the turn was pinned is what the turn answers with.
         """
         cached = self.memo.get("job_state_notes")
         if cached is None:
@@ -250,69 +213,6 @@ class ChannelTurnContext:
                 processor._build_research_inflight_note(self.channel_id, self.origin_thread_ts),
             )
         return cached
-
-    @property
-    def raw_document_texts(self) -> Tuple[Tuple[str, str], ...]:
-        """(key, raw extracted text) per attached document — what the estimate reserves for."""
-        out = []
-        for index, doc in enumerate(self.document_inputs):
-            key = str(doc.get("file_id") or doc.get("url") or doc.get("filename") or index)
-            out.append((key, str(doc.get("content") or "")))
-        return tuple(out)
-
-    @property
-    def native_file_bounds(self) -> Tuple[int, ...]:
-        """The worst-case token cost of each native input_file part riding this turn."""
-        bounds = []
-        for doc in self.document_inputs:
-            if not (doc.get("native") and doc.get("file_data_b64")):
-                continue
-            bounds.append(native_file_token_bound(
-                doc.get("size_bytes"), doc.get("total_pages"),
-                extracted_text=doc.get("content")))
-        return tuple(bounds)
-
-
-def native_file_token_bound(size_bytes: Optional[int], page_count: Optional[int],
-                            extracted_text: Optional[str] = None) -> int:
-    """The most a native input_file part can cost, and deliberately not an average.
-
-    A PAGED file — a PDF whose page count we parsed locally — is charged BOTH of the two things
-    the API does with it: it renders every page (which is what PDF_PAGE_TOKEN_BOUND prices) AND it
-    reads the text out of them. So the bound is `pages * PDF_PAGE_TOKEN_BOUND` plus the measured
-    cost of the text we extracted from the same file. `document_reserves` does NOT already cover
-    that: it reserves room for the SUMMARY we generate locally and send in the document block,
-    which is a different payload from the raw text the API tokenizes out of the native part.
-    Dropping the text leg would stop being a ceiling exactly where it matters most — a text-dense
-    PDF, where the text can cost more than the pages do.
-
-    What is gone is the BYTE leg: the API never tokenizes a PDF's container bytes, which are mostly
-    compressed images, fonts and object tables. Charging them made the container's compression
-    ratio the price of the document. The live case was a 1.1MB, 16-page image-heavy PDF priced at
-    1,169,733 tokens and refused at the door; under this bound it is 16*2500 = 40k for the pages
-    plus roughly 10k for its extracted text — about 50k, some 23x under the old estimate and
-    comfortably inside the window it was refused from.
-
-    The text is MEASURED, never ratio'd: `estimate_tokens_conservative` is the o200k count plus
-    headroom, the same instrument the admission diagnostic uses, so a page of dense CSV and a page
-    of English prose are not priced as if they were the same text.
-
-    With NO page count — an unparseable PDF, or a native part that has no pages at all, such as a
-    CSV/XLSX mounted for the sandbox — the bytes are the only thing we know. One token per byte is
-    the true worst case for high-entropy TEXT (no byte-level BPE tokenizer emits more than one
-    token per byte), which makes the byte count a reasonable proxy for a file the API will read as
-    text — a proxy, not a guarantee, since a paged or rendered part can cost more than its bytes.
-    Pre-existing behaviour on that leg, unchanged here.
-
-    UNCAPPED on purpose. A file whose worst case will not fit genuinely cannot be guaranteed to
-    fit, and admitting it on an optimistic average is how a turn dies inside the API instead of
-    at the door.
-    """
-    pages = int(page_count or 0)
-    if pages > 0:
-        return pages * PDF_PAGE_TOKEN_BOUND + estimate_tokens_conservative(extracted_text or "")
-    return int(size_bytes or 0)
-
 
 def fresh_turn_context(ctx: ChannelTurnContext, fresh_stream: ChannelStream
                        ) -> ChannelTurnContext:
@@ -330,166 +230,6 @@ def fresh_turn_context(ctx: ChannelTurnContext, fresh_stream: ChannelStream
     return replace(ctx, stream=fresh_stream, memo=fresh_memo)
 
 
-# ---------------------------------------------------------------- the estimate
-
-
-@dataclass(frozen=True)
-class AdmissionEstimate:
-    """The charge, and WHICH PART OF THE REQUEST IS CARRYING IT (R0-1).
-
-    One currency, one total — the components are a split of the same number, never a second
-    measurement. `stream_tokens` is what the canonical stream costs; `overhead_tokens` is
-    everything else (instructions, tools, attachments, the post-breakpoint evidence and the
-    suffix).
-
-    The split is kept because it is what makes a refusal diagnostic useful: an operator reading
-    "Too Much For One Request" wants to know whether the room or the attachment is what did not
-    fit, and one total cannot say.
-    """
-    total_tokens: int
-    limit_tokens: int
-    breakdown: Dict[str, int]
-    # One (key, charge) per document INSTANCE, in the order they were charged — not a mapping. Two
-    # attachments can share a key (the same file_id posted twice), and a mapping collapsed them into
-    # a single reserve that finalization then granted to both.
-    document_reserves: Tuple[Tuple[str, int], ...]
-    # The canonical (pre-breakpoint) stream's own contribution: its item text plus the structural
-    # framing each of those items pays for. Zero when the caller passed unmarked items.
-    stream_tokens: int = 0
-
-    @property
-    def fits(self) -> bool:
-        return self.total_tokens <= self.limit_tokens
-
-    @property
-    def overage(self) -> int:
-        return max(0, self.total_tokens - self.limit_tokens)
-
-    @property
-    def overhead_tokens(self) -> int:
-        """Everything the request costs that is not the stream itself."""
-        return self.total_tokens - self.stream_tokens
-
-
-def _text_tokens(content: Any) -> int:
-    """The charge for one item's content, with raw media charged through the bounds instead.
-
-    An input_image's `image_url` is a base64 data URI — charging it as text would report tens of
-    millions of tokens for one screenshot and refuse every turn that had a picture in it.
-    """
-    if isinstance(content, str):
-        return admission_charge(content)
-    total = 0
-    for part in content if isinstance(content, list) else []:
-        if not isinstance(part, dict):
-            continue
-        if part.get("type") == "input_text":
-            total += admission_charge(str(part.get("text") or ""))
-    return total
-
-
-def estimate_admission(*, instructions: str, input_items: Sequence[Dict[str, Any]],
-                       tools: Optional[Sequence[Dict[str, Any]]],
-                       raw_document_texts: Sequence[Tuple[str, str]],
-                       native_file_bounds: Sequence[int],
-                       model: Optional[str],
-                       response_format: Optional[Dict[str, Any]] = None) -> AdmissionEstimate:
-    """What this request can cost AT WORST, before anything is sent.
-
-    An upper bound in every term: text is charged one token per utf-8 byte (no byte-level BPE
-    tokenizer can exceed that, so no vocabulary is needed and no unknown table can break it), every
-    item pays `ITEM_STRUCTURAL_OVERHEAD` for role and delimiter framing that never appears in the
-    text we can see, raw extracted document text is charged whole even though only a SUMMARY will be
-    sent, images and native files are charged their ceilings, and the limit compared against is the
-    usable input figure — the model's window minus the output and estimator reserve — from the same
-    resolver the rest of the token accounting uses.
-
-    `document_reserves` is how much room each document's summary may occupy once it exists, and it
-    is the document's own charge: the request was admitted having paid for that many bytes of raw
-    text, and the summary stands in for it. Anything smaller would throw away room the turn had
-    already bought — a short document's reserve would not even hold the truncation marker, so its
-    summary would be dropped entirely. One entry PER DOCUMENT, keyed but not deduplicated, so two
-    documents that share a key are two charges and two grants [r4-3].
-
-    `response_format` is the OUTER `text.format` object a structured-output request will carry
-    (the stale-reconsideration decision is the one caller today, STALE_RECONSIDERATION §4d).
-    Charged by its serialized JSON length like other structure, under its own breakdown key;
-    absent means the request sends no format object and nothing is charged.
-    """
-    items = [item for item in input_items if isinstance(item, dict)]
-    breakdown = {
-        "instructions": admission_charge(instructions or ""),
-        "tools": (admission_charge(json.dumps(list(tools or []), default=str))
-                  if tools else 0),
-        "items": sum(_text_tokens(item.get("content")) for item in items),
-        # Every item, plus one for the developer instructions, which is framed the same way.
-        "structure": (len(items) + 1) * ITEM_STRUCTURAL_OVERHEAD,
-        "images": _count_image_parts(input_items) * IMAGE_TOKEN_BOUND,
-        "native_files": sum(int(b) for b in native_file_bounds),
-    }
-    reserves = tuple((key, admission_charge(text)) for key, text in raw_document_texts)
-    breakdown["document_text"] = sum(charge for _key, charge in reserves)
-    if response_format is not None:
-        breakdown["response_format"] = admission_charge(
-            json.dumps(response_format, default=str))
-    total = sum(breakdown.values())
-    limit = config.get_model_token_limit(model or config.gpt_model)
-    # BOTH MARKERS: the room's content is the canonical stream PLUS the origin block, which sits
-    # after the breakpoint but is still the conversation rather than evidence about it. A
-    # refusal that reported the origin as overhead would point the reader at the wrong cause.
-    canonical = [item for item in items if item.get("_stream") or item.get("_origin")]
-    stream_tokens = (sum(_text_tokens(item.get("content")) for item in canonical)
-                     + len(canonical) * ITEM_STRUCTURAL_OVERHEAD)
-    return AdmissionEstimate(total_tokens=total, limit_tokens=limit, breakdown=breakdown,
-                             document_reserves=reserves, stream_tokens=stream_tokens)
-
-
-def _count_image_parts(input_items: Sequence[Dict[str, Any]]) -> int:
-    count = 0
-    for item in input_items:
-        content = item.get("content") if isinstance(item, dict) else None
-        if not isinstance(content, list):
-            continue
-        count += sum(1 for part in content
-                     if isinstance(part, dict) and part.get("type") == "input_image")
-    return count
-
-
-TRUNCATION_NOTE = "\n[summary truncated to its admitted size]"
-
-
-def cap_summary_to_reserve(summary: str, reserved_tokens: int) -> str:
-    """Trim a rendered summary to the room the estimate reserved for its document.
-
-    A summary is normally a fraction of the text it describes, so this fires almost never — but
-    "almost never" is the wrong guarantee for a size the request was already admitted at.
-
-    Measured in the ADMISSION currency, utf-8 bytes, because that is what the reserve licenses: the
-    request was charged one token per byte of the raw text, so a replacement that stays inside the
-    reserve in bytes cannot cost more tokens than the document it replaces, whatever tokenizer reads
-    it. Comparing a token estimate against the reserve instead would let a prose summary of a dense
-    document run several times the bytes it was admitted at.
-
-    The result is guaranteed to fit, not estimated to: a zero or negative reserve leaves room for
-    nothing at all (a document whose text was charged nothing is a document with no text), a reserve
-    too small for even the truncation marker returns nothing rather than the marker's own overflow,
-    and the cut is a byte prefix, so it is exact rather than searched for.
-    """
-    text = summary or ""
-    if reserved_tokens <= 0:
-        return ""
-    data = text.encode("utf-8")
-    if len(data) <= reserved_tokens:
-        return text
-    note = TRUNCATION_NOTE.encode("utf-8")
-    if len(note) > reserved_tokens:
-        return ""
-    # `decode(..., "ignore")` drops a multi-byte character the cut landed inside, and rstrip can
-    # only shorten, so the result is never longer than the prefix that was measured.
-    head = data[:reserved_tokens - len(note)].decode("utf-8", "ignore").rstrip()
-    return (head + TRUNCATION_NOTE) if head else TRUNCATION_NOTE
-
-
 # ---------------------------------------------------------------- the assembled request
 
 
@@ -500,28 +240,10 @@ class ChannelRequest:
     tools: Optional[List[Dict[str, Any]]]
     prompt_cache_key: str
     evidence_hash: str
-    estimate: Optional[AdmissionEstimate] = None
 
     @property
     def stream_items(self) -> List[Dict[str, Any]]:
         return [item for item in self.input_items if item.get("_stream")]
-
-    @property
-    def countable_text(self) -> str:
-        """Every string this request will send, for the refusal diagnostic only.
-
-        Assembled on demand rather than kept, because on the path that matters — the request that
-        fits — nobody asks for it.
-        """
-        parts = [self.instructions or ""]
-        for item in self.input_items:
-            content = item.get("content")
-            if isinstance(content, str):
-                parts.append(content)
-            elif isinstance(content, list):
-                parts.extend(str(p.get("text") or "") for p in content
-                             if isinstance(p, dict) and p.get("type") == "input_text")
-        return "\n".join(parts)
 
 
 def _stable_hash(payload: Any) -> str:
@@ -718,8 +440,8 @@ def failed_attachments_note(items: Sequence[Tuple[str, str]]) -> str:
     into a helpful sentence and "budget.numbers is too large (60.0MB, max 50.0MB)" is.
 
     One wording, unconditionally, and no instruction in it: what to DO about a file that failed is
-    the system prompt's job. That also means admission measures exactly the bytes that get sent —
-    there is no longer a second, longer template whose delivery outcome the tense has to follow.
+    the system prompt's job, and there is no second, longer template whose delivery outcome the
+    tense has to follow.
 
     Shared with the DM path (message_processor/base.py), whose failures ride the turn's own user
     content rather than a post-breakpoint supplement — the words are the same either way.
@@ -797,9 +519,9 @@ def build_cohort_fallback(ctx: ChannelTurnContext) -> Optional[Dict[str, Any]]:
 
     UNCAPPED, like the gate's cohort itself. A cap here quietly dropped messages the turn had
     already decided it was answering — the model would reply to a burst of thirty having been shown
-    ten of them, with nothing saying so. Size is not the reason to drop them: every quoted line is
-    charged by the admission estimate, so a burst too large to send is refused at the door and said
-    out loud, rather than silently thinned.
+    ten of them, with nothing saying so. Size is not the reason to drop them: the context meter
+    measures the whole request, quoted lines included, and a request that is too big is handled
+    there rather than silently thinned here.
     """
     absent = [s for s in ctx.cohort_sources
               if s.ts and ctx.stream.trigger_view(s.ts) is None]
@@ -922,8 +644,8 @@ def build_developer_suffix(ctx: ChannelTurnContext, *, processor: Any,
         # F1/F13/F38: what is ALREADY running in this thread. Not in the plan's suffix list, and
         # load-bearing anyway — without it a turn cheerfully starts a second deck while the first
         # one is still building (live 2026-07). Volatile by nature, so post-breakpoint is exactly
-        # where it belongs — and pinned at admission, like the time above, so the bytes charged are
-        # the bytes sent.
+        # where it belongs — and pinned at first use, like the time above, so a retry sends the
+        # same notes.
         *ctx.job_state_notes(processor),
         contract_suffix,
         build_membership_suffix(ctx.num_members),
@@ -961,10 +683,7 @@ def assemble_channel_request(*, processor: Any, client: Any, ctx: ChannelTurnCon
                              contract_suffix: Optional[str],
                              registry: Any = None,
                              reply_destination: Optional[str] = None,
-                             with_estimate: bool = False,
-                             no_tools: bool = False,
-                             response_format: Optional[Dict[str, Any]] = None
-                             ) -> ChannelRequest:
+                             no_tools: bool = False) -> ChannelRequest:
     """Assemble ONE channel turn's request. Both text handlers converge here.
 
     `model` and `tools` are the only fork-local inputs: a timeout retry sends a different model
@@ -975,8 +694,7 @@ def assemble_channel_request(*, processor: Any, client: Any, ctx: ChannelTurnCon
     context's capability profile is normalized through `reconsideration_profile` with `model` as
     the called model, and `registry`, `contract_suffix` and `tools` are forced to
     None/None/[] — so the system instructions, the capability suffix and every hash describe a
-    request that genuinely offers no tool. `response_format` rides through to the admission
-    estimator so the estimate covers the structured-output format object the call will send.
+    request that genuinely offers no tool.
     """
     if no_tools:
         profile = reconsideration_profile(ctx.thread_config, model=model)
@@ -1009,7 +727,7 @@ def assemble_channel_request(*, processor: Any, client: Any, ctx: ChannelTurnCon
     # turn is in; everything below is evidence ABOUT it. Metadata rides the items for the same
     # reason the canonical ones carry it — the stale-send guard reads metadata.ts, and the
     # payload builder strips it. The items carry `_origin`, never `_stream`: see
-    # `origin_input_items`, `estimate_admission` and `to_input_items` for why it takes a second
+    # `origin_input_items` and `to_input_items` for why it takes a second
     # marker rather than reusing the first.
     items.extend(stream.origin_input_items())
 
@@ -1026,17 +744,9 @@ def assemble_channel_request(*, processor: Any, client: Any, ctx: ChannelTurnCon
     if suffix:
         items.append({"role": ROLE_DEVELOPER, "content": suffix})
 
-    evidence_hash = _evidence_hash(items)
-    estimate = None
-    if with_estimate:
-        estimate = estimate_admission(
-            instructions=instructions, input_items=items, tools=tools,
-            raw_document_texts=ctx.raw_document_texts,
-            native_file_bounds=ctx.native_file_bounds, model=model,
-            response_format=response_format)
     return ChannelRequest(instructions=instructions, input_items=items, tools=tools,
                           prompt_cache_key=prompt_cache_key(ctx.team_id, ctx.channel_id),
-                          evidence_hash=evidence_hash, estimate=estimate)
+                          evidence_hash=_evidence_hash(items))
 
 
 def _channel_instructions(processor: Any, client: Any, ctx: ChannelTurnContext,
@@ -1248,24 +958,3 @@ def cohort_sources_from_message(message: Any) -> Tuple[CohortSource, ...]:
             attachment_names=names, files=refs_by_ts.get(ts, ())))
     return tuple(out)
 
-
-def raise_if_over_budget(estimate: Optional[AdmissionEstimate], *, channel_id: str,
-                         counted_text: str = "") -> None:
-    """Refuse the turn while refusing is still free (spec §3, over-budget ordering).
-
-    `counted_text` is logged, not decided from: the charge is a bound, so a refusal leaves an
-    operator with one real question — is this window genuinely too big for one call, or did the
-    bound refuse a window that would have fit? The real o200k count of the same text answers it, and
-    counting on the refusal path costs nothing on the path that matters.
-    """
-    if estimate is None or estimate.fits:
-        return
-    if counted_text:
-        logger.warning(
-            f"{channel_id} refused at {estimate.total_tokens:,} charged tokens; the same text "
-            f"counts ~{estimate_tokens_conservative(counted_text):,} real o200k tokens. A large gap "
-            f"means the window needs compacting, not a looser bound")
-    raise StreamOverBudgetError(
-        f"{channel_id}: the assembled request needs ~{estimate.total_tokens:,} input tokens, "
-        f"{estimate.overage:,} over the {estimate.limit_tokens:,} usable for "
-        f"{json.dumps(estimate.breakdown, sort_keys=True)}")

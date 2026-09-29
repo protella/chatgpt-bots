@@ -2500,10 +2500,9 @@ async def run_reconsideration_trial(openai_client: Any, scenario: ReconsiderScen
         channel_info={"participation_level": scenario.room.participation_level,
                       "reply_in_channel": scenario.room.reply_in_channel},
         num_members=scenario.room.num_members, wake_source="channel_activity")
-    request, api_items, estimate = build_reconsideration_request(
+    request, api_items = build_reconsideration_request(
         processor=host, client=client, ctx=ctx, model=cfg["model"], pass_number=1,
         draft=scenario.draft)
-    assert estimate.fits, f"{scenario.id}: the reconsideration request should trivially fit"
     decision = await openai_client.create_reconsideration_decision(
         input_items=api_items, instructions=request.instructions, model=cfg["model"],
         reasoning_effort=cfg["reasoning_effort"], verbosity=cfg["verbosity"],

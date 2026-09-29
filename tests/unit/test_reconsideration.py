@@ -34,8 +34,7 @@ from message_processor import participation_telemetry
 from message_processor.dm_reconsideration import (DMSnapshotItem, DMSurfaceSnapshot,
                                                   pin_dm_turn_context)
 from message_processor.channel_request import to_input_items
-from message_processor.reconsideration import (RECONSIDER_FUSE_PASSES,
-                                               build_reconsideration_request, draft_fence,
+from message_processor.reconsideration import (RECONSIDER_FUSE_PASSES, draft_fence,
                                                intercept_stale_send, reconsider_stale_draft,
                                                reconsideration_item, reviewed_through_map,
                                                select_reconsideration_model,
@@ -44,7 +43,9 @@ from message_processor.stale_send_guard import (COMMITTED, PENDING, Conversation
                                                 StaleSendSuppressed)
 from message_processor.turn_runtime import TurnRuntime
 from openai_client.api.responses import (ReconsiderationDecision,
-                                         ReconsiderationDecisionError)
+                                         ReconsiderationDecisionError,
+                                         STALE_RECONSIDERATION_RESPONSE_FORMAT)
+from openai_client.api.token_count import CountResult
 from message_processor.prompts import RECONSIDERATION_INSTRUCTION
 from tests.unit.channel_turn_harness import (build_stream, normalized, pin_channel_turn,
                                              thread_config)
@@ -124,6 +125,12 @@ def _decision(decision: str, text: Optional[str] = None) -> ReconsiderationDecis
     return ReconsiderationDecision(decision=decision, text=text)
 
 
+def _counter(tokens: Optional[int] = 1_000, complete: bool = True) -> AsyncMock:
+    """Stands in for `OpenAIClient.count_input_tokens`: the runner's awaited detached count at
+    its `request_build` boundary (CONTEXT_METER §3.10). A comfortable fit by default."""
+    return AsyncMock(return_value=CountResult(tokens=tokens, complete=complete))
+
+
 def _processor(decider: FakeDecider) -> MagicMock:
     processor = MagicMock()
     processor._get_system_prompt.return_value = "SYSTEM-PROMPT"
@@ -131,7 +138,8 @@ def _processor(decider: FakeDecider) -> MagicMock:
     processor._build_generation_inflight_note.return_value = None
     processor._build_research_inflight_note.return_value = None
     processor.db = None
-    processor.openai_client = SimpleNamespace(create_reconsideration_decision=decider)
+    processor.openai_client = SimpleNamespace(create_reconsideration_decision=decider,
+                                              count_input_tokens=_counter())
     return processor
 
 
@@ -387,38 +395,39 @@ async def test_snapshot_failure_is_context_rebuild(events, monkeypatch):
         "error_dropped", "context_rebuild")
 
 
+@pytest.mark.parametrize("counted, error", [
+    (CountResult(tokens=None, complete=False), "request_build"),       # no count at all
+    (CountResult(tokens=10, complete=False), "request_build"),         # not the whole request
+    (CountResult(tokens=10**9, complete=True), "admission_overflow"),  # over the window
+])
 @pytest.mark.asyncio
-async def test_admission_overflow_refuses_readonly(events, monkeypatch):
+async def test_the_count_decides_admission_and_fails_closed(counted, error, events,
+                                                            monkeypatch):
+    """CONTEXT_METER §3.10: the review is sized by OpenAI's count of its final kwargs, awaited
+    inside the `request_build` boundary. Unknown or incomplete fails closed as `request_build`;
+    over the model's usable window is `admission_overflow`. Neither spends the decision call."""
     rig = _Rig(monkeypatch, script=[_decision("post", None)])
+    rig.processor.openai_client.count_input_tokens = _counter(counted.tokens, counted.complete)
     rig.race()
-    monkeypatch.setattr(
-        reconsideration, "estimate_admission",
-        lambda **kw: SimpleNamespace(fits=False, total_tokens=2, limit_tokens=1))
-    with pytest.raises(StaleSendSuppressed):
-        await rig.run(rig.accepting_deliver())
-    assert (rig.turn.reconsider.outcome, rig.turn.reconsider.error) == (
-        "error_dropped", "admission_overflow")
+    exc = rig.suppress()
+    with pytest.raises(StaleSendSuppressed) as raised:
+        await rig.run(rig.accepting_deliver(), suppressed=exc)
+    assert raised.value is exc
+    assert (rig.turn.reconsider.outcome, rig.turn.reconsider.error) == ("error_dropped", error)
     assert rig.decider.calls == []
+    assert rig.delivered == []
+    rig.processor.openai_client.count_input_tokens.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_an_estimate_whose_result_raises_is_request_build_and_stamps_the_gate(
-        events, monkeypatch):
-    """§4f: `request_build` covers model selection through assembly AND estimate consumption —
-    an estimate OBJECT whose result property raises is classified, never an escape that would
-    leave the once-per-turn gate unstamped."""
-    class _PoisonedEstimate:
-        total_tokens = 1
-        limit_tokens = 2
-
-        @property
-        def fits(self):
-            raise RuntimeError("poisoned estimate result")
-
+async def test_a_count_that_raises_is_request_build_and_stamps_the_gate(events, monkeypatch):
+    """§4f: `request_build` covers model selection through assembly AND the size check — a
+    count that raises is classified, never an escape that would leave the once-per-turn gate
+    unstamped."""
     rig = _Rig(monkeypatch, script=[_decision("post", None)])
+    rig.processor.openai_client.count_input_tokens = AsyncMock(
+        side_effect=RuntimeError("poisoned count"))
     rig.race()
-    monkeypatch.setattr(reconsideration, "estimate_admission",
-                        lambda **kw: _PoisonedEstimate())
     exc = rig.suppress()
     with pytest.raises(StaleSendSuppressed) as raised:
         await rig.run(rig.accepting_deliver(), suppressed=exc)
@@ -785,7 +794,6 @@ async def test_the_request_is_the_normal_assembly_plus_one_appended_developer_it
     unchanged, then EXACTLY ONE more developer item — instruction, then the fenced draft."""
     from message_processor.channel_request import (assemble_channel_request,
                                                    fresh_turn_context)
-    from openai_client.api.responses import STALE_RECONSIDERATION_RESPONSE_FORMAT
 
     fixed = _fresh_stream()
     rig = _Rig(monkeypatch, script=[_decision("skip", None)], fresh_stream=fixed)
@@ -801,8 +809,7 @@ async def test_the_request_is_the_normal_assembly_plus_one_appended_developer_it
         model="gpt-5.6-sol", tools=[], request_config=None, contract_suffix=None,
         registry=None, no_tools=True,
         reply_destination=(rig.turn.reply_destination if rig.turn.destination_selected
-                           else None),
-        response_format=STALE_RECONSIDERATION_RESPONSE_FORMAT)
+                           else None))
     assert sent[:-1] == to_input_items(expected)     # nothing replaced, merged or omitted
     extra = sent[-1]
     assert extra["role"] == "developer"
@@ -834,21 +841,23 @@ def test_the_fence_extends_past_any_backtick_run_in_the_draft():
     assert "````\ncode ```x``` more\n````" in item["content"]
 
 
-def test_admission_is_charged_over_the_final_payload():
-    """The read-only estimate covers the appended developer item AND the response format."""
-    decider = FakeDecider([])
-    processor = _processor(decider)
-    turn = TurnRuntime.for_message(_msg(), channel_post_allowed=False)
-    ctx = pin_channel_turn(turn, trigger_ts=TRIGGER_TS, origin_thread_ts=None)
-    short = build_reconsideration_request(
-        processor=processor, client=SimpleNamespace(bot_user_id="UBOT"), ctx=ctx,
-        model="gpt-5.6-sol", pass_number=1, draft="x")
-    long = build_reconsideration_request(
-        processor=processor, client=SimpleNamespace(bot_user_id="UBOT"), ctx=ctx,
-        model="gpt-5.6-sol", pass_number=1, draft="x" * 5000)
-    assert long[2].total_tokens > short[2].total_tokens + 4000
-    assert "response_format" in short[2].breakdown
-    assert short[1][-1]["role"] == "developer"       # the appended item reaches the wire
+@pytest.mark.asyncio
+async def test_the_count_is_taken_over_the_final_payload(events, monkeypatch):
+    """R3-6: the runner counts EXACTLY the kwargs the decision call sends — the appended
+    developer item and the structured response format included."""
+    from openai_client.api.responses import _reconsideration_create_kwargs
+
+    rig = _Rig(monkeypatch, script=[_decision("skip", None)])
+    rig.race()
+    with pytest.raises(StaleSendSuppressed):
+        await rig.run(rig.accepting_deliver())
+
+    counted = rig.processor.openai_client.count_input_tokens.await_args.args[0]
+    sent = dict(rig.decider.calls[0])
+    assert counted == _reconsideration_create_kwargs(
+        input_items=sent.pop("input_items"), **sent)
+    assert counted["input"][-1]["role"] == "developer"   # the appended item is counted
+    assert counted["text"]["format"] == STALE_RECONSIDERATION_RESPONSE_FORMAT
 
 
 def test_model_precedence_last_attempt_then_falsey_fallback():
@@ -1180,6 +1189,7 @@ class SiteOpenAI:
         self.background_job = background_job
         self.terminal_action = terminal_action
         self.create_reconsideration_decision = FakeDecider(list(decisions or []))
+        self.count_input_tokens = _counter()
 
     async def create_streaming_response_with_tool_loop(
             self, messages=None, tools=None, registry=None, tool_context=None,
@@ -1238,7 +1248,6 @@ def _site_processor(openai):
 
     p._add_message_with_token_management = MagicMock()
     p._inject_image_analyses = _passthru
-    p._pre_trim_messages_for_api = _passthru
     p._get_system_prompt = MagicMock(return_value="SYSTEM-PROMPT")
     p._build_time_suffix_context = MagicMock(return_value="[time: pinned]")
     p._build_generation_inflight_note = MagicMock(return_value=None)
@@ -1258,7 +1267,7 @@ def _site_thread_state():
     return SimpleNamespace(
         messages=[{"role": "user", "content": "hi"}], channel_id=CH, thread_ts=TRIGGER_TS,
         current_model="gpt-5.6-sol", config_overrides={}, has_summary_head=False,
-        channel_directives=None, record_usage=MagicMock(), last_usage=None)
+        channel_directives=None, last_usage=None)
 
 
 class SiteRig:
@@ -2159,7 +2168,7 @@ class MainRig:
         self.message = _main_message(channel)
         self.decider = FakeDecider(decisions)
         self.bot.processor.openai_client = SimpleNamespace(
-            create_reconsideration_decision=self.decider)
+            create_reconsideration_decision=self.decider, count_input_tokens=_counter())
         self.bot.processor._persist_tool_provenance = MagicMock()
         self.deliver_result = deliver_result
         self.sent: List[Dict[str, Any]] = []

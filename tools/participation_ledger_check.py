@@ -168,9 +168,11 @@ MANDATORY: Dict[str, Tuple[Tuple[str, str], ...]] = {
 #   outbound_receipt.prior_state/new_state/reason — omitted when None; `absent` is a real state,
 #       so a missing one is "no transition recorded", checked only against the vocabulary.
 #   turn_outcome.chars/error/H/attempt_id — chars is None on a turn that delivered no text,
-#       error only on the four fail-closed codes (TURN_ERRORS below: stream_data_invalid,
-#       stream_over_budget, history_fetch_failed, origin_fetch_failed), attempt_id only on a
-#       GATED turn.
+#       error only on the three fail-closed codes (TURN_ERRORS below: stream_data_invalid,
+#       history_fetch_failed, origin_fetch_failed), attempt_id only on a GATED turn.
+#   stream_render.build_seq — rows written before the field existed carry none, at the same
+#       contract version, so it is validated only when present. Absence is a defect only on a
+#       turn with SEVERAL rows, where it is the ordering evidence (_check_stream_render_joins).
 #   model_response.model/token counts — a call that raised before the response has none.
 #   reconsider_start.attempt_id/model_attempt_seq — ungated turns (channel or DM) mint no
 #       attempt, and a failed attempt-sink open omits the seq (telemetry never blocks the model
@@ -227,17 +229,17 @@ INVENTORY_STATES = frozenset({"absent", "cold", "warm", "limited_retention", "li
 # Every field above is MANDATORY on every row. `origin_thread_ts` and `trigger_ts` are the only
 # optional ones — a turn with no origin root, or no trigger, emits neither. Absence and None are
 # ONE case here, because record() omits None-valued fields rather than writing null.
+# (`build_seq` sits outside this set too — see "Legal absences" above.)
 STREAM_RENDER_MANDATORY = (STREAM_RENDER_STRINGS + STREAM_RENDER_HASHES
                            + STREAM_RENDER_COUNTS + STREAM_RENDER_VERSIONS
                            + STREAM_RENDER_BOOLS + ("inventory_state",))
 
-# THE FAIL-CLOSED VOCABULARY, by enumeration. Three survive W1's excision and W2 adds the
-# fourth. RETIRED CODES ARE VIOLATIONS, NOT GRANDFATHERED: `snapshot_unsupported` and
-# `coverage_not_ready` have no producer any more, so a fresh row carrying one means a producer
-# survived the excision — exactly the defect this check exists to catch. Validating a current
-# ledger and reading a historical one are different activities.
-TURN_ERRORS = frozenset({"stream_data_invalid", "stream_over_budget", "history_fetch_failed",
-                         "origin_fetch_failed"})
+# THE FAIL-CLOSED VOCABULARY, by enumeration. RETIRED CODES ARE VIOLATIONS, NOT GRANDFATHERED:
+# `snapshot_unsupported`, `coverage_not_ready` and `stream_over_budget` (the admission refusal —
+# an oversize request is now compacted, not refused) have no producer any more, so a fresh row
+# carrying one means a producer survived the excision — exactly the defect this check exists to
+# catch. Validating a current ledger and reading a historical one are different activities.
+TURN_ERRORS = frozenset({"stream_data_invalid", "history_fetch_failed", "origin_fetch_failed"})
 
 # RETIRED FIELDS, rejected rather than ignored. Each described the compaction-era stream — a
 # boundary with an inclusivity flag, a snapshot id, a coverage floor, a single `reanchored`
@@ -455,7 +457,7 @@ def _check_turn_outcome(row: Row, report: Report) -> None:
         report.fail("turn_outcome_missing_field", row,
                     f"stream_build_present={row.obj.get('stream_build_present')!r} is not a bool")
     # The fail-closed code, when one is present. Absence stays legal — most turns do not fail —
-    # but a code outside the enumerated four is either a typo inventing a bucket or a retired
+    # but a code outside the enumerated three is either a typo inventing a bucket or a retired
     # producer that survived the excision, and both are worth failing on.
     _check_vocabulary(row, report, "error", TURN_ERRORS, "turn_outcome_bad_error",
                       required=False)
@@ -619,7 +621,7 @@ def _check_stream_render(row: Row, report: Report) -> None:
         if field not in row.obj:
             report.fail("stream_render_missing_field", row,
                         f"stream_render has no {field!r} — every §8 field is mandatory except "
-                        "origin_thread_ts and trigger_ts")
+                        "origin_thread_ts, trigger_ts and build_seq")
 
     for field in STREAM_RENDER_RETIRED:
         if field in row.obj:
@@ -665,6 +667,14 @@ def _check_stream_render(row: Row, report: Report) -> None:
 
     _check_vocabulary(row, report, "inventory_state", INVENTORY_STATES,
                       "stream_render_bad_inventory_state", required=False)
+
+    # Optional on the row (see "Legal absences"), but never malformed when present: it is the
+    # only thing that orders a turn's rebuilds, so a bool or a negative would corrupt the join.
+    if "build_seq" in row.obj:
+        seq = _as_int(row.obj.get("build_seq"))
+        if seq is None or seq < 0:
+            report.fail("stream_render_bad_count", row,
+                        f"build_seq={row.obj.get('build_seq')!r} is not a non-negative int")
 
     # The rendered window can never hold more roots than it holds messages: roots are a SUBSET
     # of the periphery's message items, so this catches a count computed over the wrong subject
@@ -968,15 +978,25 @@ def _check_stream_render_joins(joins: Joins, report: Report, *, fragments: set) 
     rendered and then reported that it had not. Either way the fail-closed accounting is wrong.
     """
     for turn_id, renders in sorted(joins.stream_renders.items()):
-        # EXACTLY ONE, and "exactly" is not enforced by a rule that only checks presence. The
-        # timeout tool-drop retry reuses the pinned stream and emits nothing, and no rebuild path
-        # exists that could produce a second row — so two rows for one turn means either a second
-        # build nobody intended or a duplicated write, and both make every count derived from
-        # this population wrong.
+        # ONE ROW PER BUILD, and a turn builds again only after a compaction — each rebuild
+        # carries the next `build_seq`. So several rows are legal only as a STRICTLY INCREASING
+        # sequence in ledger order. The timeout tool-drop retry reuses the pinned stream and emits
+        # nothing, so a row without a sequence, or a repeated / backward one, means either a build
+        # nobody intended or a duplicated write, and both make every count derived from this
+        # population wrong.
         if len(renders) > 1:
-            report.fail("stream_render_duplicate", renders[1],
-                        f"turn_id={turn_id} has {len(renders)} stream_render rows; a turn "
-                        f"renders once (first at {_first_at(renders[1], renders[0])})")
+            previous: Optional[int] = None
+            for index, render in enumerate(renders):
+                seq = _as_int(render.obj.get("build_seq"))
+                if seq is None or (previous is not None and seq <= previous):
+                    report.fail("stream_render_duplicate", render,
+                                f"turn_id={turn_id} has {len(renders)} stream_render rows; "
+                                f"row {index + 1} has build_seq={render.obj.get('build_seq')!r} "
+                                f"after {previous!r} — a turn's builds must carry strictly "
+                                f"increasing build_seq "
+                                f"(first at {_first_at(render, renders[0])})")
+                    break
+                previous = seq
         if turn_id in joins.turn_starts:
             continue
         row = renders[0]

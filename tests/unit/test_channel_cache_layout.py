@@ -483,10 +483,6 @@ async def test_a_dm_turn_builds_no_evidence_block_and_resolves_per_user():
     host.mcp_manager = MagicMock()
     host._is_reaction_only = MagicMock(return_value=False)
 
-    async def _trim(messages, *a, **k):
-        seen["messages"] = list(messages)
-        return list(messages)
-
     async def _passthru(m, *a, **k):
         return m
 
@@ -496,7 +492,6 @@ async def test_a_dm_turn_builds_no_evidence_block_and_resolves_per_user():
     async def _empty(*a, **k):
         return ""
 
-    host._pre_trim_messages_for_api = _trim
     host._inject_image_analyses = _passthru
     host._build_channel_info = _empty
     host._build_channel_summary_block = _none
@@ -517,7 +512,7 @@ async def test_a_dm_turn_builds_no_evidence_block_and_resolves_per_user():
     thread_state = SimpleNamespace(
         messages=[{"role": "user", "content": "hi"}], channel_id="D1", thread_ts="10.0",
         current_model="gpt-5.6-sol", config_overrides={}, has_summary_head=False,
-        channel_directives=None, record_usage=MagicMock(), last_usage=None)
+        channel_directives=None, last_usage=None)
 
     async def fake_config(**kw):
         seen.setdefault("channel_turn", []).append(kw.get("channel_turn"))
@@ -528,7 +523,8 @@ async def test_a_dm_turn_builds_no_evidence_block_and_resolves_per_user():
         await host._handle_text_response("hi", thread_state, MagicMock(), message,
                                          thinking_id=None)
 
-    assert not [m for m in seen["messages"]
+    sent = host.openai_client.create_text_response.await_args.kwargs["messages"]
+    assert not [m for m in sent
                 if isinstance(m.get("content"), str)
                 and m["content"].startswith(TOOL_EVIDENCE_HEADER)]
     assert not any(seen["channel_turn"])

@@ -85,27 +85,6 @@ class TestChatBotV2Initialization:
         assert bot.processor is not None
 
     @patch('main.config')
-    @patch('slack_client.SlackBot')
-    @patch('main.MessageProcessor')
-    @pytest.mark.asyncio
-    async def test_boot_starts_the_admission_tokenizer_without_waiting_for_it(
-            self, mock_processor_class, mock_slackbot_class, mock_config):
-        """The cold-cache fetch belongs to boot, not to the first channel turn — but boot must not
-        WAIT for a network round trip either, or a blackholed egress holds the process down."""
-        import message_processor.token_counter as token_counter
-
-        mock_config.validate.return_value = None
-        mock_client = Mock()
-        mock_client.db = _startup_db()
-        mock_slackbot_class.return_value = mock_client
-
-        with patch.object(token_counter, "wait_for_admission_encoder") as warm:
-            await ChatBotV2(platform="slack").initialize()
-
-        warm.assert_called_once_with(timeout=0)
-
-
-    @patch('main.config')
     @pytest.mark.asyncio
     async def test_initialize_config_error(self, mock_config):
         """Test initialization with config validation error"""

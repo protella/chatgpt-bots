@@ -832,6 +832,9 @@ async def create_text_response_with_tool_loop(
     # Every round's text, in order — the same list, and under `aggregate_segments` the same
     # seam-joined result, as the streaming twin builds.
     segments: List[str] = []
+    # Which request of this loop is going out: the context meter preflights round 0 only, and
+    # a context overflow is recoverable only there (CONTEXT_METER §3.4-§3.5).
+    request_round = 0
 
     while True:
         # W3, request side: picks up a container a BRIDGE tool created during the previous
@@ -846,8 +849,10 @@ async def create_text_response_with_tool_loop(
             return_metadata=True,
             function_call_sink=sink,
             tool_choice=tool_choice,
+            round_index=request_round,
             **params,
         ))
+        request_round += 1
         _merge_used(tools_used_all, result.get("tools_used") or [], tool_context)
         if result.get("text"):
             segments.append(result["text"])
@@ -1154,6 +1159,8 @@ async def create_streaming_response_with_tool_loop(
     # research reads result["text"] as the report and never shows the intermediate "I'll search…"
     # preambles — must keep getting only the last round, or those preambles leak into the report.
     segments: List[str] = []
+    # Which request of this loop is going out (see the non-streaming twin).
+    request_round = 0
 
     while True:
         # W3, request side: picks up a container a BRIDGE tool created during the previous
@@ -1173,8 +1180,10 @@ async def create_streaming_response_with_tool_loop(
             tool_callback=tool_callback,
             function_call_sink=sink,
             tool_choice=tool_choice,
+            round_index=request_round,
             **params,
         )
+        request_round += 1
         # A seeded tool_choice (F37: "required") seeds the FIRST round ONLY. Left set, it would
         # force the SAME tool again on the next round — the model would be made to re-answer a
         # question it had already answered, and the second answer would overwrite the first.

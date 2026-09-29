@@ -321,7 +321,6 @@ def _spy_processor(openai):
 
     p._add_message_with_token_management = MagicMock()
     p._inject_image_analyses = _passthru
-    p._pre_trim_messages_for_api = _passthru
     p._build_participant_roster = MagicMock(return_value="")
     p._build_suffix_context = MagicMock(return_value="")
     p._build_tools_array = MagicMock(return_value=None)          # no tools -> plain API call
@@ -350,7 +349,7 @@ def _spy_state(channel=CHANNEL, thread="10.0"):
         messages=[{"role": "user", "content": "hi"}],
         channel_id=channel, thread_ts=thread, current_model="gpt-5.6-sol",
         config_overrides={}, has_summary_head=False, channel_directives=None,
-        participants={}, record_usage=MagicMock(), last_usage=None,
+        participants={}, last_usage=None,
     )
 
 
@@ -533,8 +532,6 @@ def _pipeline_processor(handler):
     p.db.get_channel_policy_async = AsyncMock(return_value=POLICY_ROW)
     p.thread_manager.acquire_thread_lock = AsyncMock(return_value=True)
     p.thread_manager.release_thread_lock = AsyncMock()
-    p.thread_manager._token_counter.count_thread_tokens = MagicMock(return_value=0)
-    p.thread_manager._token_counter.count_message_tokens = MagicMock(return_value=0)
 
     async def _state_for(*a, **k):
         return state

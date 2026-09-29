@@ -350,13 +350,13 @@ class TestStreamTimestampNotice:
         assert code == "history_fetch_failed"
 
 
-# --------------------- an over-size refusal from the API is an over-budget turn (codex r2 item 4)
+# ------------------ a size refusal is OUR failure to manage context (CONTEXT_METER OWNER-B, C-12)
 
-class TestChannelOversizeBackstop:
-    """The admission estimate is supposed to catch this at the door. When it does not, the API's
-    refusal must arrive as the same honest "too much for one request" notice — not as "something
-    went wrong", and never as a compaction retry: a channel request IS the pinned window, so
-    trimming it would answer a different question than the one that was admitted.
+class TestSizeFailuresEndGeneric:
+    """No user-facing "too much" card any more: a request over the window means we failed to
+    manage the context. The token overflow gets one compaction-and-retry upstream; whatever
+    reaches the formatter — a spent recovery, a per-field cap, a 413 — is the generic turn error.
+    The one exception is proven irreducibility, which keeps the existing "Message Too Long" copy.
     """
 
     @pytest.mark.parametrize("error", [
@@ -378,13 +378,23 @@ class TestChannelOversizeBackstop:
     def test_unrelated_failures_are_not_mistaken_for_size(self, error):
         assert MessageProcessor._channel_request_too_large(error) is False
 
-    def test_the_notice_it_maps_to_is_the_over_budget_one(self):
-        from message_processor import channel_stream
+    @pytest.mark.parametrize("error", [
+        Exception("Error code: 400 - context_length_exceeded"),
+        Exception("413 Request Entity Too Large"),
+    ])
+    def test_a_size_refusal_is_the_generic_card(self, error):
+        from message_processor.context_meter import ContextOverLimit
 
-        code, notice = MessageProcessor._channel_stream_failure(
-            channel_stream.StreamOverBudgetError("C1: too large"))
-        assert code == "stream_over_budget"
-        assert "larger than I can send in one go" in notice["message"]
+        for e in (error, ContextOverLimit(None, 1000, source="api")):
+            text = MessageProcessor._turn_error_message(e, _msg())
+            assert "Something Went Wrong" in text
+            assert "Message Too Long" not in text and "Service Issue" not in text
+
+    def test_only_proven_irreducibility_says_message_too_long(self):
+        from message_processor.context_meter import ContextIrreducible
+
+        text = MessageProcessor._turn_error_message(ContextIrreducible("over"), _msg())
+        assert "Message Too Long" in text
 
 
 class TestTurnEffectsUnsettledStreamingBoundary:

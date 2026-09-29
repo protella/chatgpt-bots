@@ -206,27 +206,26 @@ async def test_write_thread_summary_rolls_and_preserves_refs(temp_db):
 
 @pytest.mark.asyncio
 async def test_compaction_is_chunky_to_target(temp_db):
-    """One compaction pass must land at/below TOKEN_COMPACTION_TARGET — not a small
-    per-turn trim (which would bust the prefix cache every turn)."""
+    """One compaction pass must shed the whole overage down to TOKEN_COMPACTION_TARGET — not a
+    small per-turn trim (which would bust the prefix cache every turn). Progress is the official
+    measure apportioned by rendered bytes: at measure 1000 and target 700, 30% of the bytes go."""
     thread_key = "C1:100.0"
     temp_db.get_or_create_thread(thread_key, "C1")
     proc = _Proc(db=temp_db, openai_client=_mock_openai())
     state = ThreadState(thread_ts="100.0", channel_id="C1")
     for i in range(20):
-        state.messages.append({"role": "user", "content": f"filler message {i}",
-                               "metadata": {"ts": f"10{i}.0"}})
-
-    counter = MagicMock()
-    counter.count_thread_tokens = lambda msgs: 100 * len(msgs)
-    proc.thread_manager._token_counter = counter
+        state.messages.append({"role": "user", "content": f"filler message {i:02d}",
+                               "metadata": {"ts": f"1{i:02d}.0"}})
+    start_bytes = proc._thread_bytes(state.messages)
 
     with patch.object(config, "get_model_token_limit", return_value=1000), \
          patch.object(config, "token_compaction_target", 0.7):
-        processed = await proc._compact_thread_to_target(state, thread_key)
+        processed = await proc._compact_thread_to_target(state, thread_key, measure=1000)
 
     assert processed > 0
-    # target = 700 tokens = 7 messages (incl. the inserted summary head)
-    assert counter.count_thread_tokens(state.messages) <= 700
+    kept = [m for m in state.messages
+            if (m.get("metadata") or {}).get("type") != "thread_summary"]
+    assert proc._thread_bytes(kept) <= start_bytes * 0.7
     assert temp_db.get_thread_summary(thread_key) is not None
 
 
@@ -361,68 +360,40 @@ async def test_rebuild_includes_reactions_annotation(temp_db):
     assert ":tada: x1 (<@U9>)" in joined
 
 
-# --------------------------------------------- usage-driven token budgeting
-
-def test_estimator_is_chars_over_four_no_tiktoken():
-    import message_processor.token_counter as tc
-    assert not hasattr(tc, "tiktoken")
-    counter = tc.TokenCounter("gpt-5.5")
-    assert counter.count_tokens("x" * 400) == 100
-    msg = {"role": "user", "content": "x" * 400}
-    assert counter.count_message_tokens(msg) == 100 + 4 + 1  # content + overhead + role
-    assert counter.count_thread_tokens([msg, msg]) == 2 * 105 + 3
-
-
-def test_thread_state_usage_tracking():
-    state = ThreadState(thread_ts="1.0", channel_id="C1")
-    assert state.context_tokens == 0
-
-    # Estimates accumulate as messages are added
-    state.add_message("user", "x" * 400)
-    est_after_one = state.context_tokens
-    assert est_after_one > 0
-    state.add_message("assistant", "y" * 400)
-    assert state.context_tokens > est_after_one
-
-    # The API's usage number REPLACES the estimate
-    state.record_usage(input_tokens=5000, output_tokens=300)
-    assert state.context_tokens == 5300
-
-    # Next message increments on top of the authoritative number
-    state.add_message("user", "z" * 400)
-    assert state.context_tokens > 5300
-
-    # Zero/None usage never wipes the tracked number
-    state.record_usage(0, 0)
-    assert state.context_tokens > 5300
-
+# --------------------------------------------- context-meter-driven compaction
 
 @pytest.mark.asyncio
-async def test_cleanup_trigger_uses_tracked_usage(temp_db):
-    """The compaction trigger reads thread_state.context_tokens (usage-driven),
-    not a recount of the messages."""
+async def test_cleanup_trigger_uses_the_context_measure(temp_db):
+    """The compaction trigger reads the thread's accepted official measure, never a recount of
+    the messages — and with no measure at all, it decides nothing."""
     thread_key = "C1:100.0"
     temp_db.get_or_create_thread(thread_key, "C1")
     proc = _Proc(db=temp_db, openai_client=_mock_openai())
     state = ThreadState(thread_ts="100.0", channel_id="C1")
     for i in range(10):
-        # ~100 estimated tokens per message so the estimator agrees content exists
         state.messages.append({"role": "user", "content": f"msg {i} " + "x" * 390,
                                "metadata": {"ts": f"10{i}.0"}})
+
+    def _measure(tokens):
+        state.record_measure(tokens, True, state.allocate_dispatch_seq(), state.meter_generation,
+                             state.current_model, "usage")
 
     with patch.object(config, "get_model_token_limit", return_value=1000), \
          patch.object(config, "token_cleanup_threshold", 0.9), \
          patch.object(config, "token_compaction_target", 0.7):
-        # Tracked usage (authoritative) says we're tiny -> NO compaction, even
-        # though a recount of the messages would say ~1000 tokens. This is the
-        # trigger reading the tracked number, not recounting.
-        state.context_tokens = 100
+        # No measure -> no decision.
         await proc._async_post_response_cleanup(state, thread_key)
         assert temp_db.get_thread_summary(thread_key) is None
         assert len(state.messages) == 10
 
-        # Tracked usage over threshold -> compaction runs and writes the summary
-        state.context_tokens = 950
+        # The measure says we're tiny -> NO compaction.
+        _measure(100)
+        await proc._async_post_response_cleanup(state, thread_key)
+        assert temp_db.get_thread_summary(thread_key) is None
+        assert len(state.messages) == 10
+
+        # The measure is over threshold -> compaction runs and writes the summary
+        _measure(950)
         await proc._async_post_response_cleanup(state, thread_key)
         assert temp_db.get_thread_summary(thread_key) is not None
         assert len(state.messages) < 10
@@ -460,23 +431,27 @@ def test_context_length_error_detection():
 
 
 @pytest.mark.asyncio
-async def test_compaction_rebaselines_tracked_estimate(temp_db):
+async def test_compaction_invalidates_the_measure(temp_db):
+    """The request a measure described is gone once compaction rewrote the thread: the measure is
+    cleared and its generation bumped, so a late count of the old request cannot land."""
     thread_key = "C1:100.0"
     temp_db.get_or_create_thread(thread_key, "C1")
     proc = _Proc(db=temp_db, openai_client=_mock_openai())
     state = ThreadState(thread_ts="100.0", channel_id="C1")
     for i in range(20):
         state.messages.append({"role": "user", "content": "filler " * 50,
-                               "metadata": {"ts": f"10{i}.0"}})
-    state.context_tokens = 999_999  # stale huge number
+                               "metadata": {"ts": f"1{i:02d}.0"}})
+    seq = state.allocate_dispatch_seq()
+    old_generation = state.meter_generation
+    state.record_measure(999_999, True, seq, old_generation, state.current_model, "usage")
 
     with patch.object(config, "get_model_token_limit", return_value=1000), \
          patch.object(config, "token_compaction_target", 0.7):
         await proc._compact_thread_to_target(state, thread_key)
 
-    # Tracked number was re-baselined from the compacted messages, not left stale
-    assert state.context_tokens < 999_999
-    assert state.context_tokens == proc.thread_manager._token_counter.count_thread_tokens(state.messages)
+    assert state.current_measure(state.current_model) is None
+    assert state.meter_generation == old_generation + 1
+    assert not state.record_measure(5, True, seq + 1, old_generation, state.current_model, "count")
 
 
 # ------------------------------------ system prompt: date-only prefix, time suffix
@@ -783,7 +758,7 @@ async def test_save_thread_summary_distinguishes_empty_list_from_null(temp_db):
 @pytest.mark.asyncio
 async def test_dm_attachment_processing_keeps_its_combined_sequencing(temp_db):
     """[r4-8] A CHANNEL turn splits this pipeline in two — local extraction now, the utility-model
-    summary after the admission estimate. A DM keeps the shipped order: extract, summarize, and
+    summary once the turn's context is pinned. A DM keeps the shipped order: extract, summarize, and
     write the `documents` row, all inside `_process_attachments`, before the caller sees anything.
 
     Proven by the ORDER of the calls and by the row existing on return, because that is what a DM
@@ -839,7 +814,7 @@ async def test_dm_attachment_processing_keeps_its_combined_sequencing(temp_db):
 @pytest.mark.asyncio
 async def test_a_deferred_channel_document_leaves_the_summary_for_later(temp_db):
     """The other side of the same seam: nothing is summarized and NO row is written until
-    `finalize_deferred_documents` runs, which is what lets the estimate sit between them."""
+    `finalize_deferred_documents` runs, which the channel turn calls before assembling its request."""
     proc = _Proc(db=temp_db)
 
     class _Handler:
@@ -873,43 +848,10 @@ async def test_a_deferred_channel_document_leaves_the_summary_for_later(temp_db)
     assert documents[0]["summary"] is None and "_persist" in documents[0]
     assert await temp_db.get_thread_documents_async("C1:100.0") == []
 
-    await proc.finalize_deferred_documents(documents, client, message,
-                                          reserves=(("F1", 10_000),))
+    await proc.finalize_deferred_documents(documents, client, message)
     assert documents[0]["summary"] == "a summary"
     rows = await temp_db.get_thread_documents_async("C1:100.0")
     assert [r["filename"] for r in rows] == ["q3.pdf"]
-
-
-@pytest.mark.asyncio
-async def test_two_documents_with_one_file_id_each_get_their_own_reserve(temp_db):
-    """[r4-3] Slack will deliver the same file twice in one message, and both copies key to the same
-    file_id. Admission charges both; a key-to-reserve MAPPING then granted the single surviving
-    reserve to each of them, so the second summary spent room bought once and a request admitted at
-    the door could exceed its budget on the way out. Each document takes the charge admission made
-    for it, in order — the second one's small reserve must still bite."""
-    from message_processor.channel_request import TRUNCATION_NOTE
-
-    proc = _Proc(db=temp_db)
-    proc._update_status = MagicMock()
-    proc._summarize_document_for_attach = AsyncMock(return_value="s" * 500)
-
-    def _entry():
-        return {"filename": "q3.pdf", "file_id": "F1", "mimetype": "application/pdf",
-                "_persist": {"extracted": {"content": "the whole report"}, "thread_id": "C1:100.0",
-                             "message_ts": "100.0", "url_private": "https://x/q3.pdf",
-                             "size_bytes": 13}}
-
-    documents = [_entry(), _entry()]
-    message = Message(text="have a look", user_id="U1", channel_id="C1", thread_id="100.0",
-                      metadata={"ts": "100.0", "username": "Peter"})
-
-    await proc.finalize_deferred_documents(documents, MagicMock(), message,
-                                           reserves=(("F1", 10_000), ("F1", 60)))
-
-    assert documents[0]["summary"] == "s" * 500, "the first document's own reserve was not granted"
-    assert documents[1]["summary"].endswith(TRUNCATION_NOTE), \
-        "the second document was granted the first one's reserve"
-    assert len(documents[1]["summary"].encode("utf-8")) <= 60
 
 
 @pytest.mark.asyncio

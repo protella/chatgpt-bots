@@ -31,10 +31,6 @@ class TestMessageProcessor:
             get_recent_messages=MagicMock(return_value=[]),
             message_count=0  # Add this for comparison operations
         )
-        # Add token counter
-        mock._token_counter = MagicMock()
-        mock._token_counter.count_message_tokens.return_value = 100
-        mock._token_counter.count_thread_tokens.return_value = 100
         mock._max_tokens = 100000  # Add max tokens limit
         return mock
     
@@ -80,8 +76,6 @@ class TestMessageProcessor:
                 processor.thread_manager = mock_thread_manager
                 processor.openai_client = mock_openai_client
                 # Add required attributes
-                processor._token_counter = MagicMock()
-                processor._token_counter.count_thread_tokens.return_value = 100
                 processor._max_tokens = 100000
                 return processor
     

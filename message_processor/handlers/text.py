@@ -9,6 +9,7 @@ from message_processor.client_contract import BaseClient, Message, Response
 from config import config, pipeline_status, SUPPORTED_CHAT_MODELS
 from message_processor import participation_telemetry
 from message_processor._host import _Host
+from message_processor.context_meter import (ContextIrreducible, ContextOverLimit, MeterHook)
 from message_processor.dm_reconsideration import pin_dm_turn_context
 from message_processor.reconsideration import intercept_stale_send
 from message_processor.routing_facts import POSTURE_THREAD
@@ -907,13 +908,12 @@ class TextHandlerMixin(_Host):
                                           message: Message, tools_disabled: bool, turn: Any,
                                           thread_key: str):
         """Resolve a CHANNEL turn's tool exposure, sandbox binding and catalogs in one pass,
-        before the trim.
+        before the request is assembled.
 
         The evidence block those catalogs produce is part of the request, so it has to exist
-        while there is still a budget to fit it into — which means the catalogs must be fetched
-        before `_pre_trim_messages_for_api`, not at the tools-array build far below. DM turns
-        keep the original two-stage sequencing verbatim; nothing on that path reads a catalog
-        early.
+        when the request is built — which means the catalogs must be fetched here, not at the
+        tools-array build far below. DM turns keep the original two-stage sequencing verbatim;
+        nothing on that path reads a catalog early.
 
         This says nothing about the thinking placeholder: main.py posts that before
         process_message is ever called, on both surfaces, so the container is resolved well
@@ -953,14 +953,13 @@ class TextHandlerMixin(_Host):
                                         thread_state, turn: Any, thread_config: dict,
                                         model: str, *, thread_key: str,
                                         tools_disabled: bool = False,
-                                        exclude_mcp_server=None,
-                                        with_estimate: bool = False):
+                                        exclude_mcp_server=None):
         """ONE channel attempt's request, from the turn's pinned state (spec §3).
 
-        Both text handlers call this and base.py calls it once more for the admission estimate, so
-        there is exactly one description of what a channel request looks like. `model` and the
-        tools array are the only things an attempt may change; the stream, the evidence and the
-        suffix all come from the pins, so two attempts of one turn answer the same question.
+        Both text handlers call this, so there is exactly one description of what a channel
+        request looks like. `model` and the tools array are the only things an attempt may
+        change; the stream, the evidence and the suffix all come from the pins, so two attempts
+        of one turn answer the same question.
 
         Returns (request, prepared, registry, request_config, no_reply_available,
         contract_suffix, ci_container).
@@ -980,16 +979,14 @@ class TextHandlerMixin(_Host):
             request_config=request_config, contract_suffix=contract_suffix, registry=registry,
             reply_destination=(getattr(turn, "reply_destination", None)
                                if turn is not None
-                               and getattr(turn, "destination_selected", False) else None),
-            with_estimate=with_estimate)
+                               and getattr(turn, "destination_selected", False) else None))
         return (request, prepared, registry, request_config, no_reply_available,
                 contract_suffix, ci_container)
 
     # Every way the API says "this request is bigger than I will take". `_is_context_length_error`
-    # covers the context-window wording only, and a channel request can be refused for size
-    # without ever using it — a per-field length cap, or a payload the transport rejects outright.
-    # For a CHANNEL turn all of them mean the same thing (the admission estimate under-counted),
-    # so they are matched here rather than left to fall through as a generic failure.
+    # covers the TOKEN context-window wording only — the one size failure compaction can answer.
+    # The rest (a per-field length cap, a payload the transport rejects outright) are matched here
+    # so they end as the generic turn error and never as a size-specific card (CONTEXT_METER C-12).
     _OVERSIZE_MARKERS = (
         "context_length_exceeded", "maximum context length", "context window",
         "string_above_max_length", "string too long", "too many tokens",
@@ -1013,6 +1010,192 @@ class TextHandlerMixin(_Host):
         if (response_text or "").strip():
             return False
         return _reaction_committed(local_tool_calls)
+
+    # ------------------------------------------------------------ context meter (CONTEXT_METER)
+
+    @staticmethod
+    def _turn_is_heavy(message: Message, user_content: Any, turn: Optional[Any]) -> bool:
+        """Preflight rule (b): does this turn carry attachments, documents, images or a batched
+        cohort? Each can move the request further than the thread's last measure knows."""
+        if message.attachments:
+            return True
+        meta = message.metadata or {}
+        try:
+            if int(meta.get("queued_batch_size") or 0) > 1:
+                return True
+        except (TypeError, ValueError):
+            pass
+        if isinstance(user_content, list) and any(
+                isinstance(part, dict) and part.get("type") in ("input_image", "input_file")
+                for part in user_content):
+            return True
+        if isinstance(user_content, str) and "=== DOCUMENT:" in user_content:
+            return True
+        ctx = getattr(turn, "channel_turn_context", None) if turn is not None else None
+        if ctx is not None:
+            return bool(getattr(ctx, "image_parts", ()) or getattr(ctx, "file_parts", ())
+                        or getattr(ctx, "document_inputs", ())
+                        or getattr(ctx, "batched_image_parts", ())
+                        or getattr(ctx, "cohort_sources", ()))
+        return False
+
+    def _turn_meter(self, turn: Optional[Any], thread_state: Any, thread_key: str,
+                    channel_turn: bool, message: Message, user_content: Any) -> MeterHook:
+        """THIS TURN's context meter — built once and reused by every attempt, so the parallel
+        counts of a streaming attempt and its buffered fallback land in one sequence."""
+        existing = getattr(turn, "context_meter", None) if turn is not None else None
+        if isinstance(existing, MeterHook):
+            return existing
+
+        def _after_turn(model: Optional[str]) -> None:
+            self._schedule_channel_compaction(thread_key, thread_state=thread_state, model=model,
+                                              turn=turn)
+
+        meter = MeterHook(
+            client=self.openai_client, schedule=self._schedule_async_call,
+            thread_state=thread_state, key=thread_key,
+            heavy=self._turn_is_heavy(message, user_content, turn),
+            # §3.7: a CHANNEL turn's after-turn trigger. A DM keeps its post-response cleanup,
+            # which reads the same measure.
+            on_threshold=_after_turn if channel_turn else None)
+        if turn is not None:
+            turn.context_meter = meter
+        return meter
+
+    def _schedule_channel_compaction(self, thread_key: str, *, thread_state: Any = None,
+                                     model: Optional[str] = None,
+                                     turn: Optional[Any] = None) -> None:
+        """§3.7: background compaction of a CHANNEL origin thread whose accepted measure reached
+        the cleanup threshold after a turn. Runs detached via `_schedule_async_call`, outside any
+        turn lock, and commits nothing but the summary row; a trigger while one runs for the
+        same thread is coalesced."""
+        stream = getattr(turn, "channel_stream", None) if turn is not None else None
+        if stream is None:
+            self.log_debug(f"Context meter {thread_key}: at threshold with no pinned stream")
+            return
+        from message_processor import channel_thread_summary
+        if channel_thread_summary.schedule_background(self, stream=stream,
+                                                      thread_state=thread_state, model=model):
+            self.log_info(f"Context meter {thread_key}: at the cleanup threshold on {model} — "
+                          "background thread summary started")
+
+    async def _compact_channel_origin_for_recovery(self, turn: Optional[Any], thread_state: Any,
+                                                   overflow: ContextOverLimit) -> str:
+        """§3.5/§3.6: foreground compaction of a CHANNEL origin thread, on the ALREADY-held turn
+        lock. Returns `committed` | `summary_failed` | `irreducible` | `stale`. On `committed`
+        the new summary is frozen onto this turn's own origin pin and installed (R3-1), so the
+        caller's reassembly reads the compacted request."""
+        from message_processor import channel_thread_summary
+        stream = getattr(turn, "channel_stream", None) if turn is not None else None
+        if stream is None:
+            return channel_thread_summary.OUTCOME_SUMMARY_FAILED
+        result = await channel_thread_summary.compact_origin(
+            openai_client=self.openai_client, db=self.db, stream=stream,
+            thread_state=thread_state, measure=overflow.measure,
+            model=(overflow.kwargs or {}).get("model"))
+        if result.outcome == channel_thread_summary.OUTCOME_COMMITTED and result.row is not None:
+            rebuilt = channel_thread_summary.rebuild_with_row(stream, result.row)
+            if rebuilt is None:
+                self.log_warning("A committed thread summary did not judge valid against the "
+                                 "turn's own origin — retrying on the unchanged stream")
+            else:
+                channel_thread_summary.install_rebuilt_stream(turn, rebuilt)
+        return result.outcome
+
+    def _channel_overflow_is_own(self, turn: Optional[Any], overflow: ContextOverLimit) -> bool:
+        """§3.6 Outcomes / §3.8: an irreducible channel overflow is the turn's OWN content
+        (the trigger, its attachments) unless the periphery alone fills the window — which is
+        pathological, and logged at ERROR with the periphery's share."""
+        ctx = getattr(turn, "channel_turn_context", None) if turn is not None else None
+        if ctx is not None and (ctx.image_parts or ctx.file_parts or ctx.document_inputs
+                                or ctx.batched_image_parts):
+            return True
+        stream = getattr(turn, "channel_stream", None) if turn is not None else None
+        request_bytes = 0
+        kwargs = overflow.kwargs or {}
+        request_bytes += len(str(kwargs.get("instructions") or "").encode("utf-8"))
+        for item in kwargs.get("input") or []:
+            content = item.get("content") if isinstance(item, dict) else None
+            if isinstance(content, str):
+                request_bytes += len(content.encode("utf-8"))
+            elif isinstance(content, list):
+                request_bytes += sum(len(str(p.get("text") or "").encode("utf-8"))
+                                     for p in content if isinstance(p, dict))
+        if stream is None or request_bytes <= 0:
+            return True
+        share = stream.byte_count / request_bytes
+        periphery_tokens = int(share * (overflow.measure or overflow.limit))
+        if periphery_tokens >= overflow.limit:
+            self.log_error(
+                f"context over limit: the channel periphery alone holds ~{periphery_tokens:,} "
+                f"tokens ({share:.0%} of the request) against {overflow.limit:,} usable — "
+                "nothing in the thread is left to summarize")
+            return False
+        return True
+
+    async def _recover_context_overflow(self, overflow: ContextOverLimit, *,
+                                        turn: Optional[Any], thread_state: Any,
+                                        thread_key: str, channel_turn: bool, committed: bool,
+                                        own_messages: List[Dict[str, Any]],
+                                        already_used: bool = False) -> None:
+        """THE one recovery for a request over the context window (CONTEXT_METER §3.5).
+
+        Returns when the caller should reassemble its request and run it once more. Raises
+        otherwise: the overflow itself (the generic turn error) when recovery is not allowed or
+        was already spent, `ContextIrreducible` ("Message Too Long") when compaction proved there
+        is nothing left to compact but the turn's own content.
+
+        Allowed only while no effect of the turn is committed — no request of the TURN has
+        completed (so no tool round ran, no reaction landed) and no text of this turn has reached
+        Slack — and once per turn: the budget lives on the turn and is taken BEFORE the
+        compaction is awaited, so no re-entry can spend it twice. Both facts are turn-scoped: a
+        loop re-entered after an MCP failure starts at its own round 0, and that must not reopen
+        a turn that already did work.
+        """
+        used = already_used or bool(getattr(turn, "context_recovery_used", False))
+        meter = getattr(turn, "context_meter", None) if turn is not None else None
+        worked = (not overflow.recoverable
+                  or bool(getattr(meter, "effects_committed", False)))
+        shown = f"{overflow.tokens:,}" if overflow.tokens is not None else "unknown"
+        if used or worked or committed:
+            why = ("recovery already spent this turn" if used
+                   else "a request of this turn already completed" if worked
+                   else "text of this turn already reached Slack")
+            self.log_error(f"context over limit ({overflow.source}): {shown} > "
+                           f"{overflow.limit:,} — not recoverable ({why})")
+            raise overflow
+        if turn is not None:
+            turn.context_recovery_used = True
+
+        # R3-5, as refined: the measure compaction apportions against. A preflight overflow
+        # carries its own count. A REAL rejection is the API saying the request is over the
+        # window, so no stored measure may contradict it into a no-op: the failing kwargs are
+        # counted once, and the measure is never taken below the limit it was rejected against.
+        measure = overflow.tokens
+        if measure is None:
+            if overflow.kwargs:
+                measure = (await self.openai_client.count_input_tokens(overflow.kwargs)).tokens
+            measure = max(measure or 0, overflow.limit)
+        overflow.measure = measure
+        self.log_error(f"context over limit ({overflow.source}): "
+                       f"{measure if measure is not None else 'unknown'} > {overflow.limit} "
+                       "— compacting")
+
+        if channel_turn:
+            outcome = await self._compact_channel_origin_for_recovery(turn, thread_state,
+                                                                      overflow)
+        else:
+            outcome = await self._compact_dm_for_recovery(
+                thread_state, thread_key, own_messages, measure=overflow.measure)
+        self.log_info(f"Context recovery for {thread_key}: {outcome}")
+        if outcome == "irreducible":
+            if channel_turn and not self._channel_overflow_is_own(turn, overflow):
+                raise overflow          # the periphery's, not the user's: the generic error
+            self.log_error(f"context over limit for {thread_key}: nothing left to compact but "
+                           "this turn's own content")
+            raise ContextIrreducible(str(overflow)) from overflow
+        # committed | summary_failed | stale: reassemble and run once more — the API judges, and
+        # a second overflow is the generic error.
 
     def _persist_destination_provenance(self, turn: Optional[Any],
                                         local_tool_calls: Optional[List[dict]],
@@ -1189,7 +1372,10 @@ class TextHandlerMixin(_Host):
         # streamed; once a reply has begun the call is rejected and the model completes it),
         # so streaming no longer risks orphaning a partial reply.
         # Stream on first attempt OR on MCP-failure retry (streaming itself didn't fail)
-        should_stream = can_stream and (retry_count == 0 or failed_mcp_server is not None)
+        # ...but never a context-recovery retry: it is the buffered replay of a request that was
+        # just compacted, and keeps its capabilities rather than its transport (§3.5).
+        should_stream = (can_stream and not _context_retry
+                         and (retry_count == 0 or failed_mcp_server is not None))
         if should_stream:
             return await self._handle_streaming_text_response(
                 user_content, thread_state, client, message, thinking_id, attachment_urls,
@@ -1206,6 +1392,8 @@ class TextHandlerMixin(_Host):
         web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
         model = effective_request_model(thread_config)
         retry_timeout = 60.0 if retry_count > 0 else None
+        # The DM messages THIS attempt appended — what context recovery sets aside (R3-4).
+        own_messages: List[Dict[str, Any]] = []
         # CV8: one carrier for every Responses call this entry makes, built after retry_timeout
         # so the reason can name the retry that armed it.
         attempt_sink = _model_attempt_sink(turn, channel_turn, _fork_reason(
@@ -1247,6 +1435,7 @@ class TextHandlerMixin(_Host):
                 # Add simplified breadcrumb to thread state (no base64 data)
                 message_ts = message.metadata.get("ts") if message.metadata else None
                 self._add_message_with_token_management(thread_state, "user", breadcrumb_text, db=self.db, thread_key=thread_key, message_ts=message_ts)
+                own_messages = thread_state.messages[-1:]
 
                 # Use the full content with images for the actual API call
                 messages_for_api = thread_state.messages[:-1] + [{"role": "user", "content": user_content}]
@@ -1261,6 +1450,7 @@ class TextHandlerMixin(_Host):
                     message_metadata = {"contains_document": True}
 
                 self._add_message_with_token_management(thread_state, "user", user_content, db=self.db, thread_key=thread_key, message_ts=message_ts, metadata=message_metadata)
+                own_messages = thread_state.messages[-1:]
                 messages_for_api = thread_state.messages
 
             # Inject stored image analyses into the conversation for full context
@@ -1272,8 +1462,6 @@ class TextHandlerMixin(_Host):
                 if msg.get("role") == "assistant" and isinstance(msg.get("content"), str):
                     msg["content"] = strip_used_tools_footer(msg["content"])
 
-            # Pre-trim messages to fit within context window
-            messages_for_api = await self._pre_trim_messages_for_api(messages_for_api, model=thread_state.current_model)
             # The request is settled: record the newest inbound source it carries, so the
             # stale guard compares any later arrival against what this turn answered.
             advance_lease_to_request(turn, messages_for_api, message)
@@ -1373,6 +1561,11 @@ class TextHandlerMixin(_Host):
             except Exception as e:
                 self.log_warning(f"Failed to start progress updater: {e}")
 
+        # This turn's context meter: preflight on round 0, a parallel count per request, and the
+        # response's own usage — all riding the wrappers (CONTEXT_METER §3.2).
+        meter = self._turn_meter(turn, thread_state, thread_key, channel_turn, message,
+                                 user_content)
+
         # Generate response with or without tools
         tools_actually_used = []  # Track which tools were actually invoked
         local_tool_calls = []     # [{"name","ok"}] record of local tool executions
@@ -1385,7 +1578,6 @@ class TextHandlerMixin(_Host):
         # is not in `response_text` — and the marker the model wrote in its opening tokens lives
         # in exactly such a round whenever a tool ran before the answer.
         response_segments: Optional[List[str]] = None
-        usage_info: Dict[str, Any] = {}   # response.usage lands here (usage-driven budgeting)
         mcp_discovered: Dict[str, Any] = {}  # mcp_list_tools payloads land here (discovery cache)
         mcp_results: List[Any] = []       # F12: completed mcp_call outputs land here (result memory)
         # F32: shared across every attempt this turn — a container a FAILED attempt used still
@@ -1435,8 +1627,8 @@ class TextHandlerMixin(_Host):
                     store=False,
                     prompt_cache_key=cache_key,
                     layout=request_layout,
-                    usage_sink=usage_info,
                     attempt_sink=attempt_sink,
+                    meter=meter,
                     mcp_tools_sink=mcp_discovered,
                     mcp_results_sink=mcp_results,
                     artifacts_sink=artifacts,
@@ -1481,8 +1673,8 @@ class TextHandlerMixin(_Host):
                         return_metadata=True,
                         prompt_cache_key=cache_key,
                         layout=request_layout,
-                        usage_sink=usage_info,
                         attempt_sink=attempt_sink,
+                        meter=meter,
                         mcp_tools_sink=mcp_discovered,
                         mcp_results_sink=mcp_results,
                         artifacts_sink=artifacts,
@@ -1506,8 +1698,8 @@ class TextHandlerMixin(_Host):
                         return_metadata=True,
                         prompt_cache_key=cache_key,
                         layout=request_layout,
-                        usage_sink=usage_info,
                         attempt_sink=attempt_sink,
+                        meter=meter,
                         mcp_tools_sink=mcp_discovered,
                         mcp_results_sink=mcp_results,
                         artifacts_sink=artifacts,
@@ -1535,6 +1727,7 @@ class TextHandlerMixin(_Host):
                         prompt_cache_key=cache_key if channel_turn else None,
                         layout=request_layout,
                         attempt_sink=attempt_sink,
+                        meter=meter,
                         service_tier_eligible=(not channel_turn
                                                and thread_config.get("service_tier") == "fast")
                     )
@@ -1549,49 +1742,38 @@ class TextHandlerMixin(_Host):
                         verbosity=thread_config.get("verbosity"),
                         prompt_cache_key=cache_key,
                         layout=request_layout,
-                        usage_sink=usage_info,
                         attempt_sink=attempt_sink,
+                        meter=meter,
                         service_tier_eligible=(not channel_turn
                                                and thread_config.get("service_tier") == "fast")
                     )
+        except ContextOverLimit as overflow:
+            # CONTEXT_METER §3.5 — the one recovery. Returns only when a retry is warranted: this
+            # entry never commits text before it returns, so only an EARLIER attempt's partial
+            # (`visible_already_committed`) can make the turn's effects committed.
+            await self._recover_context_overflow(
+                overflow, turn=turn, thread_state=thread_state, thread_key=thread_key,
+                channel_turn=channel_turn, committed=visible_already_committed,
+                own_messages=own_messages, already_used=_context_retry)
+            # The user message added this attempt gets re-added by the retry. DM/legacy only: a
+            # channel turn's input is the stream, never this list.
+            if (not channel_turn and thread_state.messages
+                    and thread_state.messages[-1].get("role") == "user"):
+                thread_state.messages.pop()
+            return await self._handle_text_response(
+                user_content, thread_state, client, message, thinking_id,
+                attachment_urls, retry_count=retry_count,
+                failed_mcp_server=failed_mcp_server, _context_retry=True,
+                visible_already_committed=visible_already_committed,
+                artifacts_acc=artifacts, turn=turn, lazy_surface_ts=lazy_surface_ts,
+                # One snapshot per responder turn — a retry must not re-read the table.
+                channel_steering_text=channel_steering_text
+            )
         except Exception as api_error:
-            # Usage-estimator backstop: the API is the final authority on context
-            # size. On a context-window rejection, compact once and retry.
-            if channel_turn and self._channel_request_too_large(api_error):
-                # Nothing here is compactable: a channel request IS the pinned window, and
-                # trimming it would answer a different question than the one admitted.
-                #
-                # RESIDUAL DEFENCE, not half the guarantee [r3-1]. Admission charges one token per
-                # utf-8 byte, which no byte-level BPE tokenizer can exceed, so nothing should reach
-                # this branch on size at all; it survives for the size refusals that are not about
-                # the context window (a per-field cap, a transport limit) and as the place a broken
-                # invariant becomes visible instead of becoming a crash.
-                #
-                # Checked BEFORE the compact-and-retry branch and with no retry gate of its own: a
-                # size refusal is a size refusal however the API words it, and every path out of
-                # this branch for a channel turn is the same honest notice.
-                from message_processor.channel_stream import StreamOverBudgetError
-                self.log_error(
-                    f"Channel request rejected as too large despite passing the admission "
-                    f"estimate: {api_error}")
-                raise StreamOverBudgetError(
-                    f"{message.channel_id}: the API rejected this channel request as too "
-                    f"large for one call") from api_error
-            if self._is_context_length_error(api_error) and not _context_retry:
-                self.log_warning("Context window exceeded — compacting thread and retrying once")
-                await self._compact_thread_to_target(thread_state, thread_key)
-                # The user message added this attempt gets re-added by the retry
-                if thread_state.messages and thread_state.messages[-1].get("role") == "user":
-                    thread_state.messages.pop()
-                return await self._handle_text_response(
-                    user_content, thread_state, client, message, thinking_id,
-                    attachment_urls, retry_count=retry_count,
-                    failed_mcp_server=failed_mcp_server, _context_retry=True,
-                    visible_already_committed=visible_already_committed,
-                    artifacts_acc=artifacts, turn=turn, lazy_surface_ts=lazy_surface_ts,
-                    # One snapshot per responder turn — a retry must not re-read the table.
-                    channel_steering_text=channel_steering_text
-                )
+            if self._channel_request_too_large(api_error):
+                # A size refusal the meter cannot answer — a per-field cap, a payload the
+                # transport rejects outright. No compaction; the generic turn error (C-12).
+                self.log_error(f"Request rejected for size (not the context window): {api_error}")
             raise
         finally:
             # §5.4a EXIT-PATH GUARANTEE. A destination commits INSIDE the loop above, and this
@@ -1643,9 +1825,6 @@ class TextHandlerMixin(_Host):
                                                    segments=response_segments)
         response_text = strip_provenance_echo(strip_citation_markers(strip_sandbox_links(response_text)))
 
-        # Record the API's authoritative context size on the thread
-        thread_state.record_usage(usage_info.get("input_tokens", 0),
-                                  usage_info.get("output_tokens", 0))
 
         # Feed any mcp_list_tools discovery payloads into the informational cache. Off the
         # event loop: the cache write is a sync SQLite call whose 5s busy-wait, run on the
@@ -1984,11 +2163,13 @@ class TextHandlerMixin(_Host):
             self, thread_state, message, channel_turn, turn=turn)
         web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
         model = effective_request_model(thread_config)
+        # The DM messages THIS attempt appended — what context recovery sets aside (R3-4).
+        own_messages: List[Dict[str, Any]] = []
 
         if channel_turn:
-            # Spec §3: one canonical assembler, the same one the non-streaming path calls and the
-            # same one base.py measured for admission. Streaming never disables tools (a streaming
-            # failure falls back to the non-streaming path, which resolves its own).
+            # Spec §3: one canonical assembler, the same one the non-streaming path calls.
+            # Streaming never disables tools (a streaming failure falls back to the non-streaming
+            # path, which resolves its own).
             (request, _prepared, registry, request_config, no_reply_available,
              contract_suffix, ci_container) = await self._assemble_channel_attempt(
                 client, message, thread_state, turn, thread_config, model,
@@ -2019,6 +2200,7 @@ class TextHandlerMixin(_Host):
                 # Add simplified breadcrumb to thread state (no base64 data)
                 message_ts = message.metadata.get("ts") if message.metadata else None
                 self._add_message_with_token_management(thread_state, "user", breadcrumb_text, db=self.db, thread_key=thread_key, message_ts=message_ts)
+                own_messages = thread_state.messages[-1:]
 
                 # Use the full content with images for the actual API call
                 messages_for_api = thread_state.messages[:-1] + [{"role": "user", "content": user_content}]
@@ -2033,6 +2215,7 @@ class TextHandlerMixin(_Host):
                     message_metadata = {"contains_document": True}
 
                 self._add_message_with_token_management(thread_state, "user", user_content, db=self.db, thread_key=thread_key, message_ts=message_ts, metadata=message_metadata)
+                own_messages = thread_state.messages[-1:]
                 messages_for_api = thread_state.messages
 
             # Inject stored image analyses into the conversation for full context
@@ -2044,8 +2227,6 @@ class TextHandlerMixin(_Host):
                 if msg.get("role") == "assistant" and isinstance(msg.get("content"), str):
                     msg["content"] = strip_used_tools_footer(msg["content"])
 
-            # Pre-trim messages to fit within context window
-            messages_for_api = await self._pre_trim_messages_for_api(messages_for_api, model=thread_state.current_model)
             # The request is settled: record the newest inbound source it carries, so the
             # stale guard compares any later arrival against what this turn answered.
             advance_lease_to_request(turn, messages_for_api, message)
@@ -3237,10 +3418,13 @@ class TextHandlerMixin(_Host):
             self.log_warning(f"Failed to start progress updater: {e}")
             progress_task = None
 
+        # This turn's context meter — the SAME hook the buffered fallback reuses (CONTEXT_METER §3.2).
+        meter = self._turn_meter(turn, thread_state, thread_key, channel_turn, message,
+                                 user_content)
+
         # Start streaming from OpenAI with the callback
         try:
             local_tool_calls = []  # [{"name","ok"}] record of local tool executions
-            usage_info: Dict[str, Any] = {}   # response.usage lands here (usage-driven budgeting)
             mcp_discovered: Dict[str, Any] = {}  # mcp_list_tools payloads land here (discovery cache)
             mcp_results: List[Any] = []       # F12: completed mcp_call outputs land here (result memory)
             # F32: shared across every attempt this turn (see _handle_text_response).
@@ -3288,8 +3472,8 @@ class TextHandlerMixin(_Host):
                     store=False,
                     prompt_cache_key=cache_key,
                     layout=request_layout,
-                    usage_sink=usage_info,
                     attempt_sink=attempt_sink,
+                    meter=meter,
                     mcp_tools_sink=mcp_discovered,
                     mcp_results_sink=mcp_results,
                     artifacts_sink=artifacts,
@@ -3339,8 +3523,8 @@ class TextHandlerMixin(_Host):
                     store=False,  # Match the existing behavior
                     prompt_cache_key=cache_key,
                     layout=request_layout,
-                    usage_sink=usage_info,
                     attempt_sink=attempt_sink,
+                    meter=meter,
                     mcp_tools_sink=mcp_discovered,
                     mcp_results_sink=mcp_results,
                     artifacts_sink=artifacts,
@@ -3363,8 +3547,8 @@ class TextHandlerMixin(_Host):
                     verbosity=thread_config.get("verbosity"),
                     prompt_cache_key=cache_key,
                     layout=request_layout,
-                    usage_sink=usage_info,
                     attempt_sink=attempt_sink,
+                    meter=meter,
                     hidden_suppression_sink=hidden_stale,
                     service_tier_eligible=(not channel_turn
                                            and thread_config.get("service_tier") == "fast")
@@ -3425,9 +3609,6 @@ class TextHandlerMixin(_Host):
                     "Hidden stale turn has no draft to deliver — the refusal stands")
                 raise hidden_stale[0]
 
-            # Record the API's authoritative context size on the thread
-            thread_state.record_usage(usage_info.get("input_tokens", 0),
-                                      usage_info.get("output_tokens", 0))
 
             # Feed any mcp_list_tools discovery payloads into the informational cache (off the
             # event loop — see the non-streaming twin above for why).
@@ -4165,15 +4346,24 @@ class TextHandlerMixin(_Host):
             # and run a second attempt behind that state.
             raise
         except Exception as e:
-            # Usage-estimator backstop: on a context-window rejection, compact the
-            # thread before the standard non-streaming fallback retries below.
-            if self._is_context_length_error(e):
-                self.log_warning("Context window exceeded during streaming — compacting before fallback")
+            # CONTEXT_METER §3.5: an overflow either earns the turn's ONE recovery — compaction
+            # here, then the buffered fallback below reassembles and runs once more — or ends the
+            # turn as the generic error. It never rides the fallback as an ordinary retry.
+            #
+            # Either way the attempt's surfaces are cleaned up and reconciled below EXACTLY as for
+            # any other failed stream; only the ending differs — a recovered overflow retries
+            # buffered WITH this attempt's capabilities, a refused one raises instead of retrying.
+            context_recovered = False
+            context_fatal: Optional[BaseException] = None
+            if isinstance(e, ContextOverLimit):
                 try:
-                    await self._compact_thread_to_target(
-                        thread_state, f"{thread_state.channel_id}:{thread_state.thread_ts}")
-                except Exception as compact_err:
-                    self.log_error(f"Compaction after context error failed: {compact_err}")
+                    await self._recover_context_overflow(
+                        e, turn=turn, thread_state=thread_state, thread_key=thread_key,
+                        channel_turn=channel_turn, committed=visible_content_delivered,
+                        own_messages=own_messages)
+                    context_recovered = True
+                except Exception as refusal:  # noqa: BLE001 — raised after the cleanup below
+                    context_fatal = refusal
 
             # Check if this is an MCP connection error first (before logging).
             # Structured fields (status_code 424, error body) are checked before
@@ -4224,7 +4414,7 @@ class TextHandlerMixin(_Host):
                 # loop rebinds only its own local list), which is exactly the case that has to be
                 # unbound.
                 await self._drop_dead_containers(dead_ids, thread_key)
-            else:
+            elif not isinstance(e, ContextOverLimit):
                 # Unexpected errors - log as ERROR
                 self.log_error(f"Error in streaming response generation: {e}")
 
@@ -4397,6 +4587,10 @@ class TextHandlerMixin(_Host):
                               "interrupted": True},
                 )
 
+            if context_fatal is not None:
+                # The surfaces are settled; the overflow is not replayed (§3.5).
+                raise context_fatal
+
             # Retry request - streaming preserved for MCP failures, non-streaming for other errors
             if failed_mcp_server:
                 self.log_info("Retrying with streaming (excluding failed MCP server)")
@@ -4428,10 +4622,19 @@ class TextHandlerMixin(_Host):
                                  else thinking_id)
             return await self._handle_text_response(
                 user_content, thread_state, client, message, retry_thinking_id,
-                attachment_urls, retry_count=1, failed_mcp_server=failed_mcp_servers,
+                attachment_urls,
+                # A context recovery is NOT the timeout retry: it keeps this attempt's local
+                # tools and MCP exclusions and only drops streaming (`_context_retry`). Every
+                # other failure takes the tools-disabled retry it always has.
+                retry_count=0 if context_recovered else 1,
+                failed_mcp_server=failed_mcp_servers if not context_recovered
+                else exclude_mcp_server,
                 # CV8: THE streaming→buffered fork. Only names the reason when nothing more
                 # specific does — an MCP failover still reports itself as one.
                 _nonstreaming_fallback=True,
+                # The overflow recovery this fallback carries out: its budget is spent (the turn
+                # holds it too), and the entry is the context retry it is.
+                _context_retry=context_recovered,
                 visible_already_committed=visible_content_delivered,
                 artifacts_acc=artifacts, turn=turn,
                 # F38: an MCP retry keeps streaming, so hand it the one surface this attempt

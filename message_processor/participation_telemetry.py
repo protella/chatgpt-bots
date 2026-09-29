@@ -87,7 +87,8 @@ EVENTS.
                   carries `stream_build_present: false` and no `H` — a DM has no stream, and the
                   row says so rather than implying one.
   stream_render   one channel stream BUILD: the pinned window, the hashes that identify it, and
-                  what it cost in bytes. Joins to its turn by `turn_id`.
+                  what it cost in bytes. Joins to its turn by `turn_id`; `build_seq` orders a
+                  turn's rebuilds after a compaction (0 = the first build).
   model_response  one Responses API attempt on a turn, success or failure.
   outbound_receipt one receipt state transition (spec §5), from the transition's own result rather
                   than from what the caller intended.
@@ -1124,12 +1125,13 @@ def turn_outcome(channel_id: Optional[str], trigger_ts: Optional[str], *,
     disclosure post is a real destination the room saw. `reconsider` and `edits` may coexist
     on one row.
 
-    `error` is one of the FOUR fail-closed codes (stream_over_budget, history_fetch_failed,
-    stream_data_invalid, and origin_fetch_failed — a partial origin thread is a different
-    conversation, not a smaller one), absent on a turn that did not fail that way.
-    `coverage_not_ready` and `snapshot_unsupported` were retired with the machinery that raised
-    them; rows in older ledgers still carry them and stay valid under their own contract, while
-    a FRESH row carrying one is a violation the checker reports.
+    `error` is one of the THREE fail-closed codes (history_fetch_failed, stream_data_invalid,
+    and origin_fetch_failed — a partial origin thread is a different conversation, not a smaller
+    one), absent on a turn that did not fail that way. `coverage_not_ready` and
+    `snapshot_unsupported` were retired with the machinery that raised them, and
+    `stream_over_budget` with the admission refusal (an oversize request is now compacted, not
+    refused); rows in older ledgers still carry them, while a FRESH row carrying one is a
+    violation the checker reports.
     `stream_build_present` says whether the room was actually rendered — a turn that failed before
     the fetch answered from nothing, and its `kind` must not be read as a judgment.
 
@@ -1206,17 +1208,20 @@ def emit_turn_outcome(turn: Any, *, channel_id: Optional[str], trigger_ts: Optio
 
 
 def stream_render(*, turn_id: Optional[str], origin_thread_ts: Optional[str] = None,
-                  trigger_ts: Optional[str] = None, **fields: Any) -> None:
+                  trigger_ts: Optional[str] = None, build_seq: int = 0, **fields: Any) -> None:
     """One channel stream build, identified by its hashes.
 
     `**fields` is ChannelStream.stream_render_fields() verbatim — the pinned window, the SEVEN
     hashes that make two builds comparable, and the byte/message cost. Passing the dict through
     rather than restating its keys here is deliberate: the serializer owns what identifies a
     build, and a second enumeration of those keys is a second thing to keep in step.
+
+    `build_seq` is which build of the turn this is: 0 for the first, +1 for each rebuild after a
+    compaction. A turn may therefore write several rows, and only in strictly increasing order.
     """
     channel_id = fields.pop("channel_id", None)
     record("stream_render", channel_id=channel_id, trigger_ts=trigger_ts, turn_id=turn_id,
-           origin_thread_ts=origin_thread_ts, **fields)
+           origin_thread_ts=origin_thread_ts, build_seq=build_seq, **fields)
 
 
 def model_response(*, turn_id: Optional[str], attempt_seq: Optional[int],

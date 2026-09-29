@@ -3,7 +3,7 @@
 `MessageProcessor` is resolved lazily. `message_processor.base` pulls in the whole
 processing graph — the Slack and OpenAI clients, the streaming package, the tool
 handlers — and several of those reach back into this package for leaf modules
-(`prompts`, `message_markers`, `tool_registry`, `token_counter`). Binding the class
+(`prompts`, `message_markers`, `tool_registry`). Binding the class
 eagerly here would make every one of those leaf imports execute the full graph
 first, so whichever package was imported first would fail on a partially
 initialized module.

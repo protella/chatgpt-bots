@@ -11,18 +11,19 @@ import openai
 from message_processor.client_contract import BaseClient, ChannelStreamError, HistoryFetchError, Message, Response
 from message_processor.thread_manager import AsyncThreadStateManager
 from openai_client import OpenAIClient
-from config import config, pipeline_status
+from config import config
 from logger import LoggerMixin
 from slack_client import admission_watermark
 from . import channel_steering, image_catalog, participation_telemetry, routing_facts
 from .containers import ContainerManager
+from .context_meter import ContextIrreducible, ContextOverLimit
 from .message_timestamps import stamp_content
 from .thread_management import ThreadManagementMixin
 from .stale_send_guard import StaleSendSuppressed
 from .turn_runtime import TurnRuntime
 from .handlers.text import TextHandlerMixin, pinned_thread_config
 from .handlers.image_gen import ImageJobMixin
-from .utilities import MessageUtilitiesMixin, effective_request_model
+from .utilities import MessageUtilitiesMixin
 from message_processor.ingestion.image_url_handler import ImageURLHandler
 from openai_client.mcp_manager import MCPManager
 from message_processor.tool_registry import SURFACE_CHANNEL
@@ -55,6 +56,17 @@ TIMEOUT_MESSAGE = (
     "Ask me again and I'll have another go. Anything already running in the background — an "
     "image, a research job — will still land here on its own."
 )
+
+def _measure_note(thread_state: Any, thread_config: Any) -> str:
+    """` | Tokens: N` from the thread's last accepted context measure, or nothing."""
+    try:
+        model = ((thread_config or {}).get("model")
+                 or getattr(thread_state, "current_model", None))
+        measure = thread_state.current_measure(model) if thread_state is not None else None
+        return f" | Tokens: {int(measure[0]):,}" if measure is not None else ""
+    except Exception:  # noqa: BLE001 — a log suffix never costs the turn
+        return ""
+
 
 # The one-line version for the status/thinking indicator, which has no room for the above.
 TIMEOUT_STATUS = "That took too long — I stopped waiting."
@@ -293,7 +305,7 @@ class MessageProcessor(ThreadManagementMixin,
             # settings; DMs simply have no channel_settings row → no-op there).
             # Spec §3b: on a channel turn the capability keys are the CHANNEL's, resolved the
             # same way the handler resolves them. The values here are not advisory — they pick
-            # the model this turn trims against and decide whether an attachment is mounted for
+            # the model this turn is measured against and decide whether an attachment is mounted for
             # the sandbox — so reading them requester-first would let whoever spoke change the
             # room's machine before the handler ever corrected it.
             #
@@ -303,7 +315,7 @@ class MessageProcessor(ThreadManagementMixin,
             thread_config = await pinned_thread_config(
                 self, thread_state, message, channel_turn, turn=turn)
             
-            # Update thread state with current model for token limit calculations
+            # Update thread state with current model (the context meter measures per model)
             thread_state.current_model = thread_config["model"]
             
             # Ensure the current requester is in the @mention roster
@@ -543,22 +555,20 @@ class MessageProcessor(ThreadManagementMixin,
             if channel_turn:
                 # A notice this turn owes is prose in the thread, so the answer belongs with it —
                 # which settles the destination. Settle it BEFORE the request is assembled, not
-                # after [r3-3]: admission pins the tool tuple and the suffix, so a destination
-                # settled afterwards would leave the admitted request advertising
+                # after [r3-3]: the first assembly pins the tool tuple and the suffix, so a
+                # destination settled afterwards would leave the pinned request advertising
                 # `set_reply_destination` and saying nothing about where the reply goes, while the
                 # request actually sent carries `reply_destination=thread` and refuses that tool at
-                # runtime. Bytes admitted == bytes sent only if the lock precedes the estimate.
+                # runtime.
                 #
                 # Settled unconditionally rather than on a confirmed send, because there is no send
                 # yet. The cost if the notice then fails to post is a reply in the thread rather
-                # than at top level; the cost of the other order is an estimate that measured a
-                # different request.
+                # than at top level.
                 if prior_timeout_owed and turn is not None:
                     turn.settle_structural_thread()
-                # Steps 3 + 11 pre-flight. A channel turn does not trim: the request is the
-                # pinned window, and there is nothing in it a trim could drop without answering
-                # a different question. It is ADMITTED instead — measured whole, before the first
-                # API call, and refused outright if the worst case will not fit.
+                # Step 11: pin the turn's context and finalize its documents, BEFORE the request
+                # is assembled (C-30). Nothing here measures or refuses: the request's size is the
+                # context meter's question, answered by OpenAI's own count in the wrapper.
                 await self._admit_channel_request(
                     message, client, turn, thread_state, thread_config, thinking_id,
                     stream=stream, steering=steering, image_inputs=image_inputs,
@@ -566,141 +576,11 @@ class MessageProcessor(ThreadManagementMixin,
                     batched_image_inputs=batched_image_inputs,
                     batched_images_omitted=batched_images_omitted,
                     failed_attachments=failed_file_facts)
-                # The window exists and the request fits. NOW the owed prose can be said: every
-                # fail-closed condition that would have contradicted it is behind us, so these are
-                # promises the turn is in a position to keep.
+                # The window exists. NOW the owed prose can be said: every fail-closed condition
+                # that would have contradicted it is behind us, so these are promises the turn is
+                # in a position to keep.
                 if prior_timeout_owed:
                     await self._post_prior_timeout_notice(message, client, turn, thread_key)
-            else:
-                # Check if adding this message would exceed limits and trim if needed
-                # We temporarily add the message to check, then remove it
-                thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
-                message_ts = message.metadata.get("ts") if message.metadata else None
-            
-                # Determine what content to use for checking
-                content_to_check = enhanced_text if not image_inputs else (enhanced_text if enhanced_text else f"{username}: [uploaded image(s) for analysis]")
-            
-                # Check token count with the new message (WITHOUT adding it to thread yet)
-                model = thread_state.current_model or config.gpt_model
-                max_tokens = config.get_model_token_limit(model)
-
-                # Calculate what the tokens would be with the new message
-                temp_message = {"role": "user", "content": content_to_check}
-                new_message_tokens = self.thread_manager._token_counter.count_message_tokens(temp_message)
-                current_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
-                projected_tokens = current_tokens + new_message_tokens
-
-                # Debug logging for token counting
-                self.log_debug(f"Token calculation: current={current_tokens}, new_message={new_message_tokens}, projected={projected_tokens}")
-                self.log_debug(f"New message length: {len(content_to_check)} chars = {new_message_tokens} tokens")
-
-                # Apply smart trimming if needed - keep trimming until under limit
-                if projected_tokens > max_tokens:
-                    self.log_info(f"Thread would exceed limit with new message ({projected_tokens}/{max_tokens} tokens), applying smart trim")
-
-                    # Update status to show we're optimizing (routes to the composer
-                    # status on status-only DMs where no indicator message exists)
-                    self._update_status(
-                        client,
-                        message.channel_id,
-                        thinking_id,
-                        pipeline_status("optimizing_history", f"Optimizing conversation history ({projected_tokens:,}/{max_tokens:,} tokens)…"),
-                        emoji=config.circle_loader_emoji, thread_id=message.thread_id, turn=turn)
-
-                    total_trimmed = 0
-
-                    # Keep trimming until we're under the limit (accounting for the new message we'll add)
-                    while projected_tokens > max_tokens:
-                        # Smart trim will work on existing messages only (not the temp one)
-                        trimmed_count = await self._smart_trim_with_summarization(thread_state)
-                        total_trimmed += trimmed_count
-                    
-                        if trimmed_count == 0:
-                            # No more messages to trim, we've done all we can
-                            self.log_warning(f"Cannot trim further - still at {projected_tokens} tokens")
-                            break
-
-                        # Recalculate tokens after trimming (including the message we'll add)
-                        current_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
-                        projected_tokens = current_tokens + new_message_tokens
-                        self.log_debug(f"After trimming {trimmed_count} messages, now at {projected_tokens}/{max_tokens} tokens (current: {current_tokens} + new: {new_message_tokens})")
-                
-                    if total_trimmed > 0:
-                        self.log_info(f"Smart trim complete: {total_trimmed} total messages processed, final: {projected_tokens}/{max_tokens} tokens")
-
-                    # Check if we're still over the limit after trimming
-                    if projected_tokens > max_tokens:
-                        self.log_warning(f"Smart trim insufficient. Need {projected_tokens - max_tokens} more tokens. Dropping oldest messages...")
-
-                        # Keep dropping oldest messages until we fit
-                        messages_dropped = 0
-                        while projected_tokens > max_tokens and len(thread_state.messages) > 0:
-                            # Drop the oldest non-preserved message
-                            dropped = False
-                            for i in range(len(thread_state.messages)):
-                                if not self._should_preserve_message(thread_state.messages[i]):
-                                    dropped_msg = thread_state.messages.pop(i)
-                                    messages_dropped += 1
-                                    dropped = True
-
-                                    # Recalculate tokens
-                                    current_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
-                                    projected_tokens = current_tokens + new_message_tokens
-                                    self.log_debug(f"Dropped message {i}, now at {projected_tokens}/{max_tokens} tokens")
-                                    break
-
-                            if not dropped:
-                                # No more droppable messages
-                                self.log_warning("No more messages can be dropped (all are preserved)")
-                                break
-
-                            # Safety check to prevent infinite loop
-                            if messages_dropped > 50:
-                                self.log_error("Dropped 50 messages but still over limit - something is wrong")
-                                break
-
-                        if messages_dropped > 0:
-                            self.log_info(f"Dropped {messages_dropped} oldest messages to make room. Final: {projected_tokens}/{max_tokens} tokens")
-                            # Mark that we've trimmed messages
-                            thread_state.has_trimmed_messages = True
-
-                # No need to remove temp message since we never added it to thread_state.messages
-            
-                # Check if this single message alone exceeds the model's context window
-                model = thread_state.current_model or config.gpt_model
-                max_model_tokens = config.get_model_token_limit(model)
-
-                # Check if this single message exceeds the model's context window
-                if new_message_tokens > max_model_tokens:
-                    error_msg = (
-                        f"❌ Your message is too large for the model to process.\n\n"
-                        f"• Message size: {new_message_tokens:,} tokens\n"
-                        f"• Model limit: {max_model_tokens:,} tokens\n\n"
-                        f"Please reduce the size of your documents or split them into smaller requests."
-                    )
-
-                    # Log the issue
-                    self.log_error(f"Message exceeds context window: {new_message_tokens} > {max_model_tokens}")
-                
-                    # Add minimal breadcrumb to history
-                    thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
-                    message_ts = message.metadata.get("ts") if message.metadata else None
-                    formatted_error_breadcrumb = self._format_user_content_with_username(
-                        f"[Attempted to upload {len(document_inputs)} document(s) - exceeded context limit]", 
-                        message
-                    )
-                    self._add_message_with_token_management(
-                        thread_state, "user", 
-                        formatted_error_breadcrumb,
-                        db=self.db, thread_key=thread_key, message_ts=message_ts
-                    )
-                    self._add_message_with_token_management(
-                        thread_state, "assistant", error_msg,
-                        db=self.db, thread_key=thread_key
-                    )
-
-                    return Response(type="error", content=error_msg)
-
 
             # F34: image generation and editing are TOOLS, so there is nothing left for a
             # pre-flight router to decide. The model sees uploaded images directly (they ride
@@ -788,8 +668,8 @@ class MessageProcessor(ThreadManagementMixin,
             elapsed = time.time() - request_start_time
             response_type = response.type if response else "None"
             
-            # Calculate final token count
-            final_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
+            # The thread's last accepted context measure, when there is one (CONTEXT_METER §3.3).
+            token_info = _measure_note(thread_state, thread_config)
 
             # F38: the "📊 CONTEXT USAGE NOTIFICATION" box is gone. Compaction is a
             # behind-the-scenes function and the bot has no business narrating it — this
@@ -800,7 +680,7 @@ class MessageProcessor(ThreadManagementMixin,
 
             self.log_info("")
             self.log_info("="*100)
-            self.log_info(f"REQUEST END | Thread: {thread_key} | Status: {response_type.upper()} | Time: {elapsed:.2f}s | Tokens: {final_tokens}")
+            self.log_info(f"REQUEST END | Thread: {thread_key} | Status: {response_type.upper()} | Time: {elapsed:.2f}s{token_info}")
             self.log_info("="*100)
             self.log_info("")
             return response
@@ -808,12 +688,8 @@ class MessageProcessor(ThreadManagementMixin,
         except TimeoutError as e:
             # Handle timeout errors gracefully without stack trace
             elapsed = time.time() - request_start_time
-            # Try to get token count even on error
-            try:
-                error_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages) if 'thread_state' in locals() else 0
-                token_info = f" | Tokens: {error_tokens}" if error_tokens > 0 else ""
-            except Exception:
-                token_info = ""
+            token_info = _measure_note(locals().get("thread_state"),
+                                            locals().get("thread_config"))
 
             # Get the operation type that timed out
             operation_type = getattr(e, 'operation_type', 'unknown')
@@ -1035,12 +911,8 @@ class MessageProcessor(ThreadManagementMixin,
             # Log full error details for non-timeout exceptions
             self.log_error(f"Error processing message: {e}", exc_info=True)
             elapsed = time.time() - request_start_time
-            # Try to get token count even on error
-            try:
-                error_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages) if 'thread_state' in locals() else 0
-                token_info = f" | Tokens: {error_tokens}" if error_tokens > 0 else ""
-            except Exception:
-                token_info = ""
+            token_info = _measure_note(locals().get("thread_state"),
+                                            locals().get("thread_config"))
 
             self.log_info("")
             self.log_info("="*100)
@@ -1103,6 +975,14 @@ class MessageProcessor(ThreadManagementMixin,
                 content=error_message
             )
         finally:
+            # The turn is over: an accepted context measure at the threshold may now trigger the
+            # after-turn compaction (CONTEXT_METER §3.7); later measures trigger as they land.
+            meter = getattr(turn, "context_meter", None)
+            if meter is not None:
+                try:
+                    meter.finish()
+                except Exception as meter_error:  # noqa: BLE001
+                    self.log_warning(f"Context meter finish failed for {thread_key}: {meter_error}")
             # Phase Q drain hook — runs while we STILL HOLD the lock so that (a) no new
             # message can jump ahead of the queued backlog and (b) stragglers arriving
             # during the linger enqueue (lock held) and join the same batch. Must never
@@ -1129,6 +1009,16 @@ class MessageProcessor(ThreadManagementMixin,
         Log the actual error for debugging, but don't show technical details to the user.
         """
         error_details = str(e)
+
+        # CONTEXT_METER §3.5 (OWNER-B): a request over the window means WE failed to manage the
+        # context, so there is no size card — except proven irreducibility, where what is left
+        # is the user's own content and the old copy is still the honest one.
+        if isinstance(e, ContextIrreducible):
+            return (f"{config.error_emoji} **Message Too Long**\n\nYour message is too long. "
+                    "Please try a shorter request.")
+        if isinstance(e, ContextOverLimit) or TextHandlerMixin._channel_request_too_large(e):
+            return (f"{config.error_emoji} **Something Went Wrong**\n\nPlease try again. If "
+                    "this keeps happening, try later.")
 
         # Check for common error types and provide user-friendly messages
         # IMPORTANT: Check MCP errors FIRST before generic "context" check (which would match "context7" server names)
@@ -1159,9 +1049,6 @@ class MessageProcessor(ThreadManagementMixin,
             # Real throttling, from the exception itself. Substrings lied both ways: "limit" caught
             # the patch 400 above, and "rate" matches "generate".
             error_message = f"{config.error_emoji} **Too Many Requests**\n\nOpenAI is busy. Please wait a minute and try again."
-        elif "context_length_exceeded" in error_details.lower() or "maximum context length" in error_details.lower():
-            # More specific context window check (avoid matching MCP server names like "context7")
-            error_message = f"{config.error_emoji} **Message Too Long**\n\nYour message is too long. Please try a shorter request."
         elif "api" in error_details.lower() or "openai" in error_details.lower():
             error_message = f"{config.error_emoji} **Service Issue**\n\nOpenAI is having problems. Please try again shortly."
         else:
@@ -1198,9 +1085,7 @@ class MessageProcessor(ThreadManagementMixin,
         or which has never been swept at all, answers from what it can reach and declares that
         in its horizon. Nothing about the thread index refuses a turn.
         """
-        from message_processor.channel_stream import (OriginFetchError,
-                                                     StreamOverBudgetError,
-                                                     StreamTimestampError)
+        from message_processor.channel_stream import OriginFetchError, StreamTimestampError
         if isinstance(error, StreamTimestampError):
             # NOT a Slack problem, so it must not wear the Slack notice: a timestamp we cannot
             # parse means a record — in a payload or in one of our own rows — is malformed, and
@@ -1226,15 +1111,6 @@ class MessageProcessor(ThreadManagementMixin,
                             "Slack didn't give me all of this thread, and I won't answer from "
                             "part of a conversation — the half I'm missing is as likely to be "
                             "the half that matters. Please try again in a moment."),
-            }
-        if isinstance(error, StreamOverBudgetError):
-            return "stream_over_budget", {
-                "status": "That's more than I can fit in one request.",
-                "message": (f"{config.error_emoji} **Too Much For One Request**\n\n"
-                            "This channel's history plus what's attached here is larger than I "
-                            "can send in one go, so I stopped rather than answer from part of it. "
-                            "A smaller attachment, or asking in a thread with fewer files, will "
-                            "get through."),
             }
         return "history_fetch_failed", {
             "status": "Couldn't load this channel from Slack.",
@@ -1283,6 +1159,20 @@ class MessageProcessor(ThreadManagementMixin,
         stream = result.stream
         turn.channel_stream = stream
         turn.stream_build_present = True
+        # R3-2: the builder only REPORTS a stored thread summary that no longer matches its
+        # thread; the turn is where it is acted on. Delete it (only if it is still the row that
+        # was judged — R3-3), and the request the meter last measured is gone with it.
+        if stream.pinned.summary_invalid and stream.pinned.origin_root_ts:
+            from message_processor import channel_thread_summary
+            try:
+                await channel_thread_summary.invalidate_if_unchanged(
+                    self.db, channel_thread_summary.thread_key(
+                        message.channel_id, stream.pinned.origin_root_ts),
+                    stream.pinned.summary_judged)
+            except Exception as e:  # noqa: BLE001 — the thread already renders in full
+                self.log_warning(f"Thread summary invalidation failed for {message.channel_id}: "
+                                 f"{e}")
+            thread_state.invalidate_measure()
         self.log_info(
             f"Channel stream for {message.channel_id}: {stream.message_count} message(s), "
             f"{stream.root_count} root(s), {stream.byte_count} bytes, "
@@ -1327,7 +1217,10 @@ class MessageProcessor(ThreadManagementMixin,
             # hashes, and nothing else about whose turn it is. The origin root reaches the
             # emitter as the build input above — it is no longer passed twice under two names.
             turn_id=getattr(turn, "turn_id", None),
-            trigger_ts=(message.metadata or {}).get("ts"))
+            trigger_ts=(message.metadata or {}).get("ts"),
+            # §3.6: the trigger is never covered by a thread summary; the builder adds the newest
+            # TOKEN_TRIM_MESSAGE_COUNT eligible origin messages to it.
+            protected_ts=frozenset({str((message.metadata or {}).get("ts") or message.thread_id)}))
 
     async def _admit_channel_request(self, message: Message, client: BaseClient, turn,
                                      thread_state, thread_config: dict,
@@ -1336,25 +1229,20 @@ class MessageProcessor(ThreadManagementMixin,
                                      document_inputs: list, batched_image_inputs: list,
                                      batched_images_omitted: int,
                                      failed_attachments: tuple = ()) -> None:
-        """Step 11's pre-flight: pin the turn's context, ADMIT the request, then summarize.
+        """Step 11: pin the turn's context, then finalize its documents.
 
-        The ordering is the whole point [r3-4]. The estimate is the last thing that happens before
-        the first Responses API call of the turn — and the document summarizer IS a Responses API
-        call, so it has to come after. Otherwise a turn that could never have been sent still
-        spends a utility-model call per attached document to find that out.
+        Documents are finalized BEFORE the request is assembled (CONTEXT_METER C-30): their
+        summaries are part of the request, so the handler's first assembly has to find them
+        already written. Nothing here measures or refuses — the request's size is decided by
+        OpenAI's own count, in the wrapper that sends it.
 
-        Each summary is then capped to what the estimate reserved for that document's raw text: the
-        request was admitted at a size, and a summary is not allowed to exceed it afterwards.
-
-        A catch-up turn's carried documents are finalized here too [r5-2], for the same reason and
-        under the same gate: the queue drain that staged them could not summarize them, because it
-        runs before this turn exists.
+        A catch-up turn's carried documents are finalized here too [r5-2]: the queue drain that
+        staged them could not summarize them, because it runs before this turn exists.
         """
         from message_processor.channel_request import (ChannelTurnContext, RequesterFacts,
                                                        canonical_files_from_stream,
                                                        cohort_sources_from_message,
-                                                       merge_absent_source_files,
-                                                       raise_if_over_budget)
+                                                       merge_absent_source_files)
 
         meta = message.metadata or {}
         cohort = cohort_sources_from_message(message)
@@ -1408,28 +1296,15 @@ class MessageProcessor(ThreadManagementMixin,
         )
         turn.channel_turn_context = ctx
 
-        model = effective_request_model(thread_config)
-        request, *_ = await self._assemble_channel_attempt(
-            client, message, thread_state, turn, thread_config, model,
-            thread_key=f"{thread_state.channel_id}:{thread_state.thread_ts}",
-            with_estimate=True)
-        estimate = request.estimate
-        self.log_info(
-            f"Channel request admission for {message.channel_id}: ~{estimate.total_tokens:,} of "
-            f"{estimate.limit_tokens:,} usable input tokens {estimate.breakdown}")
-        raise_if_over_budget(estimate, channel_id=str(message.channel_id),
-                             counted_text=("" if estimate.fits else request.countable_text))
         await self.finalize_deferred_documents(
             list(document_inputs or []), client, message, thinking_id,
-            reserves=estimate.document_reserves,
             # CV8: attach-time summarization is a Responses call on this turn, so it needs the
             # turn's attempt sink or "one model_response per attempt" is false for it.
             turn=turn,
         )
         # [r5-2] And the documents an earlier queued message brought, which the drain staged rather
-        # than summarizing. NO reserve: they are not in this request — the estimate never charged
-        # them — so there is no room to cap their summaries against. What they are here for is the
-        # ledger row that makes read_document/mount_file able to reach them.
+        # than summarizing. They are not in this request; what they are here for is the ledger row
+        # that makes read_document/mount_file able to reach them.
         carried_documents = (message.metadata or {}).get("batched_deferred_documents") or []
         if carried_documents:
             await self.finalize_deferred_documents(

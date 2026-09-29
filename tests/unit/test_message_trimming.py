@@ -1,6 +1,8 @@
 """
 Tests for message trimming, preservation, and document summarization functionality
 """
+import asyncio
+
 import pytest
 from unittest.mock import patch
 from message_processor.base import MessageProcessor
@@ -169,7 +171,7 @@ class TestMessageTrimming:
         assert processor._should_preserve_message(summarized_doc), "Summarized documents should be preserved"
         
     def test_async_post_response_cleanup_under_threshold(self, processor):
-        """Test async cleanup does nothing when under threshold"""
+        """Test async cleanup does nothing when the thread's context measure is under threshold"""
         thread_state = ThreadState(
             channel_id="C123",
             thread_ts="T456",
@@ -177,15 +179,13 @@ class TestMessageTrimming:
                 {"role": "user", "content": "Small message", "metadata": {}}
             ]
         )
-        
-        # Mock token counting to be under threshold
-        with patch.object(processor.thread_manager._token_counter, 'count_thread_tokens') as mock_count:
-            mock_count.return_value = 50000  # Well under 80% of limit
-            
-            with patch.object(processor, '_smart_trim_with_summarization') as mock_trim:
-                # Run cleanup
-                processor._async_post_response_cleanup(thread_state, "C123:T456")
-                
-                # Should NOT have called trim
-                mock_trim.assert_not_called()
-    
+        # An accepted official measure well under the cleanup threshold
+        thread_state.record_measure(50000, True, thread_state.allocate_dispatch_seq(),
+                                    thread_state.meter_generation, thread_state.current_model,
+                                    "usage")
+
+        with patch.object(processor, '_smart_trim_with_summarization') as mock_trim:
+            asyncio.run(processor._async_post_response_cleanup(thread_state, "C123:T456"))
+
+            # Should NOT have called trim
+            mock_trim.assert_not_called()

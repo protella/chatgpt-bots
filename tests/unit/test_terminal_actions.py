@@ -361,7 +361,6 @@ def _terminal_processor(loop_result, *, background=False, sandbox_assets=(), art
         return ""
 
     host._inject_image_analyses = _passthru
-    host._pre_trim_messages_for_api = _passthru
     host._build_channel_info = _empty
     host._drop_dead_containers = _none
     host._resolve_ci_container = _none
@@ -405,7 +404,7 @@ async def test_a_silent_turn_still_hands_over_everything_it_produced():
     thread_state = SimpleNamespace(
         messages=[{"role": "user", "content": "hi"}], channel_id="C1", thread_ts="10.0",
         current_model="gpt-5.6-sol", config_overrides={}, has_summary_head=False,
-        channel_directives=None, record_usage=MagicMock(), last_usage=None)
+        channel_directives=None, last_usage=None)
 
     async def fake_config(**kw):
         return {"model": "gpt-5.6-sol", "temperature": 1.0, "max_tokens": 100,
@@ -442,7 +441,7 @@ async def test_a_started_job_is_never_hidden_by_the_silence_that_accompanied_it(
     thread_state = SimpleNamespace(
         messages=[{"role": "user", "content": "hi"}], channel_id="C1", thread_ts="10.0",
         current_model="gpt-5.6-sol", config_overrides={}, has_summary_head=False,
-        channel_directives=None, record_usage=MagicMock(), last_usage=None)
+        channel_directives=None, last_usage=None)
 
     async def fake_config(**kw):
         return {"model": "gpt-5.6-sol", "temperature": 1.0, "max_tokens": 100,

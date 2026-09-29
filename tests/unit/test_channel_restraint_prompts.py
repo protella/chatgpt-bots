@@ -1048,7 +1048,7 @@ def _assembled(contract_suffix):
                                                 sender_type="human"))
     return channel_request.assemble_channel_request(
         processor=host, client=MagicMock(), ctx=ctx, model="gpt-5.6-sol", tools=None,
-        request_config=thread_config(), contract_suffix=contract_suffix, with_estimate=True)
+        request_config=thread_config(), contract_suffix=contract_suffix)
 
 
 def test_the_conduct_paragraph_lands_after_the_breakpoint():
@@ -1068,14 +1068,14 @@ def test_the_conduct_paragraph_lands_after_the_breakpoint():
     assert min(carriers) > breakpoint_index
 
 
-def test_the_conduct_paragraph_is_charged_by_admission():
-    """Every byte a turn sends is measured before the turn is allowed to run. A paragraph the
-    estimate did not see is a paragraph that can push a request past the window after it was
-    admitted — the one failure mode admission exists to prevent."""
+def test_the_conduct_paragraph_rides_the_request_that_is_measured():
+    """The context meter counts the request the wrapper actually sends, so the paragraph has to be
+    IN that request — in the suffix, on the turns that expose the tool, and nowhere otherwise."""
     with_conduct = _assembled(CONDUCT)
     without = _assembled(None)
-    assert with_conduct.estimate.total_tokens > without.estimate.total_tokens
     assert CONDUCT in with_conduct.input_items[-1]["content"]
+    assert not any(isinstance(item.get("content"), str) and CONDUCT in item["content"]
+                   for item in without.input_items)
 
 
 # -------------------------------------------------------------- the two byte-identity guarantees

@@ -27,9 +27,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from config import config
-from message_processor.channel_request import estimate_admission
 from message_processor.stale_send_guard import ts_key
-from openai_client.api.responses import STALE_RECONSIDERATION_RESPONSE_FORMAT
 from slack_client.history_fetch import FetchBudget, iter_pages, page_messages
 
 
@@ -322,13 +320,9 @@ class DMReconsiderSurface:
 
         items: List[Dict[str, Any]] = snapshot.input_items()
         items.append(reconsideration_item(pass_number, draft, self.trigger_line()))
-        estimate = estimate_admission(
-            instructions=self.ctx.instructions, input_items=items, tools=None,
-            raw_document_texts=(), native_file_bounds=(), model=self.model,
-            response_format=STALE_RECONSIDERATION_RESPONSE_FORMAT)
         cfg = self.ctx.thread_config or {}
         return PreparedDecision(
-            instructions=self.ctx.instructions, api_items=items, estimate=estimate,
+            instructions=self.ctx.instructions, api_items=items,
             params={"reasoning_effort": cfg.get("reasoning_effort"),
                     "verbosity": cfg.get("verbosity"),
                     "max_output_tokens": cfg.get("max_tokens"),

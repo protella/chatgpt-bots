@@ -54,9 +54,11 @@ from message_processor.canvas_content import CANVAS_MIMETYPE
 from config import clamp_effort, config
 from message_processor import document_tools, outbound_receipts
 from message_processor.artifacts import strip_citation_markers, strip_sandbox_links
+from message_processor.context_meter import MeterHook, usable_limit
 from message_processor.destination_tools import parse_destination_marker
 from message_processor.tool_registry import (SURFACE_CHANNEL, SURFACE_DM, ToolContext,
                                              ToolRegistry)
+from openai_client.api.token_count import CountResult
 from openai_client.api.tool_loop import NO_CAP
 
 # Process-lifetime flag: set once a labelled findings post fails (likely a missing
@@ -2182,6 +2184,7 @@ async def _consume_research_stream(processor, *, messages: List[Dict[str, Any]],
                                    pre_round_input_callback: Optional[
                                        Callable[[], Any]] = None,
                                    job_id: str = "",
+                                   meter: Optional[MeterHook] = None,
                                    ) -> Dict[str, Any]:
     """Run the job's Responses tool loop as an INTERNAL stream (never streamed to Slack).
 
@@ -2283,6 +2286,10 @@ async def _consume_research_stream(processor, *, messages: List[Dict[str, Any]],
         extra["artifacts_sink"] = artifacts_sink
     if container_gone_sink is not None:
         extra["container_gone_sink"] = container_gone_sink
+    if meter is not None:
+        # Only the build phase passes one (a detached hook); research and delivery planning
+        # send exactly what they always sent.
+        extra["meter"] = meter
     result = await processor.openai_client.create_streaming_response_with_tool_loop(
         messages=messages, tools=tools, registry=registry, tool_context=tool_context,
         stream_callback=_stream_cb, tool_callback=None, tool_event_callback=_on_event,
@@ -2928,73 +2935,6 @@ def _is_retryable_build_error(e: BaseException) -> bool:
         return False
 
 
-async def _thread_document_bounds(processor, thread_key: str
-                                  ) -> Dict[str, Tuple[Optional[int], Optional[int]]]:
-    """filename → (size_bytes, total_pages) for this thread's documents.
-
-    The metadata `_native_file_bounds` needs to price a native part properly, read once per
-    build. Rows come back oldest-first, so a filename written twice keeps the NEWEST row —
-    the one carrying whatever richer metadata arrived later, same rule as the file catalog's
-    dedupe. Never raises: a lookup failure costs the better estimate, not the build.
-    """
-    db = getattr(processor, "db", None)
-    if db is None:
-        return {}
-    try:
-        rows = await db.get_thread_documents_async(thread_key)
-    except Exception as e:  # noqa: BLE001
-        processor.log_warning(f"Document metadata lookup failed for {thread_key}: {e}")
-        return {}
-    bounds: Dict[str, Tuple[Optional[int], Optional[int]]] = {}
-    for row in rows or []:
-        filename = row.get("filename")
-        if filename:
-            bounds[str(filename)] = (row.get("size_bytes"), row.get("total_pages"))
-    return bounds
-
-
-def _native_file_bounds(items: List[Dict[str, Any]],
-                        doc_bounds: Optional[Dict[str, Tuple[Optional[int], Optional[int]]]] = None
-                        ) -> List[int]:
-    """Worst-case token bound per native file part actually present in the candidate input.
-
-    Priced off the thread's DOCUMENT METADATA, through the same `native_file_token_bound` the
-    interactive path uses — never reimplemented here. Charging one token per base64 character
-    prices a PDF's container bytes (mostly compressed images, fonts and object tables) as text
-    the API will read, and the API never reads them: live, a 24-page PDF converted from a 76MB
-    pptx scored ~2.27M tokens inside a 2,287-token thread, so the 2,867-character revision
-    master the job had been asked to edit was dropped for want of room nothing was occupying.
-
-    An `input_file` part legally carries `filename` (`utilities._API_PART_KEYS`), which is what
-    matches it to a row. A part with no matching row falls back to the base64 length exactly as
-    before — no new failure mode — and a matched row with no page count resolves to its byte
-    count, which is that same behaviour and is the right bound for a CSV/XLSX.
-
-    The extracted text is deliberately NOT part of the charge: raw document text is never
-    persisted (CLAUDE.md pitfall 4), so a paged file is charged its pages leg alone. That is a
-    SMALLER ceiling than the interactive path's, and accepted — it is still a ceiling on the
-    render leg, admission keeps `_REVISION_ADMISSION_HEADROOM` under the model's limit, and the
-    alternative it replaces was a ~1000x over-estimate that silently discarded the master.
-    """
-    from message_processor.channel_request import native_file_token_bound
-
-    known = doc_bounds or {}
-    bounds: List[int] = []
-    for item in items:
-        content = item.get("content")
-        if not isinstance(content, list):
-            continue
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "input_file":
-                metadata = known.get(str(part.get("filename") or ""))
-                if metadata is None:
-                    bounds.append(len(part.get("file_data") or ""))
-                else:
-                    size_bytes, total_pages = metadata
-                    bounds.append(native_file_token_bound(size_bytes, total_pages))
-    return bounds
-
-
 async def _bank_wedged_container(processor, *, job_id: str, ledger_key: str,
                                  container_ids: List[str], suppress_digests: List[str],
                                  expect_filenames: List[str],
@@ -3074,10 +3014,11 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
 
     Never raises: a build failure costs the file, not the research report.
     """
-    from message_processor import (channel_request, export_tool, fetch_to_sandbox, file_mount,
-                                   image_catalog, image_tools)
+    from message_processor import (export_tool, fetch_to_sandbox, file_mount, image_catalog,
+                                   image_tools)
     from message_processor.artifacts import collect_container_ids
     from message_processor.containers import auto_container, replace_wedged_container
+    from openai_client.base import _build_request_params
     from openai_client.container_errors import (is_container_wedged, persistent_container_ids,
                                                 pin_container_tools, wedged_container_ids)
 
@@ -3221,42 +3162,56 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
         items.extend(steering_items)
         return items
 
+    # The build loop's effort and verbosity, fixed for the whole build. Named once because the
+    # admission count below must describe the SAME request the loop's first round sends.
+    build_effort = clamp_effort(model, getattr(config, "deep_research_reasoning_effort",
+                                               "high") or "high")
+    build_verbosity = getattr(config, "deep_research_verbosity", "medium") or "medium"
+
     build_input: List[Dict[str, Any]] = _assemble(_revision_master_items(master))
     if master is not None and master.get("text"):
-        # Admission at ASSEMBLY time, which is the first moment the real numbers exist — the
+        # Admission at ASSEMBLY time, which is the first moment the real request exists — the
         # tools list and the instruction text are both built by now. A master that would push
         # the build over the window is replaced by the unavailable item rather than truncated:
         # the build then knows to mount the file, instead of editing half of it.
         #
-        # The thread's document metadata is read ONCE here, and only where there is an admission
-        # check to spend it on: it is what prices a native file part by its pages rather than by
-        # the length of its base64 blob (see _native_file_bounds).
-        doc_bounds = await _thread_document_bounds(processor, thread_key)
+        # Decided on OpenAI's own count of the request the loop's first round would send, built
+        # by the same builder with the same arguments `_consume_research_stream` passes it.
+        # Native files, images and MCP tools are priced by the counter itself, never by us.
+        budget = usable_limit(model) - _REVISION_ADMISSION_HEADROOM
 
-        def _fits(candidate: List[Dict[str, Any]]) -> Tuple[bool, Any]:
-            est = channel_request.estimate_admission(
-                instructions=system_prompt or "", input_items=candidate, tools=tools,
-                raw_document_texts=[],
-                native_file_bounds=_native_file_bounds(candidate, doc_bounds),
-                model=model)
-            return (est.total_tokens + _REVISION_ADMISSION_HEADROOM <= est.limit_tokens), est
-        admitted, estimate = _fits(build_input)
-        if not admitted:
+        async def _count(candidate: List[Dict[str, Any]]) -> CountResult:
+            return await processor.openai_client.count_input_tokens(_build_request_params(
+                model=model, input_items=candidate, system_prompt=system_prompt,
+                reasoning_effort=build_config.get("reasoning_effort"),
+                effort_override=build_effort, reasoning_summary="auto",
+                verbosity=build_verbosity, stream=True, store=False, tools=tools,
+                parallel_tool_calls=True, legacy_kind="tools"))
+
+        measured = await _count(build_input)
+        if measured.tokens is None or not measured.complete:
+            # An unknown number is not a reason to drop the file the job was asked to edit: keep
+            # the master and let the API be the judge.
+            processor.log_warning(
+                f"Build phase {job_id}: revision master {master.get('filename')!r} kept without "
+                f"a complete input count ({measured.tokens} tokens, complete="
+                f"{measured.complete}); proceeding")
+        elif measured.tokens > budget:
             processor.log_warning(
                 f"Build phase {job_id}: revision master {master.get('filename')!r} does not fit "
-                f"({estimate.total_tokens} + {_REVISION_ADMISSION_HEADROOM} headroom tokens vs "
-                f"limit {estimate.limit_tokens}); building without it")
+                f"({measured.tokens} tokens vs {budget} = usable limit less "
+                f"{_REVISION_ADMISSION_HEADROOM} headroom); building without it")
             master = {"filename": master.get("filename") or _REVISION_UNNAMED,
                       "reason": "too large to inline"}
             build_input = _assemble(_revision_master_items(master))
             # Verification, not an assertion: if even the one-line unavailable variant is over
             # the limit, the whole build was never going to be admitted and that is not this
             # round's problem to solve. Say so in the log and proceed.
-            re_admitted, re_estimate = _fits(build_input)
-            if not re_admitted:
+            recounted = await _count(build_input)
+            if recounted.tokens is not None and recounted.tokens > budget:
                 processor.log_warning(
                     f"Build phase {job_id}: input still over the limit without the master "
-                    f"({re_estimate.total_tokens} vs {re_estimate.limit_tokens}); proceeding")
+                    f"({recounted.tokens} vs {budget}); proceeding")
 
     artifacts: List[Any] = []
     containers_gone: List[Any] = []
@@ -3386,15 +3341,16 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
                                  f"({attempt + 1}/{total_attempts})…")
         return True
 
+    build_meter = MeterHook(client=processor.openai_client,
+                            schedule=processor._schedule_async_call, thread_state=None,
+                            key=f"build {job_id}")
     attempt = 1
     while attempt <= total_attempts:
         try:
             result = await _consume_research_stream(
                 processor, messages=attempt_input, tools=tools, registry=registry,
                 tool_context=build_ctx, model=model, system_prompt=system_prompt,
-                effort=clamp_effort(model, getattr(config, "deep_research_reasoning_effort",
-                                                   "high") or "high"),
-                verbosity=getattr(config, "deep_research_verbosity", "medium") or "medium",
+                effort=build_effort, verbosity=build_verbosity,
                 # F38: the SAME card the research phase drove. It used to be handed None here,
                 # which left the longest, quietest half of a job — minutes of sandbox work
                 # between two update_todos calls — with no live line at all.
@@ -3403,7 +3359,10 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
                 # No ration and no clock: a build is done when the files are built and verified,
                 # and running out of rounds mid-build is the difference between a deck and an
                 # apology.
-                job_id=job_id)
+                job_id=job_id,
+                # DETACHED: every round's parallel count is logged, none is preflighted and none
+                # writes a thread's meter — the build is not a turn of the thread it serves.
+                meter=build_meter)
             # The wedge that raises NOTHING. A sandbox that can no longer run code can also let
             # the response complete cleanly, so "the stream finished" is not "the build ran": the
             # detector marks the container in this same artifacts sink, and this is the only place

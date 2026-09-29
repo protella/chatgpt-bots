@@ -507,6 +507,15 @@ class TurnRuntime:
     # estimate measured and the request that gets sent are built from the same evidence — and so
     # the canvas API call behind the catalog happens once per turn rather than once per attempt.
     channel_prepared: Any = field(default=None, repr=False)
+    # CONTEXT METER (CONTEXT_METER_SPEC §3.5). The turn's ONE recovery from a request over the
+    # context window — set before the compaction it pays for is awaited, and read by every
+    # re-entry (streaming, the buffered fallback, the MCP retry), so no path can spend it twice.
+    context_recovery_used: bool = False
+    # This turn's MeterHook, built once by the handler and reused by every attempt.
+    context_meter: Any = field(default=None, repr=False)
+    # Which build of this turn's channel stream is installed: 0 for the first, +1 for each
+    # rebuild after a foreground thread compaction (R3-1). `stream_render.build_seq`.
+    stream_build_seq: int = 0
     # Who has spoken in the ORIGIN thread, `{user_id: name}`, read off the pinned stream. The
     # roster's tail: people who may not have spoken inside the window but are plainly part of the
     # conversation this turn is in.
@@ -526,8 +535,8 @@ class TurnRuntime:
     # Did a stream build actually happen? Distinguishes "channel turn that rendered the room"
     # from one that failed closed before the fetch — a distinction turn_outcome reports.
     stream_build_present: bool = False
-    # Which fail-closed condition ended this turn, as one of the three declared codes
-    # (stream_data_invalid, stream_over_budget, history_fetch_failed). None on a turn that did
+    # Which fail-closed condition ended this turn, as one of the declared codes
+    # (stream_data_invalid, origin_fetch_failed, history_fetch_failed). None on a turn that did
     # not fail that way.
     turn_error: Optional[str] = None
     # WHERE this turn's own words landed. Appended at the first Slack-accepted surface, marked

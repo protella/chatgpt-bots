@@ -30,6 +30,7 @@ one that failed.
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import inspect
 import json
@@ -86,7 +87,9 @@ REACH_TOOLS = prompts.REACH_TOOLS
 # v6: the image marker's bytes changed — its gist is now a text-first analysis that can carry
 # words painted into someone's image, so the marker names the payload as quoted content
 # (IMAGE_MARKER_FRAME) and neutralizes brackets inside it.
-SERIALIZER_VERSION = 6
+# v7: the origin block may carry a frozen THREAD SUMMARY (CONTEXT_METER §3.6) — a summarized
+# header, one synthetic summary item after the root, and no items for the covered messages.
+SERIALIZER_VERSION = 7
 
 # Versions the SELECTION POLICY — floor semantics, target/ceiling arithmetic,
 # eligibility — separately from the serializer GRAMMAR, because a policy change must
@@ -130,6 +133,22 @@ ORIGIN_HEADER_TEMPLATE = (
     "This is the whole of the thread you are being asked in. Messages from it may also appear "
     "above, in the channel's recent activity; that is the same thread seen from the room."
 )
+
+# The same header when the origin's earlier messages are carried by a frozen thread summary
+# (CONTEXT_METER §3.6): "complete" gives way to what is true instead. `origin_count` still counts
+# rendered MESSAGE items only — the summary item is not a message.
+ORIGIN_HEADER_SUMMARIZED_TEMPLATE = (
+    "[CURRENT THREAD — thread={origin_root_ts} — its earlier messages are summarized below; the "
+    "originals are still in Slack, {origin_count} messages]\n"
+    "This is the whole of the thread you are being asked in. Messages from it may also appear "
+    "above, in the channel's recent activity; that is the same thread seen from the room."
+)
+
+# The synthetic summary item's framing. Both prefixes are A2-reserved, so no payload line can
+# forge either one; the summary text itself is escaped the same way.
+SUMMARY_ITEM_HEAD_TEMPLATE = ("[THIS THREAD BEFORE {before}: {covered_count} earlier messages, "
+                              "summarized]")
+SUMMARY_ITEM_TAIL = "[END EARLIER THREAD CONTEXT]"
 
 # A5. The orphaned-reply marker. A reply at or above the floor may belong to a root BELOW it;
 # that reply renders a `thread=<root_ts>` label pointing at a root the model cannot see anywhere,
@@ -239,10 +258,6 @@ class SidecarPinMismatch(ChannelStreamError):
 
 class FreezeError(ChannelStreamError):
     """§1p: a pin carries a cycle, or a value of a type the freeze policy has no rule for."""
-
-
-class StreamOverBudgetError(ChannelStreamError):
-    """The assembled request cannot fit the model's context even before the API sees it."""
 
 
 class StreamTimestampError(ChannelStreamError, ValueError):
@@ -437,6 +452,24 @@ class SidecarPin:
 
 
 @dataclass(frozen=True)
+class OriginSummary:
+    """A thread summary judged valid against THIS origin fetch and frozen onto its pin
+    (CONTEXT_METER §3.6). `covered_ts` are the eligible messages it speaks for — they render no
+    item of their own; `first_uncovered_ts` is the first eligible message after the boundary."""
+    text: str
+    boundary_ts: str
+    covered_ts: FrozenSet[str]
+    first_uncovered_ts: Optional[str]
+    # The stored row's fingerprint — with `boundary_ts`, the identity of the row this pin was
+    # judged against, which a later commit from this pin must still find in place (R3-3).
+    source_fingerprint: Optional[str] = None
+
+    @property
+    def covered_count(self) -> int:
+        return len(self.covered_ts)
+
+
+@dataclass(frozen=True)
 class PinnedTuple:
     """Everything the build is a pure function of, once the world has been read.
 
@@ -490,6 +523,16 @@ class PinnedTuple:
     serializer_config: Mapping[str, Any] = field(default_factory=dict)
     sidecar_markers: Tuple[Tuple[str, Tuple[str, ...]], ...] = ()
     chrome_ts: FrozenSet[str] = frozenset()
+    # --- the origin's thread summary (CONTEXT_METER §3.6) -----------------------------------
+    # What no summary may cover: the trigger plus the newest TOKEN_TRIM_MESSAGE_COUNT eligible.
+    protected_ts: FrozenSet[str] = frozenset()
+    # The stored summary, judged valid at pin time; None renders the origin in full.
+    origin_summary: Optional[OriginSummary] = None
+    # A stored row that did NOT judge valid (R3-2). The builder only reports it: the normal turn
+    # path deletes it, the reconsideration snapshot and the probe never write. `summary_judged`
+    # is the (boundary_ts, source_fingerprint) that was judged, which the delete re-checks.
+    summary_invalid: bool = False
+    summary_judged: Optional[Tuple[str, Optional[str]]] = None
 
     def __post_init__(self) -> None:
         _checked_ts(self.H, "H")
@@ -526,6 +569,18 @@ class PinnedTuple:
                 f"recomputed-only={sorted(recomputed - supplied)}); the pin and the selection "
                 "that acted on it disagree about which of our own messages are chrome")
         object.__setattr__(self, "chrome_ts", supplied)
+
+    def with_origin_summary(self, summary: Optional[OriginSummary]) -> "PinnedTuple":
+        """The same pin with a different origin summary — and NOTHING ELSE recomputed (R3-1).
+
+        Not `dataclasses.replace`: that re-runs `__post_init__`, which re-renders the sidecar
+        markers from live configuration and could move the frozen pre-breakpoint bytes. A
+        shallow copy keeps every already-frozen field exactly as it was pinned."""
+        clone = copy.copy(self)
+        object.__setattr__(clone, "origin_summary", summary)
+        object.__setattr__(clone, "summary_invalid", False)
+        object.__setattr__(clone, "summary_judged", None)
+        return clone
 
     @property
     def inventory_state(self) -> str:
@@ -1137,10 +1192,21 @@ def render_horizon(*, floor_ts: str, inventory_state: str,
     return HORIZON_TEMPLATE.format(floor_ts=floor_ts, reach_clause=reach, index_clause=clause)
 
 
-def render_origin_header(*, origin_root_ts: str, origin_count: int) -> str:
-    """The A2 origin header item content."""
-    return ORIGIN_HEADER_TEMPLATE.format(origin_root_ts=origin_root_ts,
-                                         origin_count=int(origin_count))
+def render_origin_header(*, origin_root_ts: str, origin_count: int,
+                         summarized: bool = False) -> str:
+    """The A2 origin header item content — the summarized variant when a thread summary carries
+    the origin's earlier messages."""
+    template = ORIGIN_HEADER_SUMMARIZED_TEMPLATE if summarized else ORIGIN_HEADER_TEMPLATE
+    return template.format(origin_root_ts=origin_root_ts, origin_count=int(origin_count))
+
+
+def render_summary_item(summary: "OriginSummary", *, h: str) -> str:
+    """The synthetic summary item (§3.6 Rendering): head, the escaped summary, tail. `before` is
+    the first uncovered message's minute — or H's, when nothing after the boundary rendered."""
+    before = iso_minute(summary.first_uncovered_ts or h)
+    head = SUMMARY_ITEM_HEAD_TEMPLATE.format(before=before,
+                                             covered_count=summary.covered_count)
+    return f"{head}\n{escape_payload(summary.text)}\n{SUMMARY_ITEM_TAIL}"
 
 
 def render_orphan_marker(*, root_ts: str, reach_tools: Sequence[str] = ()) -> str:
@@ -1593,11 +1659,19 @@ def serialize_stream(pinned: PinnedTuple) -> ChannelStream:
     canonical.append(end_marker)
     items = tuple(canonical)
 
-    # ---- the post-breakpoint origin block: the COMPLETE thread, never truncated -------------
+    # ---- the post-breakpoint origin block: the whole thread -------------------------------
+    # With a frozen thread summary the COVERED messages render no item — and record no receipt
+    # membership, because they do not render — and one synthetic summary item stands in for them
+    # right after the root (§3.6). It carries no ts: it is not a message, not an edit target and
+    # never a stale-send lease.
+    summary = pinned.origin_summary
+    covered = summary.covered_ts if summary is not None else frozenset()
     origin_by_ts = {m.ts: m for m in pinned.origin_snapshot}
     origin_ordered = sorted(pinned.origin_snapshot, key=lambda m: parse_ts(m.ts))
     origin_items: List[StreamItem] = []
     for message in origin_ordered:
+        if message.ts in covered:
+            continue
         role = _role_for(message)
         if role is None:
             continue
@@ -1605,13 +1679,20 @@ def serialize_stream(pinned: PinnedTuple) -> ChannelStream:
         origin_items.append(_render_message_item(
             message, role=role, actor_names=actor_names, root=root, markers=markers,
             files_limit=files_limit, reactions_limit=reactions_limit))
+    origin_count = len(origin_items)
+    if summary is not None:
+        root_rendered = bool(origin_items) and (
+            origin_items[0].metadata.get("ts") == str(pinned.origin_root_ts or ""))
+        origin_items.insert(1 if root_rendered else 0, StreamItem(
+            role=ROLE_USER, content=render_summary_item(summary, h=pinned.H), metadata={}))
 
     origin_header = None
     if origin_items:
         origin_header = StreamItem(
             role=ROLE_USER,
             content=render_origin_header(origin_root_ts=str(pinned.origin_root_ts or ""),
-                                         origin_count=len(origin_items)),
+                                         origin_count=origin_count,
+                                         summarized=summary is not None),
             metadata={})
 
     # ---- the two hashes, on the LANDED v1 framing ------------------------------------------
@@ -1656,7 +1737,7 @@ def serialize_stream(pinned: PinnedTuple) -> ChannelStream:
         byte_count=byte_count,
         origin_byte_count=origin_byte_count,
         message_count=len(message_items),
-        origin_count=len(origin_items),
+        origin_count=origin_count,
         candidate_count=len(pinned.fetch_snapshot),
         root_count=len({m.ts for m in periphery if not m.is_reply}),
         orphan_root_count=orphan_root_count,
@@ -1880,13 +1961,18 @@ async def _gather_or_cancel(tasks: List[asyncio.Task]) -> List[Any]:
 # ---------------------------------------------------------------- the build
 
 def _emit_stream_render(result: StreamBuildResult, *, turn_id: Optional[str],
-                        origin_root_ts: Optional[str], trigger_ts: Optional[str]) -> None:
+                        origin_root_ts: Optional[str], trigger_ts: Optional[str],
+                        build_seq: int = 0) -> None:
     """One line per BUILD, for the TURN population only. TAKES THE WHOLE CARRIER.
 
     `result.stream.stream_render_fields()` supplies everything derivable from the build;
     `reselected`, `anchor_advanced` and all THREE page counts come off the carrier, because none
     of them is knowable at serialization — the two booleans postdate the bytes and the page
     counts postdate the pin the bytes were made from.
+
+    `build_seq` numbers the builds of ONE turn: 0 for the first, +1 for each rebuild after a
+    compaction. It is a fact about this emission, not about the stream, so it rides beside the
+    stream's fields rather than inside them.
 
     A build with NO turn_id is not a turn: the dev probes and out-of-process rebuilds all come
     through here, and their rows would join to nothing and inflate the build count. So they emit
@@ -1901,7 +1987,7 @@ def _emit_stream_render(result: StreamBuildResult, *, turn_id: Optional[str],
             turn_id=turn_id, origin_thread_ts=origin_root_ts, trigger_ts=trigger_ts,
             reselected=result.reselected, anchor_advanced=result.anchor_advanced,
             history_pages=result.pages.history, reply_pages=result.pages.reply,
-            origin_pages=result.pages.origin,
+            origin_pages=result.pages.origin, build_seq=build_seq,
             **result.stream.stream_render_fields())
     except Exception as e:  # noqa: BLE001
         logger.debug(f"stream_render telemetry not emitted: {e}")
@@ -2356,8 +2442,16 @@ def _discovery_roots(candidates: Sequence[NormalizedMessage], discovery: Mapping
 
 
 async def build_origin_pin(shared: SharedChannelPin, origin_fetch: OriginFetch, *,
-                           db: Any, client: Any = None) -> Tuple[PinnedTuple, int]:
+                           db: Any, client: Any = None,
+                           protected_ts: FrozenSet[str] = frozenset()
+                           ) -> Tuple[PinnedTuple, int]:
     """The per-origin pin AND that origin's page count. It performs NO Slack fetch.
+
+    It READS the origin's thread summary row and judges it (CONTEXT_METER §3.6, R3-2) — and never
+    writes: a valid row is frozen onto the pin as `origin_summary`, an invalid one is only
+    reported (`summary_invalid`) for the turn path to act on. `protected_ts` is the caller's
+    trigger; the newest TOKEN_TRIM_MESSAGE_COUNT eligible origin messages join it here, where the
+    eligible set is first known.
 
     IT VALIDATES THE DEADLINE IT CAN ACTUALLY SEE. This is a WIRING assertion, not a timeout: it
     catches a caller that built the two components against two clocks, which is the defect the
@@ -2431,6 +2525,18 @@ async def build_origin_pin(shared: SharedChannelPin, origin_fetch: OriginFetch, 
         for uid, name in origin_names:
             actor_map.setdefault(uid, name)
 
+    # The origin's thread summary: protected set, then the READ-ONLY judgment of the stored row.
+    from message_processor import channel_thread_summary
+
+    eligible = channel_thread_summary.eligible_origin(
+        origin_messages, sidecars=merged,
+        receipt_feature_epoch_ts=merged.receipt_feature_epoch_ts, chrome_ts=chrome_ts)
+    protected = channel_thread_summary.protected_set(
+        eligible, frozenset(protected_ts), int(config.token_trim_message_count))
+    judgement = await channel_thread_summary.load_judgement(
+        db, channel_id=shared.channel_id, origin_root_ts=origin_fetch.origin_root_ts,
+        origin_snapshot=origin_messages, eligible=eligible, h=shared.h, protected=protected)
+
     pinned = PinnedTuple(
         team_id=shared.team_id, channel_id=shared.channel_id,
         window=(shared.periphery_floor_ts, True), H=shared.h,
@@ -2452,7 +2558,11 @@ async def build_origin_pin(shared: SharedChannelPin, origin_fetch: OriginFetch, 
         receipt_map=tuple((r.ts, r.state, r.turn_id, r.thread_root_ts) for r in merged.receipts),
         sidecars=merged,
         serializer_config=dict(shared.serializer_config),
-        chrome_ts=chrome_ts)
+        chrome_ts=chrome_ts,
+        protected_ts=protected,
+        origin_summary=judgement.summary,
+        summary_invalid=judgement.invalid,
+        summary_judged=judgement.judged)
     return pinned, origin_fetch.pages
 
 
@@ -2468,7 +2578,9 @@ async def build_channel_stream(*, client: Any, db: Any, team_id: str, channel_id
                                origin_budget: Optional[FetchBudget] = None,
                                barrier_context: Optional[Dict[str, Any]] = None,
                                turn_id: Optional[str] = None,
-                               trigger_ts: Optional[str] = None) -> StreamBuildResult:
+                               trigger_ts: Optional[str] = None,
+                               protected_ts: FrozenSet[str] = frozenset()
+                               ) -> StreamBuildResult:
     """Build one channel turn's stream. THE COMPOSITION of the phases above.
 
     Its signature, its position in the turn and its observable behaviour are what every caller
@@ -2514,7 +2626,8 @@ async def build_channel_stream(*, client: Any, db: Any, team_id: str, channel_id
         client, channel_id, origin_root_ts, h, origin_budget, trigger_ts))
     shared, origin_fetch = await _gather_or_cancel([shared_task, origin_task])
 
-    pinned, origin_pages = await build_origin_pin(shared, origin_fetch, db=db, client=client)
+    pinned, origin_pages = await build_origin_pin(shared, origin_fetch, db=db, client=client,
+                                                  protected_ts=protected_ts)
     stream = serialize_stream(pinned)
 
     # PERSIST F' — skipped when the floor is the sentinel or unchanged. A failure is a WARNING,
@@ -2589,7 +2702,10 @@ async def build_reconsideration_snapshot(*, client: Any, db: Any, team_id: str, 
         client, channel_id, origin_root_ts, pin.h, origin_budget, trigger_ts))
     shared, origin_fetch = await _gather_or_cancel([shared_task, origin_task])
 
-    pinned, origin_pages = await build_origin_pin(shared, origin_fetch, db=db, client=client)
+    # The trigger is protected exactly as it was on the turn: a summary may not have covered it.
+    pinned, origin_pages = await build_origin_pin(
+        shared, origin_fetch, db=db, client=client,
+        protected_ts=frozenset({str(trigger_ts)}) if trigger_ts else frozenset())
     stream = serialize_stream(pinned)
 
     # No anchor persist, no actor-tail reconcile, no `_emit_stream_render` — the snapshot reads

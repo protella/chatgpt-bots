@@ -173,9 +173,6 @@ class _TimeoutHarness:
 @pytest.fixture
 def manager():
     m = AsyncThreadStateManager(db=None)
-    m._token_counter = Mock()
-    m._token_counter.count_message_tokens = Mock(return_value=10)
-    m._token_counter.count_thread_tokens = Mock(return_value=10)
     return m
 
 

@@ -860,6 +860,10 @@ class AmbientArtifactService:
             summary = await self.db.get_thread_summary_async(thread_key)
             if not summary:
                 return  # thread never compacted — nothing for this message to be behind
+            if summary.get("source_fingerprint") is not None:
+                # A CHANNEL origin summary (CONTEXT_METER §3.6): it never takes addenda — READY
+                # artifacts are not summary input, and a late one stays out.
+                return
             boundary = float(summary.get("boundary_ts"))
             source = float(job.source_ts)
         except Exception:  # noqa: BLE001 — missing/non-numeric boundary or ts: skip safely

@@ -4,7 +4,8 @@ from typing import Any, Dict, List, Optional
 
 from message_processor.client_contract import BaseClient, Message
 from message_processor.canvas_content import CANVAS_MIMETYPE
-from config import config, pipeline_status
+from config import clamp_effort, config, pipeline_status
+from message_processor.context_meter import is_context_length_error
 from message_processor.message_markers import (
     ends_with_continuation,
     starts_as_continuation,
@@ -21,105 +22,22 @@ from slack_client.normalizer import parse_ts
 
 class ThreadManagementMixin(_Host):
     def _add_message_with_token_management(self, thread_state, role: str, content: Any, db=None, thread_key: Optional[str] = None, message_ts: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, skip_auto_trim: bool = False):
-        """Helper method to add messages with token management
-        
-        Args:
-            skip_auto_trim: If True, skip the automatic simple trimming (used during rebuild to allow smart trimming later)
-        """
-        # Get dynamic token limit based on current model
-        model = thread_state.current_model or config.gpt_model
-        max_tokens = config.get_model_token_limit(model)
-        
-        # Count tokens for this message
-        msg_tokens = self.thread_manager._token_counter.count_message_tokens({"role": role, "content": content})
-        
-        # Add the message
-        # During rebuild, we skip auto-trim to allow smart trimming with summarization
-        if skip_auto_trim:
-            thread_state.add_message(
-                role=role,
-                content=content,
-                db=db,
-                thread_key=thread_key,
-                message_ts=message_ts,
-                metadata=metadata,
-                token_counter=None,  # Skip automatic trimming
-                max_tokens=None
-            )
-        else:
-            thread_state.add_message(
-                role=role,
-                content=content,
-                db=db,
-                thread_key=thread_key,
-                message_ts=message_ts,
-                metadata=metadata,
-                token_counter=self.thread_manager._token_counter,
-                max_tokens=max_tokens
-            )
-        
-        # Log token info in debug mode
-        total_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
-        self.log_debug(f"MESSAGE ADDED | Role: {role} | Tokens: {msg_tokens} | Total: {total_tokens}/{max_tokens}")
+        """Append one message to the thread state.
 
-    async def _pre_trim_messages_for_api(self, messages: List[Dict[str, Any]], new_message_tokens: int = 0, model: Optional[str] = None, thread_state=None) -> List[Dict[str, Any]]:
-        """Pre-trim messages to fit within context window before sending to API
-        
-        Args:
-            messages: List of messages to potentially trim
-            new_message_tokens: Tokens that will be added (for pre-checks)
-            model: Model name to get appropriate token limit
-            thread_state: Optional thread state for smart trimming
-            
-        Returns:
-            Trimmed list of messages that fits within context
+        Nothing is trimmed at append time any more: the request's size is the context meter's
+        question (message_processor/context_meter.py), answered with OpenAI's own count before
+        the request goes out. `skip_auto_trim` is accepted for its callers' sake and changes
+        nothing.
         """
-        # Get dynamic token limit based on model
-        model = model or config.gpt_model
-        max_tokens = config.get_model_token_limit(model)
-        current_tokens = self.thread_manager._token_counter.count_thread_tokens(messages) + new_message_tokens
-        
-        if current_tokens <= max_tokens:
-            return messages
-        
-        self.log_info(f"Pre-trimming messages: {current_tokens} tokens exceeds {max_tokens} limit")
-        
-        # If we have thread_state, use smart trimming
-        if thread_state:
-            # Apply smart trimming with document summarization
-            trimmed_count = await self._smart_trim_with_summarization(thread_state)
-            if trimmed_count > 0:
-                new_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
-                self.log_info(f"Smart trim complete: {current_tokens} → {new_tokens} tokens ({trimmed_count} messages processed)")
-            return thread_state.messages
-        
-        # Fallback to basic trimming if no thread_state
-        # Find first non-system message index
-        start_index = 0
-        for i, msg in enumerate(messages):
-            if msg.get("role") not in ["system", "developer"]:
-                start_index = i
-                break
-        
-        # Create a copy to work with
-        trimmed_messages = messages.copy()
-        removed_count = 0
-        
-        # Remove messages from the beginning (after system messages)
-        while current_tokens > max_tokens and len(trimmed_messages) > start_index + 1:
-            if start_index < len(trimmed_messages) - 1:
-                trimmed_messages.pop(start_index)
-                removed_count += 1
-                current_tokens = self.thread_manager._token_counter.count_thread_tokens(trimmed_messages) + new_message_tokens
-                self.log_debug(f"Pre-trimmed message {removed_count}, tokens now: {current_tokens}")
-            else:
-                self.log_warning("Cannot trim further - would remove current message")
-                break
-        
-        if removed_count > 0:
-            self.log_info(f"Pre-trimmed {removed_count} messages to fit within context limit")
-        
-        return trimmed_messages
+        thread_state.add_message(
+            role=role,
+            content=content,
+            db=db,
+            thread_key=thread_key,
+            message_ts=message_ts,
+            metadata=metadata,
+        )
+        self.log_debug(f"MESSAGE ADDED | Role: {role} | Messages: {len(thread_state.messages)}")
 
     def _should_preserve_message(self, msg: Dict[str, Any]) -> bool:
         """Determine if a message should be preserved during trimming
@@ -220,7 +138,10 @@ class ThreadManagementMixin(_Host):
                 model=config.utility_model,
                 temperature=0.3,
                 max_tokens=800,  # Increased for better summaries
-                system_prompt=None  # Already using developer message above
+                system_prompt=None,  # Already using developer message above
+                reasoning_effort=clamp_effort(config.utility_model,
+                                              config.utility_reasoning_effort),
+                verbosity=config.utility_verbosity,
             )
             
             # Format the summarized version
@@ -243,6 +164,27 @@ class ThreadManagementMixin(_Host):
                 # Return truncated version with error marker
                 return f"[ERROR: Document too large for model context window]\n{content[:1000]}..."
             return content  # Return original if summarization fails for other reasons
+
+    async def _count_document_summary_request(self, content: str) -> Optional[int]:
+        """The official input-token count of the request `_summarize_document_content` would send
+        for `content` — None when it would send none, or when no count could be taken."""
+        import re
+        doc_text_match = re.search(r'=== DOCUMENT:.*?===\n(.*?)\n=== DOCUMENT END:', content,
+                                   re.DOTALL)
+        if not doc_text_match:
+            return None
+        from message_processor.prompts import DOCUMENT_SUMMARIZATION_PROMPT
+        from openai_client.base import _build_request_params
+        request = _build_request_params(
+            model=config.utility_model,
+            input_items=[{"role": "developer", "content": DOCUMENT_SUMMARIZATION_PROMPT},
+                         {"role": "user", "content": doc_text_match.group(1).strip()}],
+            max_output_tokens=800,
+            reasoning_effort=clamp_effort(config.utility_model, config.utility_reasoning_effort),
+            verbosity=config.utility_verbosity,
+            temperature=0.3,
+        )
+        return (await self.openai_client.count_input_tokens(request)).tokens
 
     async def _smart_trim_with_summarization(self, thread_state, trim_count: Optional[int] = None,
                                              collector: Optional[List[Dict]] = None) -> int:
@@ -295,15 +237,13 @@ class ThreadManagementMixin(_Host):
                 if "=== DOCUMENT:" in content and "[SUMMARIZED" not in content:
                     original_content = msg.get("content", "")
 
-                    # Check if document would exceed context window for summarization
-                    # Count tokens to see if it fits in the 350k limit
-                    doc_tokens = self.thread_manager._token_counter.count_tokens(original_content)
+                    # C-16: what has to fit is the SUMMARIZATION request, in the UTILITY model's
+                    # window — counted by OpenAI. An unknown count proceeds: the API judges, and
+                    # the summarizer's own failure path already degrades.
+                    doc_tokens = await self._count_document_summary_request(original_content)
+                    max_tokens = config.get_model_token_limit(config.utility_model)
 
-                    # Get the model's token limit
-                    model = thread_state.current_model or config.gpt_model
-                    max_tokens = config.get_model_token_limit(model)
-
-                    if doc_tokens > max_tokens:  # Model's token limit
+                    if doc_tokens is not None and doc_tokens > max_tokens:
                         self.log_warning(f"Document too large to summarize: {doc_tokens} tokens > {max_tokens} limit - dropping from context")
 
                         # Replace the message content with a placeholder
@@ -417,7 +357,8 @@ class ThreadManagementMixin(_Host):
 
     SUMMARY_HEAD_MARKER = "thread_summary"
 
-    async def _compact_thread_to_target(self, thread_state, thread_key: str) -> int:
+    async def _compact_thread_to_target(self, thread_state, thread_key: str,
+                                        measure: Optional[int] = None) -> int:
         """Compact a thread to the configured target in ONE deliberate pass.
 
         Prompt-cache note: rewriting the head of the conversation is an expected,
@@ -429,40 +370,80 @@ class ThreadManagementMixin(_Host):
         thread_summaries table, with structured refs preserved, and the summary head
         message in the live thread state is created/updated in place.
 
+        PROGRESS is measured against the official count (CONTEXT_METER §3.9), apportioned by
+        rendered bytes: the thread must shed `bytes(thread) × (1 − target / measure)`. `measure`
+        is the caller's number (recovery's overflow count); otherwise the thread's current
+        measure; with neither, the limit itself (R3-5).
+
         Returns the number of messages dropped or summarized-in-place.
         """
         model = thread_state.current_model or config.gpt_model
         max_tokens = config.get_model_token_limit(model)
         target_tokens = int(max_tokens * config.token_compaction_target)
+        if measure is None:
+            current = thread_state.current_measure(model)
+            measure = current[0] if current is not None else max_tokens
+        start_bytes = self._thread_bytes(thread_state.messages)
+        goal_bytes = start_bytes * (1 - target_tokens / measure) if measure > 0 else 0
+        if goal_bytes <= 0:
+            self.log_debug(f"Compaction of {thread_key} not needed: measure {measure} ≤ target "
+                           f"{target_tokens}")
+            return 0
 
         dropped: List[Dict] = []
         total_processed = 0
-        current_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
-
-        while current_tokens > target_tokens:
+        while start_bytes - self._thread_bytes(thread_state.messages) < goal_bytes:
             processed = await self._smart_trim_with_summarization(thread_state, collector=dropped)
             if processed == 0:
                 self.log_warning(
-                    f"Compaction stalled at {current_tokens}/{target_tokens} tokens — "
-                    f"no trimmable messages left"
+                    f"Compaction stalled for {thread_key}: shed "
+                    f"{start_bytes - self._thread_bytes(thread_state.messages):,} of "
+                    f"{int(goal_bytes):,} bytes — no trimmable messages left"
                 )
                 break
             total_processed += processed
-            current_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
 
         if dropped:
             await self._write_thread_summary(thread_state, thread_key, dropped)
 
-        # Re-baseline the tracked context size from the compacted messages; the next
-        # API call's usage replaces this with the exact number.
-        thread_state.reset_context_estimate(self.thread_manager._token_counter)
-
         if total_processed:
+            # The request the measure described no longer exists; the next count or usage
+            # replaces it.
+            thread_state.invalidate_measure()
             self.log_info(
                 f"Compacted thread {thread_key}: {total_processed} message(s) processed, "
-                f"now at {current_tokens}/{target_tokens} target tokens"
+                f"{start_bytes:,} → {self._thread_bytes(thread_state.messages):,} bytes "
+                f"(measure {measure:,}, target {target_tokens:,} tokens)"
             )
         return total_processed
+
+    def _thread_bytes(self, messages: List[Dict[str, Any]]) -> int:
+        """The rendered utf-8 size of a message list — the scale the official measure is
+        apportioned over."""
+        return sum(len(self._content_to_text(m.get("content")).encode("utf-8"))
+                   for m in messages)
+
+    async def _compact_dm_for_recovery(self, thread_state, thread_key: str,
+                                       own_messages: List[Dict[str, Any]],
+                                       measure: Optional[int] = None) -> str:
+        """R3-4: the DM foreground adapter around the UNCHANGED compactor.
+
+        The current turn's own message(s) are set aside first — they are what the turn is
+        answering, never compaction material — and restored exactly once afterwards, whatever
+        happens. Outcome: `committed` when anything was processed, `irreducible` when nothing
+        could be, `summary_failed` when the compactor raised."""
+        own_ids = {id(m) for m in own_messages}
+        set_aside = [m for m in thread_state.messages if id(m) in own_ids]
+        thread_state.messages[:] = [m for m in thread_state.messages if id(m) not in own_ids]
+        try:
+            processed = await self._compact_thread_to_target(thread_state, thread_key,
+                                                             measure=measure)
+        except Exception as e:  # noqa: BLE001 — recovery still gets its one retry
+            self.log_error(f"Context recovery compaction failed for {thread_key}: {e}")
+            return "summary_failed"
+        finally:
+            thread_state.messages.extend(set_aside)
+        return "committed" if processed > 0 else "irreducible"
 
     async def _write_thread_summary(self, thread_state, thread_key: str, dropped: List[Dict]):
         """Fold a dropped span into the rolling thread summary (DB row + in-state head).
@@ -524,7 +505,10 @@ class ThreadManagementMixin(_Host):
                 model=config.utility_model,
                 temperature=0.3,
                 max_tokens=1200,
-                system_prompt=None
+                system_prompt=None,
+                reasoning_effort=clamp_effort(config.utility_model,
+                                              config.utility_reasoning_effort),
+                verbosity=config.utility_verbosity,
             )
             summary_text = (summary_text or "").strip()
             if not summary_text:
@@ -671,24 +655,10 @@ class ThreadManagementMixin(_Host):
             })
         thread_state.has_summary_head = True
 
-    def _tracked_context_tokens(self, thread_state):
-        """The usage-tracked context size as an int, or None when unavailable
-        (falls back to a chars/4 estimate at the call site)."""
-        try:
-            value = int(getattr(thread_state, "context_tokens", 0))
-        except (TypeError, ValueError):
-            return None
-        return value if value > 0 else None
-
     @staticmethod
     def _is_context_length_error(e) -> bool:
-        """Detect the API's context-window-exceeded error (backstop for the chars/4
-        estimator — compact + retry once instead of failing the response)."""
-        s = str(e).lower()
-        return ("context_length_exceeded" in s
-                or "maximum context length" in s
-                or "context window" in s
-                or getattr(e, "code", None) == "context_length_exceeded")
+        """The API's TOKEN context-window rejection (see context_meter.is_context_length_error)."""
+        return is_context_length_error(e)
 
     @staticmethod
     def _render_reactions_annotation(reactions) -> str:
@@ -979,11 +949,14 @@ class ThreadManagementMixin(_Host):
             model = thread_state.current_model or config.gpt_model
             max_tokens = config.get_model_token_limit(model)
             cleanup_threshold = int(max_tokens * config.token_cleanup_threshold)
-            
-            # Usage-driven budgeting: the tracked number (API usage + increment
-            # estimates) is authoritative; fall back to a fresh estimate if unset.
-            current_tokens = self._tracked_context_tokens(thread_state) or \
-                self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
+
+            # The context meter's last accepted measure — OpenAI's own count or the response's
+            # usage (CONTEXT_METER §3.7). No measure, no decision: nothing is guessed.
+            measure = thread_state.current_measure(model)
+            if measure is None:
+                self.log_debug(f"No context measure for {thread_key} on {model} — no cleanup")
+                return
+            current_tokens = measure[0]
 
             # Cost visibility: >272K input bills at 2x input / 1.5x output on 5.5/5.6.
             # Log once per thread when it crosses the tier (log only — never block).
@@ -1004,14 +977,14 @@ class ThreadManagementMixin(_Host):
                 # Phase S: one chunky compaction down to the target (not a small per-turn
                 # trim) — dropped span is folded into the rolling thread summary. No DB
                 # message mirror to maintain anymore.
-                processed = await self._compact_thread_to_target(thread_state, thread_key)
+                processed = await self._compact_thread_to_target(thread_state, thread_key,
+                                                                 measure=current_tokens)
 
                 if processed > 0:
-                    new_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
-                    self.log_info(f"Compaction complete: {current_tokens} → {new_tokens} tokens ({processed} messages processed)")
+                    self.log_info(f"Compaction complete: {processed} messages processed")
                 else:
                     self.log_warning("Compaction triggered but no trimmable messages found")
-            
+
         except Exception as e:
             self.log_error(f"Error during async cleanup: {e}")
             # Don't let cleanup errors affect the main flow
@@ -1114,6 +1087,9 @@ class ThreadManagementMixin(_Host):
         
         if should_rebuild:
             self.log_info(f"Checking thread history for {message.thread_id}")
+            # The message list is about to be replaced, so the request the meter last measured
+            # is gone with it (CONTEXT_METER C-11: here, not on every entry).
+            thread_state.invalidate_measure()
 
             # Phase S: Slack is the only transcript. A rebuild always starts from a clean
             # slate (fresh fetch is authoritative — edited/deleted messages must not
@@ -1566,45 +1542,10 @@ class ThreadManagementMixin(_Host):
                 except Exception as e:
                     self.log_warning(f"F3 preserved_ts backfill failed for {thread_key}: {e}")
 
-        # Pre-flight compaction decision after rebuild. Cold rebuild has no usage
-        # number yet — the whole assembled context is ESTIMATED at chars/4 (crude is
-        # fine under TOKEN_BUFFER_PERCENTAGE headroom; the context_length_exceeded
-        # backstop catches estimator edge cases like document-heavy rebuilds).
-        model = thread_state.current_model or config.gpt_model
-        max_tokens = config.get_model_token_limit(model)
-        try:
-            thread_state.reset_context_estimate(self.thread_manager._token_counter)
-        except Exception:
-            pass  # non-standard thread_state (tests); estimate below regardless
-        current_tokens = self._tracked_context_tokens(thread_state) or \
-            self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
-        
-        if current_tokens > max_tokens:
-            self.log_info(f"Thread rebuilt over limit ({current_tokens}/{max_tokens} tokens), compacting")
-
-            # Update status to show we're compacting
-            if thinking_id:
-                self._update_status(
-                    client,
-                    message.channel_id,
-                    thinking_id,
-                    pipeline_status("optimizing_history", f"Optimizing conversation history ({current_tokens:,}/{max_tokens:,} tokens)…"),
-                    emoji=config.circle_loader_emoji
-                )
-
-            # Phase S: one chunky compaction to target; the dropped span rolls into the
-            # thread summary (DB) and the summary head message updates in place.
-            thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
-            total_trimmed = await self._compact_thread_to_target(thread_state, thread_key)
-            current_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
-
-            if total_trimmed > 0:
-                self.log_info(f"Compaction during rebuild complete: {total_trimmed} messages processed, final: {current_tokens}/{max_tokens} tokens")
-        
-        # Log final token count
-        final_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
+        # No compaction here: the request's size is measured by the context meter's preflight
+        # on the turn's first request, and an overflow there is recovered on the held lock.
         self.log_info("="*100)
-        self.log_info(f"THREAD STATE | Messages: {len(thread_state.messages)} | Tokens: {final_tokens}/{max_tokens}")
+        self.log_info(f"THREAD STATE | Messages: {len(thread_state.messages)}")
         self.log_info("="*100)
-        
+
         return thread_state

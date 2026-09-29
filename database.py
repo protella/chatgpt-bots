@@ -679,6 +679,7 @@ class DatabaseManager(LoggerMixin):
                 boundary_ts TEXT NOT NULL,
                 refs_json TEXT,
                 preserved_ts_json TEXT,
+                source_fingerprint TEXT,
                 updated_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (thread_id) REFERENCES threads(thread_id) ON DELETE CASCADE
             )
@@ -1381,6 +1382,18 @@ class DatabaseManager(LoggerMixin):
                 self.conn.execute("ALTER TABLE thread_summaries ADD COLUMN preserved_ts_json TEXT")
                 self.conn.commit()
                 self.log_info("DB: Successfully added preserved_ts_json column")
+
+        with self._migration_step("thread_summaries.source_fingerprint"):
+            # CONTEXT_METER §3.6: a CHANNEL origin summary's fingerprint over the stable fields of
+            # the root and every covered message. NULL on every DM row, which is how a DM row and
+            # a channel row are told apart (channel rows never take addenda).
+            cursor = self.conn.execute("PRAGMA table_info(thread_summaries)")
+            ts_columns = [col[1] for col in cursor.fetchall()]
+            if ts_columns and 'source_fingerprint' not in ts_columns:
+                self.log_info("DB: Adding source_fingerprint column to thread_summaries")
+                self.conn.execute("ALTER TABLE thread_summaries ADD COLUMN source_fingerprint TEXT")
+                self.conn.commit()
+                self.log_info("DB: Successfully added source_fingerprint column")
 
         with self._migration_step("users.real_name"):
             # Check if real_name column exists in users table
@@ -4357,29 +4370,53 @@ class DatabaseManager(LoggerMixin):
 
     async def save_thread_summary_async(self, thread_id: str, summary_text: str, boundary_ts: str,
                                         refs: Optional[List[Dict]] = None,
-                                        preserved_ts: Optional[List[str]] = None):
-        """Async version of save_thread_summary (upsert, rolling)."""
+                                        preserved_ts: Optional[List[str]] = None,
+                                        source_fingerprint: Optional[str] = None):
+        """Async version of save_thread_summary (upsert, rolling).
+
+        `source_fingerprint` is set only by a CHANNEL origin summary (CONTEXT_METER §3.6); a DM
+        row writes NULL, as every DM row always has."""
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             await db.execute("PRAGMA journal_mode=WAL")
 
             await db.execute("""
                 INSERT INTO thread_summaries
-                    (thread_id, summary_text, boundary_ts, refs_json, preserved_ts_json, updated_ts)
-                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    (thread_id, summary_text, boundary_ts, refs_json, preserved_ts_json,
+                     source_fingerprint, updated_ts)
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(thread_id) DO UPDATE SET
                     summary_text = excluded.summary_text,
                     boundary_ts = excluded.boundary_ts,
                     refs_json = excluded.refs_json,
                     preserved_ts_json = excluded.preserved_ts_json,
+                    source_fingerprint = excluded.source_fingerprint,
                     updated_ts = CURRENT_TIMESTAMP
             """, (thread_id, summary_text, boundary_ts,
                   json.dumps(refs) if refs else None,
                   # `is not None`: an explicit [] persists as "[]" (verified empty), distinct
                   # from NULL (legacy/unknown). F3.
-                  json.dumps(preserved_ts) if preserved_ts is not None else None))
+                  json.dumps(preserved_ts) if preserved_ts is not None else None,
+                  source_fingerprint))
             await db.commit()
         self.log_info(f"DB: Saved thread summary for {thread_id} (boundary_ts={boundary_ts}, async)")
+
+    async def delete_thread_summary_async(self, thread_id: str) -> None:
+        """Delete a thread's summary row AND its addenda in ONE transaction (PRAGMA foreign_keys
+        is never enabled, so the cascade is explicit)."""
+        async with aiosqlite.connect(self.db_path, isolation_level=None) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA busy_timeout=5000")
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                await db.execute("DELETE FROM thread_summaries WHERE thread_id = ?", (thread_id,))
+                await db.execute("DELETE FROM thread_summary_addenda WHERE thread_id = ?",
+                                 (thread_id,))
+                await db.execute("COMMIT")
+            except Exception:
+                await db.execute("ROLLBACK")
+                raise
+        self.log_info(f"DB: Deleted thread summary for {thread_id}")
 
     # --- Track 1: per-channel "recent channel narrative" summary CRUD --------------------
     # Every query is strictly WHERE channel_id = ? — NO workspace-scope fallback, so one

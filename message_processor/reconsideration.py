@@ -53,15 +53,17 @@ from config import config
 from logger import setup_logger
 from message_processor import participation_telemetry
 from message_processor.channel_request import (assemble_channel_request,
-                                               capability_profile_hash, estimate_admission,
-                                               fresh_turn_context, reconsideration_profile,
-                                               to_input_items, tool_schema_version)
+                                               capability_profile_hash, fresh_turn_context,
+                                               reconsideration_profile, to_input_items,
+                                               tool_schema_version)
 from message_processor.channel_stream import build_reconsideration_snapshot
+from message_processor.context_meter import usable_limit
 from message_processor.stale_send_guard import (Scope, StaleSendSuppressed, TurnSendLease,
                                                 scopes_for, ts_key)
 from message_processor.turn_runtime import ReconsiderFacts
 from message_processor.utilities import effective_request_model
-from openai_client.api.responses import STALE_RECONSIDERATION_RESPONSE_FORMAT
+from slack_client.normalizer import TimestampError
+from openai_client.api.responses import build_reconsideration_create_kwargs
 from message_processor.prompts import RECONSIDERATION_INSTRUCTION
 
 logger = setup_logger(name="slack_bot.Reconsideration")
@@ -133,27 +135,19 @@ def trigger_identity_line(ctx: Any) -> str:
 def build_reconsideration_request(*, processor: Any, client: Any, ctx: Any, model: Any,
                                   pass_number: int, draft: str,
                                   reply_destination: Optional[str] = None
-                                  ) -> Tuple[Any, List[Dict[str, Any]], Any]:
+                                  ) -> Tuple[Any, List[Dict[str, Any]]]:
     """§4d request grammar, literally: the ENTIRE normal assembled channel request over the
     (fresh) context, unchanged and in its existing order, in no-tools mode — then the one
-    appended developer item. Returns (request, api_items, estimate); the READ-ONLY admission
-    estimate is charged over this FINAL payload, response format included."""
+    appended developer item. Returns (request, api_items). PURE and synchronous: what the
+    request costs is OpenAI's count of the final create kwargs, taken by the runner inside its
+    `request_build` boundary (CONTEXT_METER §3.10)."""
     request = assemble_channel_request(
         processor=processor, client=client, ctx=ctx, model=model, tools=[],
         request_config=None, contract_suffix=None, registry=None,
-        reply_destination=reply_destination, with_estimate=False, no_tools=True,
-        response_format=STALE_RECONSIDERATION_RESPONSE_FORMAT)
+        reply_destination=reply_destination, no_tools=True)
     extra = reconsideration_item(pass_number, draft, trigger_identity_line(ctx))
-    estimate = estimate_admission(
-        instructions=request.instructions,
-        input_items=[*request.input_items, extra],
-        tools=request.tools,
-        raw_document_texts=ctx.raw_document_texts,
-        native_file_bounds=ctx.native_file_bounds,
-        model=model,
-        response_format=STALE_RECONSIDERATION_RESPONSE_FORMAT)
     api_items = [*to_input_items(request), extra]
-    return request, api_items, estimate
+    return request, api_items
 
 
 # --------------------------------------------------------------------- reviewed-through
@@ -173,6 +167,23 @@ def suppressing_ts_present(stream: Any, observed_latest_ts: Any) -> bool:
         return False
     target = str(observed_latest_ts)
     return any(item.metadata.get("ts") == target for item in _snapshot_items(stream))
+
+
+def suppressing_ts_summarized(stream: Any, observed_latest_ts: Any) -> bool:
+    """Is the suppressing message inside the fresh snapshot's thread summary? It never should be
+    — the protected rule keeps the newest messages out of every summary (CONTEXT_METER §3.10) —
+    so True is a broken invariant, and a review of a message the model sees only as a summary
+    cannot claim to have read it."""
+    summary = getattr(getattr(stream, "pinned", None), "origin_summary", None)
+    if summary is None or observed_latest_ts is None:
+        return False
+    target = str(observed_latest_ts)
+    if target in summary.covered_ts:
+        return True
+    try:
+        return ts_key(target) <= ts_key(summary.boundary_ts)
+    except TimestampError:
+        return True
 
 
 def reviewed_through_map(lease: TurnSendLease, stream: Any) -> Dict[Scope, str]:
@@ -210,11 +221,11 @@ def reviewed_through_map(lease: TurnSendLease, stream: Any) -> Dict[Scope, str]:
 
 @dataclass
 class PreparedDecision:
-    """One pass's request, whatever surface built it: what to send, and what it costs."""
+    """One pass's request, whatever surface built it: what to send. What it costs is counted
+    by the runner over the final create kwargs, never estimated here."""
 
     instructions: str
     api_items: List[Dict[str, Any]]
-    estimate: Any
     params: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -256,7 +267,7 @@ class ChannelReconsiderSurface:
     def build_request(self, stream: Any, *, pass_number: int,
                       draft: str) -> PreparedDecision:
         fresh_ctx = fresh_turn_context(self.ctx, stream)
-        request, api_items, estimate = build_reconsideration_request(
+        request, api_items = build_reconsideration_request(
             processor=self._processor, client=self._client, ctx=fresh_ctx, model=self.model,
             pass_number=pass_number, draft=draft,
             reply_destination=(getattr(self._turn, "reply_destination", None)
@@ -264,7 +275,7 @@ class ChannelReconsiderSurface:
                                else None))
         cfg = self.ctx.thread_config
         return PreparedDecision(
-            instructions=request.instructions, api_items=api_items, estimate=estimate,
+            instructions=request.instructions, api_items=api_items,
             params={"reasoning_effort": cfg.get("reasoning_effort"),
                     "verbosity": cfg.get("verbosity"),
                     "max_output_tokens": cfg.get("max_tokens"),
@@ -423,26 +434,31 @@ async def reconsider_stale_draft(*, processor: Any, client: Any, message: Any, t
                              f"{rebuild_error}")
                 raise _give_up("context_rebuild") from rebuild_error
 
-            # ---- the request over it (§4d). Assembly and estimation failures are
-            # `request_build` again — the snapshot already succeeded. The estimate's RESULT is
-            # consumed inside the same boundary (§4f: request_build covers model selection
-            # through assembly AND estimate consumption), so a poisoned estimate object whose
-            # properties raise is classified rather than escaping unclassified. ----------------
+            # ---- the request over it (§4d). Assembly and counting failures are
+            # `request_build` again — the snapshot already succeeded. The count is taken over
+            # the FINAL create kwargs the decision call sends (R3-6) and consumed inside the
+            # same boundary (§4f: request_build covers model selection through assembly AND
+            # the size check), so nothing about it escapes unclassified. -------------------
             try:
                 present = suppressing_ts_present(fresh_stream, current.observed_latest_ts)
                 reviewed = reviewed_through_map(lease, fresh_stream)
                 prepared = surface.build_request(fresh_stream, pass_number=pass_number,
                                                  draft=current_draft)
-                estimate = prepared.estimate
-                fits = bool(estimate.fits)
-                overflow_note = ("" if fits else
-                                 f"~{estimate.total_tokens:,} of {estimate.limit_tokens:,}")
+                counted = await processor.openai_client.count_input_tokens(
+                    build_reconsideration_create_kwargs(prepared, model=surface.model))
+                limit = usable_limit(surface.model)
             except asyncio.CancelledError:
                 raise
             except Exception as assembly_error:  # noqa: BLE001 — §4f: never post unexamined
                 logger.error(f"Reconsideration request assembly failed on {channel_id}: "
                              f"{assembly_error}")
                 raise _give_up("request_build") from assembly_error
+            if suppressing_ts_summarized(fresh_stream, current.observed_latest_ts):
+                logger.error(
+                    f"Reconsideration snapshot on {channel_id} carries the suppressing ts "
+                    f"{current.observed_latest_ts} inside its thread summary — the protected "
+                    "rule failed; dropping")
+                raise _give_up("request_build")
             if not present:
                 # The suppressing message is missing, deleted, malformed or filtered — the
                 # review cannot claim to have covered it. Fail closed (§4a).
@@ -450,10 +466,17 @@ async def reconsider_stale_draft(*, processor: Any, client: Any, message: Any, t
                     f"Reconsideration snapshot on {channel_id} does not contain the "
                     f"suppressing ts {current.observed_latest_ts} — dropping")
                 raise _give_up("context_rebuild")
-            if not fits:
+            if counted.tokens is None or not counted.complete:
+                # A detached count that could not describe the whole request: unlike a turn's
+                # preflight, a review that cannot be sized fails closed (CONTEXT_METER §3.10).
                 logger.warning(
-                    f"Reconsideration request on {channel_id} over budget "
-                    f"({overflow_note}) — dropping")
+                    f"Reconsideration request on {channel_id} could not be counted "
+                    f"(tokens={counted.tokens}, complete={counted.complete}) — dropping")
+                raise _give_up("request_build")
+            if counted.tokens > limit:
+                logger.warning(
+                    f"Reconsideration request on {channel_id} over the context window "
+                    f"({counted.tokens:,} of {limit:,} tokens) — dropping")
                 raise _give_up("admission_overflow")
 
             # ---- the decision call (§4d): a NEW ModelAttempt of the SAME turn ---------------

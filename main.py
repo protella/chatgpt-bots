@@ -25,7 +25,6 @@ from message_processor.turn_runtime import (DEST_KIND_CORRECTION_ANNOUNCEMENT,
                                             DEST_KIND_POST_TO_THREAD, DEST_KIND_RECONCILED,
                                             DEST_KIND_REPLY, DEST_KIND_SPLIT, TurnRuntime)
 from message_processor import thread_files
-import message_processor.token_counter as token_counter
 from message_processor.client_contract import BaseClient, Message
 from slack_client import admission_watermark
 from slack_client.event_handlers import registration
@@ -244,21 +243,6 @@ class ChatBotV2:
         # have put a mkdir and a file open inside the first gate call — on the hot path of the
         # decision the whole turn is waiting for — and retried it after every failure.
         participation_telemetry.initialize()
-
-        # Same reasoning for the o200k tokenizer, though what rides on it is smaller than it looks:
-        # admission is decided by the utf-8 byte bound, which needs no vocabulary at all, and this
-        # counter's one production job is the REFUSAL diagnostic — the real token count logged
-        # beside the charged bound so an operator can tell "this window needs compacting" from "the
-        # bound refused something that would have fit". On a cold tiktoken cache `get_encoding`
-        # fetches the vocabulary over the network, and a refusal is the worst place to discover
-        # that. Started here so the fetch overlaps the rest of boot.
-        #
-        # timeout=0 is the point: this STARTS the loader (it runs in its own daemon thread) and
-        # does not wait for it. Waiting would put a network round trip in front of the socket
-        # connecting, and a blackholed egress would hold the process down for the TCP timeout — so
-        # the head start is taken and nothing depends on it having finished. A load that fails logs
-        # its own warning from that thread.
-        token_counter.wait_for_admission_encoder(timeout=0)
 
         # Validate configuration
         try:

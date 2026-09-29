@@ -611,7 +611,6 @@ def _completion_host(loop_result, *, streaming=False):
         return ""
 
     host._inject_image_analyses = _passthru
-    host._pre_trim_messages_for_api = _passthru
     host._build_channel_info = _empty
     host._drop_dead_containers = _none
     host._resolve_ci_container = _none
@@ -642,7 +641,7 @@ async def _drive(host, turn, *, streaming=False):
     thread_state = SimpleNamespace(
         messages=[{"role": "user", "content": "hi"}], channel_id="C1", thread_ts="10.0",
         current_model="gpt-5.6-sol", config_overrides={}, has_summary_head=False,
-        channel_directives=None, record_usage=MagicMock(), last_usage=None, participants={})
+        channel_directives=None, last_usage=None, participants={})
 
     async def fake_config(**kw):
         return {"model": "gpt-5.6-sol", "temperature": 1.0, "max_tokens": 100,

@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.3.0] - 2026-09-28
+
+### ✨ Added
+
+- **Long channel threads stay in full view.** When a channel thread grows long, the bot now
+  summarizes its oldest part and keeps the root, the newest messages and the rest of the channel
+  as they are, so it can keep working in the thread without losing the room around it. The
+  summary is rebuilt from Slack: editing or deleting a message inside the summarized part throws
+  it away and starts over.
+
+### 🔧 Changed
+
+- **Conversation size is measured by OpenAI's own token counter.** Every request is counted in
+  parallel and checked against what OpenAI reports back, replacing the bot's own estimate, which
+  counted about three times too high.
+
+### 🐛 Fixed
+
+- **A long channel thread is no longer refused as "too long".** The inflated estimate could turn
+  a thread away at about a third of the real limit. If a request ever does come back too large,
+  the bot summarizes and retries once instead of showing an error.
+
+### 🗑️ Removed
+
+- The `tiktoken` dependency.
+
 ## [3.2.9] - 2026-09-28
 
 ### 🔧 Changed

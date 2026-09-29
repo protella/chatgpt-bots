@@ -227,6 +227,47 @@ def _close_attempt_error(attempt_sink, attempts: List[Any],
                    detail=type(exc).__name__)
 
 
+# ------------------------------------------------------------------ context meter (§3.2)
+#
+# The meter rides beside the attempt sink and in the same fixed order (CONTEXT_METER C-14):
+# final kwargs → preflight → _open_attempt → dispatched → _safe_api_call → usage. Duck-typed on
+# purpose: the hook lives in message_processor, which imports back into this package.
+
+
+# One wrapper's dispatches, in order: (dispatch seq, the kwargs that dispatch actually sent). A
+# container retry is a second dispatch with its own kwargs, and the LIVE one is always the last.
+_Dispatches = List[Tuple[int, Dict[str, Any]]]
+
+
+def _meter_dispatch(meter: Optional[Any], request_params: Dict[str, Any], round_index: int,
+                    seqs: Optional[_Dispatches]) -> None:
+    """Register the request about to be sent (after `_open_attempt`, before the call)."""
+    if meter is None or seqs is None:
+        return
+    seqs.append((meter.dispatched(request_params, round_index), request_params))
+
+
+def _meter_usage(meter: Optional[Any], seqs: _Dispatches, usage: Dict[str, Any]) -> None:
+    """Hand the response's usage to the meter against the LIVE dispatch. A response that came
+    back at all means the turn's request completed — from here its overflow is not recoverable."""
+    if meter is None or not seqs:
+        return
+    meter.usage(seqs[-1][0], usage)
+    meter.request_completed()
+
+
+def _meter_overflow(meter: Optional[Any], error: BaseException, request_params: Dict[str, Any],
+                    round_index: int, seqs: Optional[_Dispatches] = None
+                    ) -> Optional[BaseException]:
+    """A real TOKEN context-length 400, re-expressed as the meter's `ContextOverLimit` carrying
+    the kwargs the failing dispatch ACTUALLY sent (a container retry's, when there was one —
+    R3-5); the meter's own overflow passes through as itself; None for anything else."""
+    if meter is None:
+        return None
+    live = seqs[-1][1] if seqs else request_params
+    return meter.overflow_from(error, live, round_index)
+
+
 def _incomplete_reason(response) -> str:
     """Best-effort reason string from a `response.incomplete` terminal event."""
     details = getattr(response, "incomplete_details", None)
@@ -259,6 +300,9 @@ async def _create_with_container_recovery(self, request_params: Dict[str, Any],
                                          attempt_sink: Optional[Any] = None,
                                          attempts: Optional[List[Any]] = None,
                                          artifacts_sink: Optional[List[Dict[str, Any]]] = None,
+                                         meter: Optional[Any] = None,
+                                         round_index: int = 0,
+                                         meter_seqs: Optional[_Dispatches] = None,
                                          **safe_call_kwargs):
     """`responses.create`, surviving a container that died since we verified it.
 
@@ -287,6 +331,7 @@ async def _create_with_container_recovery(self, request_params: Dict[str, Any],
     attempt_log = attempts if attempts is not None else []
     try:
         _open_attempt(attempt_sink, request_params, attempt_log)
+        _meter_dispatch(meter, request_params, round_index, meter_seqs)
         return await self._safe_api_call(
             self.client.responses.create, operation_type=operation_type,
             **safe_call_kwargs, **request_params)
@@ -310,8 +355,13 @@ async def _create_with_container_recovery(self, request_params: Dict[str, Any],
 
         retry_params = {**request_params, "tools": demoted}
         _close_attempt(attempt_sink, attempt_log, status="error", detail=type(e).__name__)
+        if meter is not None:
+            # The retry is a different request (a new tools array): it is preflighted like any
+            # other before its attempt opens, under the same turn-scoped round rule.
+            await meter.preflight(retry_params, round_index)
         _open_attempt(attempt_sink, retry_params, attempt_log,
                       fork_reason=FORK_CONTAINER_RECOVERY)
+        _meter_dispatch(meter, retry_params, round_index, meter_seqs)
         return await self._safe_api_call(
             self.client.responses.create, operation_type=operation_type,
             **safe_call_kwargs, **retry_params)
@@ -805,6 +855,8 @@ async def create_text_response(
     attempt_sink: Optional[Any] = None,
     layout: str = "legacy",
     service_tier_eligible: bool = False,
+    meter: Optional[Any] = None,
+    round_index: int = 0,
 ) -> str:
     """
     Create a text response using the Responses API
@@ -845,6 +897,10 @@ async def create_text_response(
 
     self.log_debug(f"Creating text response with model {model}, temp {temperature}")
 
+    if meter is not None:
+        # Before any attempt opens: an overflow found here leaves no ledger row, sends nothing.
+        await meter.preflight(request_params, round_index)
+    meter_seqs: _Dispatches = []
     attempts: List[Any] = []
     usage_captured: Dict[str, Any] = {}
     try:
@@ -854,6 +910,7 @@ async def create_text_response(
 
         # API call with enforced timeout wrapper
         _open_attempt(attempt_sink, request_params, attempts)
+        _meter_dispatch(meter, request_params, round_index, meter_seqs)
         response = await self._safe_api_call(
             self.client.responses.create,
             operation_type=operation_type,
@@ -861,6 +918,7 @@ async def create_text_response(
         )
 
         usage_captured = _capture_usage(usage_sink, response)
+        _meter_usage(meter, meter_seqs, usage_captured)
         _log_service_tier_echo(self, request_params, response)
         _close_attempt(attempt_sink, attempts, status="ok", usage=usage_captured)
 
@@ -870,6 +928,12 @@ async def create_text_response(
         return output_text
 
     except Exception as e:
+        overflow = _meter_overflow(meter, e, request_params, round_index, meter_seqs)
+        if overflow is not None:
+            self.log_warning(f"Text response rejected as over the context window: {e}")
+            if overflow is e:
+                raise
+            raise overflow from e
         self.log_error(f"Error creating text response: {e}", exc_info=True)
         raise
     finally:
@@ -900,6 +964,8 @@ async def create_text_response_with_tools(
     container_gone_sink: Optional[List[str]] = None,
     layout: str = "legacy",
     service_tier_eligible: bool = False,
+    meter: Optional[Any] = None,
+    round_index: int = 0,
 ) -> str:
     """
     Create text response with tools (e.g., web search)
@@ -949,6 +1015,10 @@ async def create_text_response_with_tools(
 
     self.log_debug(f"Creating text response with tools using model {model}, tools: {tools}")
 
+    if meter is not None:
+        # Before any attempt opens: an overflow found here leaves no ledger row, sends nothing.
+        await meter.preflight(request_params, round_index)
+    meter_seqs: _Dispatches = []
     attempts: List[Any] = []
     usage_captured: Dict[str, Any] = {}
     try:
@@ -962,9 +1032,11 @@ async def create_text_response_with_tools(
             container_gone_sink=container_gone_sink,
             attempt_sink=attempt_sink, attempts=attempts,
             artifacts_sink=artifacts_sink,
+            meter=meter, round_index=round_index, meter_seqs=meter_seqs,
         )
 
         usage_captured = _capture_usage(usage_sink, response)
+        _meter_usage(meter, meter_seqs, usage_captured)
         _log_service_tier_echo(self, request_params, response)
         _close_attempt(attempt_sink, attempts, status="ok", usage=usage_captured)
 
@@ -1044,6 +1116,12 @@ async def create_text_response_with_tools(
         return output_text
 
     except Exception as e:
+        overflow = _meter_overflow(meter, e, request_params, round_index, meter_seqs)
+        if overflow is not None:
+            self.log_warning(f"Response with tools rejected as over the context window: {e}")
+            if overflow is e:
+                raise
+            raise overflow from e
         self.log_error(f"Error creating response with tools: {e}", exc_info=True)
         raise
     finally:
@@ -1069,6 +1147,8 @@ async def create_streaming_response(
     layout: str = "legacy",
     service_tier_eligible: bool = False,
     hidden_suppression_sink: Optional[List[BaseException]] = None,
+    meter: Optional[Any] = None,
+    round_index: int = 0,
 ) -> str:
     """
     Create a streaming text response using the Responses API
@@ -1117,6 +1197,10 @@ async def create_streaming_response(
 
     self.log_debug(f"Creating streaming response with model {model}, temp {temperature}")
 
+    if meter is not None:
+        # Before any attempt opens: an overflow found here leaves no ledger row, sends nothing.
+        await meter.preflight(request_params, round_index)
+    meter_seqs: _Dispatches = []
     attempts: List[Any] = []
     usage_captured: Dict[str, Any] = {}
     # A refusal an EARLIER round of this turn already hid (the tool loop passes one sink through
@@ -1129,6 +1213,7 @@ async def create_streaming_response(
         operation_type = "text_normal"
 
         _open_attempt(attempt_sink, request_params, attempts)
+        _meter_dispatch(meter, request_params, round_index, meter_seqs)
         response = await self._safe_api_call(
             self.client.responses.create,
             operation_type=operation_type,
@@ -1229,6 +1314,7 @@ async def create_streaming_response(
                     # Usage rides the terminal event's response object on every outcome, not
                     # just success — capture it so token budgeting doesn't fall back to chars/4.
                     usage_captured = _capture_usage(usage_sink, resp)
+                    _meter_usage(meter, meter_seqs, usage_captured)
                     if event_type == "response.failed":
                         stream_error = _stream_failure_error(resp)
                         self.log_error(
@@ -1344,6 +1430,12 @@ async def create_streaming_response(
                 f"Streaming failed after a hidden stale refusal — reporting the suppression "
                 f"rather than the failure ({e})")
             raise hidden from e
+        overflow = _meter_overflow(meter, e, request_params, round_index, meter_seqs)
+        if overflow is not None:
+            self.log_warning(f"Streaming response rejected as over the context window: {e}")
+            if overflow is e:
+                raise
+            raise overflow from e
         self.log_error(f"Error creating streaming response: {e}", exc_info=True)
         raise
     finally:
@@ -1380,6 +1472,8 @@ async def create_streaming_response_with_tools(
     layout: str = "legacy",
     service_tier_eligible: bool = False,
     hidden_suppression_sink: Optional[List[BaseException]] = None,
+    meter: Optional[Any] = None,
+    round_index: int = 0,
 ) -> str:
     """
     Create streaming text response with tools (e.g., web search)
@@ -1457,6 +1551,10 @@ async def create_streaming_response_with_tools(
 
     self.log_debug(f"Creating streaming response with tools using model {model}")
 
+    if meter is not None:
+        # Before any attempt opens: an overflow found here leaves no ledger row, sends nothing.
+        await meter.preflight(request_params, round_index)
+    meter_seqs: _Dispatches = []
     attempts: List[Any] = []
     usage_captured: Dict[str, Any] = {}
     # Already hidden when an earlier round of this turn's tool loop was refused a surface.
@@ -1475,6 +1573,7 @@ async def create_streaming_response_with_tools(
             container_gone_sink=container_gone_sink,
             attempt_sink=attempt_sink, attempts=attempts,
             artifacts_sink=artifacts_sink,
+            meter=meter, round_index=round_index, meter_seqs=meter_seqs,
         )
 
         complete_text = ""
@@ -1788,6 +1887,7 @@ async def create_streaming_response_with_tools(
                     # Usage rides the terminal event's response object on every outcome, not
                     # just success — capture it so token budgeting doesn't fall back to chars/4.
                     usage_captured = _capture_usage(usage_sink, resp)
+                    _meter_usage(meter, meter_seqs, usage_captured)
                     if event_type == "response.failed":
                         stream_error = _stream_failure_error(resp)
                         self.log_error(
@@ -1917,6 +2017,13 @@ async def create_streaming_response_with_tools(
                 f"Streaming with tools failed after a hidden stale refusal — reporting the "
                 f"suppression rather than the failure ({e})")
             raise hidden from e
+        overflow = _meter_overflow(meter, e, request_params, round_index, meter_seqs)
+        if overflow is not None:
+            self.log_warning(
+                f"Streaming response with tools rejected as over the context window: {e}")
+            if overflow is e:
+                raise
+            raise overflow from e
         # Check if this is an MCP connection error (expected failure, handled gracefully)
         error_msg = str(e)
         is_mcp_error = "mcp server" in error_msg.lower() and ("404" in error_msg or "424" in error_msg)
@@ -2180,6 +2287,48 @@ def _parse_reconsideration_payload(raw: str) -> Optional[Tuple[str, Optional[str
     return decision, draft
 
 
+def _reconsideration_create_kwargs(*, input_items: List[Dict[str, Any]],
+                                   instructions: Optional[str], model: Optional[str],
+                                   reasoning_effort: Optional[str] = None,
+                                   verbosity: Optional[str] = None,
+                                   max_output_tokens: Optional[int] = None,
+                                   temperature: Optional[float] = None,
+                                   prompt_cache_key: Optional[str] = None) -> Dict[str, Any]:
+    """The reconsideration decision's exact `responses.create` body, `text.format` included."""
+    request_params = _build(
+        model=model,
+        input_items=input_items,
+        system_prompt=instructions,
+        max_output_tokens=max_output_tokens,
+        reasoning_effort=reasoning_effort,
+        verbosity=verbosity,
+        temperature=temperature,
+        top_p=None,
+        store=False,
+        tools=[],
+        prompt_cache_key=prompt_cache_key,
+        layout="channel",
+    )
+    request_params.setdefault("text", {})["format"] = dict(STALE_RECONSIDERATION_RESPONSE_FORMAT)
+    return request_params
+
+
+def build_reconsideration_create_kwargs(prepared: Any, *, model: Optional[str]) -> Dict[str, Any]:
+    """PURE: the final kwargs `create_reconsideration_decision` would send for one prepared pass
+    (R3-6). `prepared` is the runner's PreparedDecision — `instructions`, `api_items` and the
+    per-turn `params` (reasoning_effort, verbosity, max_output_tokens, temperature,
+    prompt_cache_key). The runner counts THIS dict at its `request_build` boundary, so the number
+    it decides on describes the request the decision call actually sends."""
+    params = dict(getattr(prepared, "params", None) or {})
+    return _reconsideration_create_kwargs(
+        input_items=list(getattr(prepared, "api_items", None) or []),
+        instructions=getattr(prepared, "instructions", None), model=model,
+        reasoning_effort=params.get("reasoning_effort"), verbosity=params.get("verbosity"),
+        max_output_tokens=params.get("max_output_tokens"),
+        temperature=params.get("temperature"),
+        prompt_cache_key=params.get("prompt_cache_key"))
+
+
 async def create_reconsideration_decision(
     self,
     *,
@@ -2213,21 +2362,11 @@ async def create_reconsideration_decision(
     output, with the failed attempt closed under that detail; API and timeout errors propagate
     unchanged and the `finally` twin closes the attempt as the exception in flight.
     """
-    request_params = _build(
-        model=model,
-        input_items=input_items,
-        system_prompt=instructions,
-        max_output_tokens=max_output_tokens,
-        reasoning_effort=reasoning_effort,
-        verbosity=verbosity,
-        temperature=temperature,
-        top_p=None,
-        store=False,
-        tools=[],
-        prompt_cache_key=prompt_cache_key,
-        layout="channel",
-    )
-    request_params.setdefault("text", {})["format"] = dict(STALE_RECONSIDERATION_RESPONSE_FORMAT)
+    request_params = _reconsideration_create_kwargs(
+        input_items=input_items, instructions=instructions, model=model,
+        reasoning_effort=reasoning_effort, verbosity=verbosity,
+        max_output_tokens=max_output_tokens, temperature=temperature,
+        prompt_cache_key=prompt_cache_key)
 
     attempts: List[Any] = []
     usage_captured: Dict[str, Any] = {}
@@ -2443,6 +2582,8 @@ async def _create_text_response_with_timeout(
     attempt_sink: Optional[Any] = None,
     layout: str = "legacy",
     service_tier_eligible: bool = False,
+    meter: Optional[Any] = None,
+    round_index: int = 0,
 ) -> str:
     """
     Create a text response with custom timeout (for retry scenarios)
@@ -2486,6 +2627,10 @@ async def _create_text_response_with_timeout(
 
     self.log_debug(f"Creating text response with custom timeout {timeout_seconds}s, model {model}")
 
+    if meter is not None:
+        # Before any attempt opens: an overflow found here leaves no ledger row, sends nothing.
+        await meter.preflight(request_params, round_index)
+    meter_seqs: _Dispatches = []
     attempts: List[Any] = []
     usage_captured: Dict[str, Any] = {}
     try:
@@ -2495,6 +2640,7 @@ async def _create_text_response_with_timeout(
 
         # API call with custom timeout
         _open_attempt(attempt_sink, request_params, attempts)
+        _meter_dispatch(meter, request_params, round_index, meter_seqs)
         response = await self._safe_api_call(
             self.client.responses.create,
             operation_type=operation_type,
@@ -2502,10 +2648,11 @@ async def _create_text_response_with_timeout(
             **request_params
         )
 
-        # Usage read for the ledger ONLY — this twin has never had a usage_sink, and giving it
-        # one would change what the caller budgets against. `_capture_usage(None, …)` writes
-        # nothing anywhere; it just hands back the numbers.
+        # Usage read for the ledger and the context meter — this twin has never had a
+        # usage_sink. `_capture_usage(None, …)` writes nothing anywhere; it just hands back the
+        # numbers.
         usage_captured = _capture_usage(None, response)
+        _meter_usage(meter, meter_seqs, usage_captured)
         _log_service_tier_echo(self, request_params, response)
         _close_attempt(attempt_sink, attempts, status="ok", usage=usage_captured)
 
@@ -2519,6 +2666,12 @@ async def _create_text_response_with_timeout(
         self.log_warning(f"Text response timed out: {e}")
         raise
     except Exception as e:
+        overflow = _meter_overflow(meter, e, request_params, round_index, meter_seqs)
+        if overflow is not None:
+            self.log_warning(f"Text response rejected as over the context window: {e}")
+            if overflow is e:
+                raise
+            raise overflow from e
         self.log_error(f"Error creating text response with timeout: {e}", exc_info=True)
         raise
     finally:
@@ -2550,6 +2703,8 @@ async def _create_text_response_with_tools_with_timeout(
     container_gone_sink: Optional[List[str]] = None,
     layout: str = "legacy",
     service_tier_eligible: bool = False,
+    meter: Optional[Any] = None,
+    round_index: int = 0,
 ) -> str:
     """
     Create text response with tools and custom timeout (for retry scenarios)
@@ -2597,6 +2752,10 @@ async def _create_text_response_with_tools_with_timeout(
 
     self.log_debug(f"Creating text response with tools and custom timeout {timeout_seconds}s, model {model}, tools: {tools}")
 
+    if meter is not None:
+        # Before any attempt opens: an overflow found here leaves no ledger row, sends nothing.
+        await meter.preflight(request_params, round_index)
+    meter_seqs: _Dispatches = []
     attempts: List[Any] = []
     usage_captured: Dict[str, Any] = {}
     try:
@@ -2610,12 +2769,14 @@ async def _create_text_response_with_tools_with_timeout(
             container_gone_sink=container_gone_sink,
             attempt_sink=attempt_sink, attempts=attempts,
             artifacts_sink=artifacts_sink,
+            meter=meter, round_index=round_index, meter_seqs=meter_seqs,
             timeout_seconds=timeout_seconds,
         )
 
-        # Usage-driven context budgeting must not degrade on the retry path — parity with the
-        # non-timeout twin. Without this, a retried turn silently falls back to chars/4.
+        # The context meter must not go blind on the retry path — parity with the non-timeout
+        # twin.
         usage_captured = _capture_usage(usage_sink, response)
+        _meter_usage(meter, meter_seqs, usage_captured)
         _log_service_tier_echo(self, request_params, response)
         _close_attempt(attempt_sink, attempts, status="ok", usage=usage_captured)
 
@@ -2700,6 +2861,12 @@ async def _create_text_response_with_tools_with_timeout(
         self.log_warning(f"Response with tools timed out: {e}")
         raise
     except Exception as e:
+        overflow = _meter_overflow(meter, e, request_params, round_index, meter_seqs)
+        if overflow is not None:
+            self.log_warning(f"Response with tools rejected as over the context window: {e}")
+            if overflow is e:
+                raise
+            raise overflow from e
         self.log_error(f"Error creating response with tools and timeout: {e}", exc_info=True)
         raise
     finally:

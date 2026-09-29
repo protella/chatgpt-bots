@@ -111,8 +111,6 @@ def _processor(db=None):
     p.db = db
     p.thread_manager.acquire_thread_lock = AsyncMock(return_value=True)
     p.thread_manager.release_thread_lock = AsyncMock()
-    p.thread_manager._token_counter.count_thread_tokens = MagicMock(return_value=0)
-    p.thread_manager._token_counter.count_message_tokens = MagicMock(return_value=0)
 
     state = SimpleNamespace(had_timeout=False, messages=[], thread_ts="10.0", channel_id=CH,
                             root_author=("U1", "human"), config_overrides={}, participants={},

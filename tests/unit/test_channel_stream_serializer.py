@@ -759,15 +759,15 @@ def test_a_malformed_h_or_floor_fails_the_pin():
 # ------------------------------------------------------------------ T6: the v3 sequence
 
 def test_the_canonical_sequence_is_horizon_messages_marker():
-    """T6. v3's whole item vocabulary: the horizon, the messages, the end marker, and nothing
-    else. No summary item is PRODUCIBLE — the pin has no field that could carry one — so a
-    channel cannot render compacted history it no longer has."""
+    """T6. The CANONICAL block's whole item vocabulary: the horizon, the messages, the end
+    marker, and nothing else. A thread summary (v7) lives only in the post-breakpoint origin
+    block, so the shared prefix never carries compacted history."""
     cards = sidecars(receipts=[ReceiptRec(ts=T1, state="finalized", turn_id="t1",
                                           thread_root_ts=None)])
     stream = serialize_stream(pinned(
         [msg(T0, text="a human said this"),
          msg(T1, text="and we answered", sender="B0", sender_type="self")], cards=cards))
-    assert SERIALIZER_VERSION == 6
+    assert SERIALIZER_VERSION == 7
     assert stream.items[0] is stream.horizon_item
     assert stream.items[-1] is stream.end_marker_item
     assert stream.items[1:-1] == stream.message_items

@@ -1422,6 +1422,7 @@ def test_a_real_build_emits_one_stream_render_that_matches_its_own_fields(sink):
     _emit_stream_render(_carrier(stream), turn_id="s:8", origin_root_ts="10.0",
                         trigger_ts="10.0")
     row = sink("stream_render")[0]
+    assert row["build_seq"] == 0          # the turn's first build
     for key, value in stream.stream_render_fields().items():
         if value is None:
             assert key not in row
@@ -1612,7 +1613,7 @@ def stream_render_row(**overrides):
         "receipts_included_count": 1, "receipts_excluded_count": 0,
         "history_pages": 1, "reply_pages": 0, "origin_pages": 1,
         "selection_version": 1, "serializer_version": 3,
-        "reselected": False, "anchor_advanced": False,
+        "reselected": False, "anchor_advanced": False, "build_seq": 0,
     }
     row.update(overrides)
     return row
@@ -1803,12 +1804,12 @@ def test_the_stream_render_contract_is_enforced(tmp_path):
 
     # RULE 3 — THE turn_error VOCABULARY, and retired codes are VIOLATIONS not grandfathered:
     # a fresh row carrying one means a producer survived the excision.
-    for code_name in ("stream_data_invalid", "stream_over_budget", "history_fetch_failed",
-                      "origin_fetch_failed"):
+    for code_name in ("stream_data_invalid", "history_fetch_failed", "origin_fetch_failed"):
         assert _run_checker(tmp_path, _ledger(
             render=stream_render_row(),
             outcome_extra={"error": code_name})) == (0, []), code_name
-    for retired in ("snapshot_unsupported", "coverage_not_ready", "invented_code"):
+    for retired in ("snapshot_unsupported", "coverage_not_ready", "stream_over_budget",
+                    "invented_code"):
         code, names = _run_checker(tmp_path, _ledger(
             render=stream_render_row(), outcome_extra={"error": retired}))
         assert code == 1 and "turn_outcome_bad_error" in names, retired
@@ -1819,9 +1820,17 @@ def test_the_stream_render_contract_is_enforced(tmp_path):
     code, names = _run_checker(tmp_path, _ledger(render=stream_render_row(),
                                                  stream_build_present=False))
     assert code == 1 and "stream_render_without_build" in names
-    # TWO ROWS FOR ONE turn_id — the direction "exactly one" needs and presence cannot give.
-    code, names = _run_checker(tmp_path, _ledger(
-        renders=[stream_render_row(), stream_render_row(at=3.5)]))
+    # SEVERAL ROWS FOR ONE turn_id — legal only as a rebuild sequence with strictly increasing
+    # build_seq; a repeat, a step backward or an unsequenced row is a duplicate.
+    assert _run_checker(tmp_path, _ledger(renders=[
+        stream_render_row(build_seq=0), stream_render_row(at=3.5, build_seq=1)])) == (0, [])
+    for first, second in ((0, 0), (1, 0)):
+        code, names = _run_checker(tmp_path, _ledger(renders=[
+            stream_render_row(build_seq=first), stream_render_row(at=3.5, build_seq=second)]))
+        assert code == 1 and "stream_render_duplicate" in names, (first, second)
+    unsequenced = stream_render_row(at=3.5)
+    unsequenced.pop("build_seq")
+    code, names = _run_checker(tmp_path, _ledger(renders=[stream_render_row(), unsequenced]))
     assert code == 1 and "stream_render_duplicate" in names
 
 

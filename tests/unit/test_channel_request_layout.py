@@ -1,4 +1,4 @@
-"""The channel request: one canonical layout, admitted before it is sent (spec §3).
+"""The channel request: one canonical layout (spec §3).
 
 What this file protects, in order of how expensive it is to get wrong:
 
@@ -8,9 +8,7 @@ What this file protects, in order of how expensive it is to get wrong:
    request still succeeds and just costs full price.
 2. ROLE AUTHORITY. Every piece of post-breakpoint evidence is content people wrote. The moment one
    of them arrives as `developer`, a channel topic becomes an instruction.
-3. THE ADMISSION ESTIMATE. It is the last thing before the first API call of the turn, it charges
-   raw media at its ceiling, and the summaries that follow it are capped to what it reserved.
-4. THREADSTATE IS NEVER TOUCHED. The tripwire for the whole redesign.
+3. THREADSTATE IS NEVER TOUCHED. The tripwire for the whole redesign.
 """
 from __future__ import annotations
 
@@ -22,12 +20,9 @@ import pytest
 from message_processor.client_contract import Message
 from config import config
 from message_processor import channel_request
-from message_processor.channel_request import (BATCHED_IMAGE_CAP, IMAGE_TOKEN_BOUND,
-                                               PDF_PAGE_TOKEN_BOUND, cap_summary_to_reserve,
-                                               estimate_admission, native_file_token_bound,
-                                               prompt_cache_key, to_input_items)
-from message_processor.channel_stream import END_MARKER_TEXT, StreamOverBudgetError
-from message_processor.token_counter import estimate_tokens_conservative
+from message_processor.channel_request import (BATCHED_IMAGE_CAP, prompt_cache_key,
+                                               to_input_items)
+from message_processor.channel_stream import END_MARKER_TEXT, StreamTimestampError
 from message_processor.turn_runtime import TurnRuntime
 from tests.unit.channel_turn_harness import (build_stream, file_ref, item_texts,
                                              no_tools_prepared, normalized,
@@ -60,11 +55,10 @@ def _message(channel="C1", thread="10.0", ts="10.0", text="hi"):
                    metadata={"ts": ts, "username": "Alice"})
 
 
-async def _assemble(host, turn, *, model="gpt-5.6-sol", tools_disabled=False,
-                    with_estimate=False, message=None):
+async def _assemble(host, turn, *, model="gpt-5.6-sol", tools_disabled=False, message=None):
     request, *_ = await host._assemble_channel_attempt(
         MagicMock(), message or _message(), SimpleNamespace(), turn, thread_config(), model,
-        thread_key="C1:10.0", tools_disabled=tools_disabled, with_estimate=with_estimate)
+        thread_key="C1:10.0", tools_disabled=tools_disabled)
     return request
 
 
@@ -248,10 +242,10 @@ async def test_the_rendered_time_is_pinned_so_a_retry_states_the_same_moment():
 
 
 @pytest.mark.asyncio
-async def test_the_job_state_evidence_is_pinned_at_admission_too():
-    """[r3-11] Both in-flight notes read the live ThreadManager, so a job that started between the
-    admission estimate and the request it admitted added bytes nothing had charged, a job that
-    finished changed the evidence under the responder, and a retry could see a third state again."""
+async def test_the_job_state_evidence_is_pinned_at_first_use_too():
+    """[r3-11] Both in-flight notes read the live ThreadManager, so a job that started or finished
+    between one assembly and the next changed the evidence under the responder, and a retry could
+    see a third state again."""
     host = _host()
     host._build_generation_inflight_note = MagicMock(
         side_effect=["[an image is being generated]", None, None])
@@ -260,13 +254,12 @@ async def test_the_job_state_evidence_is_pinned_at_admission_too():
     turn = TurnRuntime()
     pin_channel_turn(turn, prepared=no_tools_prepared())
 
-    admitted = "\n".join(item_texts(to_input_items(await _assemble(host, turn,
-                                                                   with_estimate=True))))
+    admitted = "\n".join(item_texts(to_input_items(await _assemble(host, turn))))
     retried = "\n".join(item_texts(to_input_items(await _assemble(host, turn))))
 
     assert "[an image is being generated]" in admitted
     assert admitted.count("[a deck is being built]") == 0
-    # The retry states what was true at admission, not what is true now.
+    # The retry states what was true at first assembly, not what is true now.
     assert "[an image is being generated]" in retried
     assert "[a deck is being built]" not in retried
     host._build_generation_inflight_note.assert_called_once()
@@ -544,482 +537,20 @@ class TestAFailedAttachmentIsVisibleToTheResponder:
         rendered = "\n".join(item_texts((await _assemble(_host(), turn)).input_items))
         assert "FAILED to load" not in rendered
 
-    @pytest.mark.asyncio
-    async def test_the_failure_evidence_is_charged_by_admission(self):
-        """It is bytes in the request like any other evidence, so it has to be paid for.
-
-        And there is exactly one wording now — no notice posts after the estimate — so what
-        admission measures is what gets sent, byte for byte.
-        """
-        plain = TurnRuntime()
-        pin_channel_turn(plain, prepared=no_tools_prepared())
-        failed = TurnRuntime()
-        pin_channel_turn(failed, prepared=no_tools_prepared(),
-                         failed_attachments=(("budget.numbers",
-                                              "is an unsupported file type (application/x-thing)"),))
-        host = _host()
-        bare = await _assemble(host, plain, with_estimate=True)
-        with_note = await _assemble(host, failed, with_estimate=True)
-        assert with_note.estimate.total_tokens > bare.estimate.total_tokens
-
-
-# --------------------------------------------------------------------------- admission
-
-@pytest.fixture
-def counted_admission():
-    """The exact-count path, for the tests that assert measured token NUMBERS.
-
-    Those numbers only hold when the o200k vocabulary is actually loaded; with a cold tiktoken cache
-    and no egress the estimator answers from its byte-ratio fallback, which is correct behaviour and
-    a different set of figures.
-    """
-    import message_processor.token_counter as token_counter
-    if token_counter.wait_for_admission_encoder() is None:
-        pytest.skip("o200k vocabulary unavailable — the fallback path is covered separately")
-
-
-def test_an_image_is_charged_its_ceiling_not_its_base64():
-    """Counting the data URI as text reports tens of millions of tokens for one screenshot and
-    refuses every turn that had a picture in it."""
-    huge = "A" * 4_000_000
-    items = [{"role": "user", "content": [
-        {"type": "input_text", "text": "look"},
-        {"type": "input_image", "image_url": f"data:image/png;base64,{huge}"}]}]
-    estimate = estimate_admission(instructions="", input_items=items, tools=None,
-                                 raw_document_texts=(), native_file_bounds=(),
-                                 model="gpt-5.6-sol")
-    assert estimate.breakdown["images"] == IMAGE_TOKEN_BOUND
-    assert estimate.breakdown["items"] < 10
-    assert estimate.fits
-
-
-def test_a_paged_native_file_is_charged_its_pages_plus_the_text_it_yields(monkeypatch):
-    """The API does BOTH things to a native PDF — renders every page AND reads the text out of
-    them — so a bound that stopped at the pages would stop being a ceiling exactly where it
-    matters, on a text-dense document. `document_reserves` does not already cover that leg: it
-    reserves room for the SUMMARY we generate locally, which is a different payload from the raw
-    text the API tokenizes out of the native part.
-
-    What is gone is the CONTAINER BYTES. A 1.1MB, 16-page image-heavy PDF was priced at
-    1,169,733 tokens and refused at the door; pages plus text puts it near 50k.
-    """
-    # The text leg is MEASURED, not ratio'd — the real o200k instrument, stubbed only so the
-    # arithmetic below is exact.
-    assert channel_request.estimate_tokens_conservative is estimate_tokens_conservative
-    monkeypatch.setattr(channel_request, "estimate_tokens_conservative",
-                        lambda text: len(text or "") // 4)
-
-    # Text-light: the live case. Pages dominate; the megabyte of compressed images never appears.
-    light = "Fig. 1\n" * 40
-    assert (channel_request.native_file_token_bound(1_100_000, 16, extracted_text=light)
-            == 16 * PDF_PAGE_TOKEN_BOUND + len(light) // 4)
-
-    # Text-dense: same pages, and the text leg is now the larger half of the ceiling.
-    dense = "x" * 200_000
-    dense_bound = channel_request.native_file_token_bound(60_000, 16, extracted_text=dense)
-    assert dense_bound == 16 * PDF_PAGE_TOKEN_BOUND + 50_000
-    assert dense_bound > 16 * PDF_PAGE_TOKEN_BOUND, "the text leg has to actually bite"
-
-    # No text in hand: the pages alone, and the container bytes never re-enter.
-    assert channel_request.native_file_token_bound(50_000_000, 2) == 2 * PDF_PAGE_TOKEN_BOUND
-
-
-def test_a_native_file_with_no_page_count_is_still_charged_by_its_bytes():
-    """An unparseable PDF, or a native part that has no pages at all (a spreadsheet mount): the
-    bytes are the only thing known locally, and one token per byte is the worst case for text —
-    a proxy for what the API will charge, not a guarantee. Pre-existing, unchanged."""
-    assert native_file_token_bound(5000, None) == 5000
-    assert native_file_token_bound(5000, 0) == 5000
-    assert native_file_token_bound(None, None) == 0
-    # Uncapped on purpose: a file whose worst case cannot fit genuinely cannot be guaranteed to.
-    assert native_file_token_bound(50_000_000, None) == 50_000_000
-
-
-def test_raw_document_text_is_charged_whole_and_reserved_at_its_charge():
-    """[r3-1] A document is charged its whole raw text even though only a summary will be sent, and
-    the reserve IS that charge: the turn already paid for those bytes, so handing the summary any
-    less would throw away room it had bought. A tighter, counted reserve looks harmless and is not —
-    a short document's counted reserve will not even hold the truncation marker, so its summary
-    would be dropped in full.
-
-    Needs no tokenizer, which is why it is not gated on one.
-    """
-    estimate = estimate_admission(
-        instructions="", input_items=[], tools=None,
-        raw_document_texts=(("a.pdf", "x" * 400), ("b.csv", "y" * 800)),
-        native_file_bounds=(), model="gpt-5.6-sol")
-    assert estimate.document_reserves == (("a.pdf", 400), ("b.csv", 800))
-    assert estimate.breakdown["document_text"] == 1200
-
-
-def test_two_documents_sharing_a_reserve_key_are_charged_and_granted_twice():
-    """[r4-3] `raw_document_texts` keys by file_id/url/filename, and Slack will happily deliver the
-    same file twice. Collapsed into a mapping, the pair was charged once and then granted that one
-    reserve EACH at finalization — two summaries spending room bought once, inside a request already
-    admitted. One entry per document, in charge order."""
-    estimate = estimate_admission(
-        instructions="", input_items=[], tools=None,
-        raw_document_texts=(("F1", "x" * 300), ("F1", "y" * 500)),
-        native_file_bounds=(), model="gpt-5.6-sol")
-    assert estimate.document_reserves == (("F1", 300), ("F1", 500))
-    assert estimate.breakdown["document_text"] == 800
-
-
-def test_every_item_pays_for_framing_its_text_cannot_show():
-    """[r2-4] Role wrappers and message delimiters are tokens the API adds around content we never
-    see, so a request assembled from forty items is not the sum of forty strings. Forty EMPTY items
-    used to cost zero, which is a bound that does not bound anything."""
-    from message_processor.token_counter import ITEM_STRUCTURAL_OVERHEAD
-
-    empty = [{"role": "user", "content": ""} for _ in range(40)]
-    estimate = estimate_admission(instructions="", input_items=empty, tools=None,
-                                  raw_document_texts=(), native_file_bounds=(),
-                                  model="gpt-5.6-sol")
-    # Forty items plus the developer instructions, which is framed the same way.
-    assert estimate.breakdown["structure"] == 41 * ITEM_STRUCTURAL_OVERHEAD
-    assert estimate.total_tokens >= 40 * ITEM_STRUCTURAL_OVERHEAD
-
-
-# Ground truth: the o200k_base token count for each of these exact literals, recorded as a NUMBER so
-# the assertions below cannot be an estimator's own formula compared against itself. The hex digest
-# is the case that matters — 1600 real tokens for 1600 bytes, which is the worst ratio any byte-level
-# BPE tokenizer can reach, and which the shipped bytes/3 estimate charged 534 for.
-_MEASURED_O200K_TOKENS = (
-    ("3f9a1c7e" * 200, 1600),                                        # hex digest, 1.00 bytes/token
-    ("QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=" * 60, 1260),             # base64
-    ("1,2.5,foo,2026-07-30,,7\n" * 100, 1700),                       # dense CSV
-    ('{"a":1,"bb":22,"ccc":"ddd","e":[1,2,3]}' * 60, 1260),          # minified JSON
-    ("日本語のテキスト" * 100, 600),                                   # CJK
-    ("\U0001f600\U0001f680\U0001f9ea\U0001f4a1" * 100, 800),         # emoji
-)
-
-
-def test_the_admission_charge_is_never_below_the_real_token_count():
-    """[r3-1] THE admission contract, and it is a bound rather than an estimate: a byte-level BPE
-    token consumes at least one input byte, so no such tokenizer can emit more tokens than the text
-    has bytes. Every literal below satisfies it by construction — which is the point. A charge that
-    needs no vocabulary cannot be wrong about a vocabulary it has never seen, which is exactly the
-    hole a counted estimate plus a 1.15x multiplier left open for gpt-5.6's unpublished table.
-
-    Not gated on the tokenizer loading: the charge does not use one.
-    """
-    from message_processor.token_counter import admission_charge, estimate_tokens
-
-    for text, measured in _MEASURED_O200K_TOKENS:
-        assert admission_charge(text) >= measured, text[:20]
-        # And every one of these is content chars/4 would have waved through.
-        assert estimate_tokens(text) < measured, text[:20]
-
-    # The bound is TIGHT, not merely large: a hex digest really does cost one token per byte, so
-    # nothing smaller than the byte count would have held for it.
-    hex_log, hex_tokens = _MEASURED_O200K_TOKENS[0]
-    assert admission_charge(hex_log) == hex_tokens
-
-
-def test_the_admission_charge_needs_no_tokenizer_at_all(monkeypatch):
-    """[r3-1] A cold tiktoken cache and no egress used to mean admission answered from utf-8 bytes/2
-    — a number the module's own comment admitted was below the worst case. The charge has no
-    tokenizer to lose now, so the fallback question does not arise for admission.
-    """
-    import message_processor.token_counter as token_counter
-
-    monkeypatch.setattr(token_counter, "_admission_encoder", lambda: None)
-    for text, measured in _MEASURED_O200K_TOKENS:
-        size = len(text.encode("utf-8"))
-        assert token_counter.admission_charge(text) == size
-        assert token_counter.admission_charge(text) >= measured, text[:20]
-        # And the RESERVE estimator, with no vocabulary, falls back to the same byte bound rather
-        # than to a ratio that would license more bytes than were charged.
-        assert token_counter.estimate_tokens_conservative(text) == size
-
-
-def test_the_reserve_estimator_covers_the_measured_token_count(counted_admission):
-    """The counted estimator no longer decides whether a turn may be sent, but it does decide how
-    much of a summary survives, so it still has to be at least the real count of what it measures.
-    """
-    from message_processor.token_counter import estimate_tokens_conservative
-
-    for text, measured in _MEASURED_O200K_TOKENS:
-        assert estimate_tokens_conservative(text) >= measured, text[:20]
-
-
-class TestTheReserveTokenizerLoadsWithoutWedgingATurn:
-    """[r3-2] The loader runs in a daemon thread because `get_encoding` fetches a vocabulary over
-    the network on a cold cache, and nothing may block a channel turn on that. Two seams broke:
-    a caller that arrived while BOOT's load was still running skipped the grace entirely, and a
-    failed load was remembered forever.
-    """
-
-    @pytest.fixture(autouse=True)
-    def _fresh_loader(self, monkeypatch):
-        import message_processor.token_counter as token_counter
-        monkeypatch.setattr(token_counter, "_ENCODER_SLOT", {})
-        monkeypatch.setattr(token_counter, "_ENCODER_THREAD", None)
-        monkeypatch.setattr(token_counter, "_ENCODER_ATTEMPTS", 0)
-
-    def test_a_caller_waits_on_the_load_boot_started(self, monkeypatch):
-        """Boot kicks the load off without waiting (`timeout=0`), so the first turn finds a thread
-        it did not start. It used to get None back immediately and answer from the fallback with a
-        perfectly good vocabulary arriving milliseconds later."""
-        import threading
-
-        import message_processor.token_counter as token_counter
-
-        release = threading.Event()
-
-        def _slow_load():
-            release.wait(5.0)
-            with token_counter._ENCODER_LOCK:
-                token_counter._ENCODER_SLOT["encoder"] = "VOCAB"
-                token_counter._ENCODER_THREAD = None
-
-        monkeypatch.setattr(token_counter, "_load_admission_encoder", _slow_load)
-        # Boot: starts the thread, waits for nothing.
-        assert token_counter.wait_for_admission_encoder(timeout=0) is None
-        boot_thread = token_counter._ENCODER_THREAD
-        assert boot_thread is not None and boot_thread.is_alive()
-
-        # The first turn arrives mid-load. It must join BOOT's thread, not decline to wait.
-        joined = []
-        monkeypatch.setattr(boot_thread, "join",
-                            lambda t=None: (joined.append(t), release.set(),
-                                            threading.Thread.join(boot_thread, 5.0))[0])
-        assert token_counter._admission_encoder() == "VOCAB"
-        assert joined == [token_counter._ENCODER_GRACE_SECONDS]
-
-    def test_a_failed_load_is_retried_by_a_later_caller(self, monkeypatch):
-        """A cold cache with momentarily no network is not a permanent verdict. Storing None as the
-        answer meant one unlucky boot cost the whole process its exact counts."""
-        import message_processor.token_counter as token_counter
-
-        attempts = []
-
-        def _flaky_load():
-            attempts.append(1)
-            encoder = "VOCAB" if len(attempts) > 1 else None
-            with token_counter._ENCODER_LOCK:
-                if encoder is not None:
-                    token_counter._ENCODER_SLOT["encoder"] = encoder
-                token_counter._ENCODER_THREAD = None
-
-        monkeypatch.setattr(token_counter, "_load_admission_encoder", _flaky_load)
-        assert token_counter.wait_for_admission_encoder(timeout=5.0) is None
-        assert len(attempts) == 1
-        # The next caller tries again rather than trusting a remembered failure.
-        assert token_counter.wait_for_admission_encoder(timeout=5.0) == "VOCAB"
-        assert len(attempts) == 2
-
-    def test_retries_are_bounded_so_a_dead_box_stops_paying_the_grace(self, monkeypatch):
-        """A permanently offline box must not spend the grace on every request forever."""
-        import message_processor.token_counter as token_counter
-
-        attempts = []
-
-        def _always_fails():
-            attempts.append(1)
-            with token_counter._ENCODER_LOCK:
-                token_counter._ENCODER_THREAD = None
-
-        monkeypatch.setattr(token_counter, "_load_admission_encoder", _always_fails)
-        for _ in range(token_counter._ENCODER_MAX_ATTEMPTS + 4):
-            assert token_counter._admission_encoder() is None
-        assert len(attempts) == token_counter._ENCODER_MAX_ATTEMPTS
-        # And the reserve estimator keeps answering throughout, from the byte bound.
-        assert token_counter.estimate_tokens_conservative("hello") == 5
-
-
-def test_a_special_token_literal_in_a_message_does_not_break_admission():
-    """tiktoken's `encode` REFUSES text containing a special-token literal, and a user is entirely
-    capable of typing one into a channel. `encode_ordinary` treats it as the text it is."""
-    from message_processor.token_counter import admission_charge, estimate_tokens_conservative
-
-    typed = "what happens if I say <|endoftext|> out loud?"
-    assert estimate_tokens_conservative(typed) > 0
-    assert admission_charge(typed) == len(typed.encode("utf-8"))
-
-
-def test_a_summary_can_never_exceed_what_the_estimate_reserved_for_it():
-    long_summary = "word " * 500
-    capped = cap_summary_to_reserve(long_summary, 50)
-    # Measured in the ADMISSION currency [r3-1]: the reserve licenses bytes, because bytes are what
-    # the document it replaces was charged. A token estimate here would let a prose summary of a
-    # dense document run several times the bytes it was admitted at.
-    assert len(capped.encode("utf-8")) <= 50
-    assert capped.endswith("[summary truncated to its admitted size]")
-    # Under the reserve, it is returned untouched — this fires almost never and must not mangle.
-    assert cap_summary_to_reserve("short", 1000) == "short"
-
-
-class TestTheCapHoldsAtEveryReserve:
-    """[f10] The cap is the second half of the admission guarantee: the request was admitted at a
-    size that charged this document's RAW text, so the summary standing in for it may not exceed
-    that. Every one of these returned MORE than the reserve before the fix — the zero case
-    returned the entire summary.
-    """
-
-    @staticmethod
-    def _fits(text, reserve):
-        # utf-8 bytes: the currency the document's own charge was in [r3-1].
-        return len(text.encode("utf-8")) <= reserve
-
-    def test_zero_reserve_admits_nothing(self):
-        # A document the estimate charged nothing for is a document with no text. Handing back the
-        # whole summary here hands the API bytes the budget check never saw.
-        assert cap_summary_to_reserve("a real summary of a real document", 0) == ""
-        assert cap_summary_to_reserve("a real summary", -25) == ""
-
-    def test_a_reserve_too_small_for_the_marker_admits_nothing(self):
-        # The honest note costs what it costs. Below that there is no truthful output, so the answer
-        # is nothing — never the marker's own overflow.
-        note = len(channel_request.TRUNCATION_NOTE.encode("utf-8"))
-        assert cap_summary_to_reserve("x" * 5000, 1) == ""
-        assert cap_summary_to_reserve("x" * 5000, note - 1) == ""
-        assert cap_summary_to_reserve("x" * 5000, note).endswith(channel_request.TRUNCATION_NOTE)
-        assert self._fits(cap_summary_to_reserve("x" * 5000, note), note)
-
-    def test_a_reserve_below_the_marker_but_above_nothing_still_admits_nothing(self):
-        """Every reserve from zero up to the marker's own size, exhaustively — the boundary is the
-        one place a cap gets to return something that does not fit."""
-        note = len(channel_request.TRUNCATION_NOTE.encode("utf-8"))
-        for reserve in range(0, note):
-            assert cap_summary_to_reserve("x" * 5000, reserve) == "", reserve
-
-    def test_a_tiny_reserve_keeps_the_marker_and_fits(self):
-        out = cap_summary_to_reserve("x" * 5000, 60)
-        assert out.endswith("[summary truncated to its admitted size]")
-        assert self._fits(out, 60)
-
-    def test_a_multibyte_summary_is_cut_on_a_character_boundary_and_fits(self):
-        """Cutting a byte prefix can land inside a multi-byte character; the result must still be
-        valid text AND still fit, at every reserve."""
-        for reserve in (15, 20, 50, 200, 999):
-            out = cap_summary_to_reserve("日本語の要約です。" * 400, reserve)
-            assert self._fits(out, reserve), (reserve, out[:40])
-            out.encode("utf-8").decode("utf-8")  # no lone surrogate / partial character survived
-
-    def test_the_capped_result_is_always_a_prefix_of_the_summary(self):
-        summary = "The document lists every regional total for Q3 and flags two outliers."
-        out = cap_summary_to_reserve(summary, 60)
-        head = out.split("\n[summary truncated")[0]
-        assert summary.startswith(head) and head
-
 
 @pytest.mark.asyncio
-async def test_an_over_budget_request_is_refused_before_any_api_call():
-    turn = TurnRuntime()
-    pin_channel_turn(
-        turn, prepared=no_tools_prepared(),
-        document_inputs=[{"filename": "huge.pdf", "mimetype": "application/pdf",
-                          "content": "z" * 8_000_000, "summary": None, "native": False,
-                          "size_bytes": 8_000_000}])
-    request = await _assemble(_host(), turn, with_estimate=True)
-    assert not request.estimate.fits
-    with pytest.raises(StreamOverBudgetError) as raised:
-        channel_request.raise_if_over_budget(request.estimate, channel_id="C1")
-    assert "over the" in str(raised.value)
-
-
-@pytest.mark.asyncio
-async def test_a_refusal_reports_the_real_count_beside_the_charged_bound(caplog):
-    """The charge is a bound, so it over-charges prose about 4.5x. When a window is refused, the one
-    question left is whether it was genuinely too big or whether the bound refused something that
-    would have fit — so the refusal logs both figures. Counted only here, never on the path that
-    fits."""
-    turn = TurnRuntime()
-    pin_channel_turn(
-        turn, prepared=no_tools_prepared(),
-        document_inputs=[{"filename": "huge.pdf", "mimetype": "application/pdf",
-                          "content": "prose about quarterly totals " * 100_000, "summary": None,
-                          "native": False, "size_bytes": 2_800_000}])
-    request = await _assemble(_host(), turn, with_estimate=True)
-    assert not request.estimate.fits
-    with caplog.at_level("WARNING"), pytest.raises(StreamOverBudgetError):
-        channel_request.raise_if_over_budget(request.estimate, channel_id="C1",
-                                             counted_text=request.countable_text)
-    assert any("real o200k tokens" in r.message for r in caplog.records)
-
-
-@pytest.mark.asyncio
-async def test_a_request_that_fits_is_never_counted():
-    """`countable_text` joins every string in the request; asking for it on the happy path would
-    add a full pass over the whole window to every turn."""
-    turn = TurnRuntime()
-    pin_channel_turn(turn, prepared=no_tools_prepared())
-    request = await _assemble(_host(), turn, with_estimate=True)
-    assert request.estimate.fits
-    with patch.object(channel_request, "estimate_tokens_conservative") as counted:
-        channel_request.raise_if_over_budget(request.estimate, channel_id="C1",
-                                             counted_text="")
-    counted.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_the_estimate_runs_before_summarization_and_caps_what_follows():
-    """The ordering [r3-4]: the summarizer IS a Responses API call, so a turn that could never
-    have been sent must not spend one per attached document to find that out — and once the
-    request has been admitted at a size, the summary it then renders cannot exceed it."""
+async def test_a_queued_documents_summary_is_finalized_by_the_catch_up_turn():
+    """[r5-2] A document an EARLIER queued message brought. The drain that folded that message into
+    this catch-up could not summarize it — the turn did not exist yet — so it is staged there and
+    finalized here. It is not in this request; what it is here for is the ledger row that
+    read_document/mount_file reach it by."""
     from message_processor.base import MessageProcessor
 
     with patch("message_processor.base.AsyncThreadStateManager"), \
          patch("message_processor.base.OpenAIClient"):
         processor = MessageProcessor()
     processor.db = None
-    order = []
-    processor._summarize_document_for_attach = AsyncMock(
-        side_effect=lambda *a, **k: order.append("summarize") or ("SUM " * 400))
-    processor._update_status = MagicMock()
-    processor.thread_manager.get_or_create_document_ledger = MagicMock()
-    processor._build_channel_info = AsyncMock(return_value=None)
-    processor._build_tools_array = MagicMock(return_value=None)
-    processor._get_system_prompt = MagicMock(return_value="SYSTEM")
-    processor._prepare_channel_turn_tools = AsyncMock(
-        return_value=no_tools_prepared())
-
-    doc = {"filename": "q3.pdf", "mimetype": "application/pdf", "content": "x" * 4000,
-           "summary": None, "native": False, "size_bytes": 4000}
-    processor._stage_document_summary(
-        doc, {"content": doc["content"]}, _message(), url_private="u", size_bytes=4000)
-
-    turn = TurnRuntime()
-    pin_channel_turn(turn, prepared=no_tools_prepared())
-    real_estimate = channel_request.estimate_admission
-
-    def _tracking_estimate(**kw):
-        order.append("estimate")
-        return real_estimate(**kw)
-
-    with patch.object(channel_request, "estimate_admission", _tracking_estimate):
-        await processor._admit_channel_request(
-            _message(), MagicMock(), turn, SimpleNamespace(channel_id="C1", thread_ts="10.0"),
-            thread_config(), None, stream=turn.channel_stream, steering=steering(),
-            image_inputs=[], file_inputs=[], document_inputs=[doc],
-            batched_image_inputs=[], batched_images_omitted=0)
-
-    assert order == ["estimate", "summarize"]
-    # Capped to the reserve, in the currency the reserve licenses: the summary that was actually
-    # rendered occupies no more bytes than the document's raw text was charged.
-    assert len(doc["summary"].encode("utf-8")) <= len(("x" * 4000).encode("utf-8"))
-
-
-@pytest.mark.asyncio
-async def test_a_queued_documents_summary_waits_for_the_catch_up_turns_admission():
-    """[r5-2] The same ordering, for a document an EARLIER queued message brought. The drain that
-    folded that message into this catch-up could not summarize it — the turn did not exist yet, so
-    there was nothing to admit — and doing it anyway spent a Responses call on a turn that might
-    still be refused. It is staged there and finalized here, after the estimate.
-
-    With NO reserve: the estimate never charged it, because it is not in this request. What it is
-    here for is the ledger row that read_document/mount_file reach it by, so capping its summary
-    against room it never occupies would only destroy the row's content."""
-    from message_processor.base import MessageProcessor
-
-    with patch("message_processor.base.AsyncThreadStateManager"), \
-         patch("message_processor.base.OpenAIClient"):
-        processor = MessageProcessor()
-    processor.db = None
-    order = []
-    processor._summarize_document_for_attach = AsyncMock(
-        side_effect=lambda *a, **k: order.append("summarize") or ("SUM " * 400))
+    processor._summarize_document_for_attach = AsyncMock(return_value="SUM " * 400)
     processor._update_status = MagicMock()
     processor.thread_manager.get_or_create_document_ledger = MagicMock()
     processor._build_channel_info = AsyncMock(return_value=None)
@@ -1036,72 +567,15 @@ async def test_a_queued_documents_summary_waits_for_the_catch_up_turns_admission
     message.metadata["batched_deferred_documents"] = [carried]
     turn = TurnRuntime()
     pin_channel_turn(turn, prepared=no_tools_prepared())
-    real_estimate = channel_request.estimate_admission
+    await processor._admit_channel_request(
+        message, MagicMock(), turn, SimpleNamespace(channel_id="C1", thread_ts="10.0"),
+        thread_config(), None, stream=turn.channel_stream, steering=steering(),
+        image_inputs=[], file_inputs=[], document_inputs=[],
+        batched_image_inputs=[], batched_images_omitted=0)
 
-    def _tracking_estimate(**kw):
-        order.append("estimate")
-        return real_estimate(**kw)
-
-    with patch.object(channel_request, "estimate_admission", _tracking_estimate):
-        await processor._admit_channel_request(
-            message, MagicMock(), turn, SimpleNamespace(channel_id="C1", thread_ts="10.0"),
-            thread_config(), None, stream=turn.channel_stream, steering=steering(),
-            image_inputs=[], file_inputs=[], document_inputs=[],
-            batched_image_inputs=[], batched_images_omitted=0)
-
-    assert order == ["estimate", "summarize"]
-    assert carried["summary"] == "SUM " * 400, "an uncharged summary must not be capped"
+    processor._summarize_document_for_attach.assert_awaited_once()
+    assert carried["summary"] == "SUM " * 400
     assert "_persist" not in carried, "the staged step must be consumed, not left for a retry"
-
-
-@pytest.mark.asyncio
-async def test_the_admitted_size_bounds_the_request_that_is_actually_sent():
-    """[f10] THE invariant, end to end: a request that passed admission cannot then grow past the
-    budget it was admitted against. Everything else in this section protects one term of it; this
-    measures the assembled request AFTER summarization against the estimate that admitted it, with
-    a summarizer that returns far more prose than the document it describes.
-    """
-    from message_processor.base import MessageProcessor
-
-    with patch("message_processor.base.AsyncThreadStateManager"), \
-         patch("message_processor.base.OpenAIClient"):
-        processor = MessageProcessor()
-    processor.db = None
-    processor._summarize_document_for_attach = AsyncMock(return_value="verbose prose " * 2000)
-    processor._update_status = MagicMock()
-    processor.thread_manager.get_or_create_document_ledger = MagicMock()
-    processor._build_channel_info = AsyncMock(return_value=None)
-    processor._build_tools_array = MagicMock(return_value=None)
-    processor._get_system_prompt = MagicMock(return_value="SYSTEM")
-    processor._prepare_channel_turn_tools = AsyncMock(return_value=no_tools_prepared())
-
-    # A short document: the reserve is small, so an unbounded summary would blow straight through it.
-    doc = {"filename": "note.txt", "mimetype": "text/plain", "content": "x" * 150,
-           "summary": None, "native": False, "size_bytes": 150}
-    processor._stage_document_summary(
-        doc, {"content": doc["content"]}, _message(), url_private="u", size_bytes=150)
-
-    turn = TurnRuntime()
-    pin_channel_turn(turn, prepared=no_tools_prepared(), document_inputs=[doc])
-    admitted = []
-    real_estimate = channel_request.estimate_admission
-
-    def _capture(**kw):
-        estimate = real_estimate(**kw)
-        admitted.append(estimate)
-        return estimate
-
-    with patch.object(channel_request, "estimate_admission", _capture):
-        await processor._admit_channel_request(
-            _message(), MagicMock(), turn, SimpleNamespace(channel_id="C1", thread_ts="10.0"),
-            thread_config(), None, stream=turn.channel_stream, steering=steering(),
-            image_inputs=[], file_inputs=[], document_inputs=[doc],
-            batched_image_inputs=[], batched_images_omitted=0)
-
-    assert doc["summary"].endswith("[summary truncated to its admitted size]")
-    sent = await _assemble(_host(), turn, with_estimate=True)
-    assert sent.estimate.total_tokens <= admitted[0].total_tokens
-    assert sent.estimate.fits
 
 
 # --------------------------------------------------------------------------- the pinned hashes
@@ -1257,8 +731,9 @@ class TestTheRequestNamesTheModelItIsSentTo:
         assert channel_request.capability_profile_hash(off) == plain
 
     def test_every_request_site_calls_the_resolver_instead_of_copying_it(self):
-        """[r3-12] The three sites that pick the model to SEND to used to each restate the
-        expression. They agreed, which is exactly why the drift would have been silent."""
+        """[r3-12] The sites that pick the model to SEND to used to each restate the
+        expression. They agreed, which is exactly why the drift would have been silent. The
+        handlers are the sites now; base.py no longer assembles a request of its own."""
         import inspect
 
         import message_processor.base as base
@@ -1267,7 +742,7 @@ class TestTheRequestNamesTheModelItIsSentTo:
         for module in (base, th):
             src = inspect.getsource(module)
             assert "config.web_search_model or thread_config" not in src, module.__name__
-            assert "effective_request_model(thread_config)" in src, module.__name__
+        assert "effective_request_model(thread_config)" in inspect.getsource(th)
 
 
 # --------------------------------------------------------------------------- retries
@@ -1459,7 +934,7 @@ async def test_a_fail_closed_turn_speaks_only_where_somebody_asked(wake, meta, p
     to us; a STRICT 1:1 continuation is a person carrying on what is effectively a private
     thread with us; and a catch-up turn that absorbed an owed @mention answers for that mention,
     so it owes the mentioner the reason it could not. A peer bot that said our name has nobody:
-    it cannot act on "try a smaller attachment", and a card posted at a bot is a loop seed.
+    it cannot act on the notice, and a card posted at a bot is a loop seed.
 
     The OUTCOME is identical in every case — `turn.turn_error` is what the ledger's fail-closed
     code is read from, and it is written before this decision is made.
@@ -1472,9 +947,8 @@ async def test_a_fail_closed_turn_speaks_only_where_somebody_asked(wake, meta, p
     processor.db = None
     processor.thread_manager.acquire_thread_lock = AsyncMock(return_value=True)
     processor.thread_manager.release_thread_lock = AsyncMock()
-    # The live shape: a 16-page image-heavy PDF whose admission put the turn over the limit.
     processor.get_or_create_channel_thread_state = AsyncMock(
-        side_effect=StreamOverBudgetError("C1: 1169733 tokens over the limit"))
+        side_effect=StreamTimestampError("C1: a timestamp that does not parse"))
 
     message = _message(ts="10.0")
     message.metadata.update(meta)
@@ -1482,14 +956,13 @@ async def test_a_fail_closed_turn_speaks_only_where_somebody_asked(wake, meta, p
     with patch.object(config, "enable_channel_memory", False):
         response = await processor.process_message(message, MagicMock(), None, turn=turn)
 
-    assert turn.turn_error == "stream_over_budget", wake
+    assert turn.turn_error == "stream_data_invalid", wake
     assert response.type == "error", wake
-    assert "Too Much For One Request" in response.content, wake
+    assert "Can't Place This Channel's History" in response.content, wake
     assert (response.metadata.get("suppress_error_post") is not True) is posts, wake
 
 
 @pytest.mark.parametrize("error_name,code,needle", [
-    ("StreamOverBudgetError", "stream_over_budget", "Too Much For One Request"),
     ("StreamTimestampError", "stream_data_invalid", "Can't Place This Channel's History"),
 ])
 def test_each_fail_closed_condition_gets_its_own_honest_notice(error_name, code, needle):
@@ -1506,32 +979,6 @@ def test_each_fail_closed_condition_gets_its_own_honest_notice(error_name, code,
     assert resolved == code
     assert needle in notice["message"]
     assert notice["status"] and not notice["status"].startswith("Something")
-
-
-@pytest.mark.asyncio
-async def test_a_mounted_spreadsheet_is_charged_by_its_bytes():
-    """A CSV/XLSX rides the turn as a native input_file so it auto-mounts in the sandbox (F32).
-    It has no page count, so the bound is one token per byte — the true worst case for
-    high-entropy text — and a 50k-row CSV is therefore charged what it could actually cost rather
-    than what its extracted preview does."""
-    turn = TurnRuntime()
-    pin_channel_turn(
-        turn, prepared=no_tools_prepared(),
-        document_inputs=[{"filename": "rows.csv", "mimetype": "text/csv",
-                          "content": "a,b\n1,2\n", "summary": "two columns",
-                          "native": True, "file_data_b64": "QUJD", "size_bytes": 120_000,
-                          "total_pages": None}])
-    request = await _assemble(_host(), turn, with_estimate=True)
-    assert request.estimate.breakdown["native_files"] == 120_000
-    # …and the same file WITHOUT the sandbox is not a native part at all, so nothing is charged.
-    plain = TurnRuntime()
-    pin_channel_turn(
-        plain, prepared=no_tools_prepared(),
-        document_inputs=[{"filename": "rows.csv", "mimetype": "text/csv",
-                          "content": "a,b\n1,2\n", "summary": "two columns",
-                          "native": False, "file_data_b64": None, "size_bytes": 120_000}])
-    assert (await _assemble(_host(), plain, with_estimate=True)
-            ).estimate.breakdown["native_files"] == 0
 
 
 @pytest.mark.asyncio
@@ -1773,66 +1220,21 @@ async def test_the_real_guard_ignores_framing_and_marker_items():
 
 
 @pytest.mark.asyncio
-async def test_a_refused_channel_turn_spends_nothing():
-    """T46. An oversized origin refuses at admission, and NOT ONE Responses call is spent.
-
-    The traps are the test. Asserting the estimate does not fit proves the arithmetic; it does
-    not prove the turn stopped. Every wrapper that could reach the API is trapped by name and
-    asserted at zero, because a refusal that still paid for a summarization round is the
-    expensive failure this row exists to prevent.
-    """
-    import openai_client.base as oai
-
-    calls = []
-    wrappers = ("create_text_response", "create_text_response_with_tools",
-                "create_streaming_response", "create_streaming_response_with_tools",
-                "create_text_response_with_tool_loop",
-                "create_streaming_response_with_tool_loop")
-
-    def _trap(name):
-        async def _call(*a, **k):
-            calls.append(name)
-            raise AssertionError(f"a refused turn reached the API through {name}")
-        return _call
-
-    turn = _origin_turn(origin_messages=[normalized("10.0", "z" * 40_000_000)])
-    with patch.multiple(oai.OpenAIClient, **{n: _trap(n) for n in wrappers}):
-        request = await _assemble(_host(), turn, with_estimate=True)
-        assert not request.estimate.fits
-        with pytest.raises(StreamOverBudgetError):
-            channel_request.raise_if_over_budget(request.estimate, channel_id="C1")
-
-    assert calls == [], f"a refused turn spent Responses calls: {calls}"
-
-    # The origin is charged as ROOM CONTENT, not overhead — `stream_tokens` carries it, which is
-    # what makes the refusal diagnostic point at the right cause.
-    assert request.estimate.stream_tokens > 10_000_000
-
-
-@pytest.mark.asyncio
 async def test_the_origin_block_carries_its_own_marker_and_is_stripped():
-    """T46's MECHANISM half, on a small ADMITTED request — the shape a real turn sends.
+    """T46's MECHANISM half, on a small request — the shape a real turn sends.
 
-    `_stream` and `_origin` pull in opposite directions against one flag: the origin must be
-    OUTSIDE `_stream` so the evidence hash covers it, and INSIDE the room-content figure so a
-    refusal names the right cause. Two markers is the minimal resolution, and each of the three
-    touches is checked here rather than inferred from a number.
+    The origin must be OUTSIDE `_stream` so the evidence hash covers it, and it still needs a
+    marker of its own. Each touch is checked here rather than inferred from a number.
     """
     turn = _origin_turn()
-    request = await _assemble(_host(), turn, with_estimate=True)
-    assert request.estimate.fits, "this half is about an ADMITTED request"
+    request = await _assemble(_host(), turn)
 
     # TOUCH 1 — the origin items carry `_origin` and NOT `_stream`.
     origin_items = [i for i in request.input_items if i.get("_origin")]
     assert origin_items, "the origin block must be marked"
     assert not any(i.get("_stream") for i in origin_items)
 
-    # TOUCH 2 — the estimator counts BOTH markers into stream_tokens, so the room's content is
-    # the canonical stream plus the origin block.
-    canonical_only = sum(1 for i in request.input_items if i.get("_stream"))
-    assert canonical_only and request.estimate.stream_tokens > 0
-
-    # TOUCH 3 — `to_input_items` removes BOTH keys. This is a CONTRACT, not a crash guard: the
+    # TOUCH 2 — `to_input_items` removes BOTH keys. This is a CONTRACT, not a crash guard: the
     # channel layout rebuilds role items from role+content alone, so an unstripped marker could
     # never reach the API — but this seam promises the assembler's bookkeeping does not leave
     # with the items, and a surviving marker would make that promise false.
