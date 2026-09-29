@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.3.1] - 2026-09-29
+
+### ✨ Added
+
+- **GPT-6.1 Sol replaces GPT-6 Sol** in the model picker. It works like Astra: no `none`
+  reasoning level and no temperature/top_p. Anyone on GPT-6 Sol (personal, thread or channel
+  settings) moves to GPT-6.1 Sol at startup, and a saved `none` becomes `low`.
+
+### 🐛 Fixed
+
+- **Background job results post as soon as the delivery decision is made.** The delivery step
+  used to make one extra empty model call after choosing what to post, which could hold the
+  result back by up to 18 seconds and logged a misleading "tool loop cap hit" warning.
+
 ## [3.3.0] - 2026-09-28
 
 ### ✨ Added

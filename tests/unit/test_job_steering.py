@@ -58,6 +58,15 @@ class _FakeProcessor:
     def __init__(self, openai_client=None, tm=None):
         self.openai_client = openai_client
         self.thread_manager = tm
+        self._background_tasks: set = set()
+
+    def _schedule_async_call(self, coro: Any) -> Any:
+        # The real one's contract (message_processor/utilities.py): schedule on the running loop
+        # and hold a strong reference. The build phase hands it to its context meter.
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     def _build_tools_array(self, cfg, model, registry=None):
         return [{"type": "web_search"}]

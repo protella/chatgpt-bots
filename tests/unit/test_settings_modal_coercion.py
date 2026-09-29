@@ -232,9 +232,10 @@ class TestAstraModalLadder:
     def modal(self):
         return SettingsModal(db=MagicMock())
 
-    def test_the_personal_effort_ladder_for_astra_excludes_none(self, modal):
+    @pytest.mark.parametrize("model", ["gpt-6-astra", "gpt-6.1-sol"])
+    def test_the_personal_effort_ladder_for_astra_excludes_none(self, modal, model):
         from config import GPT6_EFFORTS
-        blocks = modal._add_gpt55_settings({}, "gpt-6-astra")
+        blocks = modal._add_gpt55_settings({}, model)
         block = next(b for b in blocks if b.get("block_id") == "reasoning_block_gpt54")
         values = [o["value"] for o in block["accessory"]["options"]]
         assert values == GPT6_EFFORTS
@@ -248,13 +249,13 @@ class TestAstraModalLadder:
         assert block["accessory"]["initial_option"]["value"] == "low"
 
 
-class TestSolSamplingRoundTrip:
-    def test_sol_at_none_keeps_temperature_and_top_p(self):
-        """Render -> extract -> validate: Sol has `none`, so the sampling controls it renders
+class TestLunaSamplingRoundTrip:
+    def test_luna_at_none_keeps_temperature_and_top_p(self):
+        """Render -> extract -> validate: Luna has `none`, so the sampling controls it renders
         there must survive the submit instead of being stripped as on Astra."""
         modal = SettingsModal(db=MagicMock())
         blocks = modal._add_gpt55_settings(
-            {"reasoning_effort": "none", "temperature": 0.3, "top_p": 0.5}, "gpt-6-sol")
+            {"reasoning_effort": "none", "temperature": 0.3, "top_p": 0.5}, "gpt-6-luna")
         by_id = {b.get("block_id"): b for b in blocks}
         reasoning = by_id["reasoning_block_gpt54"]["accessory"]["initial_option"]
         temperature = by_id["temperature_block"]["element"]["initial_value"]
@@ -263,7 +264,7 @@ class TestSolSamplingRoundTrip:
         # Submit exactly what was rendered, so a renderer that dropped the saved values
         # (e.g. back to 1.0) fails here.
         extracted = modal.extract_form_values({"values": {
-            "model_block": {"model_select": {"selected_option": {"value": "gpt-6-sol"}}},
+            "model_block": {"model_select": {"selected_option": {"value": "gpt-6-luna"}}},
             "reasoning_block_gpt54": {"reasoning_level_gpt54": {
                 "selected_option": reasoning}},
             "temperature_block": {"temperature": {"value": temperature}},

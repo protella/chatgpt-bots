@@ -975,6 +975,27 @@ async def create_text_response_with_tool_loop(
             tool_choice = "none"
 
 
+async def _flush_stream_end(self: Any, stream_callback: Callable[[Optional[str]], Any],
+                            hidden_sink: Optional[List[BaseException]]) -> None:
+    """Send the completion flush (`stream_callback(None)`) the way the final streaming round does.
+
+    Same rules as responses.py: skipped in hidden-buffer mode (no surface to flush into); a
+    stale-send refusal the caller registered hides the turn; an unregistered one propagates;
+    any other callback error is logged and swallowed."""
+    if hidden_sink:
+        return
+    try:
+        result = stream_callback(None)
+        if result is not None and hasattr(result, "__await__"):
+            await result
+    except Exception as callback_error:  # noqa: BLE001 — mirrors the streaming layer's flush
+        if responses_api._hidden_for(hidden_sink, callback_error) is not None:
+            return
+        if responses_api._is_suppression(callback_error):
+            raise
+        self.log_warning(f"Stream completion callback error: {callback_error}")
+
+
 async def create_streaming_response_with_tool_loop(
     self,
     messages: List[Dict[str, Any]],
@@ -990,6 +1011,7 @@ async def create_streaming_response_with_tool_loop(
     free_tools: Optional[Iterable[str]] = None,
     aggregate_segments: bool = False,
     pre_round_input_callback: Optional[_PreRoundCallback] = None,
+    terminal_tools: Optional[Iterable[str]] = None,
     **params: Any,
 ) -> Dict[str, Any]:
     """Streaming response with local tool execution.
@@ -1037,6 +1059,11 @@ async def create_streaming_response_with_tool_loop(
     arrived while the previous round was working. See ``_inject_pre_round_items`` for the
     guarantees it is holding to — once per ROUND and not per HTTP attempt, after the round's
     replayed tool pairs, and never able to fail the round.
+
+    ``terminal_tools`` names tools whose successful call IS the answer (the delivery planner's
+    `deliver`). Once a round has run one of them with an ok result, the loop returns right after
+    that round: no further model call, so no wind-down round and no cap warning. A call that
+    came back as an error is not terminal — the model goes again, as with any other tool.
     """
     rounds_cap = int(max_tool_rounds) if max_tool_rounds is not None else config.max_tool_rounds
     calls_cap = (int(max_tool_calls) if max_tool_calls is not None
@@ -1047,6 +1074,7 @@ async def create_streaming_response_with_tool_loop(
     # charging its hosted rounds would let it run past the limit it asked for.
     uncapped = rounds_cap == NO_CAP and calls_cap == NO_CAP
     free_names = {str(n) for n in (free_tools or ())}
+    terminal_names = {str(n) for n in (terminal_tools or ())}
     free_rounds_cap = max(1, rounds_cap * _FREE_ROUND_CEILING)
     free_calls_cap = max(1, calls_cap * _FREE_ROUND_CEILING)
     budget = {"rounds": 0, "calls": 0, "free_rounds": 0, "free_calls": 0}
@@ -1145,12 +1173,11 @@ async def create_streaming_response_with_tool_loop(
     visible_committed = bool(prior_committed)
     rescued = False     # the empty-cap-forced-final retry fires at most once per turn
     # ...but not every caller wants it. "one forced tool round, and the call IS the answer" is a
-    # legitimate shape: the background-job delivery planner (message_processor/research_tools.py)
-    # seeds tool_choice="required" with a rounds cap of 1, reads its reply out of the `deliver`
-    # tool args, discards this loop's return value, and tells the model to write NOTHING after
-    # the call. Its wind-down round is SUPPOSED to be empty, so the rescue there is two wasted
-    # model calls and two misleading warnings per job. Captured here, before the loop clears the
-    # seeded tool_choice below.
+    # legitimate shape: its wind-down round is SUPPOSED to be empty, so the rescue there is two
+    # wasted model calls and two misleading warnings. (A `terminal_tools` caller never reaches
+    # the rescue once its terminal call lands — the loop returns on that round; a terminal call
+    # that failed leaves the turn owing an answer like any other.) Captured here, before the
+    # loop clears the seeded tool_choice below.
     rescue_enabled = not (tool_choice == "required" and rounds_cap == 1)
     # Every round's visible text, in order — a pre-tool preamble and the post-tool text are
     # SEPARATE rounds. ``aggregate_segments`` (the chat handler) returns the seam-joined whole so
@@ -1161,6 +1188,23 @@ async def create_streaming_response_with_tool_loop(
     segments: List[str] = []
     # Which request of this loop is going out (see the non-streaming twin).
     request_round = 0
+
+    async def _terminal_return(records_before: int) -> Optional[Dict[str, Any]]:
+        """The loop's return when the round just run landed an ok call to a terminal tool.
+
+        The streaming layer skips its completion flush on a function-call round (it expects
+        another round), so the flush the final round would have sent is sent here."""
+        if not any(r.get("ok") and r.get("name") in terminal_names
+                   for r in local_tool_calls[records_before:]):
+            return None
+        await _flush_stream_end(self, stream_callback, params.get("hidden_suppression_sink"))
+        return {
+            # A tool round's own text is preamble, which only an aggregating caller returns.
+            "text": join_segments(segments) if aggregate_segments else "",
+            "segments": list(segments),
+            "tools_used": tools_used_all,
+            "local_tool_calls": local_tool_calls,
+        }
 
     while True:
         # W3, request side: picks up a container a BRIDGE tool created during the previous
@@ -1249,6 +1293,7 @@ async def create_streaming_response_with_tool_loop(
                 # its siblings have run. The excess-bookkeeping suppression rides along so
                 # that rule holds on this round exactly as it does on any other.
                 suppressed = _suppress_excess_free(calls)
+                records_before = len(local_tool_calls)
                 outcome = await _handle_no_reply_terminal(
                     self, registry, tool_context, sink, input_items, calls, terminal_call,
                     silence_reason, tools_used_all, local_tool_calls,
@@ -1258,8 +1303,12 @@ async def create_streaming_response_with_tool_loop(
                 if outcome is not None:
                     return outcome
                 # The executor refused: the round ran (its committed preamble and outputs are
-                # already on the input) and the turn owes words. Charge it and continue.
+                # already on the input) and the turn owes words — unless a terminal sibling
+                # landed, which is the answer. Otherwise charge it and continue.
                 _charge(calls, suppressed)
+                finished = await _terminal_return(records_before)
+                if finished is not None:
+                    return finished
                 if _should_force_final():
                     tool_choice = "none"
                 continue
@@ -1283,12 +1332,16 @@ async def create_streaming_response_with_tool_loop(
             suppressed = {**_suppress_excess_free(calls), **_suppress_over_budget(calls)}
             _charge(calls, suppressed)
             _replay_committed_text(input_items, text)
+            records_before = len(local_tool_calls)
             await _run_tool_round(
                 self, registry, tool_context, sink, input_items, local_tool_calls, tool_callback,
                 result_overrides={**suppressed,
                                   **_terminal_overrides(calls, terminal_call, terminal_result)})
             _merge_used(tools_used_all, [c.get("name") for c in calls if c.get("name")],
                         tool_context)
+            finished = await _terminal_return(records_before)
+            if finished is not None:
+                return finished
             if _should_force_final():
                 tool_choice = "none"
             continue
@@ -1304,12 +1357,16 @@ async def create_streaming_response_with_tool_loop(
         suppressed = {**suppressed, **over_budget}
         _charge(calls, suppressed)
         _replay_committed_text(input_items, text)
+        records_before = len(local_tool_calls)
         await _run_tool_round(
             self, registry, tool_context, sink, input_items, local_tool_calls, tool_callback,
             result_overrides=suppressed or None,
         )
         _merge_used(tools_used_all, [c.get("name") for c in calls if c.get("name")],
                         tool_context)
+        finished = await _terminal_return(records_before)
+        if finished is not None:
+            return finished
 
         if _should_force_final():
             tool_choice = "none"

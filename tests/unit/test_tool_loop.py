@@ -2143,6 +2143,41 @@ class TestEmptyCapForcedFinalIsRescued:
         assert not [w for w in warnings if "out-of-budget" in w or "returned nothing" in w]
         assert [w for w in warnings if "Tool loop cap hit" in w]
 
+    async def test_a_terminal_tool_call_ends_the_loop_with_one_model_call(self, monkeypatch):
+        """The delivery planner's `deliver` IS the answer. It used to end on a round cap of 1,
+        which cost a wind-down model call that produced nothing (1-18s of dead time in prod)
+        and a cap warning on every job. A terminal tool that lands ends the loop right there."""
+        warnings = []
+
+        class _LoudClient(_Client):
+            def log_warning(self, msg, *a, **k):
+                warnings.append(str(msg))
+
+        state = {"n": 0}
+        streamed: list = []
+
+        async def fake_streaming(client, messages, tools, stream_callback, tool_callback=None,
+                                 function_call_sink=None, tool_choice=None, **params):
+            state["n"] += 1
+            assert state["n"] <= 5, "the loop never wound down"
+            if function_call_sink is not None:
+                function_call_sink.append(_call("deliver", f"c{state['n']}"))
+            return ""
+
+        monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
+                            fake_streaming)
+        out = await tool_loop.create_streaming_response_with_tool_loop(
+            _LoudClient(), messages=[], tools=[], registry=_registry_with("deliver"),
+            tool_context=ToolContext(), stream_callback=streamed.append,
+            terminal_tools={"deliver"}, tool_choice="required")
+
+        assert state["n"] == 1
+        assert streamed == [None]          # the completion flush the final round would send
+        assert out["text"] == ""
+        assert out["tools_used"] == ["deliver"]
+        assert [c["name"] for c in out["local_tool_calls"]] == ["deliver"]
+        assert not warnings
+
 
 @pytest.mark.asyncio
 class TestRescueSurvivesTheHandlerRebuild:

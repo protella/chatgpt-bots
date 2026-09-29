@@ -114,12 +114,12 @@ def pipeline_status(stage: str, default: str, **fmt) -> str:
 
 
 # Model knowledge cutoff dates
-# Supported models: gpt-6-astra (default), gpt-6-sol, gpt-6-luna, gpt-5.6-sol, gpt-5.6-terra,
+# Supported models: gpt-6-astra (default), gpt-6.1-sol, gpt-6-luna, gpt-5.6-sol, gpt-5.6-terra,
 # gpt-5.6-luna, gpt-5.5 (gpt-6-luna doubles as the utility model)
 MODEL_KNOWLEDGE_CUTOFFS = {
     # GPT-6 Astra (April 2026 cutoff, 1.05M context window, released September 3, 2026)
     "gpt-6-astra": "April 30, 2026",
-    "gpt-6-sol": "April 20, 2026",
+    "gpt-6.1-sol": "April 30, 2026",
     "gpt-6-luna": "May 18, 2026",
 
     # GPT-5.6 family (Feb 2026 cutoff, 1.05M context window, released July 9, 2026)
@@ -135,7 +135,7 @@ MODEL_KNOWLEDGE_CUTOFFS = {
 }
 
 # The full user-selectable model set (order = modal display order)
-SUPPORTED_CHAT_MODELS = ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol",
+SUPPORTED_CHAT_MODELS = ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna", "gpt-5.6-sol",
                          "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"]
 
 # What OPENAI_SERVICE_TIER may say. `standard` is OUR name for "send no service_tier at all" —
@@ -144,8 +144,8 @@ SUPPORTED_CHAT_MODELS = ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol"
 # honored only on the models below; everything else pays standard rates for nothing.
 SUPPORTED_SERVICE_TIERS = ("standard", "fast")
 # All verified live: `service_tier="fast"` returns 200 on each (5.6-sol/astra 2026-09-08;
-# gpt-6-sol/luna 2026-09-23, served tier echoes `fast`).
-FAST_SERVICE_TIER_MODELS = frozenset({"gpt-5.6-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"})
+# gpt-6-luna 2026-09-23; gpt-6.1-sol 2026-09-29; served tier echoes `fast`).
+FAST_SERVICE_TIER_MODELS = frozenset({"gpt-5.6-sol", "gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"})
 
 # The image models a channel or a person may select. Promoted here from the literal that used to
 # live inside the personal modal so the modal's option list and the channel resolver's allowlist
@@ -163,8 +163,9 @@ SUPPORTED_VERBOSITIES = ("low", "medium", "high")
 # `max` returns 200 on ALL three 5.6 tiers; `minimal` 400s on all of them)
 # GPT-6 Astra verified live 2026-09-08: low/medium/high/xhigh/max return 200; BOTH `none` and
 # `minimal` 400 with "Supported values are: 'low', 'medium', 'high', 'xhigh', and 'max'".
-# GPT-6 Sol/Luna verified live 2026-09-23: they carry the 5.6 ladder (`none` legal, `minimal` 400),
-# so GPT6_EFFORTS is Astra's ladder, not the family's.
+# GPT-6.1 Sol verified live 2026-09-29: Astra's exact ladder (`none` and `minimal` both 400).
+# GPT-6 Luna verified live 2026-09-23: it carries the 5.6 ladder (`none` legal, `minimal` 400),
+# so GPT6_EFFORTS is the Astra/6.1-Sol ladder, not the family's.
 GPT6_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 GPT56_EFFORTS = ["none", "low", "medium", "high", "xhigh", "max"]
 GPT55_EFFORTS = ["none", "low", "medium", "high", "xhigh"]
@@ -180,13 +181,14 @@ MIGRATED_EFFORTS = frozenset({"none", "minimal"})
 
 
 def _no_none_ladder(model: str) -> bool:
-    """Whether `model` is on the one ladder without `none`: Astra only.
+    """Whether `model` is on the ladder without `none`: Astra and 6.1 Sol.
 
-    ONE predicate, shared by `effort_ladder`, `clamp_effort` and `supports_sampling`. Astra is
-    the documented exception; Sol, Luna and any other `gpt-6-*` carry the full `none..max`
-    ladder, so a `startswith("gpt-6")` test here would clamp their legal `none` away.
+    ONE predicate, shared by `effort_ladder`, `clamp_effort` and `supports_sampling`. Astra and
+    gpt-6.1-sol (verified live 2026-09-29: `none`/`minimal` 400, sampling 400) are the named
+    exceptions; Luna and any other `gpt-6-*` carry the full `none..max` ladder, so a
+    `startswith("gpt-6")` test here would clamp their legal `none` away.
     """
-    return (model or "").startswith("gpt-6-astra")
+    return (model or "").startswith(("gpt-6-astra", "gpt-6.1-sol"))
 
 
 def effective_channel_model(stored: Optional[str], fallback: str) -> str:
@@ -210,9 +212,9 @@ def effort_ladder(model: str) -> List[str]:
     `effective_channel_model`: two spellings of this test disagreed about anything that was
     neither 5.5 nor 5.6.
 
-    Astra is tested FIRST because its ladder is the odd one out: it is the only model with no
-    `none`, so falling through to either 5.x ladder would advertise a value that 400s. Every
-    other GPT-6 model (Sol, Luna) carries the 5.6 ladder.
+    Astra and 6.1 Sol are tested FIRST because their ladder is the odd one out: they are the
+    only models with no `none`, so falling through to either 5.x ladder would advertise a value
+    that 400s. Every other GPT-6 model (Luna) carries the 5.6 ladder.
     """
     name = model or ""
     if _no_none_ladder(name):
@@ -224,11 +226,12 @@ def clamp_effort(model: str, effort: Optional[str]) -> str:
     """Coerce a stored/legacy reasoning effort into one the model accepts.
 
     Guarantees bad stored settings can never reach the API:
-    - GPT-6 Astra: neither `none` nor `minimal` exists (both 400) -> `low`, per OpenAI's own
-      migration guidance ("if you use none or minimal, start with low"). Load-bearing:
+    - GPT-6 Astra and 6.1 Sol: neither `none` nor `minimal` exists (both 400) -> `low`, per
+      OpenAI's own migration guidance ("if you use none or minimal, start with low"). Load-bearing:
       UTILITY_REASONING_EFFORT defaults to `none`, and every `none` already stored in
-      user_preferences / channel_settings / threads.config_json will meet Astra.
-    - 5.6 family and every other GPT-6 model (Sol, Luna): `minimal` is unsupported (400)
+      user_preferences / channel_settings / threads.config_json will meet Astra. The same
+      clamp covers a `configuration_update` override (6.1 Sol: -> none 400s, 2026-09-29).
+    - 5.6 family and every other GPT-6 model (Luna): `minimal` is unsupported (400)
       -> `none`; full ladder incl. `max`.
     - gpt-5.5 / gpt-5-mini and anything else: `max` doesn't exist -> `xhigh`;
       `minimal` stays valid on gpt-5-mini and maps to `low` on gpt-5.5 (its modal
@@ -258,9 +261,10 @@ def supports_sampling(model: str, effort: str) -> bool:
     Verified live 2026-09-08: GPT-6 Astra rejects both unconditionally — `temperature=1.0` is
     tolerated but any other value 400s ("'temperature' is not supported with this model"),
     and `top_p` 400s at every value including 1.0. So neither key is sent on Astra;
-    relying on a tolerated value is how the next release breaks us.
+    relying on a tolerated value is how the next release breaks us. GPT-6.1 Sol behaves
+    identically (verified live 2026-09-29).
 
-    5.5, the 5.6 family and GPT-6 Sol/Luna (verified live 2026-09-23) accept them only at
+    5.5, the 5.6 family and GPT-6 Luna (verified live 2026-09-23) accept them only at
     `effort == "none"`; every other effort is a reasoning turn where temperature is forced to 1.0.
     """
     if _no_none_ladder(model):

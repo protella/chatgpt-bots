@@ -818,9 +818,10 @@ class TestGpt6Astra:
         from config import SUPPORTED_CHAT_MODELS
         assert SUPPORTED_CHAT_MODELS[0] == "gpt-6-astra"
 
-    def test_the_ladder_has_no_none(self):
+    @pytest.mark.parametrize("model", ["gpt-6-astra", "gpt-6.1-sol"])
+    def test_the_ladder_has_no_none(self, model):
         from config import effort_ladder
-        ladder = effort_ladder("gpt-6-astra")
+        ladder = effort_ladder(model)
         assert ladder == ["low", "medium", "high", "xhigh", "max"]
         assert "none" not in ladder and "minimal" not in ladder
 
@@ -839,6 +840,7 @@ class TestGpt6Astra:
     def test_clamp_effort_on_astra(self, stored, expected):
         from config import clamp_effort
         assert clamp_effort("gpt-6-astra", stored) == expected
+        assert clamp_effort("gpt-6.1-sol", stored) == expected   # probed 2026-09-29: same ladder
 
     @pytest.mark.parametrize("model, effort, expected", [
         # GPT-6 rejects temperature and top_p at every effort — `temperature=1.0` is tolerated,
@@ -847,9 +849,11 @@ class TestGpt6Astra:
         ("gpt-6-astra", "none", False),
         ("gpt-6-astra", "low", False),
         ("gpt-6-astra", "max", False),
-        # Sol/Luna, 5.5 and 5.6 accept both, but only on a non-reasoning turn.
-        ("gpt-6-sol", "none", True),
-        ("gpt-6-sol", "low", False),
+        ("gpt-6.1-sol", "none", False),
+        ("gpt-6.1-sol", "low", False),
+        # Luna, 5.5 and 5.6 accept both, but only on a non-reasoning turn.
+        ("gpt-6-luna", "none", True),
+        ("gpt-6-luna", "low", False),
         ("gpt-5.6-sol", "none", True),
         ("gpt-5.6-sol", "medium", False),
         ("gpt-5.5", "none", True),
@@ -860,8 +864,8 @@ class TestGpt6Astra:
         from config import supports_sampling
         assert supports_sampling(model, effort) is expected
 
-    @pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna"])
-    def test_sol_and_luna_carry_the_full_ladder(self, model):
+    @pytest.mark.parametrize("model", ["gpt-6-luna"])
+    def test_luna_carries_the_full_ladder(self, model):
         from config import GPT56_EFFORTS, clamp_effort, effort_ladder
         assert effort_ladder(model) == GPT56_EFFORTS
         assert clamp_effort(model, "none") == "none"
@@ -871,6 +875,7 @@ class TestGpt6Astra:
     def test_the_knowledge_cutoff_is_registered(self):
         from config import MODEL_KNOWLEDGE_CUTOFFS
         assert MODEL_KNOWLEDGE_CUTOFFS["gpt-6-astra"] == "April 30, 2026"
+        assert MODEL_KNOWLEDGE_CUTOFFS["gpt-6.1-sol"] == "April 30, 2026"
 
     def test_get_model_token_limit_takes_the_1_05m_branch(self, mock_env):
         config = BotConfig()
@@ -887,7 +892,7 @@ class TestFastTierPreference:
     def test_both_eligible_models_are_in_the_set(self):
         from config import FAST_SERVICE_TIER_MODELS
         assert FAST_SERVICE_TIER_MODELS == frozenset(
-            {"gpt-5.6-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"})
+            {"gpt-5.6-sol", "gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"})
         assert "gpt-5.6-luna" not in FAST_SERVICE_TIER_MODELS
         assert "gpt-5.5" not in FAST_SERVICE_TIER_MODELS
 

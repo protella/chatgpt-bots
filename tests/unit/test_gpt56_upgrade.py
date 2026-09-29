@@ -66,7 +66,7 @@ class TestDefaults:
         # Astra leads: the list order is the modal's display order, and the workspace default
         # belongs at the top of it.
         assert SUPPORTED_CHAT_MODELS == [
-            "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra",
+            "gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra",
             "gpt-5.6-luna", "gpt-5.5"
         ]
 
@@ -244,9 +244,10 @@ class TestGpt6RequestShape:
         assert "temperature" not in params
         assert "top_p" not in params
 
-    def test_gpt6_sends_neither_sampling_key_at_the_lowest_effort_either(self):
-        # There is no `none` on this family, so there is no branch where sampling comes back.
-        params = _build(model="gpt-6-astra", reasoning_effort="none", temperature=0.7)
+    @pytest.mark.parametrize("model", ["gpt-6-astra", "gpt-6.1-sol"])
+    def test_gpt6_sends_neither_sampling_key_at_the_lowest_effort_either(self, model):
+        # There is no `none` on this ladder, so there is no branch where sampling comes back.
+        params = _build(model=model, reasoning_effort="none", temperature=0.7)
         assert "temperature" not in params and "top_p" not in params
         assert params["reasoning"] == {"effort": "low"}      # clamped, not passed through
 
@@ -284,21 +285,21 @@ class TestGpt6RequestShape:
         assert "prompt_cache_retention" not in params
 
 
-class TestGpt6SolLunaRequestShape:
-    """Sol/Luna share Astra's cache shape but 5.6's sampling rule (probed 2026-09-23)."""
+class TestGpt6LunaRequestShape:
+    """Luna shares Astra's cache shape but 5.6's sampling rule (probed 2026-09-23)."""
 
-    def test_sol_at_none_carries_temperature_and_top_p(self):
-        params = _build(model="gpt-6-sol", reasoning_effort="none", temperature=0.3, top_p=0.5)
+    def test_luna_at_none_carries_temperature_and_top_p(self):
+        params = _build(model="gpt-6-luna", reasoning_effort="none", temperature=0.3, top_p=0.5)
         assert params["reasoning"] == {"effort": "none"}
         assert params["temperature"] == 0.3
         assert params["top_p"] == 0.5
 
-    def test_sol_at_low_carries_neither(self):
-        params = _build(model="gpt-6-sol", reasoning_effort="low", temperature=0.3, top_p=0.5)
+    def test_luna_at_low_carries_neither(self):
+        params = _build(model="gpt-6-luna", reasoning_effort="low", temperature=0.3, top_p=0.5)
         assert "temperature" not in params and "top_p" not in params
 
-    def test_sol_cache_shape(self):
-        params = _build(model="gpt-6-sol", reasoning_effort="medium",
+    def test_luna_cache_shape(self):
+        params = _build(model="gpt-6-luna", reasoning_effort="medium",
                         prompt_cache_key="thread-key", layout="channel")
         assert params["prompt_cache_key"] == "thread-key"
         assert params["prompt_cache_options"] == {"ttl": "30m"}
@@ -307,13 +308,13 @@ class TestGpt6SolLunaRequestShape:
     def test_sampling_is_judged_against_the_overridden_effort(self):
         # Base `none` + update->`high` is a 400 with temperature; base `high` + update->`none`
         # is a 200. The API judges the EFFECTIVE effort, so the builder must too.
-        up = _build(model="gpt-6-sol", reasoning_effort="none", effort_override="high",
+        up = _build(model="gpt-6-luna", reasoning_effort="none", effort_override="high",
                     temperature=0.3, top_p=0.5)
         assert up["reasoning"] == {"effort": "none"}             # the baseline, untouched
         assert up["input"][-1] == {"type": "configuration_update",
                                    "reasoning": {"effort": "high"}}
         assert "temperature" not in up and "top_p" not in up
-        down = _build(model="gpt-6-sol", reasoning_effort="high", effort_override="none",
+        down = _build(model="gpt-6-luna", reasoning_effort="high", effort_override="none",
                       temperature=0.3, top_p=0.5)
         assert down["reasoning"] == {"effort": "high"}           # the baseline, untouched
         assert down["input"][-1] == {"type": "configuration_update",
@@ -336,9 +337,10 @@ class TestEffortOverride:
                                        "reasoning": {"effort": "high"}}
         assert len(params["input"]) == 2
 
-    def test_the_overridden_value_is_clamped_too(self):
+    @pytest.mark.parametrize("model", ["gpt-6-astra", "gpt-6.1-sol"])
+    def test_the_overridden_value_is_clamped_too(self, model):
         # A stored `none` reaching the override path must not become a 400 in an input item.
-        params = _build(model="gpt-6-astra", reasoning_effort="medium", effort_override="none")
+        params = _build(model=model, reasoning_effort="medium", effort_override="none")
         assert params["input"][-1]["reasoning"] == {"effort": "low"}
 
     def test_the_item_survives_the_channel_layout(self):

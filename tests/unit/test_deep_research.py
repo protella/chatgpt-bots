@@ -1781,6 +1781,10 @@ async def test_the_finalize_call_cannot_start_another_job(monkeypatch):
     assert names == ["deliver"]
     assert "start_background_job" not in names
     assert stub.delivery_kwargs["tool_choice"] == "required"
+    # `deliver` ends the call itself; no round cap stands in for it.
+    assert stub.delivery_kwargs["terminal_tools"] == {"deliver"}
+    assert "max_tool_rounds" not in stub.delivery_kwargs
+    assert "max_tool_calls" not in stub.delivery_kwargs
 
 
 @pytest.mark.asyncio

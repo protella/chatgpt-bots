@@ -953,12 +953,16 @@ class SettingsModal(LoggerMixin):
 
         blocks.append(reasoning_block)
 
-        # Add note about xhigh reasoning and temperature availability
+        # Add note about xhigh reasoning and temperature availability. The sampling sentence only
+        # where the ladder has a `none`: Astra and 6.1 Sol never take temperature/top_p.
+        effort_note = "_Extra High reasoning provides maximum accuracy but is slower and more expensive."
+        if "none" in effort_values:
+            effort_note += " Temperature/Top P controls are available when reasoning is set to None."
         blocks.append({
             "type": "context",
             "elements": [{
                 "type": "mrkdwn",
-                "text": "_Extra High reasoning provides maximum accuracy but is slower and more expensive. Temperature/Top P controls are available when reasoning is set to None._"
+                "text": effort_note + "_"
             }]
         })
 
@@ -1634,8 +1638,8 @@ class SettingsModal(LoggerMixin):
                 validated['reasoning_effort'] = clamped
 
         # Check if both temperature and top_p are changed for models that support them
-        # (gpt-5.5, the 5.6 family and GPT-6 Sol/Luna support temp/top_p only with
-        # reasoning=none; Astra never does)
+        # (gpt-5.5, the 5.6 family and GPT-6 Luna support temp/top_p only with
+        # reasoning=none; Astra and 6.1 Sol never do)
         from config import supports_sampling
         supports_temp = supports_sampling(model, validated.get('reasoning_effort') or '')
 
@@ -1670,7 +1674,7 @@ class SettingsModal(LoggerMixin):
             # Taglines follow OpenAI's own model classification (developers.openai.com/api/docs/models
             # and learn.chatgpt.com/docs/models, read 2026-09-09), shortened to fit a picker row.
             'gpt-6-astra': 'GPT-6 Astra (Most capable)',
-            'gpt-6-sol': 'GPT-6 Sol (Everyday professional work)',
+            'gpt-6.1-sol': 'GPT-6.1 Sol (Complex work, near-Astra)',
             'gpt-6-luna': 'GPT-6 Luna (Fast and affordable)',
             'gpt-5.6-sol': 'GPT-5.6 Sol (Complex professional work)',
             'gpt-5.6-terra': 'GPT-5.6 Terra (Balanced, everyday work)',

@@ -4117,11 +4117,11 @@ async def _plan_delivery(processor, *, job_id: str, task: str, report: str, stag
                 processor.openai_client.create_streaming_response_with_tool_loop(
                     messages=messages, tools=list(registry.schemas({})), registry=registry,
                     tool_context=ctx, stream_callback=_noop, tool_callback=None,
-                    # ONE tool round, forced. `required` makes the call unskippable — a finalize
-                    # that answers in prose delivers nothing at all — and a cap of 1 means the
-                    # loop flips to tool_choice="none" straight after, so the model cannot be
-                    # made to call `deliver` a second time and overwrite its own decision.
-                    max_tool_rounds=1, max_tool_calls=1, tool_choice="required",
+                    # `required` makes the call unskippable — a finalize that answers in prose
+                    # delivers nothing at all. `deliver` is TERMINAL: the loop returns the moment
+                    # it lands, with no wind-down model call after it. A refused call (not ok)
+                    # is not terminal, so the model goes again; `_deliver` refuses a second plan.
+                    terminal_tools={"deliver"}, tool_choice="required",
                     model=model, system_prompt=system_prompt, reasoning_effort=effort,
                     verbosity=verbosity, store=False),
                 timeout=float(getattr(config, "api_timeout_read", 300) or 300))
@@ -4130,7 +4130,7 @@ async def _plan_delivery(processor, *, job_id: str, task: str, report: str, stag
             raise
         except Exception as e:  # noqa: BLE001 — a failed plan means we fall back, never that we lose
             if plan.get("_delivered"):
-                # `deliver` already fired; the stream died on the wind-down round afterwards. The
+                # `deliver` already fired; the call errored after the plan landed. The
                 # decision is made — retrying would only spend a call to re-make it. Keyed on the
                 # sentinel, not on `reply`: an empty reply is schema-valid, and truthiness would
                 # send us round again to re-decide something already decided.

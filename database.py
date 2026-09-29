@@ -2107,10 +2107,18 @@ class DatabaseManager(LoggerMixin):
            `config.SUPPORTED_CHAT_MODELS` are selectable; any other stored
            model (user prefs or per-thread overrides) coerces to
            `config.gpt_model`, and stored reasoning efforts a model rejects are
-           clamped (`minimal` is a 400 on 5.6 and gpt-6-sol/luna -> none; `max`
-           doesn't exist on 5.5 -> xhigh; gpt-6-astra rejects both `none` and
-           `minimal` -> low). The Astra clamp is keyed on Astra alone: Sol/Luna
-           accept `none`, and a family-wide match would rewrite it on every boot.
+           clamped (`minimal` is a 400 on 5.6 and gpt-6-luna -> none; `max`
+           doesn't exist on 5.5 -> xhigh; gpt-6-astra and gpt-6.1-sol reject both
+           `none` and `minimal` -> low). That clamp is keyed on those two names
+           alone: Luna accepts `none`, and a family-wide match would rewrite it on
+           every boot. BEFORE the dropped-model reset, the successor rename
+           gpt-6-sol -> gpt-6.1-sol runs on user prefs, thread overrides AND
+           channel_settings (where no reset exists: `effective_channel_model` would
+           otherwise silently fall a Sol channel back to the workspace default),
+           so a renamed row keeps its model and its `none`/`minimal` is clamped to
+           `low` the same boot. channel_settings also takes the gpt-6.1-sol
+           none/minimal -> low clamp every boot, because Astra's channel clamp
+           lives in the sentinel-gated one-time swap and never runs again.
            Guarantees the API layer never receives a dropped model name or an
            unsupported effort. The allowlist is read from config at RUN TIME,
            never hard-coded: this part runs on every migration pass, so a
@@ -2168,6 +2176,32 @@ class DatabaseManager(LoggerMixin):
             # config.validate() refuses to boot when gpt_model is not in SUPPORTED_CHAT_MODELS,
             # so the reset target is guaranteed to be a member of the allowlist above.
             fallback_model = bot_config.gpt_model
+            # Successor rename, BEFORE the dropped-model reset below: gpt-6-sol left the
+            # allowlist when gpt-6.1-sol replaced it, and without this the reset would move
+            # its users to the workspace default instead of to Sol's successor. Idempotent —
+            # once renamed, nothing matches. Efforts are left to the clamps below, which run
+            # later in this same step against the new name.
+            cursor = self.conn.execute("""
+                UPDATE user_preferences SET model = 'gpt-6.1-sol' WHERE model = 'gpt-6-sol'
+            """)
+            users_renamed = cursor.rowcount
+            cursor = self.conn.execute("""
+                UPDATE threads
+                SET config_json = json_set(config_json, '$.model', 'gpt-6.1-sol')
+                WHERE config_json IS NOT NULL
+                  AND json_extract(config_json, '$.model') = 'gpt-6-sol'
+            """)
+            threads_renamed = cursor.rowcount
+            cursor = self.conn.execute("""
+                UPDATE channel_settings SET model = 'gpt-6.1-sol' WHERE model = 'gpt-6-sol'
+            """)
+            channels_renamed = cursor.rowcount
+            if users_renamed or threads_renamed or channels_renamed:
+                self.log_info(
+                    f"DB: Renamed gpt-6-sol -> gpt-6.1-sol for {users_renamed} user(s), "
+                    f"{threads_renamed} thread override(s) and {channels_renamed} "
+                    f"channel setting(s)"
+                )
             cursor = self.conn.execute(
                 f"""
                 UPDATE user_preferences
@@ -2184,13 +2218,13 @@ class DatabaseManager(LoggerMixin):
             cursor = self.conn.execute("""
                 UPDATE user_preferences
                 SET reasoning_effort = 'none'
-                WHERE (model LIKE 'gpt-5.6%' OR model IN ('gpt-6-sol', 'gpt-6-luna'))
+                WHERE (model LIKE 'gpt-5.6%' OR model = 'gpt-6-luna')
                   AND reasoning_effort = 'minimal'
             """)
             if cursor.rowcount:
                 self.log_info(
                     f"DB: Clamped reasoning minimal->none for {cursor.rowcount} user(s) on 5.6 "
-                    f"and gpt-6-sol/luna models"
+                    f"and gpt-6-luna models"
                 )
             cursor = self.conn.execute("""
                 UPDATE user_preferences
@@ -2204,12 +2238,13 @@ class DatabaseManager(LoggerMixin):
             cursor = self.conn.execute("""
                 UPDATE user_preferences
                 SET reasoning_effort = 'low'
-                WHERE model = 'gpt-6-astra' AND reasoning_effort IN ('none', 'minimal')
+                WHERE model IN ('gpt-6-astra', 'gpt-6.1-sol')
+                  AND reasoning_effort IN ('none', 'minimal')
             """)
             if cursor.rowcount:
                 self.log_info(
                     f"DB: Clamped reasoning none/minimal->low for {cursor.rowcount} "
-                    f"user(s) on gpt-6-astra"
+                    f"user(s) on gpt-6-astra/gpt-6.1-sol"
                 )
             cursor = self.conn.execute(
                 f"""
@@ -2230,13 +2265,13 @@ class DatabaseManager(LoggerMixin):
                 SET config_json = json_set(config_json, '$.reasoning_effort', 'none')
                 WHERE config_json IS NOT NULL
                   AND (json_extract(config_json, '$.model') LIKE 'gpt-5.6%'
-                       OR json_extract(config_json, '$.model') IN ('gpt-6-sol', 'gpt-6-luna'))
+                       OR json_extract(config_json, '$.model') = 'gpt-6-luna')
                   AND json_extract(config_json, '$.reasoning_effort') = 'minimal'
             """)
             if cursor.rowcount:
                 self.log_info(
                     f"DB: Clamped {cursor.rowcount} thread override(s) minimal->none on 5.6 "
-                    f"and gpt-6-sol/luna models"
+                    f"and gpt-6-luna models"
                 )
             cursor = self.conn.execute("""
                 UPDATE threads
@@ -2253,13 +2288,26 @@ class DatabaseManager(LoggerMixin):
                 UPDATE threads
                 SET config_json = json_set(config_json, '$.reasoning_effort', 'low')
                 WHERE config_json IS NOT NULL
-                  AND json_extract(config_json, '$.model') = 'gpt-6-astra'
+                  AND json_extract(config_json, '$.model') IN ('gpt-6-astra', 'gpt-6.1-sol')
                   AND json_extract(config_json, '$.reasoning_effort') IN ('none', 'minimal')
             """)
             if cursor.rowcount:
                 self.log_info(
                     f"DB: Clamped {cursor.rowcount} thread override(s) none/minimal->low "
-                    f"on gpt-6-astra"
+                    f"on gpt-6-astra/gpt-6.1-sol"
+                )
+            # Channel clamp for 6.1 Sol only: Astra's lives in the one-time `_migrate_gpt6`
+            # swap. Without it the channel modal renders an unavailable `none` as inherit and
+            # a plain Save silently resets the channel's effort.
+            cursor = self.conn.execute("""
+                UPDATE channel_settings
+                SET reasoning_effort = 'low'
+                WHERE model = 'gpt-6.1-sol' AND reasoning_effort IN ('none', 'minimal')
+            """)
+            if cursor.rowcount:
+                self.log_info(
+                    f"DB: Clamped {cursor.rowcount} channel setting(s) none/minimal->low "
+                    f"on gpt-6.1-sol"
                 )
             self.conn.commit()
 
