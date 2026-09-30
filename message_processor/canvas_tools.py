@@ -17,11 +17,12 @@ Probed live against the API (2026-07-12), because the docs leave the important p
   signature takes `**kwargs`. It labels the tab. Pass it or the canvas is `Untitled` FOREVER: there
   is no rename (`files.rename` / `canvases.setTitle` / `conversations.canvases.setTitle` are all
   `unknown_method`, `files.edit` is `not_allowed_token_type`), so creation is the only chance.
-* It is **not idempotent** — call it twice and the channel has two canvases and two tabs. The
-  create tool is a factory that vanishes once a canvas exists, so the mistake is unmakeable.
+* It is **not idempotent** — call it twice and the channel has two canvases and two tabs. That
+  is allowed (a channel can hold several canvas tabs), so the guard is on the TITLE: a create
+  whose title matches a canvas already here, or one made earlier this turn, is refused.
 * `properties.canvas` on `conversations.info` is **null even when a channel canvas exists**. The
   real record is `properties.tabs` — and a tab OUTLIVES its canvas for a while, so it has to be
-  cross-checked against a live file list (`_channel_canvas_id`).
+  cross-checked against a live file list (`_channel_canvas_ids`).
 * A canvas IS a file — which is why `files.info` describes it and `files.list(types="canvases")`
   enumerates it. Read/edit/delete work the same on any canvas, so the tools below still handle
   standalone canvases a human made.
@@ -63,10 +64,10 @@ MAX_READ_CHARS = 12000
 MAX_LIST = 15
 
 # Serializes the check-then-create in execute_create_channel_canvas. Sibling tool calls in one
-# round run concurrently (tool_registry gathers them), so two create_channel_canvas calls could
-# both pass the "does one exist?" check and each create a canvas — and a duplicate channel canvas
-# (with its own permanent tab) can never be removed. One create at a time, workspace-wide; canvas
-# creation is rare enough that a single lock costs nothing.
+# round run concurrently (tool_registry gathers them), so two create_channel_canvas calls with the
+# same title could both pass the duplicate-title check and each create a canvas — and a duplicate
+# channel canvas (with its own permanent tab) can never be removed. One create at a time,
+# workspace-wide; canvas creation is rare enough that a single lock costs nothing.
 _channel_canvas_create_lock = asyncio.Lock()
 # What Slack calls a canvas with no title — which is every channel canvas, permanently.
 UNTITLED = "Untitled"
@@ -373,26 +374,27 @@ async def _file_is_live(web, file_id: str, *, strict: bool = False) -> bool:
     return bool((info.get("file") or {}).get("id"))
 
 
-async def _channel_canvas_id(web, channel_id: str, live_ids: Set[str],
-                             *, strict: bool = False) -> Optional[str]:
-    """The id of THE channel canvas — the one Slack pins as a tab — or None if there isn't one.
+async def _channel_canvas_ids(web, channel_id: str, live_ids: Set[str],
+                              *, strict: bool = False) -> List[str]:
+    """The ids of the channel's canvas TABS — every live one, in tab order — or [] if none.
 
     Two things had to be probed live, because neither is in the docs:
 
     1. `properties.canvas` is NULL even on a channel that demonstrably has a channel canvas. The
-       real record is `properties.tabs`, where the canvas appears as `{"type": "canvas",
-       "data": {"file_id": …}}`. So the tab IS the channel canvas.
+       real record is `properties.tabs`, where each canvas appears as `{"type": "canvas",
+       "data": {"file_id": …}}`. So a canvas tab IS a channel canvas, and a channel can have
+       several: `conversations.canvases.create` adds another tab each time it is called.
     2. **A tab outlives its canvas** — delete the canvas and the tab lingers — so a tab alone is
        not proof. But `files.list` is eventually consistent in BOTH directions, so it is not proof
        either: a canvas created seconds ago is missing from it. Taking absence as death was a real
        bug — right after the bot made the agenda, the catalog decided the tab was stale, dropped
-       the canvas, and offered `create_channel_canvas` again while `edit_canvas` had no id to aim
-       at. So `files.list` is only the fast path; anything it doesn't list is settled by
-       `files.info`, which answers `file_deleted` precisely.
+       the canvas, and left `edit_canvas` with no id to aim at. So `files.list` is only the fast
+       path; anything it doesn't list is settled by `files.info`, which answers `file_deleted`
+       precisely.
 
     `strict` is for callers where "I could not tell" must NOT read as "there isn't one". Building
     a catalog can shrug off a failed lookup; deciding whether the thing about to be irreversibly
-    deleted is the channel's own document cannot — swallowing the error there turns a Slack
+    deleted is one of the channel's own tabs cannot — swallowing the error there turns a Slack
     outage into a licence to delete. (A test caught exactly that.)
     """
     try:
@@ -401,29 +403,68 @@ async def _channel_canvas_id(web, channel_id: str, live_ids: Set[str],
         if strict:
             raise
         logger.warning(f"Channel canvas lookup failed for {channel_id}: {e}")
-        return None
+        return []
     props = (info.get("channel") or {}).get("properties") or {}
-    candidates = []
+    candidates: List[str] = []
     canvas_prop = props.get("canvas") or {}
     if canvas_prop.get("file_id"):
         candidates.append(canvas_prop["file_id"])
     for tab in props.get("tabs") or []:
         if tab.get("type") == "canvas":
             fid = (tab.get("data") or {}).get("file_id")
-            if fid:
+            if fid and fid not in candidates:
                 candidates.append(fid)
+    found: List[str] = []
     for fid in candidates:
-        if fid in live_ids:
-            return fid
-        if await _file_is_live(web, fid, strict=strict):
-            return fid                # brand new: files.list simply hasn't caught up yet
-    return None
+        if fid in live_ids or await _file_is_live(web, fid, strict=strict):
+            found.append(fid)         # not listed = brand new: files.list hasn't caught up yet
+    return found
+
+
+async def _live_catalog(client, web, channel_id: str) -> List[Dict[str, Any]]:
+    """The channel's canvases, fetched now. RAISES when `files.list` fails — the caller decides
+    whether "I couldn't look" is survivable (the catalog) or not (the create guard)."""
+    res = await _async(web.files_list, channel=channel_id, types="canvases", limit=MAX_LIST)
+    entries = [{"canvas_id": f["id"], "title": (f.get("title") or "").strip() or UNTITLED,
+                "is_channel_canvas": False}
+               for f in (res.get("files") or []) if f.get("id")]
+
+    tab_ids = await _channel_canvas_ids(web, channel_id, {e["canvas_id"] for e in entries})
+    listed = {e["canvas_id"] for e in entries}
+    for position, ch_id in enumerate(i for i in tab_ids if i not in listed):
+        # files.list hasn't caught up with a canvas we just made. Leaving it out would hide the
+        # new tab from read_canvas and edit_canvas for the next few minutes — exactly when the
+        # turn that created it wants to keep working on it. Every tab is repaired, not just the
+        # first: a channel's second canvas is just as fresh as its first once was.
+        title = UNTITLED
+        try:
+            info = await _async(web.files_info, file=ch_id)
+            title = ((info.get("file") or {}).get("title") or "").strip() or UNTITLED
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Could not title the fresh channel canvas {ch_id}: {exc}")
+        entries.insert(position, {"canvas_id": ch_id, "title": title, "is_channel_canvas": False})
+
+    for e in entries:
+        if e["canvas_id"] in tab_ids:
+            e["is_channel_canvas"] = True
+            if e["title"] == UNTITLED:
+                # We always create with a title, so this is the salvage path: a canvas made
+                # before we passed one, or by something else. It can never be renamed, and a
+                # document called "Untitled" is one no ask can match — so fall back to its top
+                # heading. One small fetch per untitled tab, behind the same 5-minute cache.
+                heading = await _first_heading(client, web, e["canvas_id"])
+                if heading:
+                    e["title"] = heading
+
+    logger.info(f"Canvas catalog for {channel_id}: {[e['title'] for e in entries]} "
+                f"(channel canvases: {tab_ids or 'none'})")
+    return entries
 
 
 async def build_catalog(client, channel_id: str, *, now: Optional[float] = None
                         ) -> List[Dict[str, Any]]:
-    """The canvases in this channel, id + title, with the channel canvas marked. Never raises —
-    no catalog just means the model has to look them up, which is where we started."""
+    """The canvases in this channel, id + title, with the channel's canvas tabs marked. Never
+    raises — no catalog just means the model has to look them up, which is where we started."""
     if not client or not channel_id or not getattr(config, "enable_canvas_tools", True):
         return []
 
@@ -438,58 +479,27 @@ async def build_catalog(client, channel_id: str, *, now: Optional[float] = None
         logger.warning(f"Canvas catalog: no Slack web client on {type(client).__name__}")
         return []
     try:
-        res = await _async(web.files_list, channel=channel_id, types="canvases", limit=MAX_LIST)
-    except Exception as exc:  # noqa: BLE001 — `exc`, not `e`: the loop below owns that name
+        entries = await _live_catalog(client, web, channel_id)
+    except Exception as exc:  # noqa: BLE001
         logger.warning(f"Canvas catalog lookup failed for {channel_id}: {exc}")
         return []
 
-    entries = [{"canvas_id": f["id"], "title": (f.get("title") or "").strip() or UNTITLED,
-                "is_channel_canvas": False}
-               for f in (res.get("files") or []) if f.get("id")]
-
-    ch_id = await _channel_canvas_id(web, channel_id, {e["canvas_id"] for e in entries})
-    if ch_id and ch_id not in {e["canvas_id"] for e in entries}:
-        # files.list hasn't caught up with a canvas we just made. Leaving it out would hide the
-        # channel's own document from read_canvas and edit_canvas for the next few minutes —
-        # exactly when the turn that created it wants to keep working on it.
-        title = UNTITLED
-        try:
-            info = await _async(web.files_info, file=ch_id)
-            title = ((info.get("file") or {}).get("title") or "").strip() or UNTITLED
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"Could not title the fresh channel canvas {ch_id}: {exc}")
-        entries.insert(0, {"canvas_id": ch_id, "title": title, "is_channel_canvas": False})
-
-    for e in entries:
-        if e["canvas_id"] == ch_id:
-            e["is_channel_canvas"] = True
-            if e["title"] == UNTITLED:
-                # We always create with a title, so this is the salvage path: a canvas made
-                # before we passed one, or by something else. It can never be renamed, and a
-                # document called "Untitled" is one no ask can match — so fall back to its top
-                # heading. One small fetch, at most one canvas, behind the same 5-minute cache.
-                heading = await _first_heading(client, web, e["canvas_id"])
-                if heading:
-                    e["title"] = heading
-
     _catalog_cache[channel_id] = {"at": stamp, "entries": entries}
-    logger.info(f"Canvas catalog for {channel_id}: {[e['title'] for e in entries]} "
-                f"(channel canvas: {ch_id or 'none'})")
     return entries
 
 
 def catalog_lines(entries: List[Dict[str, Any]]) -> str:
-    """One line per canvas. The channel canvas is called out by ROLE rather than by name, because
-    it does not have a usable one: `conversations.canvases.create` takes no title (see
-    `execute_create_channel_canvas`), so Slack reports it as "Untitled" forever. Its identity to
-    a reader is "the channel's document", which is exactly what we say."""
+    """One line per canvas. A channel canvas is called out by ROLE as well as by name, because a
+    legacy one may not have a usable name: one made without a title is "Untitled" forever (see
+    `execute_create_channel_canvas`). Its identity to a reader is "a document pinned as a tab
+    here", which is exactly what we say."""
     out = []
     for e in entries:
         title = e.get("title") or UNTITLED
         if e.get("is_channel_canvas"):
-            role = ("the channel canvas — this channel's pinned document"
+            role = ("a channel canvas — pinned as a tab in this channel"
                     if title == UNTITLED else
-                    f"{title} (the channel canvas — this channel's pinned document)")
+                    f"{title} (a channel canvas — pinned as a tab in this channel)")
             out.append(f"{e['canvas_id']} — {role}")
         else:
             out.append(f"{e['canvas_id']} — {title}")
@@ -506,27 +516,23 @@ EVIDENCE_HEADER = "Canvases in this channel:"
 def catalog_evidence_lines(entries: Optional[List[Dict[str, Any]]] = None) -> List[str]:
     """The canvas section of a channel turn's tool-evidence block, one entry per line.
 
-    Same text the factory schemas carried, moved out of the cached prefix. The channel-canvas
-    line is part of the evidence because the static create tool no longer disappears once one
-    exists — the model needs to know before it calls and gets refused.
+    Same text the factory schemas carried, moved out of the cached prefix. The closing line is
+    the choice the model faces with a list in front of it: extend the canvas that already IS the
+    document, or add a new tab for a new one.
     """
     entries = entries or []
     if not entries:
         return [EVIDENCE_HEADER, "(none — this channel has no canvas yet)"]
     lines = [EVIDENCE_HEADER] + catalog_lines(entries).split("\n")
-    existing = channel_canvas_id(entries)
-    lines.append(f"the channel canvas already exists ({existing}) — create_channel_canvas will "
-                 "refuse; extend it with edit_canvas"
-                 if existing else
-                 "this channel has no channel canvas yet — create_channel_canvas is available")
+    lines.append("a channel can have several canvas tabs — if one of these already is the "
+                 "document being asked for, extend it with edit_canvas; for a new document, "
+                 "create_channel_canvas adds a new tab")
     return lines
 
 
-def channel_canvas_id(entries: Optional[List[Dict[str, Any]]]) -> Optional[str]:
-    for e in entries or []:
-        if e.get("is_channel_canvas") and e.get("canvas_id"):
-            return e["canvas_id"]
-    return None
+def channel_canvas_ids(entries: Optional[List[Dict[str, Any]]]) -> List[str]:
+    return [e["canvas_id"] for e in entries or []
+            if e.get("is_channel_canvas") and e.get("canvas_id")]
 
 
 def _catalog(thread_config: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -536,32 +542,30 @@ def _catalog(thread_config: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # --- schemas ------------------------------------------------------------------------------
 
 def get_create_channel_canvas_schema(thread_config: Optional[Dict[str, Any]] = None
-                                     ) -> Optional[Dict[str, Any]]:
-    """Offered ONLY when the channel has no canvas yet.
+                                     ) -> Dict[str, Any]:
+    """Offered whenever canvas tools are on, whatever the channel already holds.
 
-    "Create if not exists" is a rule the model would otherwise have to remember and would
-    eventually forget — and forgetting is expensive here, because `conversations.canvases.create`
-    is NOT idempotent: called twice it cheerfully makes a SECOND channel canvas with a SECOND tab
-    (verified live). So the rule is enforced by the schema instead: once a channel canvas exists
-    this tool disappears, and `edit_canvas` — which already has the id in its enum — is the only
-    way to write to it.
+    A channel can carry several canvas tabs — `conversations.canvases.create` adds another each
+    time (verified live), and the one-per-channel rule this tool used to enforce by vanishing was
+    ours, not Slack's. What must not happen is the SAME document twice, and that is a question of
+    title, which the executor answers under its create lock. ``thread_config`` is accepted and
+    IGNORED, so the DM and channel surfaces carry the same tool.
     """
-    if channel_canvas_id(_catalog(thread_config)):
-        return None
     return {
         "type": "function",
         "name": "create_channel_canvas",
         "description": (
-            "Create this channel's canvas — a living document pinned as a TAB at the top of the "
-            "channel, editable later by you or by anyone else.\n\n"
+            "Create a new canvas in this channel — a living document pinned as a TAB at the top "
+            "of the channel, editable later by you or by anyone else.\n\n"
             "Reach for it when the thing you are producing will be RETURNED TO: a running spec, a "
             "standing agenda, a checklist, an onboarding guide, a plan that will change. A chat "
-            "message is buried within the hour and a posted file forks into `_final_v3`; the "
-            "channel canvas stays put, stays editable, and is the one document everybody can "
-            "find.\n\n"
-            "There is exactly ONE canvas per channel and this channel has none yet, so what you "
-            "write is its starting content. From then on you extend it with edit_canvas rather "
-            "than making another.\n\n"
+            "message is buried within the hour and a posted file forks into `_final_v3`; a "
+            "canvas tab stays put, stays editable, and is where everybody will look for it.\n\n"
+            "A channel can have several canvas tabs. Check the canvases already here first: if "
+            "one of them already IS the document being asked for, extend it with edit_canvas "
+            "rather than starting a second copy. Create a new one when the user asks for a new "
+            "document or the content is a different document. A title matching a canvas "
+            "already in this channel is refused.\n\n"
             "Do NOT use it as a fancy way to answer a question — if the reply is just an answer, "
             "write the answer. And do not use it for generated data files (a chart, a workbook, a "
             "deck): those are files, and the code sandbox already delivers them."
@@ -721,9 +725,9 @@ def get_edit_canvas_schema(thread_config: Optional[Dict[str, Any]] = None
 #
 # On a channel turn the canvas catalog leaves the schemas and rides the turn's evidence block
 # instead, so the tools array stays a function of (channel, channel config, bot version). The
-# lifecycle the factories encoded — create disappears once a canvas exists, read/edit/delete
-# appear only when one does — moves into the executors, which already re-check it live against
-# files.info rather than against the catalog we built earlier.
+# lifecycle the factories encoded — read/edit/delete appear only when a canvas exists — moves into
+# the executors, which already re-check it live against files.info rather than against the
+# catalog we built earlier.
 
 _CANVAS_CATALOG_POINTER = ("Canvas ids come from the canvas catalog in this turn's evidence. If "
                            "the canvas you want is not listed there, use list_canvases rather "
@@ -734,53 +738,10 @@ def get_create_channel_canvas_schema_static(thread_config: Optional[Dict[str, An
                                             ) -> Dict[str, Any]:
     """Channel-surface create_channel_canvas. ``thread_config`` is accepted and IGNORED.
 
-    The factory hid this tool once a canvas existed; the executor's live check-then-create under
-    the create lock is the real guard, and it refuses with ``already_exists`` — so the schema can
-    stop hiding the tool without making a duplicate channel canvas possible.
+    Identical to the factory now that the factory no longer hides the tool: the executor's
+    duplicate-title check under the create lock is the guard on both surfaces.
     """
-    return {
-        "type": "function",
-        "name": "create_channel_canvas",
-        "description": (
-            "Create this channel's canvas — a living document pinned as a TAB at the top of the "
-            "channel, editable later by you or by anyone else.\n\n"
-            "Reach for it when the thing you are producing will be RETURNED TO: a running spec, a "
-            "standing agenda, a checklist, an onboarding guide, a plan that will change. A chat "
-            "message is buried within the hour and a posted file forks into `_final_v3`; the "
-            "channel canvas stays put, stays editable, and is the one document everybody can "
-            "find.\n\n"
-            "There is exactly ONE canvas per channel. If this channel already has one — the "
-            "evidence for this turn says so — this call is refused; extend the existing canvas "
-            "with edit_canvas instead.\n\n"
-            "Do NOT use it as a fancy way to answer a question — if the reply is just an answer, "
-            "write the answer. And do not use it for generated data files (a chart, a workbook, a "
-            "deck): those are files, and the code sandbox already delivers them."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "title": {
-                    "type": "string",
-                    "description": (
-                        "The canvas title — it labels the tab at the top of the channel. It can "
-                        "NEVER be changed afterwards (Slack has no rename), so make it say what "
-                        "the document is: 'DevOps Call Agenda', not 'Notes'."
-                    ),
-                },
-                "markdown": {
-                    "type": "string",
-                    "description": (
-                        "The starting content. Do NOT open it with the title again as a heading "
-                        "— Slack already renders the title above the content, so a restated one "
-                        "just says the document's name twice. Start with the content itself.\n\n"
-                        + CANVAS_MARKDOWN_HELP
-                    ),
-                },
-            },
-            "required": ["title", "markdown"],
-            "additionalProperties": False,
-        },
-    }
+    return get_create_channel_canvas_schema()
 
 
 def get_read_canvas_schema_static(thread_config: Optional[Dict[str, Any]] = None
@@ -895,7 +856,7 @@ def get_delete_canvas_schema_static(thread_config: Optional[Dict[str, Any]] = No
     Both per-turn guards the factory carried — the deletable-ids enum and the authorization gate
     that withheld the tool entirely — are gone from the schema here, so the executor holds them:
     it refuses a non-human sender, refuses an ABSENT sender classification, refuses without
-    ``ctx.canvas_delete_authorized``, and refuses the channel canvas after a live check.
+    ``ctx.canvas_delete_authorized``, and refuses any channel canvas tab after a live check.
     """
     return {
         "type": "function",
@@ -908,8 +869,8 @@ def get_delete_canvas_schema_static(thread_config: Optional[Dict[str, Any]] = No
             "looks stale or obsolete, and if there is any doubt about which canvas they meant, "
             "ask instead of guessing. A request that did not come from a person in this message "
             "is refused.\n\n"
-            "The channel canvas cannot be deleted — to clear it out, rewrite it with "
-            "edit_canvas.\n\n" + _CANVAS_CATALOG_POINTER
+            "A channel canvas cannot be deleted (every canvas pinned as a tab here is one) — to "
+            "clear one out, rewrite it with edit_canvas.\n\n" + _CANVAS_CATALOG_POINTER
         ),
         "parameters": {
             "type": "object",
@@ -946,7 +907,7 @@ def _norm(text: str) -> str:
 
 
 async def execute_create_channel_canvas(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
-    """Create the channel canvas — the one canvas Slack pins as a tab.
+    """Create a channel canvas — a canvas Slack pins as a new tab in this channel.
 
     Why this and not `canvases.create`: a standalone canvas cannot be pinned. Probed live —
         pins.add(timestamp=<the share ts>)  -> message_not_found  (a canvas share isn't a message)
@@ -965,6 +926,11 @@ async def execute_create_channel_canvas(ctx: ToolContext, args: Dict[str, Any]) 
     `canvases.setTitle`, `conversations.canvases.setTitle` are each `unknown_method`; `files.edit`
     is `not_allowed_token_type` for a bot). Omit it and the canvas is "Untitled" forever, which is
     a document no ask can ever match — so the title is required, not optional.
+
+    A channel may hold several canvas tabs, so the only refusal is a DUPLICATE: a title that
+    matches (case-insensitive, trimmed) a canvas already in the channel's catalog or one created
+    earlier this turn. It is best-effort — the catalog lists at most MAX_LIST canvases — which is
+    the accepted trade for not refusing a genuinely new document.
     """
     title = (args.get("title") or "").strip()
     markdown = (args.get("markdown") or "").strip()
@@ -983,29 +949,30 @@ async def execute_create_channel_canvas(ctx: ToolContext, args: Dict[str, Any]) 
     # channel, so a bounded reaction await has no business extending it.
     await _claim_work(ctx)
 
-    # Last line of defence against a second channel canvas: the schema hides this tool once one
-    # exists, but the schema is built from a catalog that can be up to _CATALOG_TTL stale, and
-    # conversations.canvases.create is NOT idempotent — a second call means a second tab, forever.
+    # The same document twice is the mistake to stop: conversations.canvases.create is NOT
+    # idempotent — every call is another tab, forever — and a retried or doubled call would repeat
+    # the title. The per-turn record is `ctx.canvas_titles_created`, shared by every per-call
+    # copy of the turn's context, so a sibling create sees its neighbour's canvas.
+    created_this_turn = ctx.canvas_titles_created
+    wanted = _norm(title)
     # The whole check-then-create is serialized so two sibling calls gathered in one round cannot
-    # both pass the existence check and each create a canvas.
+    # both pass the duplicate check and each create a canvas.
     async with _channel_canvas_create_lock:
         try:
-            listed = await _async(web.files_list, channel=ctx.channel_id, types="canvases",
-                                  limit=MAX_LIST)
-            live = {f["id"] for f in (listed.get("files") or []) if f.get("id")}
-            existing = await _channel_canvas_id(web, ctx.channel_id, live)
+            entries = await _live_catalog(ctx.client, web, ctx.channel_id)
         except Exception as e:  # noqa: BLE001 — fail CLOSED: a duplicate canvas is unrecoverable
-            logger.error(f"Could not verify whether a channel canvas already exists: {e}",
+            logger.error(f"Could not list this channel's canvases before creating one: {e}",
                          exc_info=True)
             return _err("check_failed",
-                        "I couldn't check whether this channel already has a canvas, so I didn't "
-                        "create one — a duplicate channel canvas can't be undone. Try again in a "
-                        "moment.")
-        if existing:
-            return _err("already_exists",
-                        "This channel already has a canvas. Edit it with edit_canvas instead of "
-                        "creating another — a channel is meant to have exactly one.",
-                        canvas_id=existing)
+                        "I couldn't check this channel's existing canvases, so I didn't create "
+                        "one — a duplicate canvas can't be undone. Try again in a moment.")
+        duplicate = created_this_turn.get(wanted) or next(
+            (e["canvas_id"] for e in entries if _norm(e.get("title") or "") == wanted), None)
+        if duplicate:
+            return _err("duplicate_title",
+                        f"This channel already has a canvas called {title!r} ({duplicate}). "
+                        "Edit that canvas with edit_canvas instead of creating another.",
+                        canvas_id=duplicate)
 
         try:
             created = await _async(
@@ -1015,6 +982,14 @@ async def execute_create_channel_canvas(ctx: ToolContext, args: Dict[str, Any]) 
             canvas_id = created.get("canvas_id")
         except Exception as e:  # noqa: BLE001
             logger.error(f"conversations.canvases.create failed: {e}", exc_info=True)
+            err = str(getattr(getattr(e, "response", None), "get", lambda _: "")("error") or e)
+            # Slack still documents a one-canvas-per-channel limit, and some workspaces (free
+            # plans) enforce it. Say so plainly rather than as a generic failure.
+            if ("channel_canvas_already_exists" in err
+                    or "free_team_canvas_tab_already_exists" in err):
+                return _err("canvas_limit",
+                            "This workspace allows only one canvas here. Edit the existing "
+                            "canvas with edit_canvas instead of creating another.")
             return _err("create_failed", f"Slack refused to create the canvas: {e}")
 
         if not canvas_id:
@@ -1023,16 +998,18 @@ async def execute_create_channel_canvas(ctx: ToolContext, args: Dict[str, Any]) 
         # No canvases.access.set here, unlike a standalone canvas: the channel canvas belongs to
         # the channel, so Slack shares it in on creation (files.info shows the channel under
         # `shares` with source CHANNEL_TAB) and everyone who can see the channel can already see
-        # it. Invalidate inside the lock so the next check (ours or a sibling's) SEES this canvas.
+        # it. Record and invalidate inside the lock so the next check (ours or a sibling's) SEES
+        # this canvas even while files.list lags.
+        created_this_turn[wanted] = canvas_id
         _invalidate_catalog(ctx.channel_id)
 
     url = await _permalink(web, canvas_id)
-    logger.info(f"Created the channel canvas {canvas_id} ({title!r}) in {ctx.channel_id}")
+    logger.info(f"Created a channel canvas {canvas_id} ({title!r}) in {ctx.channel_id}")
     return {"ok": True, "canvas_id": canvas_id, "title": title, "is_channel_canvas": True,
             "url": url,
-            "message": ("The channel canvas is created, and Slack has pinned it as a tab at the "
-                        "top of the channel. Tell the user it exists and what is in it; don't "
-                        "paste its contents back." + _link_hint(url, title))}
+            "message": ("The canvas is created, and Slack has pinned it as a new tab at the top "
+                        "of the channel. Tell the user it exists and what is in it; don't paste "
+                        "its contents back." + _link_hint(url, title))}
 
 
 async def execute_list_canvases(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1420,10 +1397,10 @@ async def execute_edit_canvas(ctx: ToolContext, args: Dict[str, Any]) -> Dict[st
 def get_delete_canvas_schema(thread_config: Optional[Dict[str, Any]] = None
                             ) -> Optional[Dict[str, Any]]:
     entries = _catalog(thread_config)
-    # The channel canvas is NOT deletable and is left out of the enum entirely. It is the
-    # channel's own document and its tab is part of the furniture — "clear the agenda" means
-    # rewrite it, never destroy it — and deleting it would strand the tab (Slack keeps showing
-    # one for a dead canvas). Emptying it is an edit; there is no ask that needs this.
+    # A channel canvas is NOT deletable and is left out of the enum entirely — every tab, not
+    # just the first. It is the channel's own document and its tab is part of the furniture —
+    # "clear the agenda" means rewrite it, never destroy it — and deleting it would strand the
+    # tab (Slack keeps showing one for a dead canvas). Emptying it is an edit.
     ids = [e["canvas_id"] for e in entries
            if e.get("canvas_id") and not e.get("is_channel_canvas")]
     if not ids:
@@ -1439,8 +1416,8 @@ def get_delete_canvas_schema(thread_config: Optional[Dict[str, Any]] = None
             "Never tidy up on your own initiative, never delete something merely because it "
             "looks stale or obsolete, and if there is any doubt about which canvas they meant, "
             "ask instead of guessing.\n\n"
-            "The channel canvas cannot be deleted and is not listed here — to clear it out, "
-            "rewrite it with edit_canvas.\n\n"
+            "A channel canvas (one pinned as a tab) cannot be deleted and is not listed here — "
+            "to clear one out, rewrite it with edit_canvas.\n\n"
             "Canvases in this channel:\n" + catalog_lines(listable)
         ),
         "parameters": {
@@ -1488,21 +1465,22 @@ async def execute_delete_canvas(ctx: ToolContext, args: Dict[str, Any]) -> Dict[
         return _err("not_in_this_channel", f"{canvas_id} is not a canvas in this channel.")
 
     # Re-checked at execution, not just in the schema: the enum is built from a catalog that can
-    # be stale, and an id is not authorization. Slack would happily delete the channel canvas.
+    # be stale, and an id is not authorization. Slack would happily delete a channel canvas, and
+    # every canvas tab is one — not just the first.
     try:
         listed = await _async(web.files_list, channel=ctx.channel_id, types="canvases",
                               limit=MAX_LIST)
         live = {f["id"] for f in (listed.get("files") or []) if f.get("id")}
-        is_channel_canvas = canvas_id == await _channel_canvas_id(
+        is_channel_canvas = canvas_id in await _channel_canvas_ids(
             web, cast(str, ctx.channel_id), live, strict=True)
     except Exception as e:  # noqa: BLE001 — a failed check must not become a licence to delete
-        logger.warning(f"Could not confirm {canvas_id} is not the channel canvas: {e}")
+        logger.warning(f"Could not confirm {canvas_id} is not a channel canvas: {e}")
         return _err("check_failed",
-                    "Could not confirm that isn't the channel canvas, so it was left alone.")
+                    "Could not confirm that isn't a channel canvas, so it was left alone.")
     if is_channel_canvas:
         return _err("is_channel_canvas",
-                    "That is the channel canvas — the channel's own pinned document — and it "
-                    "cannot be deleted. If it needs clearing out, rewrite it with edit_canvas.")
+                    "That is a channel canvas — pinned as a tab in this channel — and it cannot "
+                    "be deleted. If it needs clearing out, rewrite it with edit_canvas.")
 
     try:
         await _async(web.canvases_delete, canvas_id=canvas_id)
@@ -1552,10 +1530,10 @@ def register_canvas_tools(registry: ToolRegistry) -> None:
     the word "canvas" — and the set of tools on offer states the truth about the channel:
 
       no canvas yet   -> only create_channel_canvas   (nothing to read, edit or delete)
-      canvas exists   -> read / edit / delete, and create DISAPPEARS, so a second channel
-                         canvas (and a second tab, forever) is not a mistake that can be made
+      canvas exists   -> read / edit / delete, and create stays: a channel can hold several
+                         canvas tabs, and the executor refuses only a duplicate title
 
-    Delete is the odd one out twice over: it excludes the channel canvas from its enum, and it is
+    Delete is the odd one out twice over: it excludes every channel canvas from its enum, and it is
     withheld unless a PERSON directly addressed the bot in this message (see `_delete_enabled`), so
     the model can honour a genuine "delete that canvas" but can never decide to tidy up a channel it
     was only listening in.

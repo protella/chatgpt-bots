@@ -230,8 +230,19 @@ def _close_attempt_error(attempt_sink, attempts: List[Any],
 # ------------------------------------------------------------------ context meter (§3.2)
 #
 # The meter rides beside the attempt sink and in the same fixed order (CONTEXT_METER C-14):
-# final kwargs → preflight → _open_attempt → dispatched → _safe_api_call → usage. Duck-typed on
+# final kwargs → _open_attempt → dispatched → _safe_api_call → usage. Nothing is awaited before
+# the send (v3.3.2): the count runs in parallel and the API judges the size. Duck-typed on
 # purpose: the hook lives in message_processor, which imports back into this package.
+
+# The output items a single model pass produces. Anything else in a response's output — a
+# web_search / code_interpreter / file_search / mcp_call / image_generation / tool-search call,
+# and whatever type the API adds next — means the response ran more than one internal pass.
+# Deliberately CONSERVATIVE: a client-side item type outside this set also reads as multi-pass,
+# and all that costs is a usage the meter does not record (the dispatch's count stands).
+# `mcp_list_tools` is NOT a pass: every request that offers an MCP server gets one per server,
+# and a plain reply carrying them reports usage == count exactly (probed live 2026-09-30:
+# 9,013 == 9,013 with three listings and one message).
+_SINGLE_PASS_ITEM_TYPES = frozenset({"message", "reasoning", "function_call", "mcp_list_tools"})
 
 
 # One wrapper's dispatches, in order: (dispatch seq, the kwargs that dispatch actually sent). A
@@ -247,13 +258,47 @@ def _meter_dispatch(meter: Optional[Any], request_params: Dict[str, Any], round_
     seqs.append((meter.dispatched(request_params, round_index), request_params))
 
 
-def _meter_usage(meter: Optional[Any], seqs: _Dispatches, usage: Dict[str, Any]) -> None:
-    """Hand the response's usage to the meter against the LIVE dispatch. A response that came
-    back at all means the turn's request completed — from here its overflow is not recoverable."""
+def _ran_hosted_tools(response: Any) -> bool:
+    """Did this response's output carry anything but a single model pass's items?
+
+    Read from the RESPONSE (the raw SDK object, or a stream's terminal `event.response`), never
+    from the request's tool list: a request that offers web_search and does not use it is one
+    pass. A response with no readable output list carries no evidence of hosted work."""
+    output = getattr(response, "output", None)
+    if not isinstance(output, (list, tuple)):
+        return False
+    for item in output:
+        item_type = item.get("type") if isinstance(item, dict) else getattr(item, "type", None)
+        if item_type not in _SINGLE_PASS_ITEM_TYPES:
+            return True
+    return False
+
+
+def _meter_usage(meter: Optional[Any], seqs: _Dispatches, usage: Dict[str, Any],
+                 response: Any, *, completed: bool = True) -> None:
+    """Hand the response's usage to the meter against the LIVE dispatch, with whether that
+    response ran hosted tools (a multi-pass usage is a billing total the meter must not record).
+    A response that came back at all means the turn's request completed — from here its overflow
+    is not recoverable — unless the caller says it is a failed terminal that did nothing
+    (`completed=False`, R4)."""
     if meter is None or not seqs:
         return
-    meter.usage(seqs[-1][0], usage)
-    meter.request_completed()
+    meter.usage(seqs[-1][0], usage, multi_pass=_ran_hosted_tools(response))
+    if completed:
+        meter.request_completed()
+
+
+def _failed_before_any_output(meter: Optional[Any], stream_error: BaseException,
+                              request_params: Dict[str, Any], round_index: int,
+                              seqs: Optional[_Dispatches], text: str,
+                              saw_function_call: bool, response: Any) -> bool:
+    """A `response.failed` terminal that is the API's context-length rejection and produced no
+    text, no tool call and no hosted-tool work: the request never ran, so it must not mark the
+    turn's request completed — that would make the overflow unrecoverable (CONTEXT_METER §3.5,
+    v3.3.2 R4). A hosted call that already ran (a code_interpreter run, a search) is an effect."""
+    if text or saw_function_call or _ran_hosted_tools(response):
+        return False
+    return _meter_overflow(meter, stream_error, request_params, round_index, seqs) is not None
 
 
 def _meter_overflow(meter: Optional[Any], error: BaseException, request_params: Dict[str, Any],
@@ -291,7 +336,12 @@ def _stream_failure_error(response) -> Exception:
         code = error.get("code", code)
         message = error.get("message", message)
     detail = message or code or "response.failed with no error detail"
-    return RuntimeError(f"OpenAI streaming response failed: {detail}")
+    failure = RuntimeError(f"OpenAI streaming response failed: {detail}")
+    # The API's structured code rides along even when the message is what gets shown, so
+    # `is_context_length_error` can see a context-length rejection whose wording it does not
+    # recognise (v3.3.2 R4). Still a plain RuntimeError: the attempt ledger records its type.
+    setattr(failure, "code", code if isinstance(code, str) else None)
+    return failure
 
 
 async def _create_with_container_recovery(self, request_params: Dict[str, Any],
@@ -355,10 +405,6 @@ async def _create_with_container_recovery(self, request_params: Dict[str, Any],
 
         retry_params = {**request_params, "tools": demoted}
         _close_attempt(attempt_sink, attempt_log, status="error", detail=type(e).__name__)
-        if meter is not None:
-            # The retry is a different request (a new tools array): it is preflighted like any
-            # other before its attempt opens, under the same turn-scoped round rule.
-            await meter.preflight(retry_params, round_index)
         _open_attempt(attempt_sink, retry_params, attempt_log,
                       fork_reason=FORK_CONTAINER_RECOVERY)
         _meter_dispatch(meter, retry_params, round_index, meter_seqs)
@@ -897,9 +943,6 @@ async def create_text_response(
 
     self.log_debug(f"Creating text response with model {model}, temp {temperature}")
 
-    if meter is not None:
-        # Before any attempt opens: an overflow found here leaves no ledger row, sends nothing.
-        await meter.preflight(request_params, round_index)
     meter_seqs: _Dispatches = []
     attempts: List[Any] = []
     usage_captured: Dict[str, Any] = {}
@@ -918,7 +961,7 @@ async def create_text_response(
         )
 
         usage_captured = _capture_usage(usage_sink, response)
-        _meter_usage(meter, meter_seqs, usage_captured)
+        _meter_usage(meter, meter_seqs, usage_captured, response)
         _log_service_tier_echo(self, request_params, response)
         _close_attempt(attempt_sink, attempts, status="ok", usage=usage_captured)
 
@@ -1015,9 +1058,6 @@ async def create_text_response_with_tools(
 
     self.log_debug(f"Creating text response with tools using model {model}, tools: {tools}")
 
-    if meter is not None:
-        # Before any attempt opens: an overflow found here leaves no ledger row, sends nothing.
-        await meter.preflight(request_params, round_index)
     meter_seqs: _Dispatches = []
     attempts: List[Any] = []
     usage_captured: Dict[str, Any] = {}
@@ -1036,7 +1076,7 @@ async def create_text_response_with_tools(
         )
 
         usage_captured = _capture_usage(usage_sink, response)
-        _meter_usage(meter, meter_seqs, usage_captured)
+        _meter_usage(meter, meter_seqs, usage_captured, response)
         _log_service_tier_echo(self, request_params, response)
         _close_attempt(attempt_sink, attempts, status="ok", usage=usage_captured)
 
@@ -1197,9 +1237,6 @@ async def create_streaming_response(
 
     self.log_debug(f"Creating streaming response with model {model}, temp {temperature}")
 
-    if meter is not None:
-        # Before any attempt opens: an overflow found here leaves no ledger row, sends nothing.
-        await meter.preflight(request_params, round_index)
     meter_seqs: _Dispatches = []
     attempts: List[Any] = []
     usage_captured: Dict[str, Any] = {}
@@ -1314,19 +1351,23 @@ async def create_streaming_response(
                     # Usage rides the terminal event's response object on every outcome, not
                     # just success — capture it so token budgeting doesn't fall back to chars/4.
                     usage_captured = _capture_usage(usage_sink, resp)
-                    _meter_usage(meter, meter_seqs, usage_captured)
+                    ran = True
                     if event_type == "response.failed":
                         stream_error = _stream_failure_error(resp)
                         self.log_error(
                             f"Stream failed after {len(complete_text)} chars: {stream_error}")
-                    elif event_type == "response.incomplete":
+                        ran = not _failed_before_any_output(
+                            meter, stream_error, request_params, round_index, meter_seqs,
+                            complete_text, False, resp)
+                    _meter_usage(meter, meter_seqs, usage_captured, resp, completed=ran)
+                    if event_type == "response.incomplete":
                         # Truncated (e.g. max_output_tokens / content filter) but the partial
                         # text is real — return it, exactly as the non-streaming path returns
                         # whatever text a response carries regardless of status.
                         self.log_warning(
                             f"Stream incomplete ({_incomplete_reason(resp)}) after "
                             f"{len(complete_text)} chars")
-                    else:
+                    elif event_type != "response.failed":
                         self.log_info("Stream completed")
                     # Always signal completion so the callback flushes any buffered text — a
                     # failed/incomplete stream that skips this leaves the buffer stuck forever.
@@ -1551,9 +1592,6 @@ async def create_streaming_response_with_tools(
 
     self.log_debug(f"Creating streaming response with tools using model {model}")
 
-    if meter is not None:
-        # Before any attempt opens: an overflow found here leaves no ledger row, sends nothing.
-        await meter.preflight(request_params, round_index)
     meter_seqs: _Dispatches = []
     attempts: List[Any] = []
     usage_captured: Dict[str, Any] = {}
@@ -1887,16 +1925,20 @@ async def create_streaming_response_with_tools(
                     # Usage rides the terminal event's response object on every outcome, not
                     # just success — capture it so token budgeting doesn't fall back to chars/4.
                     usage_captured = _capture_usage(usage_sink, resp)
-                    _meter_usage(meter, meter_seqs, usage_captured)
+                    ran = True
                     if event_type == "response.failed":
                         stream_error = _stream_failure_error(resp)
                         self.log_error(
                             f"Stream failed after {len(complete_text)} chars: {stream_error}")
-                    elif event_type == "response.incomplete":
+                        ran = not _failed_before_any_output(
+                            meter, stream_error, request_params, round_index, meter_seqs,
+                            complete_text, saw_function_call, resp)
+                    _meter_usage(meter, meter_seqs, usage_captured, resp, completed=ran)
+                    if event_type == "response.incomplete":
                         self.log_warning(
                             f"Stream incomplete ({_incomplete_reason(resp)}) after "
                             f"{len(complete_text)} chars")
-                    else:
+                    elif event_type != "response.failed":
                         self.log_info("Stream completed")
                     # Only a NORMAL completion with local function calls defers the flush — the
                     # tool loop will run another round, so the buffered text isn't final yet.
@@ -2627,9 +2669,6 @@ async def _create_text_response_with_timeout(
 
     self.log_debug(f"Creating text response with custom timeout {timeout_seconds}s, model {model}")
 
-    if meter is not None:
-        # Before any attempt opens: an overflow found here leaves no ledger row, sends nothing.
-        await meter.preflight(request_params, round_index)
     meter_seqs: _Dispatches = []
     attempts: List[Any] = []
     usage_captured: Dict[str, Any] = {}
@@ -2652,7 +2691,7 @@ async def _create_text_response_with_timeout(
         # usage_sink. `_capture_usage(None, …)` writes nothing anywhere; it just hands back the
         # numbers.
         usage_captured = _capture_usage(None, response)
-        _meter_usage(meter, meter_seqs, usage_captured)
+        _meter_usage(meter, meter_seqs, usage_captured, response)
         _log_service_tier_echo(self, request_params, response)
         _close_attempt(attempt_sink, attempts, status="ok", usage=usage_captured)
 
@@ -2752,9 +2791,6 @@ async def _create_text_response_with_tools_with_timeout(
 
     self.log_debug(f"Creating text response with tools and custom timeout {timeout_seconds}s, model {model}, tools: {tools}")
 
-    if meter is not None:
-        # Before any attempt opens: an overflow found here leaves no ledger row, sends nothing.
-        await meter.preflight(request_params, round_index)
     meter_seqs: _Dispatches = []
     attempts: List[Any] = []
     usage_captured: Dict[str, Any] = {}
@@ -2776,7 +2812,7 @@ async def _create_text_response_with_tools_with_timeout(
         # The context meter must not go blind on the retry path — parity with the non-timeout
         # twin.
         usage_captured = _capture_usage(usage_sink, response)
-        _meter_usage(meter, meter_seqs, usage_captured)
+        _meter_usage(meter, meter_seqs, usage_captured, response)
         _log_service_tier_echo(self, request_params, response)
         _close_attempt(attempt_sink, attempts, status="ok", usage=usage_captured)
 

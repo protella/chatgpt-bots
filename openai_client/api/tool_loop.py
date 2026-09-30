@@ -832,8 +832,8 @@ async def create_text_response_with_tool_loop(
     # Every round's text, in order — the same list, and under `aggregate_segments` the same
     # seam-joined result, as the streaming twin builds.
     segments: List[str] = []
-    # Which request of this loop is going out: the context meter preflights round 0 only, and
-    # a context overflow is recoverable only there (CONTEXT_METER §3.4-§3.5).
+    # Which request of this loop is going out: a context overflow is recoverable only on round
+    # 0 (CONTEXT_METER §3.5).
     request_round = 0
 
     while True:

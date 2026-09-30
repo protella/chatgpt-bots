@@ -45,6 +45,7 @@ class MessageProcessorHost:
     _is_context_length_error: Callable[..., Any]
     _persist_tool_provenance: Callable[..., Any]
     _schedule_async_call: Callable[..., Any]
+    _schedule_dm_compaction: Callable[..., Any]
     _start_progress_updater_async: Callable[..., Any]
     _summarize_document_for_attach: Callable[..., Any]
     _update_status: Callable[..., Any]

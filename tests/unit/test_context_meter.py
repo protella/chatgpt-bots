@@ -1,8 +1,9 @@
 """The context meter (CONTEXT_METER_SPEC §3.1-§3.5, §4 tests 1-4).
 
 OpenAI's own input-token count is the only number a size decision is made on. These pin the
-counter's request body, the thread meter's ordering rules, when preflight awaits a count, the
-wrapper order it rides in, and the one recovery a turn gets when a request is over the window.
+counter's request body, the thread meter's ordering rules, that no count is ever awaited before a
+send (v3.3.2), which usage the meter records, the wrapper order it rides in, and the one recovery a
+turn gets when a request is over the window.
 """
 from __future__ import annotations
 
@@ -130,7 +131,7 @@ def test_another_models_measure_is_not_current():
     assert state.current_measure("gpt-5.5") == (500, True)
 
 
-# ------------------------------------------------------------------ 3. preflight
+# ------------------------------------------------------------------ 3. never awaited before a send
 
 class _Scheduled:
     """Collects what the hook schedules; closes the coroutines it never runs."""
@@ -146,12 +147,11 @@ class _Scheduled:
             coro.close()
 
 
-def _hook(state: ThreadState, *, tokens: Any = 100, heavy: bool = False) -> Any:
+def _hook(state: ThreadState, *, tokens: Any = 100) -> Any:
     client = MagicMock()
     client.count_input_tokens = AsyncMock(return_value=CountResult(tokens, True))
     scheduled = _Scheduled()
-    hook = MeterHook(client=client, schedule=scheduled, thread_state=state, key="C1:10.0",
-                     heavy=heavy)
+    hook = MeterHook(client=client, schedule=scheduled, thread_state=state, key="C1:10.0")
     return hook, client, scheduled
 
 
@@ -162,38 +162,23 @@ def _measured(tokens: int, complete: bool = True) -> ThreadState:
     return state
 
 
-@pytest.mark.parametrize("case", ["no_measure", "heavy", "over_threshold", "incomplete"])
-async def test_preflight_awaits_a_count_when_the_margin_may_be_gone(case):
-    limit = 1000
-    state = {"no_measure": _state(), "heavy": _measured(100),
-             "over_threshold": _measured(900), "incomplete": _measured(100, False)}[case]
-    hook, client, scheduled = _hook(state, heavy=(case == "heavy"))
-    with patch.object(config, "get_model_token_limit", return_value=limit), \
-         patch.object(config, "token_cleanup_threshold", 0.5):
-        await hook.preflight({"model": MODEL}, 0)
-    client.count_input_tokens.assert_awaited_once()
-    scheduled.close()
-
-
-async def test_a_healthy_margin_awaits_nothing_and_counts_in_parallel():
-    state = _measured(100)
-    hook, client, scheduled = _hook(state)
-    kwargs = {"model": MODEL, "input": []}
-    with patch.object(config, "get_model_token_limit", return_value=1000), \
-         patch.object(config, "token_cleanup_threshold", 0.5):
-        await hook.preflight(kwargs, 0)
-        client.count_input_tokens.assert_not_awaited()
-        hook.dispatched(kwargs, 0)
-        assert len(scheduled.coros) == 1
-        await scheduled.coros.pop()
-    client.count_input_tokens.assert_awaited_once()
-
-
-async def test_preflight_runs_on_round_zero_only():
+async def test_no_count_is_awaited_before_the_send_on_a_no_measure_turn():
+    """v3.3.2: a new thread (no measure — the common case in prod) used to wait 2-12s for an
+    awaited count before its first reply. The send goes out first; the count runs beside it."""
+    events: List[str] = []
     hook, client, scheduled = _hook(_state())
-    await hook.preflight({"model": MODEL}, 1)
-    client.count_input_tokens.assert_not_awaited()
-    scheduled.close()
+
+    async def _count(kwargs: Any) -> CountResult:
+        events.append("count")
+        return CountResult(100, True)
+
+    client.count_input_tokens = AsyncMock(side_effect=_count)
+    await R.create_text_response(_wrapper_host(events), messages=[{"role": "user", "content": "x"}],
+                                 model=MODEL, meter=hook)
+    assert events == ["create"]                      # nothing awaited before the send
+    assert len(scheduled.coros) == 1                 # the parallel count, scheduled
+    await scheduled.coros.pop()
+    assert events == ["create", "count"]
 
 
 def _wrapper_host(events: List[str]) -> Any:
@@ -221,41 +206,25 @@ class _Sink:
         self.events.append("close")
 
 
-async def test_the_wrapper_order_is_preflight_open_dispatched_create_usage():
+async def test_the_wrapper_order_is_open_dispatched_create_usage():
     events: List[str] = []
     state = _state()
     hook, client, scheduled = _hook(state, tokens=100)
     real_dispatched, real_usage = hook.dispatched, hook.usage
 
-    async def _preflight(kwargs: Any, round_index: int) -> None:
-        events.append("preflight")
-
     def _dispatched(kwargs: Any, round_index: int) -> int:
         events.append("dispatched")
         return real_dispatched(kwargs, round_index)
 
-    def _usage(seq: int, usage: Any) -> None:
+    def _usage(seq: int, usage: Any, *, multi_pass: bool) -> None:
         events.append("usage")
-        real_usage(seq, usage)
+        real_usage(seq, usage, multi_pass=multi_pass)
 
-    hook.preflight, hook.dispatched, hook.usage = _preflight, _dispatched, _usage
+    hook.dispatched, hook.usage = _dispatched, _usage
     await R.create_text_response(_wrapper_host(events), messages=[{"role": "user", "content": "x"}],
                                  model=MODEL, attempt_sink=_Sink(events), meter=hook)
-    assert events == ["preflight", "open", "dispatched", "create", "usage", "close"]
+    assert events == ["open", "dispatched", "create", "usage", "close"]
     assert state.current_measure(MODEL) == (321, True)
-    scheduled.close()
-
-
-async def test_an_overflow_raises_before_any_attempt_is_opened():
-    events: List[str] = []
-    hook, _client, scheduled = _hook(_state(), tokens=5_000)
-    with patch.object(config, "get_model_token_limit", return_value=1000):
-        with pytest.raises(ContextOverLimit) as raised:
-            await R.create_text_response(
-                _wrapper_host(events), messages=[{"role": "user", "content": "x"}],
-                model=MODEL, attempt_sink=_Sink(events), meter=hook)
-    assert events == []
-    assert raised.value.tokens == 5_000 and raised.value.kwargs["model"] == MODEL
     scheduled.close()
 
 
@@ -419,7 +388,7 @@ async def _run_dm_turn(host: Any, turn: Any) -> Response:
                                                 thinking_id=None, turn=turn)
 
 
-async def test_a_preflight_overflow_compacts_once_and_retries_once():
+async def test_an_overflow_compacts_once_and_retries_once():
     ok = {"text": "answer", "tools_used": [], "local_tool_calls": []}
     host = _handler_host([_overflow(), ok])
     response = await _run_dm_turn(host, TurnRuntime())
@@ -450,12 +419,10 @@ def test_the_too_much_for_one_request_card_is_gone():
 
 async def test_recovery_eligibility_is_turn_scoped_across_loop_reentry():
     """[codex 2] A re-entered loop starts at its own round 0; once a request of the TURN has
-    completed, an overflow there is not recoverable and preflight no longer runs."""
+    completed, an overflow there is not recoverable."""
     state = _measured(100)
     hook, client, scheduled = _hook(state)
     hook.request_completed()
-    await hook.preflight({"model": MODEL}, 0)
-    client.count_input_tokens.assert_not_awaited()
     overflow = hook.overflow_from(RuntimeError("400 context_length_exceeded"), {"model": MODEL}, 0)
     assert isinstance(overflow, ContextOverLimit) and overflow.recoverable is False
 
@@ -529,3 +496,119 @@ async def test_an_unrecoverable_streaming_overflow_still_cleans_up_its_partial()
     deleted = [c.args[1] for c in client.delete_message.await_args_list]
     assert "SEED" in deleted
     host._handle_text_response.assert_not_called()
+
+
+# ------------------------------------------------------------------ v3.3.2: usage + late counts
+
+def _usage_host(output: List[Any]) -> Any:
+    host = MagicMock()
+
+    async def _safe(method: Any, **kw: Any) -> Any:
+        return SimpleNamespace(output=output, usage=SimpleNamespace(
+            input_tokens=900, output_tokens=5, input_tokens_details=None,
+            output_tokens_details=None))
+
+    host._safe_api_call = _safe
+    return host
+
+
+@pytest.mark.parametrize("item_types,after_count", [
+    # One pass: usage is exact. An MCP server's tool listing is not a pass (probed live).
+    (["mcp_list_tools", "reasoning", "function_call", "message"], (900, True)),
+    (["web_search_call", "message"], (100, True)),              # hosted: the count stands
+])
+async def test_usage_is_recorded_only_for_a_single_pass_response(item_types, after_count):
+    """A response that ran hosted tools reports the SUM of its internal passes as input_tokens —
+    a billing total, not the context's size (prod: count 54,846 vs usage 71,718). The meter
+    records usage only for a single-pass response; otherwise the dispatch's own count stands."""
+    state = _state()
+    hook, _client, scheduled = _hook(state, tokens=100)
+    output = [SimpleNamespace(type=t) for t in item_types]
+    await R.create_text_response(_usage_host(output), messages=[{"role": "user", "content": "x"}],
+                                 model=MODEL, meter=hook)
+    single_pass = after_count[0] == 900
+    assert state.current_measure(MODEL) == ((900, True) if single_pass else None)
+    await scheduled.coros.pop()                      # the dispatch's parallel count lands
+    assert state.current_measure(MODEL) == after_count
+
+
+def _fake_stream_host(events: List[Any]) -> Any:
+    host = MagicMock()
+    host._safe_api_call = AsyncMock(return_value=SimpleNamespace())
+
+    async def _iter(response: Any, op: Any) -> Any:
+        for event in events:
+            yield event
+
+    host._safe_stream_iteration = _iter
+    return host
+
+
+@pytest.mark.parametrize("item_type,recorded", [("message", (700, True)), ("mcp_call", None)])
+async def test_a_streamed_terminal_response_is_judged_by_its_own_output(item_type, recorded):
+    state = _state()
+    hook, _client, scheduled = _hook(state)
+    terminal = SimpleNamespace(output=[SimpleNamespace(type=item_type)],
+                               usage=SimpleNamespace(input_tokens=700, output_tokens=3))
+    host = _fake_stream_host([
+        SimpleNamespace(type="response.output_text.delta", delta="hi"),
+        SimpleNamespace(type="response.completed", response=terminal),
+    ])
+    await R.create_streaming_response(host, messages=[{"role": "user", "content": "x"}],
+                                      stream_callback=lambda c: None, model=MODEL, meter=hook)
+    assert state.current_measure(MODEL) == recorded
+    scheduled.close()
+
+
+@pytest.mark.parametrize("output,recoverable", [
+    ([], True),
+    ([SimpleNamespace(type="code_interpreter_call")], False),   # hosted work already ran
+])
+async def test_a_streamed_context_rejection_on_round_zero_stays_recoverable(output, recoverable):
+    """[R4] The API can reject an oversized request as a `response.failed` terminal. One that ran
+    nothing — no text, no tool call, no hosted work — must not mark the turn's request
+    completed, and its structured code must survive even when the message wording is one we do
+    not recognise. One whose sandbox already ran has an effect behind it: not recoverable."""
+    hook, _client, scheduled = _hook(_state())
+    failed = SimpleNamespace(usage=None, output=output, error=SimpleNamespace(
+        code="context_length_exceeded", message="Your input is too large for this model."))
+    host = _fake_stream_host([SimpleNamespace(type="response.failed", response=failed)])
+    with patch.object(config, "get_model_token_limit", return_value=1000):
+        with pytest.raises(ContextOverLimit) as raised:
+            await R.create_streaming_response(host, messages=[{"role": "user", "content": "x"}],
+                                              stream_callback=lambda c: None, model=MODEL,
+                                              meter=hook)
+    assert raised.value.recoverable is recoverable
+    assert hook.effects_committed is not recoverable
+    scheduled.close()
+
+
+async def test_a_dm_count_that_lands_after_cleanup_still_compacts():
+    """[R3] Nothing waits for the count now, so on a DM it can land after the post-response
+    cleanup already looked and found no measure. A late measure at the threshold compacts."""
+    from message_processor.handlers.text import TextHandlerMixin
+    from message_processor.thread_management import ThreadManagementMixin
+
+    host = MagicMock()
+    for name in ("_schedule_dm_compaction", "_async_dm_compaction", "_dm_compaction_pass"):
+        setattr(host, name, getattr(ThreadManagementMixin, name).__get__(host))
+    host._turn_meter = TextHandlerMixin._turn_meter.__get__(host)
+    host._dm_compactions_in_flight = set()
+    scheduled: List[Any] = []
+    host._schedule_async_call = scheduled.append
+    # Exactly AT the threshold (1000 × 0.5): R3 says ≥, and the trigger must agree.
+    host.openai_client.count_input_tokens = AsyncMock(return_value=CountResult(500, True))
+    host._compact_thread_to_target = AsyncMock(return_value=3)
+    state = _state()
+
+    with patch.object(config, "get_model_token_limit", return_value=1000), \
+         patch.object(config, "token_cleanup_threshold", 0.5):
+        meter = host._turn_meter(None, state, "D1:10.0", False)
+        meter.dispatched({"model": MODEL, "input": []}, 0)
+        meter.finish()
+        await host._async_dm_compaction(state, "D1:10.0")     # the cleanup: no measure yet
+        host._compact_thread_to_target.assert_not_awaited()
+        await scheduled.pop(0)                                 # the parallel count lands late
+        assert len(scheduled) == 1                             # ...and schedules the compaction
+        await scheduled.pop()
+    host._compact_thread_to_target.assert_awaited_once()

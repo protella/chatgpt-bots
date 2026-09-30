@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.3.2] - 2026-09-30
+
+### ✨ Added
+
+- **A channel can have more than one canvas.** Ask for a new canvas and the bot adds another tab
+  instead of saying it can't. A canvas whose title matches an existing one is still refused, so a
+  retry never makes a duplicate tab.
+
+### 🐛 Fixed
+
+- **Replies no longer wait on the token count.** The first reply in a new or restarted conversation
+  used to wait 2–12 seconds for OpenAI's token counter; the count now always runs alongside the
+  request. A request that turns out too large is still caught by OpenAI and summarized once.
+- **Conversation size after web searches is measured correctly.** Replies that used web search or
+  the code sandbox reported a billing total across several internal passes, which overstated the
+  thread by 30–50% and could summarize it early. Those replies now keep the real count.
+
 ## [3.3.1] - 2026-09-29
 
 ### ✨ Added

@@ -380,23 +380,29 @@ Consequences of that choice, each of which bites:
   are each `unknown_method`; `files.edit` is `not_allowed_token_type` for a bot. Get it right at
   creation or live with it. (`_first_heading` salvages a legacy `Untitled` canvas for the catalog
   by reading its top heading, but that is a fallback, not the mechanism.)
-- **It is NOT idempotent**: a second call = a second canvas AND a second permanent tab. So
-  `create_channel_canvas` is a schema FACTORY that disappears once a canvas exists (and re-checks
-  live before creating), making "create if not exists" unmakeable rather than remembered.
+- **It is NOT idempotent**: a second call = a second canvas AND a second permanent tab. That is
+  allowed — a channel can hold several canvas tabs (verified live; the old one-per-channel rule
+  was ours, not Slack's) — so `create_channel_canvas` is always offered, and the guard is the
+  TITLE: under the create lock, a title matching (case-insensitive, trimmed) a canvas in the
+  channel's live catalog or one created earlier this turn is refused with a pointer to
+  `edit_canvas`. The per-turn record is `ToolContext.canvas_titles_created`, one dict
+  every sibling call's shallow context copy shares. Best-effort by design (the catalog lists 15). Where
+  Slack does enforce one canvas (`channel_canvas_already_exists` /
+  `free_team_canvas_tab_already_exists`, e.g. free workspaces), the refusal says so plainly.
 - **`properties.canvas` is NULL even when a channel canvas exists.** The real record is
   `properties.tabs` → `{"type":"canvas","data":{"file_id":…}}`. And **a tab OUTLIVES its canvas**,
   so a tab alone is not proof one exists. But **`files.list` is eventually consistent in BOTH
   directions** — it keeps a deleted canvas for a while AND does not yet know about one created
   seconds ago — so absence from it is not proof of death either. Taking it as proof was a live bug:
-  right after the bot created the agenda, the catalog dropped it, re-offered `create_channel_canvas`,
-  and left `edit_canvas` with no id to aim at. `files.list` is the fast path; anything missing from
-  it is settled by `files.info`, which answers `file_deleted` precisely. A fresh canvas is also
-  INSERTED into the catalog, or the turn that just made it cannot then edit it.
-  `_channel_canvas_id(strict=)` exists because "I couldn't tell" must not read as "there isn't one"
+  right after the bot created the agenda, the catalog dropped it and left `edit_canvas` with no id
+  to aim at. `files.list` is the fast path; anything missing from it is settled by `files.info`,
+  which answers `file_deleted` precisely. EVERY fresh tab is INSERTED into the catalog, not just
+  the first, or the turn that just made a second canvas cannot find it.
+  `_channel_canvas_ids(strict=)` exists because "I couldn't tell" must not read as "there isn't one"
   on the delete path — swallowing that error turns a Slack outage into a licence to delete (a test
   caught exactly this).
-- The channel canvas is **not deletable** — excluded from `delete_canvas`'s enum *and* re-checked at
-  execution. Clearing it out is an edit.
+- A channel canvas is **not deletable** — every tab, not just the first — excluded from
+  `delete_canvas`'s enum *and* re-checked at execution. Clearing one out is an edit.
 
 **The tools were dead without a system prompt.** With all 23 tools on the table, "start a running
 agenda for our devops call" produced a *chat message*. A tool description is only read once the
@@ -470,7 +476,7 @@ not `<pre>`. Table cells hold `<p>`, so walking every `<p>` shreds a table into 
   `_canvas_delete_authorized` (stamped in `text.py::_materialize_request_tools`): a HUMAN sender
   AND a genuine address in THIS message — a real `<@bot>` mention or a DM. A bare name-hit does
   NOT qualify, and the routing facts (`gate_required` / `silence_capable`) do not authorize
-  anything. Absent → fail closed. The channel canvas is never offered, and a canvas the bot did
+  anything. Absent → fail closed. A channel canvas is never offered, and a canvas the bot did
   not create refuses deletion anyway (`restricted_action`).
 
 ## Scheduled deliveries: our own message events never arrive (T1)

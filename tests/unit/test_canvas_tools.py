@@ -99,17 +99,28 @@ class TestCreate:
         # title Slack now renders above it.
         assert kwargs["document_content"]["markdown"] == "First item"
 
-    async def test_a_second_channel_canvas_is_refused(self):
-        # conversations.canvases.create is NOT idempotent: a second call means a second canvas
-        # and a second tab, permanently. The schema hides the tool once one exists, but the
-        # catalog behind that schema can be stale, so the executor checks live too.
-        ctx, web = _ctx(channel_canvas="F123")
-        out = await ct.execute_create_channel_canvas(ctx, {"title": "T", "markdown": "x"})
+    async def test_a_second_canvas_is_created_but_a_duplicate_title_is_refused(self):
+        # A channel can hold several canvas tabs, so create is on offer beside an existing one —
+        # but conversations.canvases.create is NOT idempotent, so the same document twice (by
+        # title, case-insensitive and trimmed) is refused and pointed at edit_canvas.
+        registry = ToolRegistry()
+        ct.register_canvas_tools(registry)
+        cfg = {ct.CATALOG_KEY: [{"canvas_id": "F123", "title": "Launch plan",
+                                 "is_channel_canvas": True}]}
+        assert "create_channel_canvas" in {s["name"] for s in registry.schemas(cfg)}
 
+        ctx, web = _ctx(channel_canvas="F123")
+        out = await ct.execute_create_channel_canvas(ctx, {"title": "  launch PLAN ",
+                                                           "markdown": "x"})
         assert out["ok"] is False
-        assert out["error"] == "already_exists"
+        assert out["error"] == "duplicate_title"
         assert out["canvas_id"] == "F123"
+        assert "edit_canvas" in out["message"]
         web.conversations_canvases_create.assert_not_awaited()
+
+        out = await ct.execute_create_channel_canvas(ctx, {"title": "Runbook", "markdown": "x"})
+        assert out["ok"] is True
+        web.conversations_canvases_create.assert_awaited_once()
 
     async def test_a_tab_pointing_at_a_dead_canvas_does_not_block_creation(self):
         # A tab outlives its canvas by a while, so the tab alone is not proof one exists. Absence
@@ -337,17 +348,15 @@ class TestRegistration:
 
         assert names == {"create_channel_canvas", "list_canvases"}
 
-    def test_create_disappears_once_the_channel_canvas_exists(self):
-        # "Create if not exists" is not a rule the model has to remember — it is the shape of the
-        # toolset. A second conversations.canvases.create would mean a second permanent tab.
+    def test_create_stays_once_a_channel_canvas_exists(self):
+        # A channel can hold several canvas tabs; the executor refuses only a duplicate title.
         registry = ToolRegistry()
         ct.register_canvas_tools(registry)
         cfg = {ct.CATALOG_KEY: [{"canvas_id": "F1", "title": "Agenda",
                                  "is_channel_canvas": True}]}
         names = {s["name"] for s in registry.schemas(cfg)}
 
-        assert "create_channel_canvas" not in names
-        assert {"read_canvas", "edit_canvas"} <= names
+        assert {"create_channel_canvas", "read_canvas", "edit_canvas"} <= names
 
     def test_the_channel_canvas_is_not_deletable(self):
         # It is the channel's own document and its tab is furniture. "Clear the agenda" is an
@@ -593,9 +602,9 @@ class TestTheModelKnowsCanvasesExist:
         assert entries[0] == {"canvas_id": "F1", "title": "DevOps Agenda",
                               "is_channel_canvas": True}
         assert entries[1]["is_channel_canvas"] is False
-        assert ct.channel_canvas_id(entries) == "F1"
-        # ...and it is offered to the model BY ROLE, since "the canvas" means this one.
-        assert "the channel canvas" in ct.catalog_lines(entries)
+        assert ct.channel_canvas_ids(entries) == ["F1"]
+        # ...and it is offered to the model BY ROLE as well as by name.
+        assert "a channel canvas" in ct.catalog_lines(entries)
         assert "DevOps Agenda" in ct.catalog_lines(entries)
 
     async def test_a_stale_tab_is_not_mistaken_for_a_channel_canvas(self):
@@ -611,7 +620,7 @@ class TestTheModelKnowsCanvasesExist:
         client.app.client = web
 
         entries = await ct.build_catalog(client, "C1", now=1.0)
-        assert ct.channel_canvas_id(entries) is None
+        assert ct.channel_canvas_ids(entries) == []
 
     async def test_creating_a_canvas_invalidates_the_cache(self):
         # Otherwise the turn that just made a canvas could not then edit it.
@@ -1060,16 +1069,33 @@ class TestFreshCanvasIsNotMistakenForADeadOne:
         client, web = self._client(listed=[], tab="F_NEW")
         entries = await ct.build_catalog(client, "C1", now=1.0)
 
-        assert ct.channel_canvas_id(entries) == "F_NEW"
+        assert ct.channel_canvas_ids(entries) == ["F_NEW"]
         # ...and it is NAMED, so the model can act on it rather than just know it exists.
         assert entries[0]["title"] == "DevOps Call Agenda"
+
+    async def test_every_fresh_tab_is_listed_not_just_the_first(self):
+        # A channel's second canvas is as fresh as its first once was: files.list lags both.
+        web = MagicMock()
+        web.files_list = AsyncMock(return_value={"files": []})
+        web.conversations_info = AsyncMock(return_value=_tabs("F_A", "F_B"))
+        web.files_info = AsyncMock(side_effect=lambda file: {
+            "file": {"id": file, "title": {"F_A": "Agenda", "F_B": "Runbook"}[file]}})
+        client = MagicMock()
+        client.app = MagicMock()
+        client.app.client = web
+
+        entries = await ct.build_catalog(client, "C1", now=1.0)
+
+        assert [(e["canvas_id"], e["title"]) for e in entries] == [
+            ("F_A", "Agenda"), ("F_B", "Runbook")]
+        assert ct.channel_canvas_ids(entries) == ["F_A", "F_B"]
 
     async def test_a_deleted_canvas_is_still_dropped(self):
         err = Exception("The server responded with: {'ok': False, 'error': 'file_deleted'}")
         client, _ = self._client(listed=[], tab="F_DEAD", info_error=err)
         entries = await ct.build_catalog(client, "C1", now=1.0)
 
-        assert ct.channel_canvas_id(entries) is None
+        assert ct.channel_canvas_ids(entries) == []
         assert entries == []
 
 
@@ -1415,11 +1441,9 @@ class TestStaticChannelSchemas:
             for name, schema in self._all(cfg).items():
                 assert schema is not None and schema["name"] == name
 
-    def test_create_static_warns_that_a_second_canvas_is_refused(self):
-        # The factory encoded "create disappears once one exists". The static schema has to SAY it,
-        # because the executor's live check is now the only thing enforcing it.
+    def test_create_static_says_extend_or_add_a_tab(self):
         desc = ct.get_create_channel_canvas_schema_static()["description"]
-        assert "exactly ONE canvas per channel" in desc
+        assert "several canvas tabs" in desc
         assert "refused" in desc and "edit_canvas" in desc
 
     def test_the_static_schemas_point_at_the_evidence_for_ids(self):
@@ -1452,8 +1476,8 @@ class TestCatalogEvidence:
         body = "\n".join(lines)
         assert "F1" in body and "Agenda" in body
         assert "F2" in body and "Old notes" in body
-        # The create tool no longer vanishes, so the model is told the channel canvas exists.
-        assert "create_channel_canvas will refuse" in lines[-1]
+        # The closing line is the extend-or-add-a-tab choice.
+        assert "edit_canvas" in lines[-1] and "create_channel_canvas" in lines[-1]
 
     def test_an_empty_catalog_is_stated_not_omitted(self):
         lines = ct.catalog_evidence_lines([])
@@ -1461,9 +1485,9 @@ class TestCatalogEvidence:
         assert "none" in lines[1]
         assert ct.catalog_evidence_lines(None) == lines
 
-    def test_no_channel_canvas_says_create_is_available(self):
+    def test_no_channel_canvas_still_closes_with_the_choice(self):
         lines = ct.catalog_evidence_lines([{"canvas_id": "F2", "title": "Old notes"}])
-        assert "no channel canvas yet" in lines[-1]
+        assert "create_channel_canvas" in lines[-1]
 
     def test_every_entry_is_its_own_line(self):
         entries = [{"canvas_id": f"F{i}", "title": f"Doc {i}"} for i in range(5)]

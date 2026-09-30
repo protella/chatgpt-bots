@@ -170,6 +170,10 @@ class ToolContext:
     # the tool's per-turn schema gate, which the channel surface structurally ignores — so the
     # authorization moved here, where the executor checks it on BOTH surfaces. Fail-closed False.
     canvas_delete_authorized: bool = False
+    # Titles create_channel_canvas made this turn (normalized -> canvas id). One dict per context,
+    # shared BY REFERENCE through every shallow per-call copy, so a sibling create in the same
+    # round sees its neighbour's canvas.
+    canvas_titles_created: Dict[str, str] = field(default_factory=dict)
     # F38: the turn's presentation + work-claim state (message_processor.turn_runtime).
     # A slow local tool calls `await ctx.turn.claim_work(ctx.client, ctx.message)` once its
     # arguments and capacity checks have PASSED and immediately before the slow part starts —

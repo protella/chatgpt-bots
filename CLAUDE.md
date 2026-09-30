@@ -96,8 +96,9 @@ builds, and Slack canvases each carry non-obvious API constraints that have alre
   Its status card is a live todo list: the dispatching model writes the `plan`, the job revises it
   with `update_todos` — a **free** tool (`free_tools`), so card updates never spend the round
   budget the build needs for `mount_file` / `create_image_asset`.
-- Slack canvases: we create the *channel* canvas only (the sole route to a pinned tab); its title
-  is an undocumented create-time param that can never be changed after; creation is not idempotent.
+- Slack canvases: we create *channel* canvases only (the sole route to a pinned tab; a channel can
+  hold several); the title is an undocumented create-time param that can never be changed after;
+  creation is not idempotent, so a duplicate title is refused.
 
 ## Pitfalls
 

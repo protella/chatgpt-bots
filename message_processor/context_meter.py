@@ -5,17 +5,17 @@ OpenAI's own input-token count is the only number a size decision is made on (OW
 openai_client/api/responses.py and tool_loop.py — never into SDK kwargs or usage dicts — and each
 wrapper calls it in one fixed order:
 
-    final kwargs built → await preflight(kwargs, round) → _open_attempt → seq = dispatched(kwargs,
-    round) → _safe_api_call → usage(seq, usage)
+    final kwargs built → _open_attempt → seq = dispatched(kwargs, round) → _safe_api_call →
+    usage(seq, usage, multi_pass=...)
 
-`preflight` is the only step that can stop a request, and it runs before any attempt is opened,
-so an overflow it finds leaves no ledger row and sends nothing. `dispatched` starts the PARALLEL
-count (owner: measured "all along", never in the reply's critical path) and `usage` records what
-the response itself reported. Both land in `ThreadState.record_measure`, whose ordering rules keep
-a slow count from overwriting a newer truth.
+NOTHING is awaited before a send (v3.3.2, owner: "it was supposed to run as a side/bg task").
+`dispatched` starts the PARALLEL count and `usage` records what a single-pass response itself
+reported. Both land in `ThreadState.record_measure`, whose ordering rules keep a slow count from
+overwriting a newer truth. Whether a request fits is the API's call: its context-length 400 comes
+back through `overflow_from` as `ContextOverLimit` and runs the turn's one recovery (§3.5).
 
 A DETACHED hook (`thread_state=None`: research build rounds, reconsideration, utility calls) never
-writes a thread's meter and never preflights; its parallel count is logged only.
+writes a thread's meter; its parallel count is logged only.
 """
 from __future__ import annotations
 
@@ -31,14 +31,13 @@ logger = setup_logger(name="slack_bot.ContextMeter")
 class ContextOverLimit(Exception):
     """The request is bigger than the model's usable window.
 
-    Raised by preflight (`tokens` = the awaited count) or by a wrapper converting the API's own
-    TOKEN context-length 400 (`tokens=None`). Either way it carries the wrapper's FINAL kwargs,
-    so recovery can count the failing request when it has no measure of its own (R3-5), and the
-    round it happened on, which decides whether recovery is allowed at all (§3.5)."""
+    Raised by a wrapper converting the API's own TOKEN context-length 400 (`tokens=None`). It
+    carries the wrapper's FINAL kwargs, so recovery can count the failing request (R3-5), and
+    the round it happened on, which decides whether recovery is allowed at all (§3.5)."""
 
     def __init__(self, tokens: Optional[int], limit: int, *,
                  kwargs: Optional[Dict[str, Any]] = None, round_index: int = 0,
-                 source: str = "preflight", recoverable: Optional[bool] = None):
+                 source: str = "api", recoverable: Optional[bool] = None):
         self.tokens = tokens
         self.limit = limit
         self.kwargs = kwargs
@@ -79,28 +78,23 @@ class MeterHook:
 
     `client` is the OpenAIClient (`count_input_tokens`). `schedule` is the processor's
     `_schedule_async_call` — strong reference, logged failure — and carries the parallel counts;
-    without one, no parallel count runs. `heavy` is the handler's flag for a turn that carries
-    attachments, documents, images or a batched cohort (preflight rule b). `on_threshold(model)`
-    fires once the turn is finished for an accepted measure at or over the cleanup threshold
-    (§3.7) — immediately for a measure that lands after `finish()`.
+    without one, no parallel count runs. `on_threshold(model)` fires once the turn is finished
+    for an accepted measure at or over the cleanup threshold (§3.7) — immediately for a measure
+    that lands after `finish()`, which is how a parallel count that outlives the turn still
+    triggers cleanup.
     """
 
     def __init__(self, *, client: Any,
                  schedule: Optional[Callable[[Awaitable[Any]], Any]] = None,
                  thread_state: Any = None, key: str = "",
-                 heavy: bool = False,
                  on_threshold: Optional[Callable[[Optional[str]], None]] = None):
         self.client = client
         self.schedule = schedule
         self.thread_state = thread_state
         self.key = key or "(detached)"
-        self.heavy = heavy
         self.on_threshold = on_threshold
         self._local_seq = 0
         self._dispatches: Dict[int, Tuple[int, Optional[str]]] = {}
-        # The count preflight awaited, held for the dispatch it measured (by identity), so the
-        # same request is not counted twice.
-        self._preflight: Optional[Tuple[Dict[str, Any], Any]] = None
         self._turn_open = True
         self._threshold_model: Optional[str] = None
         self._threshold_pending = False
@@ -113,35 +107,7 @@ class MeterHook:
     def detached(self) -> bool:
         return self.thread_state is None
 
-    # ------------------------------------------------------------------ the three calls
-
-    async def preflight(self, create_kwargs: Dict[str, Any], round_index: int) -> None:
-        """Round 0 only, and awaited only when the margin may be gone (§3.4 rules a–d).
-
-        Raises `ContextOverLimit` for an awaited count over the limit. An unknown or incomplete
-        count under the limit proceeds: best effort, and the API is the final judge."""
-        if self.detached or round_index != 0 or self.effects_committed:
-            return
-        model = create_kwargs.get("model")
-        limit = usable_limit(model)
-        current = self.thread_state.current_measure(model)
-        if current is None:
-            reason = "no measure"
-        elif self.heavy:
-            reason = "attachments"
-        elif current[0] >= limit * config.token_cleanup_threshold:
-            reason = "over threshold"
-        elif not current[1]:
-            reason = "incomplete measure"
-        else:
-            return
-        result = await self.client.count_input_tokens(create_kwargs)
-        self._preflight = (create_kwargs, result)
-        logger.debug(f"Context meter {self.key}: preflight count ({reason}) = {result.tokens}")
-        if result.tokens is not None and result.tokens > limit:
-            raise ContextOverLimit(result.tokens, limit, kwargs=create_kwargs,
-                                   round_index=round_index, source="preflight",
-                                   recoverable=True)
+    # ------------------------------------------------------------------ the calls
 
     def dispatched(self, create_kwargs: Dict[str, Any], round_index: int) -> int:
         """Register a request that is about to be sent; start its parallel count. Returns the
@@ -154,10 +120,6 @@ class MeterHook:
             seq = self.thread_state.allocate_dispatch_seq()
             generation = self.thread_state.meter_generation
         self._dispatches[seq] = (generation, model)
-        pre, self._preflight = self._preflight, None
-        if pre is not None and pre[0] is create_kwargs and pre[1].tokens is not None:
-            self._accept(seq, pre[1].tokens, pre[1].complete, "count")
-            return seq
         if self.schedule is not None:
             from openai_client.api.token_count import count_body
             try:
@@ -166,9 +128,14 @@ class MeterHook:
                 logger.warning(f"Context meter {self.key}: parallel count not scheduled: {e}")
         return seq
 
-    def usage(self, seq: int, usage_dict: Optional[Dict[str, Any]]) -> None:
-        """The response's own `input_tokens` for dispatch `seq`. A missing usage records nothing."""
-        if not usage_dict:
+    def usage(self, seq: int, usage_dict: Optional[Dict[str, Any]], *, multi_pass: bool) -> None:
+        """The response's own `input_tokens` for dispatch `seq` — for a SINGLE-PASS response only.
+
+        A response that ran hosted tools (web_search, code_interpreter, MCP, ...) made several
+        internal model passes, and its `input_tokens` is their SUM: a billing total, not the size
+        of our context (prod: count 54,846 vs usage 71,718). That records nothing — the parallel
+        count of the same dispatch stands. A missing usage records nothing either."""
+        if not usage_dict or multi_pass:
             return
         tokens = usage_dict.get("input_tokens")
         if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens <= 0:
@@ -183,7 +150,7 @@ class MeterHook:
         if self.detached:
             return None
         if isinstance(error, ContextOverLimit):
-            return error                     # already the meter's (a retry's own preflight)
+            return error                     # already the meter's
         if not is_context_length_error(error):
             return None
         return ContextOverLimit(None, usable_limit(create_kwargs.get("model")),

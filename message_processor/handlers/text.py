@@ -1013,51 +1013,28 @@ class TextHandlerMixin(_Host):
 
     # ------------------------------------------------------------ context meter (CONTEXT_METER)
 
-    @staticmethod
-    def _turn_is_heavy(message: Message, user_content: Any, turn: Optional[Any]) -> bool:
-        """Preflight rule (b): does this turn carry attachments, documents, images or a batched
-        cohort? Each can move the request further than the thread's last measure knows."""
-        if message.attachments:
-            return True
-        meta = message.metadata or {}
-        try:
-            if int(meta.get("queued_batch_size") or 0) > 1:
-                return True
-        except (TypeError, ValueError):
-            pass
-        if isinstance(user_content, list) and any(
-                isinstance(part, dict) and part.get("type") in ("input_image", "input_file")
-                for part in user_content):
-            return True
-        if isinstance(user_content, str) and "=== DOCUMENT:" in user_content:
-            return True
-        ctx = getattr(turn, "channel_turn_context", None) if turn is not None else None
-        if ctx is not None:
-            return bool(getattr(ctx, "image_parts", ()) or getattr(ctx, "file_parts", ())
-                        or getattr(ctx, "document_inputs", ())
-                        or getattr(ctx, "batched_image_parts", ())
-                        or getattr(ctx, "cohort_sources", ()))
-        return False
-
     def _turn_meter(self, turn: Optional[Any], thread_state: Any, thread_key: str,
-                    channel_turn: bool, message: Message, user_content: Any) -> MeterHook:
+                    channel_turn: bool) -> MeterHook:
         """THIS TURN's context meter — built once and reused by every attempt, so the parallel
         counts of a streaming attempt and its buffered fallback land in one sequence."""
         existing = getattr(turn, "context_meter", None) if turn is not None else None
         if isinstance(existing, MeterHook):
             return existing
 
-        def _after_turn(model: Optional[str]) -> None:
+        def _after_channel_turn(model: Optional[str]) -> None:
             self._schedule_channel_compaction(thread_key, thread_state=thread_state, model=model,
                                               turn=turn)
+
+        def _after_dm_turn(model: Optional[str]) -> None:
+            # The same compaction the DM's post-response cleanup runs, for a parallel count that
+            # lands at the threshold after that cleanup already looked (§3.7, v3.3.2 R3).
+            self._schedule_dm_compaction(thread_state, thread_key)
 
         meter = MeterHook(
             client=self.openai_client, schedule=self._schedule_async_call,
             thread_state=thread_state, key=thread_key,
-            heavy=self._turn_is_heavy(message, user_content, turn),
-            # §3.7: a CHANNEL turn's after-turn trigger. A DM keeps its post-response cleanup,
-            # which reads the same measure.
-            on_threshold=_after_turn if channel_turn else None)
+            # §3.7: the after-turn trigger for an accepted measure at the cleanup threshold.
+            on_threshold=_after_channel_turn if channel_turn else _after_dm_turn)
         if turn is not None:
             turn.context_meter = meter
         return meter
@@ -1167,8 +1144,8 @@ class TextHandlerMixin(_Host):
         if turn is not None:
             turn.context_recovery_used = True
 
-        # R3-5, as refined: the measure compaction apportions against. A preflight overflow
-        # carries its own count. A REAL rejection is the API saying the request is over the
+        # R3-5, as refined: the measure compaction apportions against. An overflow that
+        # carries its own count uses it. A REAL rejection is the API saying the request is over the
         # window, so no stored measure may contradict it into a no-op: the failing kwargs are
         # counted once, and the measure is never taken below the limit it was rejected against.
         measure = overflow.tokens
@@ -1561,10 +1538,9 @@ class TextHandlerMixin(_Host):
             except Exception as e:
                 self.log_warning(f"Failed to start progress updater: {e}")
 
-        # This turn's context meter: preflight on round 0, a parallel count per request, and the
-        # response's own usage — all riding the wrappers (CONTEXT_METER §3.2).
-        meter = self._turn_meter(turn, thread_state, thread_key, channel_turn, message,
-                                 user_content)
+        # This turn's context meter: a parallel count per request and a single-pass response's
+        # own usage — both riding the wrappers (CONTEXT_METER §3.2).
+        meter = self._turn_meter(turn, thread_state, thread_key, channel_turn)
 
         # Generate response with or without tools
         tools_actually_used = []  # Track which tools were actually invoked
@@ -3419,8 +3395,7 @@ class TextHandlerMixin(_Host):
             progress_task = None
 
         # This turn's context meter — the SAME hook the buffered fallback reuses (CONTEXT_METER §3.2).
-        meter = self._turn_meter(turn, thread_state, thread_key, channel_turn, message,
-                                 user_content)
+        meter = self._turn_meter(turn, thread_state, thread_key, channel_turn)
 
         # Start streaming from OpenAI with the callback
         try:

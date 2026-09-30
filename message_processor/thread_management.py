@@ -944,11 +944,41 @@ class ThreadManagementMixin(_Host):
             except Exception as e:
                 self.log_debug(f"Channel memory extraction skipped: {e}")
 
+        await self._async_dm_compaction(thread_state, thread_key)
+
+    def _schedule_dm_compaction(self, thread_state, thread_key: str) -> None:
+        """The DM meter's after-turn trigger (CONTEXT_METER §3.7, v3.3.2 R3): a parallel count
+        that lands at the cleanup threshold AFTER the post-response cleanup already looked still
+        compacts. Same compaction, same in-flight guard."""
+        self._schedule_async_call(self._async_dm_compaction(thread_state, thread_key))
+
+    async def _async_dm_compaction(self, thread_state, thread_key: str) -> None:
+        """Compact a DM thread whose current measure is over the cleanup threshold.
+
+        ONE run in flight per thread: the post-response cleanup and a late count's trigger can
+        both reach here for the same measure, and the second one finding the first still running
+        is dropped. One that arrives after the first finished finds the measure invalidated by
+        the compaction and does nothing."""
+        in_flight = getattr(self, "_dm_compactions_in_flight", None)
+        if in_flight is None:
+            in_flight = set()
+            self._dm_compactions_in_flight = in_flight
+        if thread_key in in_flight:
+            self.log_debug(f"DM compaction for {thread_key} already running — trigger coalesced")
+            return
+        in_flight.add(thread_key)
+        try:
+            await self._dm_compaction_pass(thread_state, thread_key)
+        finally:
+            in_flight.discard(thread_key)
+
+    async def _dm_compaction_pass(self, thread_state, thread_key: str) -> None:
         try:
             # Get current model's token limit
             model = thread_state.current_model or config.gpt_model
             max_tokens = config.get_model_token_limit(model)
-            cleanup_threshold = int(max_tokens * config.token_cleanup_threshold)
+            # AT the threshold counts, as it does for the meter's own trigger (`_accept`).
+            cleanup_threshold = max_tokens * config.token_cleanup_threshold
 
             # The context meter's last accepted measure — OpenAI's own count or the response's
             # usage (CONTEXT_METER §3.7). No measure, no decision: nothing is guessed.
@@ -971,7 +1001,7 @@ class ThreadManagementMixin(_Host):
                     f"> {config.LONG_CONTEXT_BILLING_THRESHOLD:,} (2x input / 1.5x output pricing applies)"
                 )
 
-            if current_tokens > cleanup_threshold:
+            if current_tokens >= cleanup_threshold:
                 self.log_info(f"Thread at {current_tokens}/{max_tokens} tokens ({current_tokens/max_tokens:.1%}), triggering compaction")
 
                 # Phase S: one chunky compaction down to the target (not a small per-turn
@@ -1542,8 +1572,8 @@ class ThreadManagementMixin(_Host):
                 except Exception as e:
                     self.log_warning(f"F3 preserved_ts backfill failed for {thread_key}: {e}")
 
-        # No compaction here: the request's size is measured by the context meter's preflight
-        # on the turn's first request, and an overflow there is recovered on the held lock.
+        # No compaction here: the request's size is measured by the context meter's parallel
+        # count, and an API overflow on the turn's first request is recovered on the held lock.
         self.log_info("="*100)
         self.log_info(f"THREAD STATE | Messages: {len(thread_state.messages)}")
         self.log_info("="*100)

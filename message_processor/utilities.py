@@ -1514,11 +1514,11 @@ class MessageUtilitiesMixin(_Host):
             canvases = await canvas_tools.build_catalog(client, channel_id)
             if canvases:
                 info = dict(info)
-                # The channel canvas is named by its own top heading (Slack keeps it "Untitled"
+                # A channel canvas is named by its own top heading (Slack keeps it "Untitled"
                 # forever) and flagged, because its ROLE is what an ask will lean on: "put it on
-                # the canvas" means that one, and nothing else.
+                # the canvas" means one of the pinned tabs.
                 info["canvases"] = [
-                    (f"{c['title']} — the channel canvas, pinned as a tab"
+                    (f"{c['title']} — a channel canvas, pinned as a tab"
                      if c.get("is_channel_canvas") else c["title"])
                     for c in canvases
                 ]

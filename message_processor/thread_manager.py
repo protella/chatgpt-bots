@@ -38,9 +38,9 @@ class ThreadState:
     # thread creation / rebuild; None until known.
     root_author: Optional[tuple] = None
     # THE CONTEXT METER (CONTEXT_METER_SPEC §3.3). The last accepted official measure of this
-    # thread's request — OpenAI's own count, or the input_tokens a response reported — and the
-    # bookkeeping that decides whether a late arrival may replace it. In memory only: a restart
-    # simply means "no measure yet", which is preflight's cue to count.
+    # thread's request — OpenAI's own count, or the input_tokens a single-pass response
+    # reported — and the bookkeeping that decides whether a late arrival may replace it. In memory
+    # only: a restart simply means "no measure yet" until the next parallel count lands.
     #
     # `meter_generation` is bumped whenever the request the measure described stops existing
     # (a summary committed or removed, a DM transcript rebuilt); a count or usage dispatched
@@ -91,8 +91,11 @@ class ThreadState:
         """Accept one measure, or refuse it as stale. Returns whether it was accepted.
 
         Accepted only for the CURRENT generation, and only when it is newer than what is stored —
-        or equally new and from the response's own usage, which is the request's real size and so
-        beats a count of the same dispatch."""
+        or equally new and from the response's own usage, which beats a count of the same
+        dispatch. That is exact only for a SINGLE-PASS response (count == usage there, all day).
+        A response that ran hosted tools made several internal passes and reports their summed
+        input as usage — a billing total, not our context's size — so `MeterHook.usage` never
+        hands one here; the dispatch's count stands for it."""
         if generation != self.meter_generation:
             return False
         if seq < self.measured_seq:

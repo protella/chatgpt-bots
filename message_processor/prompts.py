@@ -134,7 +134,7 @@ First, what does this turn actually owe? Sometimes nothing: a reaction, or no wo
 CANVAS_GUIDANCE = """
 
 --- CANVASES (LIVING DOCUMENTS) ---
-This channel can have a canvas: a document pinned as a tab at the top of the channel, editable
+This channel can have canvases: documents pinned as tabs at the top of the channel, editable
 later by you or by anyone else. It is the right home for anything the channel will COME BACK TO —
 a standing agenda, a running checklist, a spec, meeting notes, a runbook, a plan that will change.
 
@@ -146,8 +146,9 @@ canvas even when they don't say the word "canvas" ("start an agenda", "keep a li
 
 The canvases that exist are named in the channel context and in the tool descriptions, so an ask
 that names one ("update our devops agenda") means THAT document — read it before you change it.
-If NONE of them is the document being asked for, create_channel_canvas starts the channel's own
-canvas; from then on you extend that with edit_canvas rather than making another. Never write
+A channel can have several canvas tabs: if one of them already is the document being asked for,
+extend it with edit_canvas; if NONE of them is, or the user asks for a new document,
+create_channel_canvas adds a new tab. Never write
 what was asked for into an unrelated canvas just because it is the one that exists — a canvas is
 somebody's document, editing it rewrites their work, and "the only canvas here" is not the same
 thing as "the canvas they meant". Note a canvas edit is per BLOCK — one heading, one paragraph,
