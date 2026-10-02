@@ -1465,7 +1465,14 @@ class TextHandlerMixin(_Host):
             # Phase 9: channel memory arrives as this turn's snapshot (base.py reads it once). The
             # prompt is built from scratch here, so before it was passed down NO ordinary model
             # call ever carried the CHANNEL MEMORY block — not even the opening turn of a thread.
-            system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, getattr(thread_state, 'has_summary_head', False), thread_config.get('custom_instructions'), participant_roster=self._build_participant_roster(thread_state, client), channel_steering=channel_steering_text, channel_info=await self._build_channel_info(client, message.channel_id), code_interpreter_enabled=thread_config.get('enable_code_interpreter', config.enable_code_interpreter), tool_surface=surface, tools_available=_prompt_tools_available(registry))
+            prompt_args = (client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, getattr(thread_state, 'has_summary_head', False), thread_config.get('custom_instructions'))
+            participant_roster = self._build_participant_roster(thread_state, client)
+            channel_info = await self._build_channel_info(client, message.channel_id)
+            system_prompt = self._get_system_prompt(*prompt_args, participant_roster=participant_roster, channel_steering=channel_steering_text, channel_info=channel_info, code_interpreter_enabled=thread_config.get('enable_code_interpreter', config.enable_code_interpreter), tool_surface=surface, tools_available=_prompt_tools_available(registry))
+            # The same prompt from the same inputs for a request that offers NO tool — what the
+            # stale reconsideration sends. Rendered now, beside the original, so that pass neither
+            # rereads live settings nor claims tools (or a settings state) it does not have.
+            tool_free_prompt = self._get_system_prompt(*prompt_args, participant_roster=participant_roster, channel_steering=channel_steering_text, channel_info=channel_info, code_interpreter_enabled=False, tool_surface=surface, tools_available=False, tools_structurally_withheld=True)
 
             # Prompt-cache hygiene: volatile context (minute-precision time + F1 in-flight note)
             # rides at the SUFFIX (last message), never in the system prompt, so the cached prefix
@@ -1491,7 +1498,8 @@ class TextHandlerMixin(_Host):
             # reconsideration runner through main.py, and the runner must re-ask under THIS
             # turn's instructions and settings.
             pin_dm_turn_context(turn, message, thread_config=thread_config,
-                                instructions=system_prompt, prompt_cache_key=cache_key)
+                                instructions=system_prompt, prompt_cache_key=cache_key,
+                                tool_free_instructions=tool_free_prompt)
 
         # Update status before generating
         failed_mcp_display = ", ".join(sorted(self._as_mcp_exclusion_set(failed_mcp_server)))
@@ -1660,6 +1668,10 @@ class TextHandlerMixin(_Host):
                     )
                     response_text = result["text"]
                     tools_actually_used = result["tools_used"]
+                    # Hosted tools ran inside this one call; the turn keeps the record the
+                    # stale reconsideration reads, as the loop and the stream already do.
+                    for used_name in tools_actually_used or ():
+                        _note_turn_external(turn, used_name)
                 else:
                     result = await self.openai_client.create_text_response_with_tools(
                         messages=messages_for_api,
@@ -1685,6 +1697,10 @@ class TextHandlerMixin(_Host):
                     )
                     response_text = result["text"]
                     tools_actually_used = result["tools_used"]
+                    # Hosted tools ran inside this one call; the turn keeps the record the
+                    # stale reconsideration reads, as the loop and the stream already do.
+                    for used_name in tools_actually_used or ():
+                        _note_turn_external(turn, used_name)
             else:
                 # Generate response without tools
                 if retry_timeout:
@@ -2226,7 +2242,14 @@ class TextHandlerMixin(_Host):
             # Phase 9: channel memory arrives as this turn's snapshot (base.py reads it once). The
             # prompt is built from scratch here, so before it was passed down NO ordinary model
             # call ever carried the CHANNEL MEMORY block — not even the opening turn of a thread.
-            system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, getattr(thread_state, 'has_summary_head', False), thread_config.get('custom_instructions'), participant_roster=self._build_participant_roster(thread_state, client), channel_steering=channel_steering_text, channel_info=await self._build_channel_info(client, message.channel_id), code_interpreter_enabled=thread_config.get('enable_code_interpreter', config.enable_code_interpreter), tool_surface=surface, tools_available=_prompt_tools_available(registry))
+            prompt_args = (client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, getattr(thread_state, 'has_summary_head', False), thread_config.get('custom_instructions'))
+            participant_roster = self._build_participant_roster(thread_state, client)
+            channel_info = await self._build_channel_info(client, message.channel_id)
+            system_prompt = self._get_system_prompt(*prompt_args, participant_roster=participant_roster, channel_steering=channel_steering_text, channel_info=channel_info, code_interpreter_enabled=thread_config.get('enable_code_interpreter', config.enable_code_interpreter), tool_surface=surface, tools_available=_prompt_tools_available(registry))
+            # The same prompt from the same inputs for a request that offers NO tool — what the
+            # stale reconsideration sends. Rendered now, beside the original, so that pass neither
+            # rereads live settings nor claims tools (or a settings state) it does not have.
+            tool_free_prompt = self._get_system_prompt(*prompt_args, participant_roster=participant_roster, channel_steering=channel_steering_text, channel_info=channel_info, code_interpreter_enabled=False, tool_surface=surface, tools_available=False, tools_structurally_withheld=True)
 
             # Prompt-cache hygiene: volatile context (minute-precision time) rides at the SUFFIX
             # (last message), never in the system prompt, so the cached prefix survives across
@@ -2246,7 +2269,8 @@ class TextHandlerMixin(_Host):
             # request it re-asks under must be THIS turn's — pinned here, where the turn's own
             # instructions and settings exist, rather than reconstructed afterwards.
             pin_dm_turn_context(turn, message, thread_config=thread_config,
-                                instructions=system_prompt, prompt_cache_key=cache_key)
+                                instructions=system_prompt, prompt_cache_key=cache_key,
+                                tool_free_instructions=tool_free_prompt)
             ci_container = await self._resolve_ci_container(request_config, thread_key)
             await self._prepare_sandbox_tools(request_config, thread_key, ci_container, client,
                                               surface=surface)

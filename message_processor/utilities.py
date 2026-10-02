@@ -1559,7 +1559,8 @@ class MessageUtilitiesMixin(_Host):
                           code_interpreter_enabled: Optional[bool] = None,
                           tool_surface: str = SURFACE_DM,
                           tools_available: Optional[bool] = None,
-                          include_date: bool = True) -> str:
+                          include_date: bool = True,
+                          tools_structurally_withheld: bool = False) -> str:
         """Get the appropriate system prompt based on the client platform with user's timezone, name, email, model, web search capability, trimming status, and custom instructions.
 
         ``tool_surface`` names which registry surface this turn runs on. The two blocks below
@@ -1575,7 +1576,12 @@ class MessageUtilitiesMixin(_Host):
 
         ``include_date=False`` omits the date line entirely — for the CHANNEL prefix, which is
         contracted to be invariant per bot version and channel and so cannot carry a string that
-        changes at midnight. That caller renders date and time together in its suffix instead."""
+        changes at midnight. That caller renders date and time together in its suffix instead.
+
+        ``tools_structurally_withheld=True`` is for a pass that offers no tool BY DESIGN (the
+        stale reconsideration). It omits the web-search guidance entirely and wins over
+        ``web_search_enabled``: "enabled" would promise a tool the request does not carry, and
+        the user-settings "disabled" sentence would state a setting the user never chose."""
         client_name = client.name.lower()
         
         # Get base prompt for the platform
@@ -1682,7 +1688,9 @@ class MessageUtilitiesMixin(_Host):
 
         # Add web search capability context
         web_search_context = ""
-        if web_search_enabled:
+        if tools_structurally_withheld:
+            pass
+        elif web_search_enabled:
             web_search_context = "\n\nAdditional capability enabled: Web Search. You can search the web for current information when needed to provide up-to-date answers.  "
         else:
             # Get the settings command dynamically
@@ -2697,7 +2705,8 @@ def effective_request_model(capability_profile: Optional[Dict[str, Any]] = None)
 
 
 def build_capability_state_suffix(capability_profile: Optional[Dict[str, Any]] = None,
-                                  settings_command: Optional[str] = None) -> Optional[str]:
+                                  settings_command: Optional[str] = None,
+                                  tools_structurally_withheld: bool = False) -> Optional[str]:
     """Model, window, and which hosted capabilities are live on THIS attempt.
 
     The window is here for the same reason the model name is: it is a fact about this turn only
@@ -2709,7 +2718,11 @@ def build_capability_state_suffix(capability_profile: Optional[Dict[str, Any]] =
 
     The model named is the EFFECTIVE one — see `effective_request_model`. Reads config only for its
     static tables and env values (no I/O, no per-turn state); everything that varies per turn
-    arrives in the pinned profile."""
+    arrives in the pinned profile.
+
+    `tools_structurally_withheld=True` (a pass that offers no tool by design) drops the web-search
+    line whatever the profile says: an "off" there is not the user's setting, and saying so sent a
+    rethought reply telling someone search was disabled right after it had searched."""
     profile = capability_profile or {}
     if not profile:
         return None       # no pinned profile is not the same claim as "these are all off"
@@ -2732,7 +2745,9 @@ def build_capability_state_suffix(capability_profile: Optional[Dict[str, Any]] =
         except Exception:  # noqa: BLE001 — an odd model must never cost the cutoff above
             pass
         lines.append(line + ".")
-    if profile.get("enable_web_search"):
+    if tools_structurally_withheld:
+        pass
+    elif profile.get("enable_web_search"):
         lines.append("web search: available — use it for anything past your knowledge cutoff.")
     else:
         cmd = settings_command or getattr(config, "settings_slash_command", "/chatgpt-settings")

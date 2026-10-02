@@ -59,6 +59,14 @@ def _function_calls(sink: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [e for e in sink if e.get("type", "function_call") == "function_call"]
 
 
+def _turn_record(record: Dict[str, Any], *, dispatched: bool) -> Dict[str, Any]:
+    """The turn's copy of a call record. A call answered by an override (over budget, excess
+    bookkeeping, a rejected terminal) never ran, and the turn's copy says so with
+    `dispatched: False` — the stale reconsideration names only tools that actually ran. Run calls
+    keep the plain shape the loop's own accumulator has."""
+    return record if dispatched else {**record, "dispatched": False}
+
+
 def _note_turn_tool_call(tool_context: Any, record: Dict[str, Any]) -> None:
     """Mirror one dispatched call onto the TURN (§5.4a amendment), if there is a turn to tell.
 
@@ -130,7 +138,7 @@ async def _run_tool_round(
         record = {"name": call.get("name"), "ok": ok,
                   "gist": gist_from_arguments(call.get("arguments"))}
         local_tool_calls.append(record)
-        _note_turn_tool_call(tool_context, record)
+        _note_turn_tool_call(tool_context, _turn_record(record, dispatched=oid not in overrides))
         self.log_info(f"Local tool '{call.get('name')}' -> "
                       f"{'ok' if ok else 'error: ' + _err_code(result)}")
         result_by_id[id(call)] = result
@@ -719,7 +727,8 @@ async def _handle_no_reply_terminal(
             record = {"name": call.get("name"), "ok": ok,
                       "gist": gist_from_arguments(call.get("arguments"))}
             local_tool_calls.append(record)
-            _note_turn_tool_call(tool_context, record)
+            _note_turn_tool_call(tool_context,
+                                 _turn_record(record, dispatched=id(call) not in overrides))
             self.log_info(f"Local tool '{call.get('name')}' -> "
                           f"{'ok' if ok else 'error: ' + _err_code(result)}")
         await _notify(f"local:{call.get('name')}", "completed")

@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.3.3] - 2026-10-02
+
+### 🐛 Fixed
+
+- **The bot no longer says web search is off when it isn't.** When a new message arrived while a
+  reply was being written, the quick rethink pass that adjusts the reply (and runs without tools)
+  was told web search was "disabled in your settings", and could repeat that to the user right
+  after searching. The rethink pass now makes no claim about settings and knows which tools the
+  draft already used.
+
 ## [3.3.2] - 2026-09-30
 
 ### ✨ Added

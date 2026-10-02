@@ -611,7 +611,8 @@ def build_evidence_items(ctx: ChannelTurnContext, *, client: Any,
 
 def build_developer_suffix(ctx: ChannelTurnContext, *, processor: Any,
                           contract_suffix: Optional[str],
-                          reply_destination: Optional[str]) -> str:
+                          reply_destination: Optional[str],
+                          tools_structurally_withheld: bool = False) -> str:
     """Step 5: the one developer-role item, last in the payload.
 
     Order is deliberate. Policy and settings first (what this channel has decided), then WHERE
@@ -640,7 +641,8 @@ def build_developer_suffix(ctx: ChannelTurnContext, *, processor: Any,
         # every UTC midnight, which is a daily cache miss for every channel and an invariant that
         # was not one. Pinned, so a retry states the same moment.
         ctx.time_suffix(processor),
-        build_capability_state_suffix(ctx.thread_config),
+        build_capability_state_suffix(ctx.thread_config,
+                                      tools_structurally_withheld=tools_structurally_withheld),
         # F1/F13/F38: what is ALREADY running in this thread. Not in the plan's suffix list, and
         # load-bearing anyway — without it a turn cheerfully starts a second deck while the first
         # one is still building (live 2026-07). Volatile by nature, so post-breakpoint is exactly
@@ -694,7 +696,9 @@ def assemble_channel_request(*, processor: Any, client: Any, ctx: ChannelTurnCon
     context's capability profile is normalized through `reconsideration_profile` with `model` as
     the called model, and `registry`, `contract_suffix` and `tools` are forced to
     None/None/[] — so the system instructions, the capability suffix and every hash describe a
-    request that genuinely offers no tool.
+    request that genuinely offers no tool. The instructions and suffix also drop the web-search
+    line: the normalized profile's `False` is ours, not the user's setting, and rendering it as
+    one told a user search was off right after the draft had searched.
     """
     if no_tools:
         profile = reconsideration_profile(ctx.thread_config, model=model)
@@ -704,7 +708,8 @@ def assemble_channel_request(*, processor: Any, client: Any, ctx: ChannelTurnCon
         contract_suffix = None
         tools = []
     stream = ctx.stream
-    instructions = _channel_instructions(processor, client, ctx, registry=registry)
+    instructions = _channel_instructions(processor, client, ctx, registry=registry,
+                                         tools_structurally_withheld=no_tools)
     items: List[Dict[str, Any]] = []
 
     # ITERATED, never named. The canonical sequence is the STREAM's to define (A1); naming its
@@ -740,7 +745,8 @@ def assemble_channel_request(*, processor: Any, client: Any, ctx: ChannelTurnCon
                                       registry=registry))
 
     suffix = build_developer_suffix(ctx, processor=processor, contract_suffix=contract_suffix,
-                                   reply_destination=reply_destination)
+                                   reply_destination=reply_destination,
+                                   tools_structurally_withheld=no_tools)
     if suffix:
         items.append({"role": ROLE_DEVELOPER, "content": suffix})
 
@@ -750,7 +756,8 @@ def assemble_channel_request(*, processor: Any, client: Any, ctx: ChannelTurnCon
 
 
 def _channel_instructions(processor: Any, client: Any, ctx: ChannelTurnContext,
-                         registry: Any = None) -> str:
+                         registry: Any = None,
+                         tools_structurally_withheld: bool = False) -> str:
     """The channel-stable slice of the system prompt: persona and capability etiquette, no clock.
 
     Everything the DM prompt carries that varies with the requester is deliberately withheld and
@@ -781,7 +788,8 @@ def _channel_instructions(processor: Any, client: Any, ctx: ChannelTurnContext,
                                              config.enable_code_interpreter),
         tool_surface=SURFACE_CHANNEL,
         tools_available=_prompt_tools_available(registry),
-        include_date=False)
+        include_date=False,
+        tools_structurally_withheld=tools_structurally_withheld)
 
 
 def _evidence_hash(items: Sequence[Dict[str, Any]]) -> str:

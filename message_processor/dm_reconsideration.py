@@ -43,6 +43,10 @@ class DMTurnContext:
     exact instructions the turn spoke under, its sampling settings, and the trigger it was
     answering (whose text is quoted back to the model, and whose position in a reconsideration
     snapshot is no longer "the newest message").
+
+    `tool_free_instructions` is the same prompt rendered from the same inputs for a request that
+    offers no tool. The reconsideration call sends `tools=[]`, and the turn's own instructions
+    describe the tools it HAD — rendered here, beside them, rather than reread or patched later.
     """
 
     channel_id: str
@@ -53,11 +57,13 @@ class DMTurnContext:
     instructions: str
     thread_config: Dict[str, Any] = field(default_factory=dict)
     prompt_cache_key: Optional[str] = None
+    tool_free_instructions: Optional[str] = None
 
 
 def pin_dm_turn_context(turn: Any, message: Any, *, thread_config: Dict[str, Any],
                         instructions: str,
-                        prompt_cache_key: Optional[str] = None) -> None:
+                        prompt_cache_key: Optional[str] = None,
+                        tool_free_instructions: Optional[str] = None) -> None:
     """Record the DM request's evidence on the turn. Idempotent per turn: an MCP retry or a
     non-streaming fallback re-enters the same handler and re-pins the same facts, and the LAST
     request the turn actually sent is the one reconsideration should re-ask under."""
@@ -73,7 +79,8 @@ def pin_dm_turn_context(turn: Any, message: Any, *, thread_config: Dict[str, Any
                            or getattr(message, "user_id", None) or "unknown"),
         instructions=instructions or "",
         thread_config=dict(thread_config or {}),
-        prompt_cache_key=prompt_cache_key)
+        prompt_cache_key=prompt_cache_key,
+        tool_free_instructions=tool_free_instructions)
 
 
 # ------------------------------------------------------------------------------ the snapshot
@@ -315,14 +322,18 @@ class DMReconsiderSurface:
         """The DM request over the fresh snapshot, plus the ONE appended developer item — the
         same grammar §4d fixes for channels, over the surface a DM actually has. The
         instructions and the sampling settings are the turn's OWN, pinned when it built its
-        request; nothing about the question is written fresh here."""
-        from message_processor.reconsideration import PreparedDecision, reconsideration_item
+        request; nothing about the question is written fresh here. The instructions are the
+        tool-free rendering pinned beside them, because this call offers no tool."""
+        from message_processor.reconsideration import (PreparedDecision, reconsideration_item,
+                                                       tools_used_summary)
 
         items: List[Dict[str, Any]] = snapshot.input_items()
-        items.append(reconsideration_item(pass_number, draft, self.trigger_line()))
+        items.append(reconsideration_item(pass_number, draft, self.trigger_line(),
+                                          tools_used=tools_used_summary(self._turn)))
         cfg = self.ctx.thread_config or {}
         return PreparedDecision(
-            instructions=self.ctx.instructions, api_items=items,
+            instructions=self.ctx.tool_free_instructions or self.ctx.instructions,
+            api_items=items,
             params={"reasoning_effort": cfg.get("reasoning_effort"),
                     "verbosity": cfg.get("verbosity"),
                     "max_output_tokens": cfg.get("max_tokens"),

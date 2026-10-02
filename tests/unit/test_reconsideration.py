@@ -2186,7 +2186,8 @@ class MainRig:
                     pin_dm_turn_context(turn, message,
                                         thread_config=dict(thread_config()),
                                         instructions="DM-SYSTEM-PROMPT",
-                                        prompt_cache_key=f"{channel}:{TRIGGER_TS}")
+                                        prompt_cache_key=f"{channel}:{TRIGGER_TS}",
+                                        tool_free_instructions="DM-TOOL-FREE-PROMPT")
                 # THE DM RACE: the same person's next question, TOP-LEVEL and therefore under a
                 # different thread root — which is why rebuilding only the original thread
                 # could never see it (ruling 6).
@@ -2492,9 +2493,10 @@ async def test_a_dm_draft_is_reconsidered_over_its_own_surface_and_posts(events,
     # The snapshot was asked for the DM SURFACE, rooted at the turn's own thread.
     assert rig.dm_snapshot_calls and rig.dm_snapshot_calls[0]["channel_id"] == DM
     assert rig.dm_snapshot_calls[0]["origin_root_ts"] == TRIGGER_TS
-    # The request re-asks under the turn's OWN pinned instructions — nothing invented here.
+    # The request re-asks under the turn's OWN pinned instructions — nothing invented here —
+    # in their tool-free rendering, because this call offers no tool.
     call = rig.decider.calls[0]
-    assert call["instructions"] == "DM-SYSTEM-PROMPT"
+    assert call["instructions"] == "DM-TOOL-FREE-PROMPT"
     assert call["prompt_cache_key"] == f"{DM}:{TRIGGER_TS}"
     # …and the rebuilt room, plus exactly one appended developer item quoting the draft.
     assert call["input_items"][-1]["role"] == "developer"

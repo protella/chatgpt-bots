@@ -146,12 +146,13 @@ def test_no_tools_assembly_claims_no_tool_on_every_surface():
     assert call.args[6] is False                                # enable_web_search
     assert call.kwargs["code_interpreter_enabled"] is False
     assert call.kwargs["tools_available"] is False              # registry=None
-    # The developer suffix: capability lines name the called model and claim no tool, and the
-    # tool contract never materializes.
+    assert call.kwargs["tools_structurally_withheld"] is True   # no settings claim either
+    # The developer suffix: capability lines name the called model and claim no tool — not even
+    # "off", which would read as the user's setting — and the tool contract never materializes.
     developer = request.input_items[-1]
     assert developer["role"] == "developer"
     assert "model: gpt-5.5" in developer["content"]
-    assert "web search: off" in developer["content"]
+    assert "web search" not in developer["content"]
     assert "code interpreter" not in developer["content"]
     assert "[CONTRACT]" not in developer["content"]
     registry.schemas.assert_not_called()
@@ -159,7 +160,8 @@ def test_no_tools_assembly_claims_no_tool_on_every_surface():
 
 def test_no_tools_assembly_equals_manual_normalization():
     """The mode IS the normalization: forcing the profile/registry/contract/tools by hand over
-    the same context produces byte-identical items."""
+    the same context produces byte-identical items — except the one thing only the mode knows,
+    that the tools are withheld by design, so its suffix states no web-search setting."""
     cfg = _everything_on_config()
     ctx = _ctx(cfg)
     processor = _processor()
@@ -176,9 +178,66 @@ def test_no_tools_assembly_equals_manual_normalization():
         processor=processor, client=client, ctx=manual_ctx, model="gpt-5.5",
         tools=[], request_config=profile, contract_suffix=None, registry=None)
 
-    assert via_mode.input_items == manual.input_items
+    assert via_mode.input_items[:-1] == manual.input_items[:-1]
+    off_line = next(line for line in manual.input_items[-1]["content"].split("\n")
+                    if line.startswith("web search: off"))
+    assert via_mode.input_items[-1] == dict(
+        manual.input_items[-1],
+        content=manual.input_items[-1]["content"].replace("\n" + off_line.rstrip("]"), ""))
     assert via_mode.instructions == manual.instructions
     assert via_mode.tools == manual.tools == []
+
+
+def _real_prompt_processor():
+    from message_processor.utilities import MessageUtilitiesMixin
+
+    processor = _processor()
+    processor._get_system_prompt = MessageUtilitiesMixin._get_system_prompt.__get__(processor)
+    return processor
+
+
+def _slack_client():
+    return SimpleNamespace(name="Slack", bot_user_id="U_BOT", tool_registry=None)
+
+
+def test_a_no_tools_request_states_no_web_search_setting_even_when_it_is_off():
+    """A pass that offers no tool by design never claims a settings state. Live: the rethought
+    reply told the user web search was off in their settings right after the draft had searched."""
+    from tests.unit.channel_turn_harness import thread_config
+
+    ctx = _ctx(thread_config(enable_web_search=False, model="gpt-5.6-sol"))
+    request = channel_request.assemble_channel_request(
+        processor=_real_prompt_processor(), client=_slack_client(), ctx=ctx, model="gpt-5.5",
+        tools=[], request_config=None, contract_suffix=None, no_tools=True)
+
+    suffix = request.input_items[-1]["content"]
+    for text in (request.instructions, suffix):
+        assert "disabled" not in text
+        assert "web search: off" not in text
+        assert config.settings_slash_command not in text
+
+
+def test_a_real_web_search_off_setting_still_renders_the_user_settings_text():
+    from tests.unit.channel_turn_harness import thread_config
+
+    ctx = _ctx(thread_config(enable_web_search=False, model="gpt-5.6-sol"))
+    request = channel_request.assemble_channel_request(
+        processor=_real_prompt_processor(), client=_slack_client(), ctx=ctx, model="gpt-5.6-sol",
+        tools=[], request_config=ctx.thread_config, contract_suffix=None)
+
+    assert "Web search is currently disabled" in request.instructions
+    assert config.settings_slash_command in request.instructions
+    suffix = request.input_items[-1]["content"]
+    assert "web search: off" in suffix and config.settings_slash_command in suffix
+
+
+def test_the_reconsideration_item_names_the_tools_the_draft_already_used():
+    from message_processor.reconsideration import reconsideration_item
+
+    item = reconsideration_item(1, "the draft", "[Alice ts=10.0] hi",
+                                tools_used=["web search", "fetch_url"])
+    assert ("Tools already used while producing this draft: web search, fetch_url. "
+            "No tools are offered in this pass.") in item["content"]
 
 
 # ------------------------------------------------------------------ the counted body

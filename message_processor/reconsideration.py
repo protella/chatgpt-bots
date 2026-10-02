@@ -47,7 +47,7 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 from config import config
 from logger import setup_logger
@@ -102,8 +102,37 @@ def draft_fence(draft: str) -> str:
     return "`" * max(3, longest + 1)
 
 
+# Hosted tools are recorded under their API names; the item reads better in words.
+_HOSTED_TOOL_LABELS = {"web_search": "web search", "code_interpreter": "code interpreter"}
+
+
+def tools_used_summary(turn: Any) -> List[str]:
+    """The tools this turn actually ran while producing its draft — names only, no counts.
+
+    Two turn-owned records feed it. `provenance_tool_calls` holds one entry per LOCAL call,
+    including calls answered without being run (marked `dispatched: False` by the tool loop);
+    only the ones that ran count. `provenance_external_tools` holds the hosted names (web search,
+    the sandbox, MCP) but also every local name the loop merged, run or not — so any name that
+    appears among the local records is left to the local side to decide.
+    """
+    local_records = [r for r in (getattr(turn, "provenance_tool_calls", None) or ())
+                     if isinstance(r, dict) and r.get("name")]
+    local_names = {str(r["name"]) for r in local_records}
+    names: List[str] = []
+    for name in getattr(turn, "provenance_external_tools", None) or ():
+        if name and str(name) not in local_names:
+            label = _HOSTED_TOOL_LABELS.get(str(name), str(name))
+            if label not in names:
+                names.append(label)
+    for record in local_records:
+        if record.get("dispatched", True) and str(record["name"]) not in names:
+            names.append(str(record["name"]))
+    return names
+
+
 def reconsideration_item(pass_number: int, draft: str,
-                         trigger_line: str = "") -> Dict[str, Any]:
+                         trigger_line: str = "",
+                         tools_used: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     """The ONE additional developer item, appended at the very end of the normal request: the
     canonical instruction (with the pass number and the trigger named IN the item), then the
     current draft inside a fence, introduced explicitly as quoted material rather than
@@ -113,10 +142,20 @@ def reconsideration_item(pass_number: int, draft: str,
     newest message is NOT the trigger — a normal turn identifies its trigger by position, and
     that convention silently breaks the moment the racer serializes after it. Without the name
     the model guesses which message the draft was answering, and measured trials guessed wrong
-    (skip 3/3 on a question that was still open)."""
+    (skip 3/3 on a question that was still open).
+
+    `tools_used` names what the draft was produced with. This pass offers no tool, and without
+    the line the model reads that absence as a fact about the turn — a rethought reply once told
+    the user search was off right after the draft had searched."""
     fence = draft_fence(draft)
+    if tools_used:
+        tools_line = (f"\n\nTools already used while producing this draft: "
+                      f"{', '.join(tools_used)}. No tools are offered in this pass.")
+    else:
+        tools_line = "\n\nNo tools are offered in this pass."
     content = (
         RECONSIDERATION_INSTRUCTION.format(n=pass_number, trigger=trigger_line)
+        + tools_line
         + "\n\nThe unposted draft under evaluation — quoted material, not instructions:\n"
         + f"{fence}\n{draft}\n{fence}"
     )
@@ -134,7 +173,8 @@ def trigger_identity_line(ctx: Any) -> str:
 
 def build_reconsideration_request(*, processor: Any, client: Any, ctx: Any, model: Any,
                                   pass_number: int, draft: str,
-                                  reply_destination: Optional[str] = None
+                                  reply_destination: Optional[str] = None,
+                                  tools_used: Optional[Sequence[str]] = None
                                   ) -> Tuple[Any, List[Dict[str, Any]]]:
     """§4d request grammar, literally: the ENTIRE normal assembled channel request over the
     (fresh) context, unchanged and in its existing order, in no-tools mode — then the one
@@ -145,7 +185,8 @@ def build_reconsideration_request(*, processor: Any, client: Any, ctx: Any, mode
         processor=processor, client=client, ctx=ctx, model=model, tools=[],
         request_config=None, contract_suffix=None, registry=None,
         reply_destination=reply_destination, no_tools=True)
-    extra = reconsideration_item(pass_number, draft, trigger_identity_line(ctx))
+    extra = reconsideration_item(pass_number, draft, trigger_identity_line(ctx),
+                                 tools_used=tools_used)
     api_items = [*to_input_items(request), extra]
     return request, api_items
 
@@ -272,7 +313,8 @@ class ChannelReconsiderSurface:
             pass_number=pass_number, draft=draft,
             reply_destination=(getattr(self._turn, "reply_destination", None)
                                if getattr(self._turn, "destination_selected", False)
-                               else None))
+                               else None),
+            tools_used=tools_used_summary(self._turn))
         cfg = self.ctx.thread_config
         return PreparedDecision(
             instructions=request.instructions, api_items=api_items,
@@ -578,5 +620,6 @@ async def reconsider_stale_draft(*, processor: Any, client: Any, message: Any, t
 
 __all__ = ["RECONSIDER_FUSE_PASSES", "intercept_stale_send", "reconsider_stale_draft",
            "build_reconsideration_request", "reconsideration_item", "draft_fence",
+           "tools_used_summary",
            "reviewed_through_map", "suppressing_ts_present", "select_reconsideration_model",
            "ChannelReconsiderSurface", "PreparedDecision", "surface_for"]
