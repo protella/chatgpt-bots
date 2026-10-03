@@ -15,7 +15,7 @@ minus deleted — and asserts the two things a reader of the channel actually ex
 import re
 from types import SimpleNamespace
 from typing import Any, Dict, List
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -641,6 +641,82 @@ async def test_direct_final_post_top_level_suppresses_footer(monkeypatch):
     resp = await _run(processor, slack, msg, ts, turn)
 
     assert resp.metadata.get("footer_attached") is not True
+
+
+class _NoCarrySlack(_FooterSlack):
+    """The reply is too long to carry the chrome (meta_out reports footer_attached False), so
+    the separate footer has to post — and it records WHEN it did."""
+
+    def __init__(self, events, **kw):
+        super().__init__(**kw)
+        self.events = events
+        self.footer_calls = 0
+
+    async def send_message(self, channel, thread, text, blocks=None, meta_out=None,
+                           username=None, lease=None, surface=None, receipts=None,
+                           receipt_kind=None, receipt_class=None, on_first_accept=None):
+        ts = await FakeSlack.send_message(self, channel, thread, text, blocks=None,
+                                          meta_out=meta_out, lease=lease, surface=surface,
+                                          receipts=receipts, receipt_kind=receipt_kind,
+                                          on_first_accept=on_first_accept)
+        if meta_out is not None:
+            meta_out["footer_attached"] = False
+        return ts
+
+    async def maybe_post_response_footer(self, message, response, receipts=None):
+        self.footer_calls += 1
+        self.events.append("footer")
+
+
+@pytest.mark.asyncio
+async def test_separate_footer_posts_before_digest_summarization_finishes(monkeypatch):
+    """The button never waits for post-delivery work: when the reply could not carry the
+    footer, the separate footer goes out as soon as the reply lands — ahead of the slow
+    per-result summaries — and main.py's later call stands down instead of posting twice."""
+    import asyncio
+
+    from message_processor.client_contract import Message
+    from slack_client.messaging import SlackMessagingMixin
+
+    events: List[str] = []
+
+    async def _slow_digests(*a, **k):
+        events.append("digests_started")
+        await asyncio.sleep(0.05)
+        events.append("digests_done")
+        return []
+
+    monkeypatch.setattr(config, "enable_no_reply_tool", True, raising=False)
+    monkeypatch.setattr(config, "enable_tool_provenance", True, raising=False)
+    monkeypatch.setattr(config, "enable_tool_result_memory", True, raising=False)
+    monkeypatch.setattr(config, "enable_tool_result_summarization", True, raising=False)
+    monkeypatch.setattr(config, "enable_response_footer", True, raising=False)
+    monkeypatch.setattr("message_processor.handlers.text.build_result_digests_summarized",
+                        _slow_digests)
+    slack = _NoCarrySlack(events, native=True)
+    processor = _processor(FakeOpenAI(["a long answer that cannot carry the footer"]))
+    # A gate-woken (silence-capable) threaded turn buffers and posts once, directly.
+    msg, ts = _message(silence_capable=True), _thread_state()
+    turn = _thread_turn(msg)
+    assert turn.silence_capable and not turn.final_post_only
+
+    resp = await _run(processor, slack, msg, ts, turn)
+
+    assert slack.posts, f"the reply never posted: {slack.calls}"
+    assert slack.footer_calls == 1
+    assert events == ["footer", "digests_started", "digests_done"], events
+    assert resp.metadata.get("footer_attached") is False
+    assert resp.metadata.get("footer_posted") is True
+
+    # main.py's later call, through the real method: a no-op for this turn.
+    s = MagicMock()
+    s.app.client.chat_postMessage = AsyncMock()
+    s.log_debug = MagicMock()
+    s._build_response_footer_blocks = (
+        SlackMessagingMixin._build_response_footer_blocks.__get__(s))
+    main_msg = Message(text="hi", user_id="U1", channel_id="C1", thread_id="10.0")
+    await SlackMessagingMixin.maybe_post_response_footer(s, main_msg, resp)
+    s.app.client.chat_postMessage.assert_not_awaited()
 
 
 # =============================================== 2c. the "_Tools Used:_" attribution footer

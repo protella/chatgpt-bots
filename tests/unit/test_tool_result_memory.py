@@ -654,3 +654,46 @@ async def test_summarize_tool_result_puts_request_into_user_message():
     fake._safe_api_call = AsyncMock(return_value=resp)
     await R.summarize_tool_result(fake, text="y" * 5000, max_chars=2000)
     assert request not in fake._safe_api_call.call_args.kwargs["input"][1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_f16_summaries_run_concurrently_and_keep_capture_order_and_fallback():
+    # The per-result utility calls are independent, so they overlap instead of queueing:
+    # every call is in flight before any returns. The FIRST-captured call finishes LAST, yet
+    # the digests still come back in capture order, and a failed call falls back to its own
+    # original output without disturbing its neighbours.
+    import asyncio
+
+    in_flight = 0
+    peak = 0
+    delays = {"A": 0.05, "B": 0.0, "C": 0.02, "D": 0.01}
+
+    async def _summarize(text, max_chars, context=None):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        try:
+            await asyncio.sleep(delays[text[0]])
+            if text[0] == "C":
+                raise TimeoutError("boom")
+            return None if text[0] == "D" else f"summary of {text[0]}"
+        finally:
+            in_flight -= 1
+
+    client = MagicMock()
+    client.summarize_tool_result = _summarize
+    out = await tp.build_result_digests_summarized(
+        [{"tool_name": "a", "output": "A" * 5000},
+         {"tool_name": "short", "output": "verbatim"},
+         {"tool_name": "b", "output": "B" * 5000},
+         {"tool_name": "c", "output": "C" * 5000},
+         {"tool_name": "d", "output": "D" * 5000}],
+        client, per_call_chars=100, per_turn_chars=6000, input_chars=20000)
+    assert peak == 4
+    assert out == [
+        {"tool_name": "a", "result_digest": "summary of A"},
+        {"tool_name": "short", "result_digest": "verbatim"},
+        {"tool_name": "b", "result_digest": "summary of B"},
+        {"tool_name": "c", "result_digest": "C" * 100 + tp.TRUNCATION_MARKER},
+        {"tool_name": "d", "result_digest": "D" * 100 + tp.TRUNCATION_MARKER},
+    ]

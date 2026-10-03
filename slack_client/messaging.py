@@ -4552,7 +4552,10 @@ class SlackMessagingMixin(_Host):
                 return
             # The chrome already rode the response message itself (native streaming
             # attaches it on stopStream) — don't double up with a separate post.
-            if (getattr(response, "metadata", None) or {}).get("footer_attached"):
+            # Or the handler already posted this separate footer itself, the moment the
+            # reply landed, so it never waited on post-delivery work — once is enough.
+            meta = getattr(response, "metadata", None) or {}
+            if meta.get("footer_attached") or meta.get("footer_posted"):
                 return
             channel_id = getattr(message, "channel_id", None)
             if not channel_id:

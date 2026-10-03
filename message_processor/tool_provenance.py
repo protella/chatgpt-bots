@@ -17,9 +17,10 @@ never reach this path.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 from config import config
 from openai_client.api.responses import WEB_SEARCH_PASSAGE_MARKER
@@ -244,6 +245,16 @@ def build_result_digests(tool_results: Optional[List[Dict[str, Any]]],
     return out
 
 
+async def _summarize_one(openai_client: Any, text: str, per_call_chars: int,
+                         context: Optional[str]) -> Optional[str]:
+    """One summarizer call, with any raise folded into None (the total fallback)."""
+    try:
+        result = await openai_client.summarize_tool_result(text, per_call_chars, context=context)
+    except Exception:
+        return None
+    return cast(Optional[str], result)
+
+
 async def build_result_digests_summarized(
     tool_results: Optional[List[Dict[str, Any]]],
     openai_client: Any,
@@ -278,7 +289,12 @@ async def build_result_digests_summarized(
     builder applies today's ``… [truncated]`` behavior. The summarizer is fed at most the
     first ``input_chars`` of each output (budget guard). Never raises; never blocks on
     outputs that don't need summarizing."""
+    # The utility calls are independent, so they run concurrently: the slots below hold each
+    # entry in CAPTURE order, and a summary only ever replaces its own slot, so the pure
+    # builder still applies the per-turn budget in capture order.
     prepared: List[Dict[str, Any]] = []
+    pending: List[int] = []
+    calls: List[Any] = []
     for entry in tool_results or []:
         name = entry.get("tool_name")
         output = entry.get("output")
@@ -294,20 +310,19 @@ async def build_result_digests_summarized(
         if len(text) <= per_call_chars and not always:
             prepared.append(entry)  # fits already — no utility call (verbatim path)
             continue
-        summary = None
-        try:
-            summary = await openai_client.summarize_tool_result(
-                text[:input_chars], per_call_chars, context=context)
-        except Exception:
-            summary = None  # defensive: the client contract is non-raising, but never trust it
-        if summary:
+        pending.append(len(prepared))
+        prepared.append(entry)  # summarizer failed/overlong → original → pure truncation
+        calls.append(_summarize_one(openai_client, text[:input_chars], per_call_chars, context))
+    if calls:
+        results = await asyncio.gather(*calls, return_exceptions=True)
+        for slot, summary in zip(pending, results):
+            if isinstance(summary, BaseException) or not summary:
+                continue  # defensive: the client contract is non-raising, but never trust it
             flat = str(summary).replace("\r", " ").replace("\n", " ").strip()
             # A summary that overshoots the cap is a failed summary — fall back to truncation
             # of the ORIGINAL output rather than truncating a lossy paraphrase.
             if flat and len(flat) <= per_call_chars:
-                prepared.append({"tool_name": name, "output": flat})
-                continue
-        prepared.append(entry)  # summarizer failed/overlong → original → pure truncation
+                prepared[slot] = {"tool_name": prepared[slot].get("tool_name"), "output": flat}
     return build_result_digests(prepared, per_call_chars, per_turn_chars)
 
 

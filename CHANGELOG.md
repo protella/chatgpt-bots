@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.3.4] - 2026-10-02
+
+### 🐛 Fixed
+
+- **The settings button shows up right under the reply.** For longer threaded replies the "Channel
+  settings" button is its own message, and it used to wait until the bot finished its after-reply
+  bookkeeping — often 5–30 seconds, long enough for someone else's message to land in between. It
+  now posts the moment the reply does.
+
+### ⚡ Changed
+
+- **The bot is ready for the next message sooner.** After a reply that used several web searches or
+  data lookups, the notes it keeps on each result are now written all at once instead of one by
+  one, so a busy thread's next message is picked up seconds sooner.
+
 ## [3.3.3] - 2026-10-02
 
 ### 🐛 Fixed

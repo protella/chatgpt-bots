@@ -4202,6 +4202,36 @@ class TextHandlerMixin(_Host):
             # Note: To properly detect if web search was used, we'd need to track
             # tool events during streaming. The presence of URLs doesn't mean web search was used.
             
+            # F5/F7: key the provenance persist on the ACTUAL delivered message ts — NOT the
+            # original `message_id` (None on native status-only streams, a deleted placeholder on
+            # native fallback). Persist ONLY on confirmed delivery: a None ts means nothing was
+            # delivered, so there is nothing to key on.
+            delivered_ts = _delivered_stream_ts(
+                native_coord, native_finalized, current_message_id, visible_content_delivered)
+
+            # The settings footer never waits for post-delivery work. When the reply has landed
+            # and the chrome did not ride it (a reply too long to carry it, a legacy correction),
+            # main.py would post the separate footer only after this handler returns — behind
+            # the provenance digests below, which can take many seconds. Post it now through the
+            # same method main.py uses (every rule of its own still applies), under the same
+            # gate main.py applies, and tell main.py it is done.
+            footer_attached = bool((native_finalized and footer_blocks) or direct_footer_attached)
+            footer_posted = False
+            post_footer = getattr(client, "maybe_post_response_footer", None)
+            if (post_footer is not None and not footer_attached
+                    and delivered_ts and (response_text or "").strip()
+                    and turn is not None
+                    and turn.resolve_reply_target(message) is not None):
+                footer_posted = True
+                try:
+                    await post_footer(
+                        message,
+                        Response(type="text", content=response_text,
+                                 metadata={"model": thread_config.get("model")}),
+                        receipts=receipts)
+                except Exception as footer_err:
+                    self.log_debug(f"Early response footer skipped: {footer_err}")
+
             # F7: tool-use provenance — warm-annotate the STORED turn with "[used tools: …]"
             # (footer stripped first) and persist it keyed on the reply's ts so a later
             # rebuild reproduces it. The posted/returned content is untouched.
@@ -4230,13 +4260,6 @@ class TextHandlerMixin(_Host):
             # path: a channel turn's own words come back from Slack, and this list is never sent).
             if not channel_turn:
                 self._add_message_with_token_management(thread_state, "assistant", stored_content, db=self.db, thread_key=thread_key)
-
-            # F5/F7: key the provenance persist on the ACTUAL delivered message ts — NOT the
-            # original `message_id` (None on native status-only streams, a deleted placeholder on
-            # native fallback). Persist ONLY on confirmed delivery: a None ts means nothing was
-            # delivered, so there is nothing to key on.
-            delivered_ts = _delivered_stream_ts(
-                native_coord, native_finalized, current_message_id, visible_content_delivered)
 
             # F7: persist under the FIRST delivered part's ts, since the history rebuild
             # merges continuation parts under it — keying on the last part makes provenance
@@ -4306,8 +4329,10 @@ class TextHandlerMixin(_Host):
                            # Chrome rode the final stopStream OR the direct final-post — tells
                            # main.py's separate footer post to stand down (falls back when neither
                            # attached: finalize failed, split reply, or top-level placement).
-                           "footer_attached": bool((native_finalized and footer_blocks)
-                                                   or direct_footer_attached),
+                           "footer_attached": footer_attached,
+                           # The separate footer already went out above, ahead of the
+                           # post-delivery work — main.py's own call stands down on this.
+                           "footer_posted": footer_posted,
                            # Honest accounting from ACTUAL delivery: a visible message ts plus
                            # non-empty text means content went out. A failed stream that left
                            # no delivered ts must not burn the unprompted quota (main.py's
