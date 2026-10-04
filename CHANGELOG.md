@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.3.5] - 2026-10-04
+
+### 🐛 Fixed
+
+- **A data source hiccup no longer ends a reply in an error.** When one of the bot's connected data
+  sources (MCP servers) briefly failed, replies for people with streaming turned off showed an
+  "MCP Connection Failed" error instead of an answer. The bot now retries without that source and
+  answers, as it already did for streamed replies.
+
 ## [3.3.4] - 2026-10-02
 
 ### 🐛 Fixed

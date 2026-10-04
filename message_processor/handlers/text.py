@@ -1296,7 +1296,8 @@ class TextHandlerMixin(_Host):
                               artifacts_acc: Optional[List[dict]] = None,
                               turn: Optional[Any] = None,
                               lazy_surface_ts: Optional[str] = None,
-                              channel_steering_text: Optional[str] = None) -> Response:
+                              channel_steering_text: Optional[str] = None,
+                              _mcp_buffered_retry: bool = False) -> Response:
         """Handle text-only response generation.
 
         ``channel_steering_text``: THIS TURN's canonical channel-steering block — the standing
@@ -1319,7 +1320,11 @@ class TextHandlerMixin(_Host):
         ``_nonstreaming_fallback``: this entry IS the streaming path handing the turn over —
         either because the client cannot stream or because the stream failed. Telemetry only
         (CV8 `fork_reason`); nothing about the request depends on it, and it is a parameter
-        because the shape of a re-entry is not recoverable from its arguments."""
+        because the shape of a re-entry is not recoverable from its arguments.
+
+        ``_mcp_buffered_retry``: this entry is the buffered path's own MCP failover retry, and
+        it stays buffered. Letting the exclusion re-enable streaming would let a generic stream
+        failure hand the turn back here with the exclusions cleared — a cycle with no bound."""
         # Spec §3b: a channel turn's capability keys come from the CHANNEL, not from whoever
         # happened to speak — two people asking the same room the same question must get the
         # same machine. DMs keep per-user settings verbatim.
@@ -1351,7 +1356,7 @@ class TextHandlerMixin(_Host):
         # Stream on first attempt OR on MCP-failure retry (streaming itself didn't fail)
         # ...but never a context-recovery retry: it is the buffered replay of a request that was
         # just compacted, and keeps its capabilities rather than its transport (§3.5).
-        should_stream = (can_stream and not _context_retry
+        should_stream = (can_stream and not _context_retry and not _mcp_buffered_retry
                          and (retry_count == 0 or failed_mcp_server is not None))
         if should_stream:
             return await self._handle_streaming_text_response(
@@ -1577,6 +1582,13 @@ class TextHandlerMixin(_Host):
         # container still answers `running`, so `ensure_sandbox()` would happily be handed the
         # same id back. With it, `container_recycled()` fails the bridge tools fast instead.
         containers_gone: List[str] = list(wedged_container_ids(artifacts))
+        # The MCP failover the streaming twin already had: a server whose tool list could not be
+        # fetched (424) re-runs the turn without it, set by the handler below and acted on after
+        # the `finally`, so this attempt's progress updater is stopped before the retry starts.
+        mcp_retry_server: Optional[str] = None
+        # Where this attempt's local tool calls start in the turn's ledger. A tool that already
+        # ran (an edit_image upload, a post) would run again on a replay from the original input.
+        tool_ledger_start = len(getattr(turn, "provenance_tool_calls", None) or [])
         try:
             if tools and registry is not None:
                 # Local tools present — run the function-call loop (composes with
@@ -1762,11 +1774,24 @@ class TextHandlerMixin(_Host):
                 channel_steering_text=channel_steering_text
             )
         except Exception as api_error:
-            if self._channel_request_too_large(api_error):
-                # A size refusal the meter cannot answer — a per-field cap, a payload the
-                # transport rejects outright. No compaction; the generic turn error (C-12).
-                self.log_error(f"Request rejected for size (not the context window): {api_error}")
-            raise
+            # Nothing of this entry has been posted yet (it delivers only after it returns), so
+            # re-running the turn cannot duplicate a reply — unless a local tool already ran, in
+            # which case it is not retried. An unrecoverable label — none, or one already
+            # excluded — comes back None and the error surfaces exactly as before.
+            ran_local_tool = (
+                (turn is None and registry is not None)  # no ledger to read: assume it ran
+                or any(r.get("dispatched") is not False
+                       for r in (getattr(turn, "provenance_tool_calls", None)
+                                 or [])[tool_ledger_start:]))
+            if not ran_local_tool:
+                mcp_retry_server = self._recoverable_mcp_failure(api_error, failed_mcp_server)
+            if not mcp_retry_server:
+                if self._channel_request_too_large(api_error):
+                    # A size refusal the meter cannot answer — a per-field cap, a payload the
+                    # transport rejects outright. No compaction; the generic turn error (C-12).
+                    self.log_error(
+                        f"Request rejected for size (not the context window): {api_error}")
+                raise
         finally:
             # §5.4a EXIT-PATH GUARANTEE. A destination commits INSIDE the loop above, and this
             # `finally` is the only thing that runs whichever way that loop leaves — returned,
@@ -1783,6 +1808,27 @@ class TextHandlerMixin(_Host):
                 except asyncio.CancelledError:
                     pass
                 self.log_debug("Cancelled progress updater - API call completed")
+
+        if mcp_retry_server:
+            # The user message added this attempt gets re-added by the retry. DM/legacy only: a
+            # channel turn's input is the stream, never this list.
+            if (not channel_turn and thread_state.messages
+                    and thread_state.messages[-1].get("role") == "user"):
+                thread_state.messages.pop()
+            # The retry excludes everything that has failed so far.
+            return await self._handle_text_response(
+                user_content, thread_state, client, message, thinking_id,
+                attachment_urls, retry_count=retry_count,
+                failed_mcp_server=(self._as_mcp_exclusion_set(failed_mcp_server)
+                                   | {mcp_retry_server}),
+                _context_retry=_context_retry,
+                _nonstreaming_fallback=_nonstreaming_fallback,
+                visible_already_committed=visible_already_committed,
+                artifacts_acc=artifacts, turn=turn, lazy_surface_ts=lazy_surface_ts,
+                # One snapshot per responder turn — a retry must not re-read the table.
+                channel_steering_text=channel_steering_text,
+                _mcp_buffered_retry=True,
+            )
 
         # F32: the model links its artifacts with `sandbox:/mnt/data/...` URIs, which are dead
         # to the user — the real file arrives as a Slack upload. Strip them before the text is
@@ -4394,21 +4440,13 @@ class TextHandlerMixin(_Host):
             # the message-text regex; exclusions ACCUMULATE across retries so two
             # broken servers can't ping-pong forever (bounded by server count).
             already_excluded = self._as_mcp_exclusion_set(exclude_mcp_server)
-            failed_mcp_server = self._extract_failed_mcp_server(e)
+            # Same server failing while excluded (or nothing left to exclude) comes back None —
+            # not a recoverable MCP failover, so it falls through to the generic non-streaming
+            # retry.
+            failed_mcp_server = self._recoverable_mcp_failure(e, exclude_mcp_server)
 
             if failed_mcp_server:
-                total_servers = len(self.mcp_manager.get_server_labels())
-                if failed_mcp_server in already_excluded or len(already_excluded) >= total_servers:
-                    # Same server failing while excluded (or nothing left to
-                    # exclude) means this isn't a recoverable MCP failover —
-                    # fall through to the generic non-streaming retry.
-                    self.log_error(
-                        f"MCP failover exhausted (failed: '{failed_mcp_server}', "
-                        f"already excluded: {sorted(already_excluded)}) - treating as generic error")
-                    failed_mcp_server = None
-                else:
-                    # Log MCP failures at INFO level - they're handled gracefully
-                    self.log_info(f"MCP server '{failed_mcp_server}' unavailable - retrying request without it")
+                pass  # logged by _recoverable_mcp_failure; the failover retry below handles it
             elif is_container_gone(e) or self._suspected_wedge(e, tools, artifacts):
                 # The container died mid-STREAM. `_create_with_container_recovery` cannot catch
                 # this: responses.create(stream=True) returns immediately and the 404 only
@@ -4689,6 +4727,28 @@ class TextHandlerMixin(_Host):
         if isinstance(value, str):
             return {value}
         return set(value)
+
+    def _recoverable_mcp_failure(self, e: Exception,
+                                 exclude_mcp_server: Any) -> Optional[str]:
+        """The MCP server label a failover retry should drop, or None.
+
+        None when the error is not an MCP failure, names no recoverable label, or names a
+        server that is already excluded (or nothing is left to exclude) — the last two mean the
+        failover is exhausted and the error is treated as generic. Exclusions ACCUMULATE across
+        retries, so two broken servers can't ping-pong forever (bounded by server count)."""
+        already_excluded = self._as_mcp_exclusion_set(exclude_mcp_server)
+        failed_mcp_server = self._extract_failed_mcp_server(e)
+        if not failed_mcp_server:
+            return None
+        total_servers = len(self.mcp_manager.get_server_labels())
+        if failed_mcp_server in already_excluded or len(already_excluded) >= total_servers:
+            self.log_error(
+                f"MCP failover exhausted (failed: '{failed_mcp_server}', "
+                f"already excluded: {sorted(already_excluded)}) - treating as generic error")
+            return None
+        # Log MCP failures at INFO level - they're handled gracefully
+        self.log_info(f"MCP server '{failed_mcp_server}' unavailable - retrying request without it")
+        return failed_mcp_server
 
     def _extract_failed_mcp_server(self, e: Exception) -> Optional[str]:
         """

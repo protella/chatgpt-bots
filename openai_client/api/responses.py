@@ -1162,7 +1162,13 @@ async def create_text_response_with_tools(
             if overflow is e:
                 raise
             raise overflow from e
-        self.log_error(f"Error creating response with tools: {e}", exc_info=True)
+        error_msg = str(e)
+        if "mcp server" in error_msg.lower() and ("404" in error_msg or "424" in error_msg):
+            # Same as the streaming twin: the handler retries without the failed server, so an
+            # MCP connection error is a WARNING, not a crash-shaped traceback.
+            self.log_warning(f"MCP connection failed (will retry without failed server): {error_msg}")
+        else:
+            self.log_error(f"Error creating response with tools: {e}", exc_info=True)
         raise
     finally:
         _close_attempt_error(attempt_sink, attempts, usage_captured)
@@ -2903,7 +2909,13 @@ async def _create_text_response_with_tools_with_timeout(
             if overflow is e:
                 raise
             raise overflow from e
-        self.log_error(f"Error creating response with tools and timeout: {e}", exc_info=True)
+        error_msg = str(e)
+        if "mcp server" in error_msg.lower() and ("404" in error_msg or "424" in error_msg):
+            # Same as the streaming twin: the handler retries without the failed server, so an
+            # MCP connection error is a WARNING, not a crash-shaped traceback.
+            self.log_warning(f"MCP connection failed (will retry without failed server): {error_msg}")
+        else:
+            self.log_error(f"Error creating response with tools and timeout: {e}", exc_info=True)
         raise
     finally:
         _close_attempt_error(attempt_sink, attempts, usage_captured)

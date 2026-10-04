@@ -6,7 +6,7 @@ import re
 
 import pytest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 
 from openai_client.mcp_manager import MCPManager
@@ -153,6 +153,85 @@ def test_streaming_retry_accumulates_exclusions_source_gate():
     assert "already_excluded | {failed_mcp_server}" in src
     assert "failed_mcp_server in already_excluded or len(already_excluded) >= total_servers" in src
     assert "failed_mcp_server=failed_mcp_servers" in src
+
+
+def _mcp_424(label):
+    e = Exception(f"Error code: 424 - Error retrieving tool list from MCP server: '{label}'")
+    e.status_code = 424
+    e.body = {"error": {"message": f"Error retrieving tool list from MCP server: '{label}'"}}
+    return e
+
+
+def _nonstreaming_mcp_host(loop_side_effect):
+    """The REAL non-streaming `_handle_text_response` with the real MCP failover helpers."""
+    from message_processor.handlers.text import TextHandlerMixin
+    from tests.unit.test_context_meter import _handler_host
+
+    host = _handler_host(loop_side_effect)
+    for name in ("_recoverable_mcp_failure", "_extract_failed_mcp_server"):
+        setattr(host, name, getattr(TextHandlerMixin, name).__get__(host))
+    host._as_mcp_exclusion_set = TextHandlerMixin._as_mcp_exclusion_set
+    host.mcp_manager.get_server_labels.return_value = ["example-mcp", "other-mcp"]
+    return host
+
+
+async def _nonstreaming_dm_turn(host, state, failed_mcp_server=None, retry_count=0,
+                                enable_streaming=False, turn=None):
+    from config import config
+    from message_processor.client_contract import Message
+    from message_processor.turn_runtime import TurnRuntime
+
+    message = Message(text="hi", user_id="U1", channel_id="D1", thread_id="10.0",
+                      metadata={"ts": "10.0", "username": "Dana Whitfield"})
+
+    async def fake_config(**kw):
+        return {"model": "gpt-5.6-sol", "temperature": 1.0, "max_tokens": 100,
+                "enable_streaming": enable_streaming, "enable_code_interpreter": False}
+
+    with patch.object(config, "get_thread_config_async", side_effect=fake_config):
+        return await host._handle_text_response("hi", state, MagicMock(), message,
+                                                thinking_id=None, turn=turn or TurnRuntime(),
+                                                retry_count=retry_count,
+                                                failed_mcp_server=failed_mcp_server)
+
+
+async def test_nonstreaming_mcp_424_retries_once_without_that_server():
+    from tests.unit.test_context_meter import _state
+
+    ok = {"text": "answer", "tools_used": [], "local_tool_calls": []}
+    host = _nonstreaming_mcp_host([_mcp_424("example-mcp"), ok])
+    host._handle_streaming_text_response = AsyncMock()
+    state = _state()
+    # The buffered fallback of a failed stream (retry_count=1, streaming on): its MCP retry
+    # must stay buffered, or a second stream failure would cycle back here forever.
+    response = await _nonstreaming_dm_turn(host, state, retry_count=1, enable_streaming=True)
+    assert response.content.startswith("answer")
+    host._handle_streaming_text_response.assert_not_awaited()
+    assert host.openai_client.create_text_response_with_tool_loop.await_count == 2
+    excluded = [c.kwargs.get("exclude_mcp_server") for c in host._build_tools_array.call_args_list]
+    assert excluded == [None, {"example-mcp"}]
+    # The retry re-adds the turn's own message; it must not be in history twice.
+    assert [m["content"] for m in state.messages if m.get("role") == "user"].count("hi") == 1
+
+
+@pytest.mark.parametrize("case", ["already_excluded", "local_tool_ran"])
+async def test_nonstreaming_mcp_424_for_an_excluded_server_still_surfaces(case):
+    from message_processor.turn_runtime import TurnRuntime
+    from tests.unit.test_context_meter import _state
+
+    turn = TurnRuntime()
+    excluded = {"example-mcp"} if case == "already_excluded" else None
+
+    async def _loop(**_kw):
+        if case == "local_tool_ran":
+            # A tool with a visible effect ran before the later round's 424: no replay.
+            turn.note_tool_call({"name": "edit_image", "ok": True})
+        raise _mcp_424("example-mcp")
+
+    host = _nonstreaming_mcp_host(_loop)
+    with pytest.raises(Exception, match="424"):
+        await _nonstreaming_dm_turn(host, _state(), failed_mcp_server=excluded, turn=turn)
+    assert host.openai_client.create_text_response_with_tool_loop.await_count == 1
 
 
 # ---------- 5. discovery cache ----------

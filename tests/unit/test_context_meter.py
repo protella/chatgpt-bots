@@ -453,7 +453,8 @@ def _streaming_host(loop: Any) -> Any:
 
     host = _handler_host(None)
     host.handler = TextHandlerMixin._handle_streaming_text_response.__get__(host)
-    for name in ("_as_mcp_exclusion_set", "_extract_failed_mcp_server", "_suspected_wedge"):
+    for name in ("_as_mcp_exclusion_set", "_extract_failed_mcp_server", "_recoverable_mcp_failure",
+                 "_suspected_wedge"):
         setattr(host, name, getattr(TextHandlerMixin, name).__get__(host)
                 if not isinstance(TextHandlerMixin.__dict__[name], staticmethod)
                 else getattr(TextHandlerMixin, name))
