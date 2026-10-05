@@ -89,7 +89,7 @@ RECONSIDER_ERRORS = frozenset({
 # how a contract drifts out from under the tool that is supposed to be grading it.
 RECONSIDER_START_FIELDS = frozenset(ENVELOPE_FIELDS) | {
     "turn_id", "channel_id", "trigger_ts", "attempt_id", "pass", "scope", "observed_latest_ts",
-    "model_attempt_seq",
+    "model_attempt_seq", "newer_responder_count",
 }
 RECONSIDER_OUTCOME_FIELDS = frozenset(ENVELOPE_FIELDS) | {
     "turn_id", "channel_id", "trigger_ts", "attempt_id", "outcome", "passes", "forced", "error",
@@ -747,7 +747,8 @@ def _check_reconsider_start(row: Row, report: Report) -> None:
     stale_send's scope[0]."""
     _check_mandatory(row, report, "reconsider_start_missing_field", reject_null=True)
     _check_join_key_string(row, report, "reconsider_start_bad_field", null_reported_elsewhere=True)
-    _check_no_explicit_nulls(row, report, ("attempt_id", "model_attempt_seq"),
+    _check_no_explicit_nulls(row, report,
+                             ("attempt_id", "model_attempt_seq", "newer_responder_count"),
                              "reconsider_start_bad_field")
     _check_unknown_fields(row, report, RECONSIDER_START_FIELDS, "reconsider_start_unknown_field")
     number = row.obj.get("pass")
@@ -765,6 +766,10 @@ def _check_reconsider_start(row: Row, report: Report) -> None:
     if "model_attempt_seq" in row.obj and not _typed(seq, int):
         report.fail("reconsider_start_bad_field", row,
                     f"model_attempt_seq={seq!r} is not an int")
+    newer = row.obj.get("newer_responder_count")
+    if "newer_responder_count" in row.obj and not _typed(newer, int):
+        report.fail("reconsider_start_bad_field", row,
+                    f"newer_responder_count={newer!r} is not an int")
 
 
 def _check_reconsider_outcome(row: Row, report: Report) -> None:

@@ -850,6 +850,19 @@ RECONSIDERATION_INSTRUCTION = (
     "prefer `skip`, and revise only when you have something the newer messages did not deliver."
 )
 
+# Appended to the reconsideration item only when newer messages already had their own responder
+# running as the request was assembled — the older turn must not answer what the successor owns.
+# `{timestamps}` is the comma-joined ts list.
+RECONSIDERATION_NEWER_RESPONDERS = (
+    "When this request was assembled, the newer messages at these timestamps each had their own "
+    "reply attempt already running: {timestamps}. Answering them is that attempt's job, not this "
+    "draft's — don't fold their questions into your reply. That attempt may or may not end up "
+    "posting, and it is not written to cover your trigger, so decide on your trigger's own needs: "
+    "if a newer message continues, narrows or replaces what your trigger asked, the reply to that "
+    "message is where the answer belongs, so skip; if your trigger is still owed something of its "
+    "own, post only that."
+)
+
 
 # The ONE description this bot ever keeps of an image — ambient capture, addressed uploads and our
 # own produced images all route through it, and the edit-instruction writer reads it back later.

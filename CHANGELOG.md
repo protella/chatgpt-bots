@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.3.6] - 2026-10-05
+
+### 🐛 Fixed
+
+- **No more double answers to quick follow-ups.** When someone sent a second question right after
+  the first, the bot could answer the second question twice — once in a rewritten reply to the
+  first message, and again in its reply to the second. A held-back reply now leaves a newer
+  message to the reply already being written for it.
+
 ## [3.3.5] - 2026-10-04
 
 ### 🐛 Fixed

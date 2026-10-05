@@ -64,7 +64,8 @@ from message_processor.turn_runtime import ReconsiderFacts
 from message_processor.utilities import effective_request_model
 from slack_client.normalizer import TimestampError
 from openai_client.api.responses import build_reconsideration_create_kwargs
-from message_processor.prompts import RECONSIDERATION_INSTRUCTION
+from message_processor.prompts import (RECONSIDERATION_INSTRUCTION,
+                                       RECONSIDERATION_NEWER_RESPONDERS)
 
 logger = setup_logger(name="slack_bot.Reconsideration")
 
@@ -132,7 +133,8 @@ def tools_used_summary(turn: Any) -> List[str]:
 
 def reconsideration_item(pass_number: int, draft: str,
                          trigger_line: str = "",
-                         tools_used: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+                         tools_used: Optional[Sequence[str]] = None,
+                         newer_responder_ts: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     """The ONE additional developer item, appended at the very end of the normal request: the
     canonical instruction (with the pass number and the trigger named IN the item), then the
     current draft inside a fence, introduced explicitly as quoted material rather than
@@ -146,13 +148,20 @@ def reconsideration_item(pass_number: int, draft: str,
 
     `tools_used` names what the draft was produced with. This pass offers no tool, and without
     the line the model reads that absence as a fact about the turn — a rethought reply once told
-    the user search was off right after the draft had searched."""
+    the user search was off right after the draft had searched.
+
+    `newer_responder_ts` names newer messages whose own reply attempt was already running when
+    the request was assembled, so the draft doesn't answer what those attempts own. Empty or None
+    leaves the item byte-identical to one without it."""
     fence = draft_fence(draft)
     if tools_used:
         tools_line = (f"\n\nTools already used while producing this draft: "
                       f"{', '.join(tools_used)}. No tools are offered in this pass.")
     else:
         tools_line = "\n\nNo tools are offered in this pass."
+    if newer_responder_ts:
+        tools_line += "\n\n" + RECONSIDERATION_NEWER_RESPONDERS.format(
+            timestamps=", ".join(newer_responder_ts))
     content = (
         RECONSIDERATION_INSTRUCTION.format(n=pass_number, trigger=trigger_line)
         + tools_line
@@ -174,7 +183,8 @@ def trigger_identity_line(ctx: Any) -> str:
 def build_reconsideration_request(*, processor: Any, client: Any, ctx: Any, model: Any,
                                   pass_number: int, draft: str,
                                   reply_destination: Optional[str] = None,
-                                  tools_used: Optional[Sequence[str]] = None
+                                  tools_used: Optional[Sequence[str]] = None,
+                                  newer_responder_ts: Optional[Sequence[str]] = None
                                   ) -> Tuple[Any, List[Dict[str, Any]]]:
     """§4d request grammar, literally: the ENTIRE normal assembled channel request over the
     (fresh) context, unchanged and in its existing order, in no-tools mode — then the one
@@ -186,7 +196,8 @@ def build_reconsideration_request(*, processor: Any, client: Any, ctx: Any, mode
         request_config=None, contract_suffix=None, registry=None,
         reply_destination=reply_destination, no_tools=True)
     extra = reconsideration_item(pass_number, draft, trigger_identity_line(ctx),
-                                 tools_used=tools_used)
+                                 tools_used=tools_used,
+                                 newer_responder_ts=newer_responder_ts)
     api_items = [*to_input_items(request), extra]
     return request, api_items
 
@@ -305,8 +316,9 @@ class ChannelReconsiderSurface:
             drain_timeout=getattr(config, "index_drain_timeout_seconds", None))
         return snapshot.stream
 
-    def build_request(self, stream: Any, *, pass_number: int,
-                      draft: str) -> PreparedDecision:
+    def build_request(self, stream: Any, *, pass_number: int, draft: str,
+                      newer_responder_ts: Optional[Sequence[str]] = None
+                      ) -> PreparedDecision:
         fresh_ctx = fresh_turn_context(self.ctx, stream)
         request, api_items = build_reconsideration_request(
             processor=self._processor, client=self._client, ctx=fresh_ctx, model=self.model,
@@ -314,7 +326,8 @@ class ChannelReconsiderSurface:
             reply_destination=(getattr(self._turn, "reply_destination", None)
                                if getattr(self._turn, "destination_selected", False)
                                else None),
-            tools_used=tools_used_summary(self._turn))
+            tools_used=tools_used_summary(self._turn),
+            newer_responder_ts=newer_responder_ts)
         cfg = self.ctx.thread_config
         return PreparedDecision(
             instructions=request.instructions, api_items=api_items,
@@ -484,8 +497,12 @@ async def reconsider_stale_draft(*, processor: Any, client: Any, message: Any, t
             try:
                 present = suppressing_ts_present(fresh_stream, current.observed_latest_ts)
                 reviewed = reviewed_through_map(lease, fresh_stream)
+                # Sampled per pass, after the rebuild and right before assembly: which newer
+                # messages already have their own responder running.
+                newer_responders = lease.newer_responding_ts()
                 prepared = surface.build_request(fresh_stream, pass_number=pass_number,
-                                                 draft=current_draft)
+                                                 draft=current_draft,
+                                                 newer_responder_ts=newer_responders)
                 counted = await processor.openai_client.count_input_tokens(
                     build_reconsideration_create_kwargs(prepared, model=surface.model))
                 limit = usable_limit(surface.model)
@@ -526,13 +543,15 @@ async def reconsider_stale_draft(*, processor: Any, client: Any, message: Any, t
                 turn=turn, fork_reason="stale_reconsideration")
 
             def _on_attempt_open(seq: Optional[int], _pass: int = pass_number,
-                                 _exc: StaleSendSuppressed = current) -> None:
+                                 _exc: StaleSendSuppressed = current,
+                                 _newer: int = len(newer_responders)) -> None:
                 nonlocal passes
                 passes = _pass
                 participation_telemetry.reconsider_start(
                     channel_id, trigger_ts, turn_id=turn_id, pass_number=_pass,
                     scope=_exc.scope, observed_latest_ts=_exc.observed_latest_ts,
-                    attempt_id=attempt_id, model_attempt_seq=seq)
+                    attempt_id=attempt_id, model_attempt_seq=seq,
+                    newer_responder_count=_newer)
 
             try:
                 decision = await processor.openai_client.create_reconsideration_decision(

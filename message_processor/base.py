@@ -68,6 +68,15 @@ def _measure_note(thread_state: Any, thread_config: Any) -> str:
         return ""
 
 
+def _reply_text_pending(response: Optional[Response]) -> bool:
+    """Does this Response carry reply words main.py still has to post? main.py's own "nothing to
+    post" test: a text Response with empty content posts no message (no_reply, reaction-only,
+    artifacts-only, words that went elsewhere), and a streamed one is already in Slack."""
+    return (response is not None and response.type == "text"
+            and not (response.metadata or {}).get("streamed")
+            and bool((response.content or "").strip()))
+
+
 # The one-line version for the status/thinking indicator, which has no room for the above.
 TIMEOUT_STATUS = "That took too long — I stopped waiting."
 
@@ -197,8 +206,18 @@ class MessageProcessor(ThreadManagementMixin,
 
         channel_turn = TextHandlerMixin._turn_surface(message) == SURFACE_CHANNEL
         h_pin = None
+        send_lease = getattr(turn, "send_lease", None)
+        # True only when the turn returns reply text main.py still has to post; every other
+        # ending clears `responding` before the drain below.
+        reply_pending = False
 
         try:
+            # The lock is held, so this turn is now actually producing a reply: a stale older
+            # turn's reconsideration reads this to leave our trigger to us. Queued turns never
+            # get here. main.py's outer finally clears it.
+            if send_lease is not None:
+                send_lease.responding = True
+
             # H, pinned HERE and never refreshed (spec §1). This is the first instant at which the
             # turn genuinely exists — the lock is held, the queue is this turn's, and nothing has
             # been awaited since — so it is the honest answer to "what had this channel said by the
@@ -683,6 +702,7 @@ class MessageProcessor(ThreadManagementMixin,
             self.log_info(f"REQUEST END | Thread: {thread_key} | Status: {response_type.upper()} | Time: {elapsed:.2f}s{token_info}")
             self.log_info("="*100)
             self.log_info("")
+            reply_pending = _reply_text_pending(response)
             return response
             
         except TimeoutError as e:
@@ -745,6 +765,7 @@ class MessageProcessor(ThreadManagementMixin,
                         channel_steering_text=channel_steering_text
                     )
                     self.log_info(f"Retry successful for {operation_type}")
+                    reply_pending = _reply_text_pending(response)
                     return response
 
                 except TimeoutError as retry_error:
@@ -975,6 +996,11 @@ class MessageProcessor(ThreadManagementMixin,
                 content=error_message
             )
         finally:
+            # A turn with nothing left to post is no longer a live reply attempt — cleared
+            # BEFORE the drain and lock release await, so a stale older turn's reconsideration
+            # doesn't defer to an answer that will never come.
+            if send_lease is not None and not reply_pending:
+                send_lease.responding = False
             # The turn is over: an accepted context measure at the threshold may now trigger the
             # after-turn compaction (CONTEXT_METER §3.7); later measures trigger as they land.
             meter = getattr(turn, "context_meter", None)

@@ -240,6 +240,23 @@ def test_the_reconsideration_item_names_the_tools_the_draft_already_used():
             "No tools are offered in this pass.") in item["content"]
 
 
+def test_the_reconsideration_item_names_newer_responders_only_when_given():
+    from message_processor.reconsideration import reconsideration_item
+
+    base = reconsideration_item(1, "the draft", "[Alice ts=10.0] hi", tools_used=["web search"])
+    for empty in (None, []):
+        assert reconsideration_item(1, "the draft", "[Alice ts=10.0] hi",
+                                    tools_used=["web search"],
+                                    newer_responder_ts=empty) == base
+    item = reconsideration_item(1, "the draft", "[Alice ts=10.0] hi", tools_used=["web search"],
+                                newer_responder_ts=["11.0", "12.0"])
+    sentence = prompts.RECONSIDERATION_NEWER_RESPONDERS.format(timestamps="11.0, 12.0")
+    content = item["content"]
+    assert sentence in content
+    assert (content.index("No tools are offered in this pass.") < content.index(sentence)
+            < content.index("The unposted draft under evaluation"))
+
+
 # ------------------------------------------------------------------ the counted body
 
 

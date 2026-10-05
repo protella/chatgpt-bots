@@ -317,8 +317,8 @@ class DMReconsiderSurface:
         text = (self.ctx.trigger_text or "").strip() or "(no text)"
         return f"[{self.ctx.requester_name} ts={self.ctx.trigger_ts}] {text}"
 
-    def build_request(self, snapshot: DMSurfaceSnapshot, *, pass_number: int,
-                      draft: str) -> Any:
+    def build_request(self, snapshot: DMSurfaceSnapshot, *, pass_number: int, draft: str,
+                      newer_responder_ts: Optional[Sequence[str]] = None) -> Any:
         """The DM request over the fresh snapshot, plus the ONE appended developer item — the
         same grammar §4d fixes for channels, over the surface a DM actually has. The
         instructions and the sampling settings are the turn's OWN, pinned when it built its
@@ -329,7 +329,8 @@ class DMReconsiderSurface:
 
         items: List[Dict[str, Any]] = snapshot.input_items()
         items.append(reconsideration_item(pass_number, draft, self.trigger_line(),
-                                          tools_used=tools_used_summary(self._turn)))
+                                          tools_used=tools_used_summary(self._turn),
+                                          newer_responder_ts=newer_responder_ts))
         cfg = self.ctx.thread_config or {}
         return PreparedDecision(
             instructions=self.ctx.tool_free_instructions or self.ctx.instructions,

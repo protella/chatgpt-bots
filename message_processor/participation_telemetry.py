@@ -871,7 +871,8 @@ def stale_send(channel_id: Optional[str], trigger_ts: Optional[str], *,
 def reconsider_start(channel_id: Optional[str], trigger_ts: Optional[str], *,
                      turn_id: Optional[str], pass_number: int, scope: Any = None,
                      observed_latest_ts: Any = None, attempt_id: Optional[str] = None,
-                     model_attempt_seq: Optional[int] = None) -> None:
+                     model_attempt_seq: Optional[int] = None,
+                     newer_responder_count: Optional[int] = None) -> None:
     """One reconsideration pass opened (v9). Emitted via the structured-decision wrapper's
     `on_attempt_open` callback, after `ModelAttemptSink.open()` and before the request.
 
@@ -888,13 +889,15 @@ def reconsider_start(channel_id: Optional[str], trigger_ts: Optional[str], *,
     `scope` is the suppressing scope as the FULL three-part tuple, written as a JSON list —
     unlike `stale_send`, which keeps its `scope[0]`-only field. `attempt_id` is absent on
     ungated channel turns; `model_attempt_seq` is absent when the attempt sink failed to open
-    (telemetry never blocks the model call). Unavailable optional fields are OMITTED — the
-    drop-None rule, never a null."""
+    (telemetry never blocks the model call). `newer_responder_count` is how many newer messages
+    the pass's request named as already having their own responder running. Unavailable
+    optional fields are OMITTED — the drop-None rule, never a null."""
     record("reconsider_start", channel_id=channel_id, trigger_ts=trigger_ts,
            turn_id=turn_id, attempt_id=attempt_id,
            scope=list(scope) if scope is not None else None,
            observed_latest_ts=observed_latest_ts,
            model_attempt_seq=model_attempt_seq,
+           newer_responder_count=newer_responder_count,
            **{"pass": pass_number})
 
 

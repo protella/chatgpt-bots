@@ -54,7 +54,7 @@ When a message carries none, the top scope is OMITTED rather than bucketed under
 collapsing unrelated senders into one scope would let a stranger's message silence an answer.
 """
 from dataclasses import dataclass, field
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from logger import setup_logger
 
@@ -182,6 +182,10 @@ class TurnSendLease:
     # that message already woke.
     ceiling_ts: Optional[str] = None
     state: str = PENDING
+    # True while this turn is actually producing a reply (it holds the conversation lock and is
+    # past the queued branch). A reconsideration pass reads it on NEWER turns: a newer message
+    # whose own responder is running is that responder's to answer, not the stale draft's.
+    responding: bool = False
     _watermarks: Any = field(default=None, repr=False)
     _closed: bool = field(default=False, repr=False)
     # WHY this turn was suppressed, kept from the first refusal. A turn is refused once and then
@@ -294,6 +298,23 @@ class TurnSendLease:
             if is_newer(candidate, newest):
                 newest, found = candidate, scope
         return newest, found
+
+    def newer_responding_ts(self) -> List[str]:
+        """The ceilings of OTHER open, responding leases in this lease's scopes that are newer
+        than this lease's own ceiling — the newer messages that already have their own reply
+        attempt running. Compared on the immutable `ceiling_ts`, never on last_seen or a
+        reviewed-through baseline: the question is which message each turn OWNS. A suppressed
+        lease still counts — it may yet post through its own reconsideration."""
+        if self._watermarks is None:
+            return []
+        found: Dict[str, None] = {}
+        for other in self._watermarks.leases_for(self.scopes):
+            if (other is self or other._closed or not other.responding
+                    or other.ceiling_ts is None):
+                continue
+            if is_newer(other.ceiling_ts, self.ceiling_ts):
+                found[other.ceiling_ts] = None
+        return sorted(found, key=ts_key)
 
     # --- reconsideration (§4a) ------------------------------------------------------------
 
@@ -415,7 +436,9 @@ class TurnSendLease:
 @dataclass
 class _Entry:
     latest_ts: Optional[str] = None
-    holders: int = 0
+    # The open leases holding this entry, keyed by each lease's private token. The entry lives
+    # exactly as long as this map is non-empty.
+    leases: Dict[object, TurnSendLease] = field(default_factory=dict)
 
 
 class ConversationWatermarks:
@@ -451,7 +474,7 @@ class ConversationWatermarks:
             entry = self._entries.get(scope)
             if entry is None:
                 entry = self._entries[scope] = _Entry()
-            entry.holders += 1
+            entry.leases[lease._token] = lease
             if is_newer(ts, entry.latest_ts):
                 entry.latest_ts = str(ts)
         return lease
@@ -464,8 +487,8 @@ class ConversationWatermarks:
             entry = self._entries.get(scope)
             if entry is None:
                 continue
-            entry.holders -= 1
-            if entry.holders <= 0:
+            entry.leases.pop(lease._token, None)
+            if not entry.leases:
                 self._entries.pop(scope, None)
 
     # --- reads ----------------------------------------------------------------------------
@@ -473,6 +496,15 @@ class ConversationWatermarks:
     def latest_for(self, scope: Scope) -> Optional[str]:
         entry = self._entries.get(scope)
         return entry.latest_ts if entry is not None else None
+
+    def leases_for(self, scopes: Tuple[Scope, ...]) -> List[TurnSendLease]:
+        """Every open lease holding any of these scopes, each once."""
+        seen: Dict[object, TurnSendLease] = {}
+        for scope in scopes:
+            entry = self._entries.get(scope)
+            if entry is not None:
+                seen.update(entry.leases)
+        return list(seen.values())
 
     @property
     def tracked_scopes(self) -> int:

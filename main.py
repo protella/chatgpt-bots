@@ -1217,6 +1217,9 @@ class ChatBotV2:
                                     # channel id is the recipient's "U…" id, and the two halves
                                     # of one turn must not disagree about which surface it is on.
                                     channel_turn=not is_dm_conversation(message.channel_id))
+                            # The reply attempt is over — landed, failed or dropped — so a stale
+                            # older turn's reconsideration stops deferring to it from here.
+                            lease.responding = False
                             # Honest accounting: the ACTUAL send result decides `posted` (a
                             # failed send must not burn the hourly unprompted quota).
                             if isinstance(response.metadata, dict):
@@ -1497,6 +1500,7 @@ class ChatBotV2:
                                 "Empty text response without a terminal action — posting nothing")
 
             except StaleSendSuppressed as stale:
+                lease.responding = False   # terminal: this turn will post no reply
                 # NOT an error, and it must never reach the handler below — that one logs an
                 # exception, files `error_unhandled`, and posts an apology. Nothing went wrong
                 # here: a newer message arrived while this turn was writing, so its answer was
@@ -1547,6 +1551,7 @@ class ChatBotV2:
                     model=(response.metadata or {}).get("model") if response is not None else None,
                 )
             except Exception as e:
+                lease.responding = False   # terminal: no further reply attempt from this turn
                 main_logger.error(f"Error handling message: {e}", exc_info=True)
                 # Closed FIRST, before the two best-effort awaits below: either of them can fail
                 # too, and the terminal event must not depend on our apology getting out.
@@ -1606,6 +1611,8 @@ class ChatBotV2:
                 except Exception as notify_error:
                     main_logger.error(f"Failed to send error notice: {notify_error}")
             finally:
+                # Covers a cancellation too, which bypasses both terminal catches above.
+                lease.responding = False
                 # F38: settle the work claim. Runs in `finally` so an exception, a cancellation,
                 # or an early return can't strand a 👀 on a message the bot then ignored.
                 try:
@@ -1634,36 +1641,42 @@ class ChatBotV2:
                     except Exception as clear_error:
                         main_logger.debug(f"Assistant status clear failed: {clear_error}")
         finally:
-            # Everything this turn CAUSED is settled before anything it POSTED is, and the whole
-            # sequence — drain, cancel, revoke, wait out the live effects, settle the receipts —
-            # is ONE unit that owns itself. Awaited through a shield for exactly that reason: a
-            # cancellation landing on this await used to be caught and stepped over, which
-            # skipped revocation and then settled anyway, and a shielded straggler could take a
-            # lease and post AFTER settlement. The unit is not something a cancellation may
-            # interleave with; it is the thing that makes the cancellation safe.
-            await _await_finalizer(asyncio.ensure_future(_finalize_turn_effects(turn)))
-            # Channel memory reads what the room actually SAW — the COMMITTED destination records
-            # — and is therefore scheduled from HERE, after every commit point by construction.
-            # A silent turn, a suppressed one, and one that died mid-stream all commit nothing and
-            # write nothing. The in-handler scheduling (handlers/text.py) stays DM-only, where the
-            # exchange is in ThreadState.messages and nothing else knows it.
-            # The turn's own row, exactly once, from the turn's accumulated state. It sits after
-            # every commit point by construction — this finally cannot run before the handlers
-            # returned — and BEFORE the memory scheduling below, which reads the committed subset
-            # of the same destination records.
-            emit_outcome = getattr(self, "_emit_turn_outcome", None)
-            if emit_outcome is not None:
-                emit_outcome(message, turn, response, kind=outcome_kind)
-            schedule_memory = getattr(self, "_schedule_channel_memory", None)
-            if schedule_memory is not None:
-                schedule_memory(message, turn)
-            participation_telemetry.abort_attempt(message)
-            if turn_task is not None and active_turns is not None:
-                active_turns.discard(turn_task)
-            # Release the scope hold LAST. An entry survives while any lease in its scope is
-            # open, so a newer turn that finishes early cannot erase the watermark an older,
-            # still-running turn is about to read.
-            lease.close()
+            # No longer producing a reply — newer-responder checks stop counting this turn now.
+            lease.responding = False
+            try:
+                # Everything this turn CAUSED is settled before anything it POSTED is, and the
+                # whole sequence — drain, cancel, revoke, wait out the live effects, settle the
+                # receipts — is ONE unit that owns itself. Awaited through a shield for exactly
+                # that reason: a cancellation landing on this await used to be caught and stepped
+                # over, which skipped revocation and then settled anyway, and a shielded straggler
+                # could take a lease and post AFTER settlement. The unit is not something a
+                # cancellation may interleave with; it is the thing that makes the cancellation
+                # safe.
+                await _await_finalizer(asyncio.ensure_future(_finalize_turn_effects(turn)))
+                # Channel memory reads what the room actually SAW — the COMMITTED destination
+                # records — and is therefore scheduled from HERE, after every commit point by
+                # construction. A silent turn, a suppressed one, and one that died mid-stream all
+                # commit nothing and write nothing. The in-handler scheduling (handlers/text.py)
+                # stays DM-only, where the exchange is in ThreadState.messages and nothing else
+                # knows it.
+                # The turn's own row, exactly once, from the turn's accumulated state. It sits
+                # after every commit point by construction — this finally cannot run before the
+                # handlers returned — and BEFORE the memory scheduling below, which reads the
+                # committed subset of the same destination records.
+                emit_outcome = getattr(self, "_emit_turn_outcome", None)
+                if emit_outcome is not None:
+                    emit_outcome(message, turn, response, kind=outcome_kind)
+                schedule_memory = getattr(self, "_schedule_channel_memory", None)
+                if schedule_memory is not None:
+                    schedule_memory(message, turn)
+                participation_telemetry.abort_attempt(message)
+                if turn_task is not None and active_turns is not None:
+                    active_turns.discard(turn_task)
+            finally:
+                # Release the scope hold LAST. An entry survives while any lease in its scope is
+                # open, so a newer turn that finishes early cannot erase the watermark an older,
+                # still-running turn is about to read.
+                lease.close()
 
     @staticmethod
     def _turn_population_surface(message: Message) -> str:

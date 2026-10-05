@@ -210,6 +210,41 @@ def test_closing_is_idempotent_and_releases_exactly_once():
     assert marks.tracked_scopes == 0
 
 
+def test_newer_responding_ts_names_only_newer_open_responding_leases():
+    """A stale turn's reconsideration must leave a newer message to the responder already
+    running for it — and only to one that is running, open and newer."""
+    marks = ConversationWatermarks()
+    older = marks.begin_turn(_msg("99.0"))
+    me = marks.begin_turn(_msg("100.0"))
+    marks.begin_turn(_msg("101.0"))                      # queued: never set responding
+    gone = marks.begin_turn(_msg("102.0"))
+    newer = marks.begin_turn(_msg("103.0"))
+    for lease in (older, me, gone, newer):
+        lease.responding = True
+    gone.close()
+
+    assert me.newer_responding_ts() == ["103.0"]
+    assert TurnSendLease(ceiling_ts="100.0").newer_responding_ts() == []
+
+
+def test_newer_responding_ts_counts_a_suppressed_lease_and_dedups_across_scopes():
+    """A suppressed newer lease may still post via its own reconsideration, so it counts. A
+    lease reached through both the thread and the top scope, and two leases owning the same
+    ceiling, are each named once."""
+    marks = ConversationWatermarks()
+    me = marks.begin_turn(_msg("100.0"))
+    reply = marks.begin_turn(_msg("101.0", thread="100.0"))      # thread scope only
+    burst = marks.begin_turn(_msg("102.0"))                     # top scope only
+    both = marks.begin_turn(_msg("100.0"))                      # held through BOTH scopes…
+    both.ceiling_ts = "103.0"                                   # …owning a newer ceiling
+    twin = marks.begin_turn(_msg("103.0", thread="100.0"))      # same ceiling, thread scope
+    for lease in (reply, burst, both, twin):
+        lease.responding = True
+    burst.state = SUPPRESSED
+
+    assert me.newer_responding_ts() == ["101.0", "102.0", "103.0"]
+
+
 # ------------------------------------------------------------------------- what this turn owns
 
 def test_absorbing_a_batched_source_keeps_the_turn_current():
