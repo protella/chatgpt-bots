@@ -3,27 +3,34 @@
 Multi-Platform Chat Bot V2 - Main Entry Point
 Supports multiple chat platforms with shared AI capabilities
 """
+import copy
 import sys
 import signal
 import asyncio
 import argparse
 import time
-from typing import Any, Dict, Optional, cast
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, cast
 from config import config, dev_epoch_fence_requested
 from logger import log_session_start, log_session_end, main_logger
 from message_processor.base import MessageProcessor
-from message_processor import (channel_steering, outbound_receipts,
+from message_processor import (channel_steering, gate_context, outbound_receipts,
                                participation_telemetry, routing_facts)
 from message_processor.destination_tools import consume_destination_marker
-from message_processor.participation import (ParticipationEngine,
-                                             resolve_participation_level)
+from message_processor.participation import (GateContextBuilder, ParticipationEngine,
+                                             SourceMessage, resolve_participation_level)
 from message_processor.reconsideration import intercept_stale_send
 from message_processor.stale_send_guard import (ConversationWatermarks,
-                                                StaleSendSuppressed)
+                                                StaleSendSuppressed, scopes_for_message,
+                                                ts_key)
 from message_processor import turn_runtime
+from message_processor.tool_provenance import (build_provenance, build_result_digests,
+                                               build_result_digests_summarized,
+                                               reattribute_reply)
+from message_processor import fail_cards
 from message_processor.turn_runtime import (DEST_KIND_CORRECTION_ANNOUNCEMENT,
                                             DEST_KIND_POST_TO_THREAD, DEST_KIND_RECONCILED,
-                                            DEST_KIND_REPLY, DEST_KIND_SPLIT, TurnRuntime)
+                                            DEST_KIND_RECONSIDER_INTERIM, DEST_KIND_REPLY,
+                                            DEST_KIND_SPLIT, DEST_KIND_STREAM, TurnRuntime)
 from message_processor import thread_files
 from message_processor.client_contract import BaseClient, Message
 from slack_client import admission_watermark
@@ -507,6 +514,63 @@ class ChatBotV2:
                 thread_files.catalog_unattended(self.processor, client, message))
         return decision
 
+    def _gate_context_builder(self, message: Message) -> Optional[GateContextBuilder]:
+        """The gate's recent-context block and in-flight lines for this message (burst follow-ups
+        Part A), as a builder the engine runs over the cohort it is about to judge.
+
+        None when the block is disabled (PARTICIPATION_GATE_CONTEXT_MESSAGES=0): the gate request
+        is then exactly the one without context. Otherwise the builder is SYNCHRONOUS and reads
+        only memory — the gate-context ring and this process's watermarks — so it adds no Slack
+        call and no await to the gate's path:
+
+        - recent context: the ring's recent messages strictly before the cohort's OLDEST member
+          (this message's thread for a reply, the channel otherwise), rendered at the per-message
+          cap;
+        - in flight: every open lease in this message's stale-guard scopes whose turn is writing
+          a reply right now, named by its trigger as the ring holds it (a trigger the ring does
+          not hold gets no line).
+
+        Any failure yields two empty strings — the gate decides as it does without context."""
+        try:
+            limit = int(getattr(config, "participation_gate_context_messages", 0) or 0)
+            if limit <= 0:
+                return None
+            char_cap = int(getattr(config, "participation_gate_context_chars", 400) or 400)
+            channel_id = message.channel_id
+            meta = message.metadata or {}
+            ts = meta.get("ts") or message.thread_id
+            thread_root = (str(message.thread_id) if message.thread_id and ts
+                           and str(message.thread_id) != str(ts) else None)
+            scopes = scopes_for_message(message)
+            watermarks = self.watermarks
+        except Exception as e:  # noqa: BLE001 — context is a hint; the gate runs without it
+            main_logger.debug(f"Gate context unavailable ({e}); deciding without it")
+            return None
+
+        def build(sources: Tuple[SourceMessage, ...]) -> Tuple[str, str]:
+            try:
+                cohort = [str(s.ts) for s in sources if s.ts] or ([str(ts)] if ts else [])
+                before = min(cohort, key=ts_key) if cohort else None
+                recent = gate_context.render_recent_context(
+                    gate_context.recent_for(channel_id, before_ts=before,
+                                            thread_root_ts=thread_root, limit=limit),
+                    char_cap=char_cap)
+                writing = sorted({lease.ceiling_ts for lease in watermarks.leases_for(scopes)
+                                  if lease.responding and lease.ceiling_ts},
+                                 key=ts_key)
+                lines = []
+                for trigger_ts in writing:
+                    entry = gate_context.get(channel_id, trigger_ts)
+                    if entry is not None:
+                        lines.append(gate_context.render_inflight_line(entry,
+                                                                       char_cap=char_cap))
+                return recent, "\n".join(lines)
+            except Exception as e:  # noqa: BLE001 — context is a hint; the gate runs without it
+                main_logger.debug(f"Gate context unavailable ({e}); deciding without it")
+                return "", ""
+
+        return build
+
     async def _gate_verdict(self, message: Message, client: BaseClient):
         """The binary wake gate for UNPROMPTED channel messages: hard rails → debounce cohort →
         ONE model call → one bit.
@@ -643,6 +707,9 @@ class ChatBotV2:
                 # This message's own arrival record, from the note above — not re-derived.
                 arrival=arrival,
                 attempt_id=attempt_id,
+                # Burst follow-ups Part A: what was just said and what the assistant is writing
+                # right now, read from memory over the cohort being judged. None when disabled.
+                gate_context_builder=self._gate_context_builder(message),
             )
             gate_latency_ms = int((time.monotonic() - gate_started_at) * 1000)
             decision = evaluation.decision
@@ -771,6 +838,12 @@ class ChatBotV2:
         beside it as `reply_stale_suppressed`: a detached producer owns a surface, or a reaction
         is on the message — from the gate or from this turn."""
         meta = (response.metadata or {}) if response is not None else {}
+        # A reconsideration that posted its interim and then skipped the answer still put this
+        # turn's own words in the room: a visible reply (burst follow-ups R2-5, codex R1 #8).
+        if turn is not None and any(
+                getattr(r, "kind", None) == DEST_KIND_RECONSIDER_INTERIM
+                for r in (getattr(turn, "committed_destinations", None) or ())):
+            return "reply"
         if (turn is not None and getattr(turn, "visible_action_committed", False)) \
                 or meta.get("background_job_started"):
             return "detached"
@@ -780,6 +853,169 @@ class ChatBotV2:
                 or (turn is not None and getattr(turn, "reaction_committed", False))):
             return "reaction_only"
         return "stale_suppressed"
+
+    async def _note_and_schedule_rerun(self, message: Message, client: Any, turn: Any,
+                                       lease: Any, retry_after: Optional[float]) -> None:
+        """A throttled fail-closed turn somebody asked for: register its re-run, then post the
+        note at the turn's reply destination. Registered FIRST, so a note the guard refuses (the
+        room moved on) still leaves the re-run owed. The bot's own re-run failing again keeps its
+        one note and simply waits for the next signal."""
+        meta = message.metadata or {}
+        trigger_ts = str(meta.get("ts") or "")
+        existing = fail_cards.registry.find(message.channel_id, trigger_ts)
+        if existing is not None:
+            turn.fail_card = (fail_cards.FAIL_CARD_POSTED if existing.card_ts
+                              else fail_cards.FAIL_CARD_SILENT)
+            fail_cards.registry.register(existing, retry_after=retry_after)
+            return
+        target = turn.resolve_reply_target(message)
+        failure = fail_cards.PendingFailure(
+            scope=fail_cards.scope_key(message.channel_id, message.thread_id, trigger_ts),
+            channel_id=message.channel_id, trigger_ts=trigger_ts,
+            sender_id=meta.get("sender_id"), cause=getattr(turn, "turn_error", None),
+            card_ts=None, start=self._rerun_starter(message, client),
+            scopes=scopes_for_message(message))
+        fail_cards.registry.register(failure, retry_after=retry_after)
+        turn.fail_card = fail_cards.FAIL_CARD_SILENT
+        # Owned THROUGH the post: a delivery or a cover landing meanwhile cannot drop the record
+        # before the note's ts is known — the note would then stand with nobody to remove it.
+        failure.posting = True
+        card_ts: Optional[str] = None
+        try:
+            card_ts = await cast(Any, client).send_message(
+                message.channel_id, target, fail_cards.TRANSIENT_NOTE, lease=lease,
+                receipts=turn.receipt_ledger, receipt_class="system_notice")
+        finally:
+            await fail_cards.finish_post(client, failure, card_ts)
+        if card_ts:
+            turn.fail_card = fail_cards.FAIL_CARD_POSTED
+
+    def _rerun_starter(self, message: Message,
+                       client: Any) -> Callable[[], Optional[Tuple[Any, Any]]]:
+        """What re-runs a throttled trigger: the NORMAL turn for that message, through the normal
+        dispatch, as an ungated route — the gate already woke it — carrying the re-run marker so
+        its own transient failure is still owed the note and another re-run. Returns the re-run
+        message and its task, so a cover can find it."""
+        def _start() -> Optional[Tuple[Any, Any]]:
+            rerun = copy.copy(message)
+            rerun.metadata = dict(message.metadata or {})
+            participation_telemetry.detach_attempt(rerun)
+            rerun.metadata[routing_facts.GATE_REQUIRED] = False
+            rerun.metadata[routing_facts.GATE_WOKE] = False
+            rerun.metadata[fail_cards.FAIL_RETRY_RERUN] = True
+            handler = getattr(client, "message_handler", None) or self.handle_message
+            dispatch = handler(rerun, client)
+            schedule = getattr(getattr(self, "processor", None), "_schedule_async_call", None)
+            task = schedule(dispatch) if callable(schedule) else asyncio.ensure_future(dispatch)
+            return rerun, task if isinstance(task, asyncio.Future) else None
+        return _start
+
+    async def _end_rerun(self, message: Message, client: Any, turn: Any, response: Any,
+                         outcome_kind: Optional[str]) -> None:
+        """The bot's re-run ended. If it neither delivered nor re-registered (throttled again),
+        its "Waiting on Slack" note comes down, logged with the outcome. Never raises. (A queued
+        re-run is not over: the drain runs it.)"""
+        try:
+            kind = outcome_kind or self._classify_visible_action(response, turn)
+            await fail_cards.end_rerun(client, channel_id=message.channel_id,
+                                       trigger_ts=(message.metadata or {}).get("ts"),
+                                       outcome=str(kind))
+        except Exception as e:  # noqa: BLE001 — a stale note is never worth a turn
+            main_logger.debug(f"Re-run note clean-up skipped: {e}")
+
+    @staticmethod
+    async def _settle_throttled_failures(message: Message, client: Any, turn: Any) -> None:
+        """After a turn that DELIVERED a reply: the throttled failure it re-ran is answered, and
+        an older same-sender one in its scope is covered. Never raises."""
+        if turn is None or getattr(turn, "turn_error", None) is not None:
+            return
+        if not fail_cards.registry.items():
+            return
+        delivered = any(getattr(r, "kind", None) in (DEST_KIND_REPLY, DEST_KIND_STREAM,
+                                                     DEST_KIND_SPLIT, DEST_KIND_RECONCILED)
+                        for r in (getattr(turn, "committed_destinations", None) or ()))
+        if not delivered:
+            return
+        meta = message.metadata or {}
+        try:
+            await fail_cards.settle_delivery(
+                client, channel_id=message.channel_id, scopes=scopes_for_message(message),
+                trigger_ts=meta.get("ts"), sender_id=meta.get("sender_id"))
+        except Exception as e:  # noqa: BLE001 — a stale note is never worth a turn
+            main_logger.debug(f"Throttled-failure settle skipped: {e}")
+
+    async def _stand_down(self, message: Message, client: Any, turn: Any, lease: Any,
+                          thinking_id: Optional[str], post_thread_id: Optional[str], *,
+                          clear_status: bool) -> None:
+        """End a turn a newer same-sender turn preempted (early stand-down). Closes its gate
+        attempt, then takes its chrome down — the actual thinking message, and the assistant
+        status when no inner cleanup will (`clear_status`); posts nothing.
+
+        Runs ONCE per turn: the preemption's cancellation is consumed here exactly once —
+        `uncancel()`ed, since left counted it would make every later `cancelling()` check in this
+        task's cleanup read as live — and the cleanup is a single task stored on the lease. A
+        later cancellation (shutdown) interrupts only this await; the callers then wait for that
+        same task and re-raise."""
+        task = asyncio.current_task()
+        if task is not None:
+            task.uncancel()
+        preempted_by = lease.preempted_by
+        main_logger.info(f"Turn for {(message.metadata or {}).get('ts')} on "
+                         f"{message.channel_id} stood down — superseded by {preempted_by}")
+        lease.responding = False
+        participation_telemetry.finish_attempt(message, "superseded", ended_by="stale_guard",
+                                               preempted_by=preempted_by)
+
+        async def _take_down_chrome() -> None:
+            if thinking_id:
+                try:
+                    await self._drop_chrome(client, turn, message.channel_id, thinking_id)
+                except Exception as cleanup_error:  # noqa: BLE001
+                    main_logger.debug(f"Stand-down chrome cleanup failed: {cleanup_error}")
+            elif (clear_status and turn is not None and turn.progress_enabled
+                  and hasattr(client, "clear_assistant_status")):
+                try:
+                    await client.clear_assistant_status(message.channel_id, post_thread_id)
+                except Exception as clear_error:  # noqa: BLE001
+                    main_logger.debug(f"Stand-down status clear failed: {clear_error}")
+
+        lease.stand_down = asyncio.ensure_future(_take_down_chrome())
+        await asyncio.shield(lease.stand_down)
+
+    async def _reattribute_reconsidered_reply(self, response: Any, turn: Any, text: str,
+                                              extra_tools: Sequence[str],
+                                              extra_results: Sequence[Dict[str, Any]],
+                                              merged_results: List[Any], *,
+                                              context: Optional[str]) -> str:
+        """Fold a tooled reconsideration's hosted tools into this non-streamed reply's own
+        record (burst follow-ups R3-5): the tools list and footer the handler built, and the F7
+        provenance it already computed — new names, and digests of results not yet in
+        `merged_results` (the closure's own record; a re-race re-delivers through it)."""
+        meta = response.metadata if isinstance(response.metadata, dict) else {}
+        tools_used = list(meta.get("tools_used") or [])
+        known = set(tools_used)
+        fresh_results = [r for r in extra_results if r not in merged_results]
+        text = reattribute_reply(
+            text, tools_used, merged_results, extra_tools, extra_results,
+            failed_display=str(meta.get("tools_failed_display") or ""),
+            show=not (turn is not None and turn.final_post_only))
+        new_names = [name for name in tools_used if name not in known]
+        meta["tools_used"] = tools_used
+        if config.enable_tool_provenance and (new_names or fresh_results):
+            provenance = list(meta.get("tool_provenance") or [])
+            provenance += build_provenance([], new_names)
+            if config.enable_tool_result_memory and fresh_results:
+                if config.enable_tool_result_summarization:
+                    provenance += await build_result_digests_summarized(
+                        fresh_results, self.processor.openai_client,
+                        config.tool_result_digest_chars, config.tool_result_turn_chars,
+                        config.tool_result_summarize_input_chars, context=context)
+                else:
+                    provenance += build_result_digests(
+                        fresh_results, config.tool_result_digest_chars,
+                        config.tool_result_turn_chars)
+            meta["tool_provenance"] = provenance
+        return text
 
     @staticmethod
     def _committed_correction_announcement(turn) -> bool:
@@ -959,7 +1195,23 @@ class ChatBotV2:
         # Also records this message as its conversation's newest inbound (message_processor.
         # stale_send_guard). Nothing is dropped after this point, so the watermark and the set
         # of turns that exist stay in step.
+        # A throttled trigger's re-run that a newer reply covered before it got here: rejected
+        # before admission — no lease, no turn (message_processor/fail_cards.py).
+        meta_in = getattr(message, "metadata", None)
+        covered_by = (meta_in.get(fail_cards.FAIL_RETRY_COVERED)
+                      if isinstance(meta_in, dict) else None)
+        if isinstance(covered_by, str) and covered_by:
+            main_logger.info(f"Re-run of {(message.metadata or {}).get('ts')} covered by "
+                             f"{covered_by} before admission — not run")
+            return
         lease = self.watermarks.begin_turn(message)
+        # A drained catch-up's trigger is admitted: the batch it carries is owned by this turn's
+        # lease from here, no longer by the drain (burst follow-ups R3-1). Synchronous, before
+        # any await, so no window opens between the two owners.
+        dispatch_owner = getattr(getattr(self, "processor", None), "thread_manager", None)
+        end_dispatch_for = getattr(dispatch_owner, "end_dispatch_for", None)
+        if callable(end_dispatch_for):
+            end_dispatch_for(message)
         turn = None
         # Bound here, not at the inner try: the outer finally reports this turn's outcome, and it
         # is reachable from the early returns above that point. `outcome_kind` is whatever label
@@ -967,6 +1219,10 @@ class ChatBotV2:
         # disagree about what the room saw; None means "derive it from the Response".
         response = None
         outcome_kind = None
+        # This turn's chrome, held at THIS scope so an early stand-down landing anywhere — even
+        # between the thinking indicator and the responder — takes down the real surfaces.
+        thinking_id: Optional[str] = None
+        post_thread_id: Optional[str] = None
         # A STRONG ref on the running turn, so shutdown can wait for what it already admitted
         # rather than closing the receipt queue underneath a reply that is still being written.
         # None for a stand-in host — nothing there is ever going to quiesce it.
@@ -1018,6 +1274,9 @@ class ChatBotV2:
             # The turn carries the lease from here on: it is already threaded to every path
             # that can post, including ToolContext.turn.
             turn.send_lease = lease
+            # …and the lease its turn, which a newer same-sender turn reads before preempting
+            # this one (early stand-down: never a turn that already put something in the room).
+            lease.turn = turn
             # ...and its receipt ledger, opened here so the FIRST thing this turn can post is
             # already covered. Settled in the outer finally below, under a shield.
             turn.bind_receipts(client, message)
@@ -1150,19 +1409,33 @@ class ChatBotV2:
                                     channel_id=message.channel_id, first_ts=ts,
                                     kind=DEST_KIND_REPLY, thread_root_ts=_thread)
 
-                            async def _reconsidered_reply_send(text: str,
-                                                               _response=response,
-                                                               _meta=send_meta,
-                                                               _blocks=footer_blocks,
-                                                               _thread=post_thread_id
-                                                               ) -> Optional[str]:
+                            # Results a tooled reconsideration already folded into provenance —
+                            # a re-race re-delivers through the closure below.
+                            reattributed_results: List[Any] = []
+
+                            async def _reconsidered_reply_send(
+                                    text: str,
+                                    extra_tools: Optional[Sequence[str]] = None,
+                                    extra_results: Sequence[Dict[str, Any]] = (),
+                                    _response=response, _meta=send_meta,
+                                    _blocks=footer_blocks, _thread=post_thread_id,
+                                    _merged=reattributed_results
+                                    ) -> Optional[str]:
                                 """The §4b delivery closure for this site. Replaces the site's
                                 canonical text — `response.content` — BEFORE the send, so the
                                 footer guard, the destination commit and the F7 persistence
                                 below all read the chosen text with no second code path; then
                                 re-runs the site's OWN send (same target, F39 top-level None
                                 stays None). Returns send_message's native Optional ts;
-                                StaleSendSuppressed propagates (a re-race is the next pass)."""
+                                StaleSendSuppressed propagates (a re-race is the next pass).
+                                `extra_tools` (not None) marks a tooled reconsideration's text:
+                                its hosted tools join the reply's attribution and F7 provenance
+                                first (burst follow-ups R3-5)."""
+                                if extra_tools is not None:
+                                    text = await self._reattribute_reconsidered_reply(
+                                        _response, turn, text, extra_tools, extra_results,
+                                        _merged,
+                                        context=(message.text or "").strip() or None)
                                 # W4: the revised text is FRESH model output — the runner asked
                                 # the model to rewrite its own draft — so it can mint a marker
                                 # the original never had. It goes through the same choke point
@@ -1384,18 +1657,30 @@ class ChatBotV2:
                         # the lines below — the outcome is recorded, only the words are withheld.
                         # `is True`, not truthiness: a stand-in Mock metadata must never be able
                         # to swallow a real notice.
+                        fail_closed = getattr(turn, "turn_error", None) is not None
                         if (response.metadata or {}).get("suppress_error_post") is True:
                             main_logger.info(
                                 "Fail-closed turn nobody addressed — recorded, nothing posted "
                                 f"for {message.channel_id}:{message.thread_id}")
+                            if fail_closed:
+                                turn.fail_card = fail_cards.FAIL_CARD_SILENT
+                        elif isinstance((response.metadata or {}).get("fail_retry"), dict):
+                            # Slack throttled us: one short note, and the bot re-runs this
+                            # trigger itself once Slack lets up (message_processor/fail_cards).
+                            await self._note_and_schedule_rerun(
+                                message, client, turn, lease,
+                                response.metadata["fail_retry"].get("retry_after"))
                         else:
-                            await client.handle_error(
+                            card_ts = await client.handle_error(
                                 message.channel_id,
                                 message.thread_id,
                                 response.content,
                                 lease=lease,
                                 receipts=turn.receipt_ledger,
                             )
+                            if fail_closed:
+                                turn.fail_card = (fail_cards.FAIL_CARD_POSTED if card_ts
+                                                  else fail_cards.FAIL_CARD_SILENT)
 
                 # Close the attempt with what the room actually SAW. Deliberately not folded into
                 # the contract check below, which asks a narrower question — is this channel one we
@@ -1499,6 +1784,22 @@ class ChatBotV2:
                             main_logger.warning(
                                 "Empty text response without a terminal action — posting nothing")
 
+            except asyncio.CancelledError:
+                # EARLY STAND-DOWN, or anything else. `preempted_by` is set only by a newer
+                # same-sender turn's preemption, so every other cancellation — shutdown above
+                # all — re-raises exactly as before. A preempted turn posts nothing and ends
+                # here, normally: the finally blocks below retract its 👀, clear its status,
+                # settle its receipts and close its lease.
+                if lease.preempted_by is None:
+                    raise
+                if lease.stand_down is not None:
+                    # A LATER cancellation (shutdown) during the stand-down: wait for its one
+                    # cleanup, then let the cancellation proceed.
+                    await _await_finalizer(lease.stand_down)
+                    raise
+                outcome_kind = "superseded"
+                await self._stand_down(message, client, turn, lease, thinking_id,
+                                       post_thread_id, clear_status=False)
             except StaleSendSuppressed as stale:
                 lease.responding = False   # terminal: this turn will post no reply
                 # NOT an error, and it must never reach the handler below — that one logs an
@@ -1613,6 +1914,7 @@ class ChatBotV2:
             finally:
                 # Covers a cancellation too, which bypasses both terminal catches above.
                 lease.responding = False
+                lease.ending = True        # no stand-down may cancel into this cleanup
                 # F38: settle the work claim. Runs in `finally` so an exception, a cancellation,
                 # or an early return can't strand a 👀 on a message the bot then ignored.
                 try:
@@ -1640,9 +1942,23 @@ class ChatBotV2:
                         await client.clear_assistant_status(message.channel_id, post_thread_id)
                     except Exception as clear_error:
                         main_logger.debug(f"Assistant status clear failed: {clear_error}")
+        except asyncio.CancelledError:
+            # The same stand-down, landing before the responder stage (the gate, the identity
+            # check): nothing is up yet to take down. Any other cancellation re-raises.
+            if lease.preempted_by is None:
+                raise
+            if lease.stand_down is not None:
+                # A later cancellation, possibly raised out of the stand-down inside: the one
+                # cleanup finishes, nothing is started twice, and the cancellation proceeds.
+                await _await_finalizer(lease.stand_down)
+                raise
+            outcome_kind = "superseded"
+            await self._stand_down(message, client, turn, lease, thinking_id,
+                                   post_thread_id, clear_status=True)
         finally:
             # No longer producing a reply — newer-responder checks stop counting this turn now.
             lease.responding = False
+            lease.ending = True
             try:
                 # Everything this turn CAUSED is settled before anything it POSTED is, and the
                 # whole sequence — drain, cancel, revoke, wait out the live effects, settle the
@@ -1669,6 +1985,13 @@ class ChatBotV2:
                 schedule_memory = getattr(self, "_schedule_channel_memory", None)
                 if schedule_memory is not None:
                     schedule_memory(message, turn)
+                # A reply landed: the throttled trigger it re-ran (or covered) is answered, and its
+                # note comes down.
+                await self._settle_throttled_failures(message, client, turn)
+                # …and a re-run that ended any other way never leaves its note standing.
+                if (message.metadata or {}).get(fail_cards.FAIL_RETRY_RERUN) is True and not (
+                        response is not None and response.type == "queued"):
+                    await self._end_rerun(message, client, turn, response, outcome_kind)
                 participation_telemetry.abort_attempt(message)
                 if turn_task is not None and active_turns is not None:
                     active_turns.discard(turn_task)
@@ -1754,10 +2077,13 @@ class ChatBotV2:
         # A CORRECTION ANNOUNCEMENT is excluded for the same reason: it is disclosure chrome
         # about an edit, not this exchange's answer — remembering "what was asked HERE" paired
         # with "Correction to my earlier message…" would store a conversation nobody had.
+        # A reconsideration's INTERIM note is chrome of the same order — "re-checking with the
+        # new details" is not the answer — and is excluded too.
         committed = [r for r in turn.committed_destinations
                      if (r.text or "").strip()
                      and r.kind not in (DEST_KIND_POST_TO_THREAD,
-                                        DEST_KIND_CORRECTION_ANNOUNCEMENT)]
+                                        DEST_KIND_CORRECTION_ANNOUNCEMENT,
+                                        DEST_KIND_RECONSIDER_INTERIM)]
         if not committed:
             return
         processor = self.processor

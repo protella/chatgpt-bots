@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from typing import Any, Dict, List, Mapping, Optional, cast
+from typing import Any, Dict, List, Mapping, Optional, Sequence, cast
 
 from message_processor.client_contract import BaseClient, Message, Response
 from config import config, pipeline_status, SUPPORTED_CHAT_MODELS
@@ -35,12 +35,12 @@ from message_processor.message_markers import (
 )
 from streaming import FenceHandler, NativeStreamCoordinator, RateLimitManager, StreamingBuffer
 from message_processor.tool_registry import SURFACE_CHANNEL, SURFACE_DM, SandboxHolder, ToolContext
-from message_processor import (canvas_tools, file_mount, image_catalog, image_service,
-                               image_tools, thread_files)
+from message_processor import (canvas_tools, file_mount, gate_context, image_catalog,
+                               image_service, image_tools, thread_files)
 from message_processor.artifacts import (collect_container_ids, stream_safe_text, strip_citation_markers,
                                          strip_sandbox_links)
 from message_processor.containers import adoption_blocked, auto_container
-from message_processor.tool_provenance import (strip_provenance_echo,
+from message_processor.tool_provenance import (reattribute_reply, strip_provenance_echo,
                                                visible_attribution_tools)
 from openai_client.container_errors import (is_container_gone, is_container_wedged,
                                             mark_container_wedged, persistent_container_ids,
@@ -69,6 +69,24 @@ def _delivered_stream_ts(native_coord, native_finalized: bool,
     if native_coord is not None and native_finalized:
         return native_coord.current_ts
     return current_message_id if content_delivered else None
+
+
+def _record_legacy_stream_reply(client: Any, channel_id: Optional[str],
+                                reply_target: Optional[str], ts: Optional[str],
+                                text: Optional[str]) -> None:
+    """Remember a LEGACY-streamed reply (seed post + edit loop) in the wake gate's
+    recent-context ring, once, with its final delivered text.
+
+    Every other reply surface records itself at the transport (`send_message` parts, a native
+    stream's finish), but this one is built from `update_message_streaming` edits, and an edit is
+    never a reply worth recording until the stream has finished — partial updates never are.
+    Bookkeeping never breaks a delivery, so any failure is swallowed."""
+    try:
+        gate_context.record_assistant_reply(
+            channel_id, reply_target, ts, text,
+            sender_id=getattr(client, "bot_user_id", None))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _delivered_without_tail(full: str, undelivered: str) -> str:
@@ -281,6 +299,28 @@ def _note_turn_external(turn: Any, name: str) -> None:
         note([name])
     except Exception:  # noqa: BLE001
         pass
+
+
+async def await_cancelled_progress(progress_task: Any) -> None:
+    """Await a progress updater we just cancelled. ITS cancellation is expected and swallowed;
+    a cancellation aimed at THIS turn (shutdown, an early stand-down) propagates — swallowing it
+    here would let a stopped turn run on."""
+    try:
+        await progress_task
+    except asyncio.CancelledError:
+        current = asyncio.current_task()
+        if current is not None and current.cancelling():
+            raise
+
+
+async def stop_progress_updater(progress_task: Any) -> None:
+    """Cancel a progress updater and wait until it has actually stopped. Cancellation-safe: it
+    runs from a `finally`, so the wait is not interrupted by the cancellation already being
+    delivered, and the updater's own CancelledError is never re-raised here."""
+    if progress_task is None or progress_task.done():
+        return
+    progress_task.cancel()
+    await asyncio.wait({progress_task})
 
 
 def _reaction_committed(local_tool_calls: Optional[List[dict]]) -> bool:
@@ -974,6 +1014,9 @@ class TextHandlerMixin(_Host):
         tools = self._build_tools_array(
             request_config, model, exclude_mcp_server=exclude_mcp_server, registry=registry,
             ci_container=ci_container, surface=SURFACE_CHANNEL)
+        if turn is not None:
+            # What a reconsideration's tooled pass must exclude too (burst follow-ups R2-3).
+            turn.mcp_exclusions = frozenset(self._as_mcp_exclusion_set(exclude_mcp_server))
         request = assemble_channel_request(
             processor=self, client=client, ctx=ctx, model=model, tools=tools,
             request_config=request_config, contract_suffix=contract_suffix, registry=registry,
@@ -1478,6 +1521,9 @@ class TextHandlerMixin(_Host):
             # stale reconsideration sends. Rendered now, beside the original, so that pass neither
             # rereads live settings nor claims tools (or a settings state) it does not have.
             tool_free_prompt = self._get_system_prompt(*prompt_args, participant_roster=participant_roster, channel_steering=channel_steering_text, channel_info=channel_info, code_interpreter_enabled=False, tool_surface=surface, tools_available=False, tools_structurally_withheld=True)
+            # …and once more for the reconsideration's TOOLED pass, which offers only the hosted
+            # tools: web search as set, no sandbox, no local tools (burst follow-ups R2-3).
+            hosted_only_prompt = self._get_system_prompt(*prompt_args, participant_roster=participant_roster, channel_steering=channel_steering_text, channel_info=channel_info, code_interpreter_enabled=False, tool_surface=surface, tools_available=False)
 
             # Prompt-cache hygiene: volatile context (minute-precision time + F1 in-flight note)
             # rides at the SUFFIX (last message), never in the system prompt, so the cached prefix
@@ -1504,7 +1550,8 @@ class TextHandlerMixin(_Host):
             # turn's instructions and settings.
             pin_dm_turn_context(turn, message, thread_config=thread_config,
                                 instructions=system_prompt, prompt_cache_key=cache_key,
-                                tool_free_instructions=tool_free_prompt)
+                                tool_free_instructions=tool_free_prompt,
+                                hosted_only_instructions=hosted_only_prompt)
 
         # Update status before generating
         failed_mcp_display = ", ".join(sorted(self._as_mcp_exclusion_set(failed_mcp_server)))
@@ -1538,6 +1585,8 @@ class TextHandlerMixin(_Host):
             tools = self._build_tools_array(request_config, model,
                                             exclude_mcp_server=failed_mcp_server, registry=registry,
                                             ci_container=ci_container, surface=surface)
+            if turn is not None:
+                turn.mcp_exclusions = frozenset(self._as_mcp_exclusion_set(failed_mcp_server))
 
         # Start progress updater for fallback/retry scenarios (streaming already has one)
         # This provides the cycling status messages during long-running API calls
@@ -1803,10 +1852,7 @@ class TextHandlerMixin(_Host):
             # Cancel progress updater when API call completes
             if progress_task and not progress_task.done():
                 progress_task.cancel()
-                try:
-                    await progress_task
-                except asyncio.CancelledError:
-                    pass
+                await await_cancelled_progress(progress_task)
                 self.log_debug("Cancelled progress updater - API call completed")
 
         if mcp_retry_server:
@@ -2073,6 +2119,9 @@ class TextHandlerMixin(_Host):
             content=response_text,
             metadata={"model": thread_config.get("model"),
                       "tool_provenance": tool_provenance,
+                      # What main.py's reconsidered delivery re-attributes from (R3-5).
+                      "tools_used": list(tools_actually_used),
+                      "tools_failed_display": failed_mcp_display,
                       "artifact_containers": artifact_containers,
                           "sandbox_image_assets": sandbox_assets,
                           "mounted_digests": mounted_digests}
@@ -2296,6 +2345,9 @@ class TextHandlerMixin(_Host):
             # stale reconsideration sends. Rendered now, beside the original, so that pass neither
             # rereads live settings nor claims tools (or a settings state) it does not have.
             tool_free_prompt = self._get_system_prompt(*prompt_args, participant_roster=participant_roster, channel_steering=channel_steering_text, channel_info=channel_info, code_interpreter_enabled=False, tool_surface=surface, tools_available=False, tools_structurally_withheld=True)
+            # …and once more for the reconsideration's TOOLED pass, which offers only the hosted
+            # tools: web search as set, no sandbox, no local tools (burst follow-ups R2-3).
+            hosted_only_prompt = self._get_system_prompt(*prompt_args, participant_roster=participant_roster, channel_steering=channel_steering_text, channel_info=channel_info, code_interpreter_enabled=False, tool_surface=surface, tools_available=False)
 
             # Prompt-cache hygiene: volatile context (minute-precision time) rides at the SUFFIX
             # (last message), never in the system prompt, so the cached prefix survives across
@@ -2316,7 +2368,8 @@ class TextHandlerMixin(_Host):
             # instructions and settings exist, rather than reconstructed afterwards.
             pin_dm_turn_context(turn, message, thread_config=thread_config,
                                 instructions=system_prompt, prompt_cache_key=cache_key,
-                                tool_free_instructions=tool_free_prompt)
+                                tool_free_instructions=tool_free_prompt,
+                                hosted_only_instructions=hosted_only_prompt)
             ci_container = await self._resolve_ci_container(request_config, thread_key)
             await self._prepare_sandbox_tools(request_config, thread_key, ci_container, client,
                                               surface=surface)
@@ -2324,6 +2377,8 @@ class TextHandlerMixin(_Host):
                                             exclude_mcp_server=exclude_mcp_server,
                                             registry=registry, ci_container=ci_container,
                                             surface=surface)
+            if turn is not None:
+                turn.mcp_exclusions = frozenset(self._as_mcp_exclusion_set(exclude_mcp_server))
 
         # Post an initial message to get the message ID for streaming updates.
         # Seed with a random pick from the loading pool (same variance as the
@@ -2541,10 +2596,7 @@ class TextHandlerMixin(_Host):
                 # Cancel progress updater when tools start (web search takes over status)
                 if progress_task and not progress_task.done():
                     progress_task.cancel()
-                    try:
-                        await progress_task
-                    except asyncio.CancelledError:
-                        pass
+                    await await_cancelled_progress(progress_task)
                     self.log_debug("Cancelled progress updater - tool started")
 
                 # Tool just started - update status with appropriate emoji
@@ -2613,10 +2665,7 @@ class TextHandlerMixin(_Host):
 
                 if progress_task and not progress_task.done():
                     progress_task.cancel()
-                    try:
-                        await progress_task
-                    except asyncio.CancelledError:
-                        pass
+                    await await_cancelled_progress(progress_task)
                     self.log_debug("Cancelled progress updater - MCP tool started")
 
                 if status == "discovering_tools" and not tool_states["mcp"]:
@@ -2917,10 +2966,7 @@ class TextHandlerMixin(_Host):
                     # IMPORTANT: Await the cancellation to prevent race condition where
                     # progress_task completes an update_message_streaming call after cancel
                     # is requested but before it takes effect, overwriting streamed content
-                    try:
-                        await progress_task
-                    except asyncio.CancelledError:
-                        pass
+                    await await_cancelled_progress(progress_task)
                     self.log_debug("Cancelled progress updater - streaming started")
 
             # ---- W4: consume the destination marker before ANYTHING else reads the text ----
@@ -3940,15 +3986,23 @@ class TextHandlerMixin(_Host):
                     # than on a placeholder that may never have carried the answer.
                     direct_send_meta: dict = {}
 
-                    async def _direct_final_post(text: str) -> Optional[str]:
+                    async def _direct_final_post(
+                            text: str, extra_tools: Optional[Sequence[str]] = None,
+                            extra_results: Sequence[Dict[str, Any]] = ()) -> Optional[str]:
                         """This site's one delivery — run directly on the first attempt and
                         re-run as the §4b closure on a reconsidered one. Replaces the site's
                         canonical text (`response_text`) BEFORE the send, so the destination
                         commit, F7 persistence and response-stream metadata below read the
                         chosen text with no second code path. Returns send_message's native
                         Optional ts; StaleSendSuppressed propagates (a re-race re-enters the
-                        runner's loop as the next pass)."""
+                        runner's loop as the next pass). `extra_tools` (not None) marks a
+                        tooled reconsideration's text: its hosted tools join this turn's
+                        attribution and provenance before the footer is rendered (R3-5)."""
                         nonlocal response_text
+                        if extra_tools is not None:
+                            text = reattribute_reply(
+                                text, tools_used, mcp_results, extra_tools, extra_results,
+                                failed_display=exclude_mcp_display, show=show_attribution)
                         # W4: a reconsidered draft is fresh model output, so it goes through the
                         # same choke point as the first one. Selection is refused by then (the
                         # destination is locked, and this post is going where it was bound), but
@@ -4206,8 +4260,16 @@ class TextHandlerMixin(_Host):
                         self.log_error(f"Final correction update failed: {final_result.get('error', 'Unknown error')}")
                         return None
 
-                    async def _correction_deliver(text: str) -> Optional[str]:
-                        """The §4b delivery closure for the covered correction branches."""
+                    async def _correction_deliver(
+                            text: str, extra_tools: Optional[Sequence[str]] = None,
+                            extra_results: Sequence[Dict[str, Any]] = ()) -> Optional[str]:
+                        """The §4b delivery closure for the covered correction branches. A
+                        tooled reconsideration's text (`extra_tools` not None) is re-attributed
+                        from this turn's merged tools first (R3-5)."""
+                        if extra_tools is not None:
+                            text = reattribute_reply(
+                                text, tools_used, mcp_results, extra_tools, extra_results,
+                                failed_display=exclude_mcp_display, show=show_attribution)
                         return await _final_correction(text, reconsidered=True)
 
                     try:
@@ -4353,6 +4415,15 @@ class TextHandlerMixin(_Host):
                     complete=delivery_complete,
                     channel_id=thread_state.channel_id,
                     thread_root_ts=turn.resolve_reply_target(message))
+
+            # The legacy stream's one completion point: its final text joins the gate's ring
+            # here, once. A native stream and a direct final post were recorded by the transport.
+            if delivered_ts and not native_finalized and not delivery_direct_post:
+                _record_legacy_stream_reply(
+                    client, thread_state.channel_id, reply_target,
+                    first_delivered_ts or delivered_ts,
+                    (delivered_text_override if delivered_text_override is not None
+                     else response_text))
 
             # Schedule async cleanup after response. Channel turns extract memory from main.py's
             # outer finally instead, off the COMMITTED records above.
@@ -4718,6 +4789,10 @@ class TextHandlerMixin(_Host):
             # is read defensively here rather than assumed.
             self._persist_destination_provenance(
                 turn, locals().get("local_tool_calls"), locals().get("tools_used"))
+            # The progress updater edits Slack on a timer, so it must not outlive this method on
+            # ANY exit — a cancellation (shutdown, an early stand-down) included, which bypasses
+            # every branch that otherwise stops it.
+            await stop_progress_updater(progress_task)
 
     @staticmethod
     def _as_mcp_exclusion_set(value) -> set:

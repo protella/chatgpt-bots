@@ -52,7 +52,7 @@ import asyncio
 import time
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Set, Tuple, cast
+from typing import Any, Awaitable, Callable, Dict, FrozenSet, List, Mapping, Optional, Set, Tuple, cast
 
 from config import config
 from logger import setup_logger
@@ -289,6 +289,9 @@ DEST_KIND_POST_TO_THREAD = "post_to_thread"
 DEST_KIND_RECONCILED = "reconciled"
 # EDIT §7. The correction disclosure `edit_own_message` posts before it overwrites anything.
 DEST_KIND_CORRECTION_ANNOUNCEMENT = "correction_announcement"
+# Burst follow-ups R2-5. The short note a reconsideration posts before re-answering with tools —
+# words in the room, but not the exchange's answer, so channel memory never reads it.
+DEST_KIND_RECONSIDER_INTERIM = "reconsider_interim"
 
 # The registry name of the tool that produces that record. Stated here, next to the kind, because
 # the responder needs the NAME (to decide whether the cross-thread conduct paragraph rides this
@@ -379,17 +382,22 @@ class ReconsiderFacts:
     passes: int
     forced: Optional[bool] = None
     error: Optional[str] = None
+    # Burst follow-ups R2-5: set only when the invocation ran its tooled pass — True when the
+    # delivered text came from it. None (omitted) on every invocation that never re-answered.
+    redone: Optional[bool] = None
 
     def as_payload(self) -> Dict[str, Any]:
         """The nested dict `turn_outcome` carries. Inapplicable keys are OMITTED — `forced`
-        only on posted outcomes, `error` only on `error_dropped` — because record() strips
-        top-level Nones but nested values survive verbatim, and a nested null would give a
-        group-by two buckets meaning the same thing."""
+        only on posted outcomes, `error` only on `error_dropped`, `redone` only after a tooled
+        pass — because record() strips top-level Nones but nested values survive verbatim, and
+        a nested null would give a group-by two buckets meaning the same thing."""
         payload: Dict[str, Any] = {"outcome": self.outcome, "passes": self.passes}
         if self.outcome in ("posted_asis", "posted_revised") and self.forced is not None:
             payload["forced"] = self.forced
         if self.outcome == "error_dropped" and self.error is not None:
             payload["error"] = self.error
+        if self.redone is not None:
+            payload["redone"] = self.redone
         return payload
 
 
@@ -476,6 +484,12 @@ class TurnRuntime:
     # non-None-ness IS the once-per-turn gate the interception wrappers consult, and
     # emit_turn_outcome attaches its as_payload() to the turn_outcome event.
     reconsider: Optional[ReconsiderFacts] = None
+    # The MCP servers this turn's latest request excluded after they failed. A reconsideration's
+    # tooled pass offers the turn's hosted tools exactly as the turn had them, exclusions included.
+    mcp_exclusions: FrozenSet[str] = frozenset()
+    # A fail-closed turn's card: "posted" or "silent" (the turn_outcome `fail_card` field). None
+    # on every turn that did not fail closed.
+    fail_card: Optional[str] = None
     ack_lease: Optional[dict] = field(default=None, repr=False)
     ack_target_ts: Optional[str] = None
     # Where that claim was staked. Kept beside the ts purely so settle_ack can report a RETRACTED
@@ -753,6 +767,15 @@ class TurnRuntime:
             record.text = text
             record.chars = len(text)
 
+    def _mark_tools_started(self) -> None:
+        """This turn has admitted a LOCAL tool call: from now on it is never preempted (early
+        stand-down eligibility — a local tool runs in a task of its own that a cancel of the turn
+        does not stop). Hosted tools run inside the turn's own Responses stream, so a hosted-only
+        turn stays eligible."""
+        lease = getattr(self, "send_lease", None)
+        if lease is not None:
+            lease.tools_started = True
+
     def note_tool_call(self, record: Dict[str, Any]) -> None:
         """Record one dispatched local tool call on the TURN, as it happens (§5.4a amendment).
 
@@ -763,6 +786,7 @@ class TurnRuntime:
         Never raises and never rejects: this is a ledger, and a turn that could not write down
         what it just did is worse off than one that wrote down something odd.
         """
+        self._mark_tools_started()
         if isinstance(record, dict) and record.get("name"):
             self.provenance_tool_calls.append(dict(record))
 
@@ -810,6 +834,7 @@ class TurnRuntime:
         run concurrently (dispatch_all gathers them), so anything else would let two siblings
         both decide they were first.
         """
+        self._mark_tools_started()
         key = (self.turn_id, str(call_id))
         existing = self._tool_flights.get(key)
         if existing is not None:
@@ -836,6 +861,7 @@ class TurnRuntime:
         never be found by a lookup and never collide with a model-supplied id. Everything else —
         the stamped deadline, the drain, the cancellation, the revocation — is identical.
         """
+        self._mark_tools_started()
         self._anonymous_flights += 1
         seq = self._anonymous_flights
         flight = ToolFlight(tool_name=str(tool_name), fingerprint=f"anonymous:{seq}",
@@ -1191,6 +1217,17 @@ class TurnRuntime:
         to retract.
 
         Purely additive and fails silent — an emoji is never worth failing a turn over."""
+        # A hosted tool's claim runs in the turn's own task (the Responses stream's callback), so
+        # a stand-down's settle retracts it through `ack_lease`. Any other caller is a local
+        # tool's own task, which a cancel of the turn would not stop: that turn is ineligible.
+        lease = getattr(self, "send_lease", None)
+        turn_task = getattr(lease, "task", None)
+        try:
+            running = asyncio.current_task()
+        except RuntimeError:
+            running = None
+        if turn_task is None or running is not turn_task:
+            self._mark_tools_started()
         if self.ack_lease is not None or self._claiming:
             return
         if not getattr(config, "enable_ack_reaction", True):

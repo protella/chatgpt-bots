@@ -209,3 +209,36 @@ def _empty_document_extraction_cache():
     _extraction_cache.clear()
     yield
     _extraction_cache.clear()
+
+
+# The wake gate's recent-context ring is process-wide (message_processor/gate_context.py), fed by
+# every test that drives the raw listeners or an assistant-reply send. Left alone, one test's
+# messages would show up as "recent conversation" in a later test's gate request.
+@pytest.fixture(autouse=True)
+def _empty_gate_context_ring():
+    from message_processor import gate_context
+
+    gate_context.ring.reset()
+    yield
+    gate_context.ring.reset()
+
+
+# The reply cache is process-wide (message_processor/reply_cache.py): one test's fetched thread
+# replies must never answer a later test's build.
+@pytest.fixture(autouse=True)
+def _empty_reply_cache():
+    from message_processor import reply_cache
+
+    reply_cache.cache().reset()
+    yield
+    reply_cache.cache().reset()
+
+
+# Outstanding fail-closed cards are tracked process-wide (message_processor/fail_cards.py).
+@pytest.fixture(autouse=True)
+def _empty_fail_card_registry():
+    from message_processor import fail_cards
+
+    fail_cards.registry.reset()
+    yield
+    fail_cards.registry.reset()

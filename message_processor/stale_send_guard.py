@@ -53,8 +53,11 @@ SCOPES. Two, and a message can be watched by both:
 When a message carries none, the top scope is OMITTED rather than bucketed under "unknown" —
 collapsing unrelated senders into one scope would let a stranger's message silence an answer.
 """
+import asyncio
+import functools
+import weakref
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, ParamSpec, Tuple, TypeVar
 
 from logger import setup_logger
 
@@ -119,6 +122,14 @@ def scopes_for(channel_id: Any, ts: Any, thread_root: Any,
     found = [s for s in (thread_scope(channel_id, ts, thread_root),
                          top_scope(channel_id, ts, thread_root, sender_id)) if s]
     return tuple(found)
+
+
+def scopes_for_message(message: Any) -> Tuple[Scope, ...]:
+    """Every scope a live Message belongs to, read exactly as `begin_turn` reads it — so a queued
+    message and the lease it would open can never disagree about where they live."""
+    meta = getattr(message, "metadata", None) or {}
+    return scopes_for(getattr(message, "channel_id", None), meta.get("ts"),
+                      getattr(message, "thread_id", None), meta.get("sender_id"))
 
 
 def primary_scope_key(channel_id: Any, ts: Any, thread_root: Any,
@@ -186,6 +197,29 @@ class TurnSendLease:
     # past the queued branch). A reconsideration pass reads it on NEWER turns: a newer message
     # whose own responder is running is that responder's to answer, not the stale draft's.
     responding: bool = False
+    # EARLY STAND-DOWN. Who this turn was opened for (the immutable Slack identity begin_turn
+    # scopes by), the asyncio task running it, and its TurnRuntime once main.py has one — what
+    # a newer same-sender turn reads to stop this one before it spends a model call and a
+    # rebuild on an answer the room no longer wants. `preempted_by` is the ceiling of the turn
+    # that stopped it; set ONLY by `preempt_older_same_sender`, it is how main.py tells this
+    # cancellation from a shutdown.
+    sender_id: Optional[str] = None
+    task: Any = field(default=None, repr=False)
+    turn: Any = field(default=None, repr=False)
+    preempted_by: Optional[str] = None
+    # Set when the turn reaches its own cleanup. A turn already ending is never preempted: a
+    # cancellation landing in its finally would skip the very cleanup a stand-down relies on.
+    ending: bool = False
+    # Set synchronously when the turn admits its first tool call (a local flight, a hosted tool,
+    # a work claim). Such a turn may have spawned work that outlives a cancel of its own task,
+    # so it is never preempted — eligibility, not armor.
+    tools_started: bool = False
+    # The stand-down's single chrome-cleanup task, once a preemption has been consumed. A later
+    # cancellation (shutdown) waits for THIS task and re-raises; it never starts another.
+    stand_down: Any = field(default=None, repr=False)
+    # A stand-down asked for while the turn was mid-mutation of Slack: the newer turn's ceiling,
+    # acted on when that mutation exits (and dropped there if the turn is no longer eligible).
+    preempt_requested_by: Optional[str] = None
     _watermarks: Any = field(default=None, repr=False)
     _closed: bool = field(default=False, repr=False)
     # WHY this turn was suppressed, kept from the first refusal. A turn is refused once and then
@@ -212,6 +246,9 @@ class TurnSendLease:
     # Unforgeable identity: every StaleSendSuppressed this lease raises carries it, and
     # rearm/force accept only an exception whose token IS this object.
     _token: object = field(default_factory=object, repr=False)
+    # Ever refused by authorize(). A lease that was suppressed belongs to its reconsideration
+    # runner from then on — even after a rearm puts it back to PENDING — and is never preempted.
+    _ever_suppressed: bool = field(default=False, repr=False)
 
     # --- what this turn has accounted for -------------------------------------------------
 
@@ -266,6 +303,7 @@ class TurnSendLease:
                     latest, scope, baseline = candidate, candidate_scope, effective
         if latest is not None:
             self.state = SUPPRESSED
+            self._ever_suppressed = True
             self._suppressed_scope = scope
             self._suppressed_latest_ts = latest
             self._suppressed_baseline = baseline
@@ -316,7 +354,87 @@ class TurnSendLease:
                 found[other.ceiling_ts] = None
         return sorted(found, key=ts_key)
 
+    def newer_deciding_ts(self) -> List[str]:
+        """The ceilings of OTHER open leases in this lease's scopes, newer than this one, that are
+        NOT responding — a newer message whose turn is still deciding (the gate, the lock) and so
+        may yet own an answer. Same comparison as `newer_responding_ts`, on `ceiling_ts`."""
+        if self._watermarks is None:
+            return []
+        found: Dict[str, None] = {}
+        for other in self._watermarks.leases_for(self.scopes):
+            if (other is self or other._closed or other.responding
+                    or other.ceiling_ts is None):
+                continue
+            if is_newer(other.ceiling_ts, self.ceiling_ts):
+                found[other.ceiling_ts] = None
+        return sorted(found, key=ts_key)
+
+    def preempt_older_same_sender(self) -> List[str]:
+        """EARLY STAND-DOWN: this turn is now actually answering, so stop every OLDER turn of the
+        SAME sender in a shared scope that has put nothing in the room yet. Returns the ceilings
+        it preempted.
+
+        Only a PENDING lease that was never suppressed (a suppressed one is its reconsideration
+        runner's — redo and the tooled pass included), whose turn has no visible action — no
+        detached producer or background job, no reaction, no edit — and whose task is not this
+        one. A different sender is never preempted: cross-author thread replies keep today's
+        suppress-and-reconsider path. Synchronous; the cancelled turn ends through its own
+        cleanup, which reads `preempted_by` to know why."""
+        if self._watermarks is None or not self.sender_id or self.ceiling_ts is None:
+            return []
+        current = _current_task()
+        preempted: List[str] = []
+        for other in self._watermarks.leases_for(self.scopes):
+            if (other is self or other.sender_id != self.sender_id
+                    or other.ceiling_ts is None
+                    or not is_newer(self.ceiling_ts, other.ceiling_ts)
+                    or not other._preemptable()):
+                continue
+            task = other.task
+            if task is None or task is current or task.done():
+                continue
+            if mutation_in_flight(task):
+                # Mid-mutation of Slack: deferred, not dropped. The mutation's own exit stands
+                # this turn down if it is still eligible then (`_run_deferred_preemption`).
+                if other.preempt_requested_by is None:
+                    other.preempt_requested_by = self.ceiling_ts
+                continue
+            other._stand_down(self.ceiling_ts, task)
+            preempted.append(other.ceiling_ts)
+        return preempted
+
+    def _preemptable(self) -> bool:
+        """Could this turn stand down right now? Open, not already preempted or ending, no local
+        tool started, PENDING and never suppressed, and nothing shown — a 👀 claim aside, which
+        its stand-down takes back."""
+        return (not self._closed and self.preempted_by is None and not self.ending
+                and not self.tools_started and self.state == PENDING
+                and not self._ever_suppressed and not _has_visible_effects(self.turn))
+
+    def _stand_down(self, by: str, task: Any) -> None:
+        self.preempted_by = by
+        self.preempt_requested_by = None
+        task.cancel()
+        logger.info(f"Early stand-down: turn for {self.ceiling_ts} preempted by the same "
+                    f"sender's newer turn {by}")
+
     # --- reconsideration (§4a) ------------------------------------------------------------
+
+    def validate_suppression(self, expected: StaleSendSuppressed) -> None:
+        """Assert the live suppression is still exactly `expected` — the interim-post check
+        (burst follow-ups R2-1). Same identity preconditions as rearm/force, and like them it
+        raises ValueError on any failure; unlike them it changes NOTHING: the lease stays
+        suppressed, so the answer itself still has to pass the rearm → deliver path."""
+        if self.state != SUPPRESSED:
+            raise ValueError(f"interim requires a suppressed lease, not {self.state}")
+        if self._closed:
+            raise ValueError("interim refused: the lease is closed")
+        if expected.lease_token is not self._token:
+            raise ValueError("interim refused: exception is not from this lease")
+        if (expected.scope != self._suppressed_scope
+                or expected.observed_latest_ts != self._suppressed_latest_ts):
+            raise ValueError(
+                "interim refused: exception evidence does not match this lease's suppression")
 
     def rearm_after_reconsideration(self, reviewed_through: Mapping[Scope, str],
                                     expected: StaleSendSuppressed) -> None:
@@ -429,8 +547,116 @@ class TurnSendLease:
             return
         self._closed = True
         self._force_waiver = False
+        # The task→lease map has weak keys but this lease holds its task strongly, so a closed
+        # lease left in it would keep a finished turn's task alive. Removed only if it is still
+        # THIS lease (a task may run more than one turn).
+        task = self.task
+        if task is not None:
+            try:
+                if _TASK_LEASES.get(task) is self:
+                    del _TASK_LEASES[task]
+            except TypeError:      # not weak-referenceable (a stand-in): never registered
+                pass
         if self._watermarks is not None:
             self._watermarks.release(self)
+
+
+def _current_task() -> Optional["asyncio.Task[Any]"]:
+    try:
+        return asyncio.current_task()
+    except RuntimeError:          # no running loop (synchronous callers, tests)
+        return None
+
+
+# EARLY STAND-DOWN's acceptance window. Slack can accept a post, a stream start, a thinking
+# indicator, a status card or a reaction while the lease is still PENDING and before the turn has
+# written down what landed. A cancel in that window would orphan visible content with no receipt,
+# no destination and no cleanup — so every transport method that mutates Slack marks its task as
+# MID-MUTATION for its whole body (acceptance AND accounting), and preemption skips such a task.
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+_VISIBLE_INFLIGHT: "weakref.WeakKeyDictionary[asyncio.Task[Any], int]" = (
+    weakref.WeakKeyDictionary())
+
+
+def visible_mutation(method: Callable[_P, Awaitable[_R]]) -> Callable[_P, Awaitable[_R]]:
+    """Mark the running task as mid-mutation of Slack for the length of `method`."""
+    @functools.wraps(method)
+    async def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        task = _current_task()
+        if task is None:
+            return await method(*args, **kwargs)
+        _VISIBLE_INFLIGHT[task] = _VISIBLE_INFLIGHT.get(task, 0) + 1
+        try:
+            return await method(*args, **kwargs)
+        finally:
+            remaining = _VISIBLE_INFLIGHT.get(task, 1) - 1
+            if remaining > 0:
+                _VISIBLE_INFLIGHT[task] = remaining
+            else:
+                _VISIBLE_INFLIGHT.pop(task, None)
+                _run_deferred_preemption(task)
+    return wrapper
+
+
+# The lease each turn task opened, so a mutation's exit can find a stand-down it deferred.
+_TASK_LEASES: "weakref.WeakKeyDictionary[asyncio.Task[Any], TurnSendLease]" = (
+    weakref.WeakKeyDictionary())
+
+
+def request_stand_down(task: Any, by: str) -> bool:
+    """Ask the turn running in `task` to stand down because `by` covered it — the normal early
+    stand-down, with the same eligibility and cleanup, deferred if it is mid-mutation. Returns
+    whether a lease was found (the turn was admitted). An ineligible turn is left to the stale
+    guard and reconsideration."""
+    try:
+        lease = _TASK_LEASES.get(task)
+    except TypeError:
+        return False
+    if lease is None:
+        return False
+    if task.done() or not lease._preemptable():
+        return True
+    if mutation_in_flight(task):
+        if lease.preempt_requested_by is None:
+            lease.preempt_requested_by = by
+        return True
+    lease._stand_down(by, task)
+    return True
+
+
+def _run_deferred_preemption(task: "asyncio.Task[Any]") -> None:
+    """The task's last Slack mutation just ended — accepted or refused, and accounted for. A
+    stand-down deferred while it ran happens now if the turn is still eligible; the cancel lands
+    at the task's next await. Never raises."""
+    try:
+        lease = _TASK_LEASES.get(task)
+        if lease is None or lease.preempt_requested_by is None:
+            return
+        requested = lease.preempt_requested_by
+        lease.preempt_requested_by = None
+        if lease.task is task and not task.done() and lease._preemptable():
+            lease._stand_down(requested, task)
+    except Exception as e:  # noqa: BLE001 — a missed stand-down leaves today's path intact
+        logger.debug(f"deferred stand-down skipped: {e}")
+
+
+def mutation_in_flight(task: Any) -> bool:
+    """Is this task inside a Slack mutation that has not been accepted/refused and accounted?"""
+    try:
+        return bool(task is not None and _VISIBLE_INFLIGHT.get(task))
+    except TypeError:             # not weak-referenceable (a stand-in): never mid-mutation
+        return False
+
+
+def _has_visible_effects(turn: Any) -> bool:
+    """Has this turn already put something in the room that its ending must account for?"""
+    if turn is None:
+        return False
+    return bool(getattr(turn, "visible_action_committed", False)
+                or getattr(turn, "reaction_committed", False)
+                or getattr(turn, "destinations", None)
+                or getattr(turn, "edits", None))
 
 
 @dataclass
@@ -466,10 +692,15 @@ class ConversationWatermarks:
         never silence an answer, because it never gets here."""
         meta = getattr(message, "metadata", None) or {}
         ts = meta.get("ts")
-        scopes = scopes_for(getattr(message, "channel_id", None), ts,
-                            getattr(message, "thread_id", None), meta.get("sender_id"))
+        scopes = scopes_for_message(message)
+        sender = meta.get("sender_id")
+        task = _current_task()
         lease = TurnSendLease(scopes=scopes, last_seen_ts=str(ts) if ts else None,
-                              ceiling_ts=str(ts) if ts else None, _watermarks=self)
+                              ceiling_ts=str(ts) if ts else None,
+                              sender_id=str(sender) if sender else None,
+                              task=task, _watermarks=self)
+        if task is not None:
+            _TASK_LEASES[task] = lease
         for scope in scopes:
             entry = self._entries.get(scope)
             if entry is None:

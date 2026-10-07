@@ -261,10 +261,12 @@ BUILD_REVISION_TIMEOUT_S = 2.0
 # a bucket and quietly deflates the real one. These sets do not gate behaviour (a line with an
 # unknown value is still written: losing the record is worse than recording an odd label); they
 # make the drift audible in app.log the first time it happens.
+# `superseded` (early stand-down): a newer turn from the same sender began answering while this
+# one had shown nothing, so this one stopped — it rides with `preempted_by`, that turn's ceiling.
 KINDS = frozenset({
     "reply", "delivery_failed", "silence", "reaction_only", "detached", "queued",
     "interrupted", "error", "error_unhandled", "aborted", "empty", "none",
-    "stale_suppressed",
+    "stale_suppressed", "superseded",
 })
 DECLINE_CAUSES = frozenset({
     "superseded", "edit_superseded", "classifier_error", "engine_off", "error", "action_error",
@@ -872,7 +874,8 @@ def reconsider_start(channel_id: Optional[str], trigger_ts: Optional[str], *,
                      turn_id: Optional[str], pass_number: int, scope: Any = None,
                      observed_latest_ts: Any = None, attempt_id: Optional[str] = None,
                      model_attempt_seq: Optional[int] = None,
-                     newer_responder_count: Optional[int] = None) -> None:
+                     newer_responder_count: Optional[int] = None,
+                     tooled: bool = False, recheck: bool = False) -> None:
     """One reconsideration pass opened (v9). Emitted via the structured-decision wrapper's
     `on_attempt_open` callback, after `ModelAttemptSink.open()` and before the request.
 
@@ -890,21 +893,30 @@ def reconsider_start(channel_id: Optional[str], trigger_ts: Optional[str], *,
     unlike `stale_send`, which keeps its `scope[0]`-only field. `attempt_id` is absent on
     ungated channel turns; `model_attempt_seq` is absent when the attempt sink failed to open
     (telemetry never blocks the model call). `newer_responder_count` is how many newer messages
-    the pass's request named as already having their own responder running. Unavailable
-    optional fields are OMITTED — the drop-None rule, never a null."""
+    the pass's request named as already having their own responder running. `tooled` (burst
+    follow-ups R2-5) is written `true` on the one pass per invocation that re-answers with the
+    turn's hosted tools, and omitted on every other pass. `recheck` (R3-2) is written `true` on
+    the tool-free pass that re-decides after a newer owner appeared following a redo decision or
+    the tooled pass — a pass with no suppression event of its own — and omitted otherwise.
+    Unavailable optional fields are OMITTED — the drop-None rule, never a null."""
+    extra: Dict[str, Any] = {"pass": pass_number}
+    if tooled:
+        extra["tooled"] = True
+    if recheck:
+        extra["recheck"] = True
     record("reconsider_start", channel_id=channel_id, trigger_ts=trigger_ts,
            turn_id=turn_id, attempt_id=attempt_id,
            scope=list(scope) if scope is not None else None,
            observed_latest_ts=observed_latest_ts,
            model_attempt_seq=model_attempt_seq,
            newer_responder_count=newer_responder_count,
-           **{"pass": pass_number})
+           **extra)
 
 
 def reconsider_outcome(channel_id: Optional[str], trigger_ts: Optional[str], *,
                        turn_id: Optional[str], outcome: str, passes: int,
                        attempt_id: Optional[str] = None, forced: Optional[bool] = None,
-                       error: Optional[str] = None) -> None:
+                       error: Optional[str] = None, redone: Optional[bool] = None) -> None:
     """How one reconsideration runner invocation ended (v9). At most one per invocation;
     exactly one on every non-cancelled path — on DM turns as well as channel turns
     (STALE_SUPPRESSION_RECONSIDERATION ruling 8; see `reconsider_start`).
@@ -913,12 +925,37 @@ def reconsider_outcome(channel_id: Optional[str], trigger_ts: Optional[str], *,
     records 5, a failure or cancellation records the passes started by then. `forced` rides
     only on posted outcomes (`posted_asis`/`posted_revised`) and is written even when False;
     `error` rides only on `error_dropped`, carrying the §4f subtype. Both are OMITTED when
-    inapplicable — no nulls. A posted outcome asserts PHYSICAL Slack acceptance of the first
-    surface, not finalized turn accounting."""
+    inapplicable — no nulls. `redone` (burst follow-ups R2-5) rides only an invocation that ran
+    its tooled pass: True when the delivered text came from it. A posted outcome asserts
+    PHYSICAL Slack acceptance of the first surface, not finalized turn accounting."""
     _soft_check(outcome, RECONSIDER_OUTCOMES, "reconsider_outcome outcome")
+    extra: Dict[str, Any] = {}
+    if redone is not None:
+        extra["redone"] = redone
     record("reconsider_outcome", channel_id=channel_id, trigger_ts=trigger_ts,
            turn_id=turn_id, attempt_id=attempt_id, outcome=outcome, passes=passes,
-           forced=forced, error=error)
+           forced=forced, error=error, **extra)
+
+
+def fail_card_cleared(channel_id: Optional[str], trigger_ts: Optional[str], *,
+                      card_ts: str, card_trigger_ts: Optional[str] = None,
+                      cause: Optional[str] = None, outcome: Optional[str] = None) -> None:
+    """A "Waiting on Slack" note came down. `trigger_ts` is the CLEARING turn's trigger;
+    `card_trigger_ts` the failed turn's. `outcome` rides only when the bot's own re-run ended
+    without a reply (its turn kind) — a delivered or covering reply carries none."""
+    record("fail_card_cleared", channel_id=channel_id, trigger_ts=trigger_ts, card_ts=card_ts,
+           card_trigger_ts=card_trigger_ts, cause=cause, outcome=outcome)
+
+
+def fail_retry(channel_id: Optional[str], trigger_ts: Optional[str], *, state: str,
+               card_ts: Optional[str] = None, cause: Optional[str] = None,
+               retry_after: Optional[float] = None, covered_by: Optional[str] = None) -> None:
+    """The bot's own re-run of a trigger Slack throttled (message_processor/fail_cards.py):
+    `scheduled` (waiting on Retry-After or the channel's next good fetch), `started` (the normal
+    turn dispatched again) or `covered` (a newer same-sender reply answered it first —
+    `covered_by` is that reply's trigger)."""
+    record("fail_retry", channel_id=channel_id, trigger_ts=trigger_ts, state=state,
+           card_ts=card_ts, cause=cause, retry_after=retry_after, covered_by=covered_by)
 
 
 def queue_link(source_attempt_id: str, *, batched_into_attempt_id: Optional[str],
@@ -1096,7 +1133,9 @@ def turn_outcome(channel_id: Optional[str], trigger_ts: Optional[str], *,
                  attempt_id: Optional[str] = None,
                  reconsider: Optional[Dict[str, Any]] = None,
                  edits: Optional[List[Dict[str, Any]]] = None,
-                 destination_contract_miss: Optional[bool] = None) -> None:
+                 destination_contract_miss: Optional[bool] = None,
+                 preempted_by: Optional[str] = None,
+                 fail_card: Optional[str] = None) -> None:
     """What one turn ended up doing. Exactly one per `turn_start`.
 
     `destinations` is the OBSERVED set — every surface Slack accepted, whether or not it reached
@@ -1147,6 +1186,13 @@ def turn_outcome(channel_id: Optional[str], trigger_ts: Optional[str], *,
     it matters — `finish_attempt` belongs to the gate population, and the ungated channel turns
     that make up most of the selectable ones never emit one, so a miss rate read from the
     terminal alone would be blind to exactly the turns the marker was built for.
+
+    `preempted_by` rides ONLY a `superseded` row: the ceiling ts of the newer same-sender turn
+    whose answering stopped this one (early stand-down).
+
+    `fail_card` rides ONLY a fail-closed row (one carrying `error`): `posted` when the turn's
+    fail-closed card reached the room, `silent` when it was withheld or did not land. The cause is
+    the row's `error` code.
     """
     _soft_check(kind, KINDS, "turn_outcome kind")
     record("turn_outcome", channel_id=channel_id, trigger_ts=trigger_ts, turn_id=turn_id,
@@ -1155,7 +1201,9 @@ def turn_outcome(channel_id: Optional[str], trigger_ts: Optional[str], *,
            chars=chars, detached_started=bool(detached_started), error=error, H=H,
            stream_build_present=bool(stream_build_present), reconsider=reconsider,
            edits=list(edits or []),
-           destination_contract_miss=True if destination_contract_miss else None)
+           destination_contract_miss=True if destination_contract_miss else None,
+           preempted_by=preempted_by if kind == "superseded" else None,
+           fail_card=fail_card if error else None)
 
 
 def emit_turn_outcome(turn: Any, *, channel_id: Optional[str], trigger_ts: Optional[str],
@@ -1203,7 +1251,9 @@ def emit_turn_outcome(turn: Any, *, channel_id: Optional[str], trigger_ts: Optio
             # W4. Read off the runtime like everything else here, so the row cannot disagree
             # with the turn that settled it.
             destination_contract_miss=bool(
-                getattr(turn, "destination_contract_miss", False)))
+                getattr(turn, "destination_contract_miss", False)),
+            preempted_by=getattr(getattr(turn, "send_lease", None), "preempted_by", None),
+            fail_card=getattr(turn, "fail_card", None))
         return True
     except Exception as e:  # noqa: BLE001 — a lost line is never worth a lost turn
         logger.debug(f"Participation turn outcome not written: {e}")

@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import replace
+from types import SimpleNamespace
+from typing import List
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -1104,7 +1106,8 @@ async def test_the_three_budgets_are_independent(client):
     assert history_budget.pages_used <= config.history_page_ceiling
     assert reply_budget.pages_used == 100, "the fan-out leaves the page budget entirely"
     assert origin_budget.pages_used == origin_pages, "and so does the origin"
-    assert result.pages == (history_budget.pages_used, 100, origin_pages)
+    assert (result.pages.history, result.pages.reply, result.pages.origin) == (
+        history_budget.pages_used, 100, origin_pages)
     # ONE SHARED BUDGET COULD NOT HAVE SERVED THIS TURN: the three components spent well past the
     # walk's own ceiling, and a single counter would have refused mid-fan-out.
     assert (history_budget.pages_used + reply_budget.pages_used
@@ -1572,3 +1575,103 @@ async def test_a_dead_unseen_root_is_dropped_and_its_activity_row_cleaned_up(cli
     # `SlackApiError` at the API boundary is what produces the real production shape. Raising
     # `HistoryPageError` from the mocked method instead would inject BELOW that conversion, hit
     # the generic retry handler, and prove nothing about the taxonomy.
+
+
+# ================================ the reply cache (burst follow-ups A)
+
+
+def _threaded_channel(client, n=3, *, latest_suffix="000500"):
+    """n reply-bearing roots on one history page; replies for a root return the root + one reply.
+    Returns the per-root call log (origin fetches excluded)."""
+    roots = _roots(n, start=1700000000)
+    calls: List[str] = []
+
+    async def _replies(**kwargs):
+        ts = kwargs["ts"]
+        if ts != ORIGIN:
+            calls.append(ts)
+        await asyncio.sleep(0)
+        return {"ok": True, "messages": [raw(ts, reply_count=1),
+                                         raw(f"{ts.split('.')[0]}.{latest_suffix}", root=ts)]}
+
+    client.app.client.conversations_history = _walk([
+        [dict(r, reply_count=1, latest_reply=f"{r['ts'].split('.')[0]}.{latest_suffix}")
+         for r in roots]])
+    client.app.client.conversations_replies = AsyncMock(side_effect=_replies)
+    return roots, calls
+
+
+async def _build(client, db=None):
+    return await build_channel_stream(client=client, db=db or _db(), team_id=TEAM,
+                                      channel_id=CH, h=H, origin_root_ts=ORIGIN,
+                                      trigger_ts=ORIGIN)
+
+
+async def test_an_unchanged_root_is_not_fetched_again(client):
+    roots, calls = _threaded_channel(client)
+    first = await _build(client)
+    second = await _build(client)
+    assert len(calls) == len(roots), "each root fetched once across both builds"
+    assert (first.pages.reply, first.pages.reply_cache_hits) == (len(roots), 0)
+    assert (second.pages.reply, second.pages.reply_cache_hits) == (0, len(roots))
+    reply = {m.ts for m in second.stream.pinned.fetch_snapshot}
+    assert {f"{r['ts'].split('.')[0]}.000500" for r in roots} <= reply
+
+
+async def test_a_changed_latest_reply_or_a_dirty_root_is_fetched_again(client):
+    roots, calls = _threaded_channel(client)
+    await _build(client)
+    _threaded_channel(client, latest_suffix="000700")        # every thread got a new reply
+    client.app.client.conversations_replies.reset_mock()
+    changed = await _build(client)
+    assert changed.pages.reply == len(roots) and changed.pages.reply_cache_hits == 0
+
+    dirty_root = roots[0]["ts"]
+    db = _db()
+    db.read_channel_discovery_roots_async = AsyncMock(return_value={
+        "activity_roots": {}, "receipt_roots": (), "dirty_roots": (dirty_root,)})
+    _, calls = _threaded_channel(client, latest_suffix="000700")
+    dirty = await _build(client, db)
+    assert calls == [dirty_root], "only the dirty root goes back to Slack"
+    assert dirty.pages.reply_cache_hits == len(roots) - 1
+
+
+async def test_two_concurrent_builds_make_one_call_per_root(client):
+    roots, calls = _threaded_channel(client)
+    first, second = await asyncio.gather(_build(client), _build(client))
+    assert sorted(calls) == sorted(r["ts"] for r in roots)
+    assert first.pages.reply + second.pages.reply == len(roots)
+    assert first.pages.reply_cache_hits + second.pages.reply_cache_hits == len(roots)
+
+
+async def test_a_shared_fetch_survives_the_cancellation_of_the_turn_that_started_it():
+    """A superseded turn's half-done fetch lands for the newer turn: one Slack call."""
+    from message_processor.reply_cache import ReplyCache
+
+    cache = ReplyCache()
+    release = asyncio.Event()
+    slack_calls: List[str] = []
+    key = ("1700000000.000500", 1, None)
+
+    async def _fetch():
+        slack_calls.append("call")
+        await release.wait()
+        return [SimpleNamespace(ts="1700000000.000500")]
+
+    first = asyncio.ensure_future(cache.get(CH, "1700000000.000000", key, floor_ts=FLOOR,
+                                            high=H, dirty=False, fetch=_fetch))
+    await asyncio.sleep(0)
+    first.cancel()                                          # its turn stood down
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    second = asyncio.ensure_future(cache.get(CH, "1700000000.000000", key, floor_ts=FLOOR,
+                                             high=H, dirty=False, fetch=_fetch))
+    await asyncio.sleep(0)
+    release.set()
+    messages, source = await second
+    assert [m.ts for m in messages] == ["1700000000.000500"] and source == "shared"
+    assert slack_calls == ["call"]
+    # …and it landed in the cache for whoever asks next.
+    _, again = await cache.get(CH, "1700000000.000000", key, floor_ts=FLOOR, high=H,
+                               dirty=False, fetch=_fetch)
+    assert again == "cache" and slack_calls == ["call"]

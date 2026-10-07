@@ -6,10 +6,15 @@ from typing import Any, Awaitable, Callable, Dict, List, NamedTuple, Optional, T
 
 from config import config
 from logger import setup_logger
+from message_processor import gate_context, reply_cache
+from message_processor.participation import describe_attachment
 from slack_client import admission_watermark
 from slack_client._host import _Host
 from slack_client.event_handlers import feedback as feedback_handlers
-from slack_client.normalizer import MUTATION_SUBTYPES, mutation_activity_ts
+from slack_client.formatting.blocks import extract_supplementary_text
+from slack_client.formatting.text import resolve_inbound_mentions
+from slack_client.normalizer import (MUTATION_SUBTYPES, canonical_sender_id,
+                                     mutation_activity_ts)
 
 # Must go through setup_logger: handlers are attached to `slack_bot.*` loggers with
 # propagate=False, so a bare getLogger(__name__) writes to NOWHERE — and the one thing this
@@ -416,6 +421,108 @@ def _admit(client_self, event) -> object:
     return ticket
 
 
+# Slack's own placeholder text for a deleted root that still has replies.
+_TOMBSTONE_TEXT = "This message was deleted."
+
+
+def _gate_context_sender_name(client_self: Any, payload: Dict[str, Any],
+                              sender_id: Optional[str]) -> Optional[str]:
+    """A display name from what is already in hand — the client's user cache, then the names
+    the event itself carries. Never a lookup: this runs before the listener's first await."""
+    cache = getattr(client_self, "user_cache", None)
+    if sender_id and isinstance(cache, dict):
+        info = cache.get(sender_id)
+        # The cohort's own naming (`user_real_name or username`), so the gate block and the
+        # messages it decides about name one person the same way.
+        name = ((info.get("real_name") or info.get("username"))
+                if isinstance(info, dict) else None)
+        if name:
+            return str(name)
+    profile = payload.get("user_profile")
+    if isinstance(profile, dict):
+        name = profile.get("display_name") or profile.get("real_name")
+        if name:
+            return str(name)
+    bot_profile = payload.get("bot_profile")
+    name = payload.get("username") or (
+        bot_profile.get("name") if isinstance(bot_profile, dict) else None)
+    return str(name) if name else None
+
+
+def _gate_context_text(client_self: Any, payload: Dict[str, Any], sender_kind: str) -> str:
+    """The words as the cohort renders them (`_event_to_message`): content Slack delivers outside
+    `text` appended (never for our own posts, whose cards live there), then mentions resolved
+    from the cache with our own dropped. Both steps are pure and synchronous — no lookup warms
+    the cache here, so a never-seen mention renders as `@<id>`, still a visible addressee."""
+    text = str(payload.get("text") or "")
+    if sender_kind != "self":
+        supplementary = extract_supplementary_text(payload, primary_text=text)
+        if supplementary:
+            text = f"{text}\n\n{supplementary}" if text.strip() else supplementary
+    return resolve_inbound_mentions(
+        text, user_cache=getattr(client_self, "user_cache", None),
+        bot_user_id=getattr(client_self, "bot_user_id", None)) or ""
+
+
+def _feed_gate_context(client_self: Any, event: Any, *, from_mention: bool) -> None:
+    """Record one raw channel event in the gate's recent-context ring. SYNCHRONOUS.
+
+    Called from both raw listeners before their first await, so a message is in the ring before
+    any turn it might start can read the ring. Both listeners see a mention; the ring dedupes on
+    (channel, ts), and the app_mention copy never overwrites a newer edit. Edits replace, a
+    deletion or a tombstone removes. Identities come from the event and the in-memory caches.
+
+    Never raises: a missed entry costs the gate one line of context, an exception here costs
+    the event."""
+    try:
+        if not isinstance(event, dict):
+            return
+        channel_id = event.get("channel")
+        if not channel_id or event.get("channel_type") == "im":
+            return
+        subtype = event.get("subtype") or ""
+        if subtype == "message_deleted":
+            prev = event.get("previous_message") or {}
+            gate_context.remove(channel_id, event.get("deleted_ts") or prev.get("ts"))
+            return
+        payload: Any = event
+        if subtype == "message_changed":
+            payload = event.get("message")
+            if not isinstance(payload, dict):
+                return
+            if payload.get("subtype") == "tombstone" or (
+                    (payload.get("text") or "").strip() == _TOMBSTONE_TEXT):
+                gate_context.remove(channel_id, payload.get("ts"))
+                return
+        if (payload.get("subtype") or "") not in gate_context.RECORDABLE_SUBTYPES:
+            return
+        ts = payload.get("ts")
+        if not ts:
+            return
+        sender_kind = client_self.classify_sender(payload)
+        sender_id = canonical_sender_id(client_self, payload)
+        edited = payload.get("edited")
+        reply_count = payload.get("reply_count")
+        files = payload.get("files")
+        gate_context.record(channel_id, gate_context.GateContextEntry(
+            ts=str(ts),
+            thread_ts=str(payload["thread_ts"]) if payload.get("thread_ts") else None,
+            sender_id=sender_id,
+            sender_kind=str(sender_kind),
+            text=_gate_context_text(client_self, payload, str(sender_kind)),
+            attachments=tuple(
+                describe_attachment(f.get("name"), f.get("mimetype"))
+                for f in (files if isinstance(files, list) else []) if isinstance(f, dict)),
+            reply_count=reply_count if isinstance(reply_count, int) else None,
+            sender_name=_gate_context_sender_name(client_self, payload, sender_id),
+            version=(str(edited["ts"]) if isinstance(edited, dict) and edited.get("ts")
+                     else None),
+            is_broadcast=(payload.get("subtype") == "thread_broadcast"),
+        ), from_mention=from_mention)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"gate context feed failed: {e}")
+
+
 class SlackRegistrationMixin(_Host):
     def _register_handlers(self):
         """Register Slack-specific event handlers."""
@@ -429,6 +536,8 @@ class SlackRegistrationMixin(_Host):
             index_ticket = _admit(self, event)
             if hasattr(self, "_feed_actor_tail"):
                 self._feed_actor_tail(event)
+            _feed_gate_context(self, event, from_mention=True)
+            reply_cache.note_inbound_event(event)
             self.log_debug(f"App mention event: channel={event.get('channel')}, ts={event.get('ts')}")
             # F52: record this genuine Slack app_mention so the edit-reply path can tell that a
             # mention-added edit is already covered by Slack's own event (editing to add a mention
@@ -459,6 +568,9 @@ class SlackRegistrationMixin(_Host):
             index_ticket = _admit(self, event)
             if hasattr(self, "_feed_actor_tail"):
                 self._feed_actor_tail(event)
+            _feed_gate_context(self, event, from_mention=False)
+            # Someone else's new reply, edit or deletion drops the reply-cache entries it touches.
+            reply_cache.note_inbound_event(event)
             # F51: ambient capture + lifecycle (edits/deletions) runs FIRST, independent of
             # channel_type and ENABLE_CHANNEL_LISTENING — memory is a distinct setting from
             # whether the bot replies. Never blocks the wake path (offer_event only enqueues).
@@ -528,6 +640,7 @@ class SlackRegistrationMixin(_Host):
         @self.app.event("reaction_added")
         @track_ingress
         async def handle_reaction_added(event):
+            reply_cache.note_inbound_event(event)     # reactions render in the stream
             # Phase H: passive feedback ingestion — thumbs reactions on OUR OWN
             # messages land in the response_feedback sink. Strictly recording:
             # no LLM call, no reply, never raises. Everything else is ignored
@@ -537,6 +650,7 @@ class SlackRegistrationMixin(_Host):
         @self.app.event("reaction_removed")
         @track_ingress
         async def handle_reaction_removed(event):
+            reply_cache.note_inbound_event(event)
             # Nothing to do: reactions are rendered from the channel stream's own fetch, not from
             # in-memory counts that could drift. Registered purely so Bolt acks it instead of
             # logging every removal as an unhandled request.

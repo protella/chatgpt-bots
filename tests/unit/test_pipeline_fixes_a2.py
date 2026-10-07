@@ -8,6 +8,7 @@ Covers:
   F35 — after a failed native ROLL the legacy fallback targets a NEW message, never the
         finished part (via the extracted _legacy_fallback_target helper).
 """
+import logging
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -296,6 +297,10 @@ class _MergeHarness:
     # turns are DMs, where it is unconditionally true — binding the stub would hide that.
     _fail_closed_notice_warranted = staticmethod(
         MessageProcessor._fail_closed_notice_warranted)
+    # The real error-text builder and a real logger: process_message reaches both, and a stub
+    # without them turned every turn into an AttributeError the assertions never got past.
+    _turn_error_message = staticmethod(MessageProcessor._turn_error_message)
+    logger = logging.getLogger("tests.pipeline_fixes_a2")
 
     def __init__(self, manager, thread_state, attach_result, reply=None):
         self.thread_manager = manager

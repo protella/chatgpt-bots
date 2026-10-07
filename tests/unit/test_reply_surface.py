@@ -980,3 +980,31 @@ def test_the_source_no_longer_claims_an_mcp_retry_keeps_its_partial():
     src = inspect.getsource(TextHandlerMixin._handle_streaming_text_response)
     assert "and native_coord.current_ts and not failed_mcp_server" not in src
     assert re.search(r"owned\s*:\s*List\[str\]", src), "expected the owned-surface ledger"
+
+
+# ============================================================ gate-context ring (burst follow-ups)
+
+@pytest.mark.asyncio
+async def test_a_legacy_stream_records_its_final_text_in_the_gate_ring_once(monkeypatch):
+    """The legacy edit loop is the one reply surface the transport cannot record (edits are not
+    replies until the stream ends). Its completion point records the FINAL text, once, under the
+    seed's ts — never a partial update."""
+    from message_processor import gate_context
+
+    monkeypatch.setattr(config, "enable_no_reply_tool", False, raising=False)
+    recorded: List[Any] = []
+    monkeypatch.setattr(gate_context, "record_assistant_reply",
+                        lambda *a, **k: recorded.append(a) or True)
+    slack = FakeSlack(native=False)
+    openai = FakeOpenAI(["The answer ", "is ", "42."])
+    processor = _processor(openai)
+    msg, ts = _message(), _thread_state()
+    turn = _thread_turn(msg)
+
+    await _run(processor, slack, msg, ts, turn)
+
+    assert len(slack.edits) >= 1, "expected the legacy edit loop to carry this reply"
+    assert len(recorded) == 1
+    channel, thread, seed_ts, text = recorded[0]
+    assert (channel, thread, seed_ts) == ("C1", "10.0", slack.posts[0])
+    assert text.startswith("The answer is 42.")

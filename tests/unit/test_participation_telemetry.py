@@ -2029,6 +2029,85 @@ def test_a_turn_cannot_start_more_passes_than_it_had_suppression_events(tmp_path
     assert code == 1 and "reconsider_start_exceeds_stale_send" in names
 
 
+def test_the_checker_grades_the_tooled_pass_and_redone(tmp_path):
+    """Burst follow-ups R3-4: a tooled pass writes no stale_send of its own and is not counted
+    against them; there is at most one; `redone` rides exactly the invocations that ran one."""
+    redo = (_suppression(), _start(1), _start(2, tooled=True))
+    code, names = _run_checker(tmp_path, _reconsider_session(
+        *redo, _outcome(outcome="posted_revised", passes=2, forced=False, redone=True)))
+    assert (code, names) == (0, [])
+    code, names = _run_checker(tmp_path, _reconsider_session(
+        *redo, _outcome(outcome="skipped", passes=2, redone=False)))
+    assert (code, names) == (0, [])
+
+    for rows, expected in [
+        ((*redo, _start(3, tooled=True), _outcome(passes=3, redone=False)),
+         "reconsider_tooled_pass_duplicate"),
+        ((_suppression(), _start(1, tooled=False), _outcome(passes=1)),
+         "reconsider_start_bad_field"),
+        ((_suppression(), _start(1), _outcome(passes=1, redone=False)),
+         "reconsider_outcome_redone_mismatch"),
+        ((*redo, _outcome(passes=2)), "reconsider_outcome_redone_mismatch"),
+        ((*redo, _outcome(outcome="skipped", passes=2, redone=True)),
+         "reconsider_outcome_bad_conditional"),
+    ]:
+        code, names = _run_checker(tmp_path, _reconsider_session(*rows))
+        assert code == 1 and expected in names, (expected, names)
+
+
+def test_the_checker_grades_the_recheck_pass(tmp_path):
+    """Ruling on R3-2/R3-4: a recheck re-decides the suppression its redo decision (or the
+    tooled pass) was made on, so it is not counted against the stale_send rows — but it must
+    follow one, carry the same evidence, and appear at most once."""
+    after_redo = (_suppression(), _start(1), _start(2, recheck=True))
+    code, names = _run_checker(tmp_path, _reconsider_session(
+        *after_redo, _outcome(outcome="posted_asis", passes=2, forced=False)))
+    assert (code, names) == (0, [])
+    after_tooled = (_suppression(), _start(1), _start(2, tooled=True), _start(3, recheck=True))
+    code, names = _run_checker(tmp_path, _reconsider_session(
+        *after_tooled, _outcome(outcome="posted_revised", passes=3, forced=False,
+                                redone=True)))
+    assert (code, names) == (0, [])
+
+    for rows, expected in [
+        ((_suppression(), _start(1, recheck=False), _outcome(passes=1)),
+         "reconsider_start_bad_field"),
+        ((_suppression(), _start(1, recheck=True), _outcome(passes=1)),
+         "reconsider_recheck_without_redo"),
+        ((_suppression(), _start(1), _start(2, recheck=True, observed_latest_ts="3.0"),
+          _outcome(passes=2)), "reconsider_recheck_without_redo"),
+        ((_suppression(), _start(1), _start(2, recheck=True), _start(3, recheck=True),
+          _outcome(passes=3)), "reconsider_recheck_pass_duplicate"),
+        ((_suppression(), _start(1), _start(2, tooled=True), _start(3),
+          _start(4, recheck=True), _outcome(passes=4, redone=False)),
+         "reconsider_recheck_without_redo"),
+    ]:
+        code, names = _run_checker(tmp_path, _reconsider_session(*rows))
+        assert code == 1 and expected in names, (expected, names)
+
+
+def test_the_checker_accepts_a_superseded_turn_with_its_preemptor(tmp_path):
+    rows = _reconsider_session()
+    outcome = next(r for r in rows if r["event"] == "turn_outcome")
+    outcome.update(kind="superseded", preempted_by="12.0")
+    assert _run_checker(tmp_path, rows) == (0, [])
+    outcome.pop("preempted_by")
+    code, names = _run_checker(tmp_path, rows)
+    assert code == 1 and "turn_outcome_bad_preempted_by" in names
+
+
+def test_the_checker_knows_the_reconsider_interim_destination(tmp_path):
+    rows = _reconsider_session(_suppression(), _start(1), _start(2, tooled=True),
+                               _outcome(outcome="skipped", passes=2, redone=False))
+    outcome = next(r for r in rows if r["event"] == "turn_outcome")
+    outcome.update(kind="reply", destinations=[{
+        "channel_id": "C1", "thread_root_ts": "1.0", "first_ts": "3.5", "state": "committed",
+        "chars": 12, "kind": "reconsider_interim"}],
+        reconsider={"outcome": "skipped", "passes": 2, "redone": False})
+    code, names = _run_checker(tmp_path, rows)
+    assert (code, names) == (0, [])
+
+
 def test_at_most_one_reconsider_outcome_per_turn(tmp_path):
     """The once-per-turn gate makes a second runner invocation impossible, so a duplicate is an
     emitter defect in any file, fragment or not."""

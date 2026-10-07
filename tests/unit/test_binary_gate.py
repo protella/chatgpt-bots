@@ -38,7 +38,20 @@ def _source(ts="10.0", text="deploy failed", **kw):
     return SourceMessage(ts=ts, text=text, **kw)
 
 
+def _start_scheduled(coro):
+    """Stand-in for `_schedule_async_call`: take the catch-up's FIRST step, which is where the
+    handler is now invoked (so its call is recorded), then discard the coroutine — the stub
+    handlers here are plain Mocks and nothing awaits their result."""
+    try:
+        coro.send(None)
+    except (StopIteration, TypeError):
+        pass
+    finally:
+        coro.close()
+
+
 # --------------------------------------------------------------------------- the classifier
+
 
 class _WakeSpy:
     """The OpenAI client `classify_wake` is bound to. Keeps the request it would have sent."""
@@ -1106,7 +1119,7 @@ class TestQueueDrainsSkipTheDebounce:
         proc.db = None
         proc._format_user_content_with_username = lambda content, m: content
         proc._add_message_with_token_management = MagicMock()
-        proc._schedule_async_call = MagicMock()
+        proc._schedule_async_call = MagicMock(side_effect=_start_scheduled)
         for name in ("log_info", "log_debug", "log_warning", "log_error"):
             setattr(proc, name, lambda *a, **k: None)
         proc._dispatch_pending_batch = MessageProcessor._dispatch_pending_batch.__get__(proc)

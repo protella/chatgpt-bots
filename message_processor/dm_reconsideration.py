@@ -47,6 +47,10 @@ class DMTurnContext:
     `tool_free_instructions` is the same prompt rendered from the same inputs for a request that
     offers no tool. The reconsideration call sends `tools=[]`, and the turn's own instructions
     describe the tools it HAD — rendered here, beside them, rather than reread or patched later.
+
+    `hosted_only_instructions` is the same prompt once more, for the tooled pass (burst
+    follow-ups R2-3): web search as the user set it, no sandbox, no local tools. None means the
+    turn pinned no such rendering, and its reconsideration is never offered `redo`.
     """
 
     channel_id: str
@@ -58,12 +62,14 @@ class DMTurnContext:
     thread_config: Dict[str, Any] = field(default_factory=dict)
     prompt_cache_key: Optional[str] = None
     tool_free_instructions: Optional[str] = None
+    hosted_only_instructions: Optional[str] = None
 
 
 def pin_dm_turn_context(turn: Any, message: Any, *, thread_config: Dict[str, Any],
                         instructions: str,
                         prompt_cache_key: Optional[str] = None,
-                        tool_free_instructions: Optional[str] = None) -> None:
+                        tool_free_instructions: Optional[str] = None,
+                        hosted_only_instructions: Optional[str] = None) -> None:
     """Record the DM request's evidence on the turn. Idempotent per turn: an MCP retry or a
     non-streaming fallback re-enters the same handler and re-pins the same facts, and the LAST
     request the turn actually sent is the one reconsideration should re-ask under."""
@@ -80,7 +86,8 @@ def pin_dm_turn_context(turn: Any, message: Any, *, thread_config: Dict[str, Any
         instructions=instructions or "",
         thread_config=dict(thread_config or {}),
         prompt_cache_key=prompt_cache_key,
-        tool_free_instructions=tool_free_instructions)
+        tool_free_instructions=tool_free_instructions,
+        hosted_only_instructions=hosted_only_instructions)
 
 
 # ------------------------------------------------------------------------------ the snapshot
@@ -317,8 +324,17 @@ class DMReconsiderSurface:
         text = (self.ctx.trigger_text or "").strip() or "(no text)"
         return f"[{self.ctx.requester_name} ts={self.ctx.trigger_ts}] {text}"
 
+    def _params(self) -> Dict[str, Any]:
+        cfg = self.ctx.thread_config or {}
+        return {"reasoning_effort": cfg.get("reasoning_effort"),
+                "verbosity": cfg.get("verbosity"),
+                "max_output_tokens": cfg.get("max_tokens"),
+                "temperature": cfg.get("temperature"),
+                "prompt_cache_key": self.ctx.prompt_cache_key}
+
     def build_request(self, snapshot: DMSurfaceSnapshot, *, pass_number: int, draft: str,
-                      newer_responder_ts: Optional[Sequence[str]] = None) -> Any:
+                      newer_responder_ts: Optional[Sequence[str]] = None,
+                      allow_redo: bool = False) -> Any:
         """The DM request over the fresh snapshot, plus the ONE appended developer item — the
         same grammar §4d fixes for channels, over the surface a DM actually has. The
         instructions and the sampling settings are the turn's OWN, pinned when it built its
@@ -330,16 +346,34 @@ class DMReconsiderSurface:
         items: List[Dict[str, Any]] = snapshot.input_items()
         items.append(reconsideration_item(pass_number, draft, self.trigger_line(),
                                           tools_used=tools_used_summary(self._turn),
-                                          newer_responder_ts=newer_responder_ts))
-        cfg = self.ctx.thread_config or {}
+                                          newer_responder_ts=newer_responder_ts,
+                                          allow_redo=allow_redo))
         return PreparedDecision(
             instructions=self.ctx.tool_free_instructions or self.ctx.instructions,
-            api_items=items,
-            params={"reasoning_effort": cfg.get("reasoning_effort"),
-                    "verbosity": cfg.get("verbosity"),
-                    "max_output_tokens": cfg.get("max_tokens"),
-                    "temperature": cfg.get("temperature"),
-                    "prompt_cache_key": self.ctx.prompt_cache_key})
+            api_items=items, params=self._params(), allow_redo=allow_redo)
+
+    @property
+    def supports_tooled(self) -> bool:
+        """Can this surface re-ask with tools? Only with the hosted-only rendering pinned."""
+        return self.ctx.hosted_only_instructions is not None
+
+    def build_tooled_request(self, snapshot: DMSurfaceSnapshot, *, pass_number: int) -> Any:
+        """The tooled pass (burst follow-ups R2-3/R2-4): the same snapshot items, the tooled
+        item in place of the quoted draft, the hosted-only instructions pinned with the turn,
+        and the turn's hosted tools."""
+        from message_processor.reconsideration import (PreparedDecision,
+                                                       hosted_reconsideration_tools,
+                                                       tooled_reconsideration_item)
+        from message_processor.tool_registry import SURFACE_DM
+
+        items: List[Dict[str, Any]] = snapshot.input_items()
+        items.append(tooled_reconsideration_item(pass_number, self.trigger_line()))
+        tools = hosted_reconsideration_tools(self._processor, self._turn,
+                                             self.ctx.thread_config, self.model,
+                                             surface=SURFACE_DM)
+        return PreparedDecision(
+            instructions=self.ctx.hosted_only_instructions or "",
+            api_items=items, params=self._params(), tools=tools)
 
 
 __all__ = ["DMTurnContext", "DMSnapshotItem", "DMSurfaceSnapshot", "DMReconsiderSurface",

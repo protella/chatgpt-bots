@@ -52,7 +52,7 @@ import logging
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from config import config
 from message_processor import participation_telemetry
@@ -90,6 +90,12 @@ LEVEL_TO_MODE = {"off": "off", "mentions_only": "tag_only", "on": "auto_respond"
 # The two levels that were merged into `on`. A pre-deploy modal still offers them, and a
 # rollback-and-forward could reintroduce them, so the mapping outlives the migration that ran once.
 _MERGED_INTO_ON = ("judicious", "active")
+
+
+# Burst follow-ups Part A: the caller's synchronous builder of the gate's recent-context block
+# and in-flight lines, handed the cohort the classifier is about to judge (its oldest member
+# bounds "before"). Returns (recent_context, inflight_lines); "" for either means none.
+GateContextBuilder = Callable[[Tuple["SourceMessage", ...]], Tuple[str, str]]
 
 
 def normalize_legacy_level(value: Any) -> Any:
@@ -686,7 +692,8 @@ class ParticipationEngine:
                     and not any((s.text or "").strip() for s in sources))
 
     async def _classify_cohort(self, sources: Tuple[SourceMessage, ...],
-                               channel_steering_text: Optional[str]
+                               channel_steering_text: Optional[str],
+                               context_builder: Optional[GateContextBuilder] = None
                                ) -> Tuple[Optional[bool], Optional[str], int]:
         """The model call, timed, with its failure captured rather than raised: (bit, failure
         type name, ms). Shared by the speculative task and the ordinary post-debounce call so the
@@ -698,13 +705,33 @@ class ParticipationEngine:
 
         A cancellation is a BaseException and so passes straight through the fail-safe below: a
         speculation somebody threw away is not a classifier failure and must not be recorded as
-        one."""
+        one.
+
+        `context_builder` (burst follow-ups Part A) runs synchronously, here, over exactly the
+        cohort being judged — after the debounce, so the block ends where the cohort begins and the
+        in-flight lines describe this moment. A failing builder costs the context, never the
+        call: the gate then asks exactly as it does without one. The two texts are passed only
+        when non-empty."""
+        recent_context, inflight_lines = "", ""
+        if context_builder is not None:
+            try:
+                recent_context, inflight_lines = context_builder(sources)
+            except Exception as e:  # noqa: BLE001 — context is a hint, never a gate failure
+                logger.debug("Wake gate: recent-context build failed (%s); deciding without it",
+                             e)
+                recent_context, inflight_lines = "", ""
+        context_kwargs: Dict[str, str] = {}
+        if recent_context:
+            context_kwargs["recent_context"] = recent_context
+        if inflight_lines:
+            context_kwargs["inflight_lines"] = inflight_lines
         started = time.monotonic()
         raw: Optional[bool] = None
         detail: Optional[str] = None
         try:
             raw = await self.openai_client.classify_wake(
-                sources=sources, channel_steering_text=channel_steering_text)
+                sources=sources, channel_steering_text=channel_steering_text,
+                **context_kwargs)
         except Exception as e:  # noqa: BLE001 — fail-safe is silence, never spam
             detail = type(e).__name__
         return raw, detail, int((time.monotonic() - started) * 1000)
@@ -779,7 +806,9 @@ class ParticipationEngine:
                        carried_sources: Optional[List[SourceMessage]] = None,
                        queue_drained: bool = False,
                        arrival: Optional[Arrival] = None,
-                       attempt_id: Optional[str] = None) -> GateEvaluation:
+                       attempt_id: Optional[str] = None,
+                       gate_context_builder: Optional[GateContextBuilder] = None
+                       ) -> GateEvaluation:
         """Debounce, coalesce, ask once, return one bit.
 
         `decision` is None when there is nothing to act on, and `decline_cause` says which kind of
@@ -801,6 +830,10 @@ class ParticipationEngine:
         Nothing here waits on anything else. The gate does not look at images, does not hold
         ambient work, and has no callback anyone can block on: the ambient worker analyses images
         on its own schedule, immediately, whatever this decides.
+
+        `gate_context_builder` is the caller's synchronous recent-context/in-flight builder
+        (burst follow-ups Part A), run over the cohort at classification time — see
+        `_classify_cohort`. None = no context, today's request.
         """
         key = self._conv_key(channel_id, ts, thread_root_ts, sender_id)
         # Monotonic; a stale caller can't clobber a newer marker.
@@ -893,7 +926,8 @@ class ParticipationEngine:
                 # the time the window closes.
                 speculated_on = self._cohort_fingerprint(cohort_now)
                 speculative = _Speculation(task=asyncio.create_task(
-                    self._classify_cohort(cohort_now, channel_steering_text)))
+                    self._classify_cohort(cohort_now, channel_steering_text,
+                                          gate_context_builder)))
                 # Registered so the NEXT message in this stream can find it and cancel it. Ours
                 # replaces whatever was here; we cancelled that one at enrollment.
                 self._speculations[key] = speculative
@@ -1001,7 +1035,7 @@ class ParticipationEngine:
             await self._abandon_speculation(key, speculative, reason="cohort changed under speculation",
                                             channel_id=channel_id, ts=ts)
             raw, detail, classifier_ms = await self._classify_cohort(
-                sources, channel_steering_text)
+                sources, channel_steering_text, gate_context_builder)
 
         if raw is None:
             # No bit. NOT a decision, and deliberately not dressed as one: the rich gate

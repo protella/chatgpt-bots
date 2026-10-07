@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.4.0] - 2026-10-07
+
+### 🐛 Fixed
+
+- **Quick follow-ups no longer go unanswered.** Sending two or three messages in a row in a busy
+  channel could leave the bot silent: every message made it re-read every thread in the channel
+  from Slack, and Slack started refusing. The bot now remembers threads that haven't changed and
+  re-reads only the ones that have, so a burst costs a handful of reads instead of hundreds.
+- **One answer to a burst, not one per message.** When someone sends a few messages in quick
+  succession, the reply being written for an earlier one now stops as soon as a newer one arrives,
+  and the newest reply covers all of them — including replies that were busy searching the web.
+- **The rethink pass keeps its web search.** When a reply is revised because new messages arrived,
+  the revision can now search the web too, instead of answering as if search were unavailable.
+
+### ✨ Added
+
+- **"Waiting on Slack…" instead of silence.** If Slack is still slowing the bot down when someone
+  talks to it, the bot posts a short "Waiting on Slack… I'll answer as soon as it catches up." note,
+  answers on its own once Slack recovers, and removes the note. A newer message from the same
+  person makes the note unnecessary, and it is removed then too.
+
+### ⚡ Changed
+
+- **Better judgment about when to chime in.** When deciding whether an unaddressed message calls
+  for a reply, the bot now sees the few messages before it and whether it is already answering
+  something, so its call fits the conversation instead of the lone message.
+
 ## [3.3.6] - 2026-10-05
 
 ### 🐛 Fixed

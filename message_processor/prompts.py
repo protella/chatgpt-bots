@@ -58,6 +58,27 @@ Do not wake it for conversation between people that has nothing to do with it, a
 When you are unsure, let the kind of doubt decide. If you cannot tell whether a genuine task or question needs it, wake it: it has the whole conversation and can still choose silence, and you have only what is below. If you cannot tell whether unaddressed banter, a courtesy, or someone talking about their own situation is an invitation, it is not — leave it alone; only banter unmistakably about this assistant itself wakes it, as above."""
 
 
+# Burst follow-ups §A3/§A4: the two sentences the gate's A/B adopted with the recent-context
+# block (variant V4:8). They ship ONLY when the block is enabled
+# (PARTICIPATION_GATE_CONTEXT_MESSAGES > 0); at 0 the gate's developer prompt is the constant above,
+# byte for byte. Wording, anchors and placement are exactly what the A/B measured.
+# The follow-up sentence: its own bullet, directly after the first "Wake it when:" bullet.
+WAKE_FOLLOWUP_ANCHOR = "- someone is talking to it, or about something it is expected to handle;\n"
+WAKE_FOLLOWUP_SENTENCE = ("A message that corrects, narrows, adds to or follows up on something the "
+                          "assistant is answering or has just answered is part of that exchange, "
+                          "and wakes it.")
+# The framing sentence: appended to the opening paragraph, where the prompt describes its input.
+WAKE_CONTEXT_FRAMING_ANCHOR = "whether to run the assistant on the messages below."
+WAKE_CONTEXT_FRAMING_SENTENCE = ("The recent conversation is there so you can tell what the "
+                                 "messages below are responding to; it is not itself what you are "
+                                 "deciding about.")
+WAKE_CLASSIFIER_CONTEXT_PROMPT = (
+    WAKE_CLASSIFIER_SYSTEM_PROMPT
+    .replace(WAKE_FOLLOWUP_ANCHOR, WAKE_FOLLOWUP_ANCHOR + "- " + WAKE_FOLLOWUP_SENTENCE + "\n", 1)
+    .replace(WAKE_CONTEXT_FRAMING_ANCHOR,
+             WAKE_CONTEXT_FRAMING_ANCHOR + " " + WAKE_CONTEXT_FRAMING_SENTENCE, 1))
+
+
 MEMORY_EXTRACTION_SYSTEM_PROMPT = """You maintain a small long-term memory for an AI assistant scoped to ONE Slack channel. After each exchange you decide whether there is a DURABLE, channel-relevant fact worth remembering for future conversations.
 
 WORTH remembering (examples): stable preferences ("they like terse answers"), where things live ("deploys go through #ops"), team conventions, ongoing project context, who owns what, decisions that will matter later.
@@ -847,7 +868,43 @@ RECONSIDERATION_INSTRUCTION = (
     "ever pass and the reply genuinely still belongs, `force_post` delivers without it. If the "
     "room no longer needs the reply, `skip` and it is never posted. When the substance of your "
     "reply has already reached the room through what arrived, a near-duplicate helps no one: "
-    "prefer `skip`, and revise only when you have something the newer messages did not deliver."
+    "prefer `skip`, and revise only when you have something the newer messages did not deliver. "
+    "A revision may use only what the draft established and what the conversation itself says: "
+    "drop, narrow, reorder or reframe, but never add a fact, figure, source or result the draft "
+    "does not contain, and never re-attach the draft's findings to a different subject than the "
+    "one they were found for. If the room now needs facts the draft lacks, a revised post cannot "
+    "provide them."
+)
+
+# Burst follow-ups B7 — appended to the reconsideration item ONLY when `redo` is offered (no
+# newer message has its own owner yet). Explains the fourth decision and the interim line.
+RECONSIDERATION_REDO = (
+    "One more decision is open on this pass. If the newer messages change or extend what was "
+    "asked so that answering well needs work the draft did not do, `redo` discards the draft, "
+    "and you then write one reply covering your trigger and those newer messages together, with "
+    "tools available again; `text` is ignored with `redo`. The combined answer takes a while, "
+    "and the people waiting have just sent several messages with nothing back yet, so with "
+    "`redo` set `interim` to a brief line that posts right away and lets them know you saw all "
+    "of it: in the conversation's own voice, saying what changed, carrying no facts of its own, "
+    "and promising nothing beyond that one combined answer. Leave `interim` null on every "
+    "decision other than `redo`."
+)
+
+# Burst follow-ups R2-4 — the ONE developer item of the tooled pass, which re-answers with the
+# turn's hosted tools after a `redo`. `{n}` is the pass number, `{trigger}` the trigger line.
+# The draft it replaces is deliberately absent: nothing in it carries over.
+RECONSIDERATION_TOOLED = (
+    "You are answering this trigger message:\n{trigger}\n\ntogether with the newer messages "
+    "that appear after it in the stream above, which changed or extended what was asked. This is "
+    "reconsideration pass {n}. The draft written before those messages arrived was discarded and "
+    "is not reproduced here; nothing in it carries over. Write the one reply the room needs now, "
+    "covering the trigger and the newer messages together, using the tools offered in this call "
+    "for whatever it needs. Every fact, figure, source or result in the reply must come from the "
+    "conversation itself or from what your tools establish in this call — never carry a finding "
+    "from one subject over to another. `post` delivers after one more staleness check against "
+    "anything even newer. If the conversation is moving too fast for that check to ever pass and "
+    "the reply genuinely still belongs, `force_post` delivers without it. If the room no longer "
+    "needs a reply at all, `skip`. With `post` or `force_post`, `text` is the complete reply."
 )
 
 # Appended to the reconsideration item only when newer messages already had their own responder

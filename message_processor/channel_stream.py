@@ -47,7 +47,7 @@ from config import config
 from database import is_unattended_summary
 from logger import setup_logger
 import message_processor.prompts as prompts
-from message_processor import dev_barriers
+from message_processor import dev_barriers, fail_cards, reply_cache
 from message_processor.turn_runtime import (AuthorizedEditTarget,
                                             RECEIPT_CLASS_ASSISTANT_REPLY)
 from message_processor.utilities import api_part
@@ -56,8 +56,8 @@ from slack_client import actor_tail as actor_tail_module
 from slack_client import admission_watermark
 from slack_sdk.errors import SlackApiError
 
-from slack_client.history_fetch import (FetchBudget, HistoryPageError, iter_pages,
-                                        page_messages, slack_error_code)
+from slack_client.history_fetch import (FetchBudget, HistoryFetchThrottled, HistoryPageError,
+                                        iter_pages, page_messages, slack_error_code)
 from slack_client.utilities import ACTOR_REMOTE_LOOKUP_DEFAULT
 from slack_client.normalizer import (
     NormalizedMessage,
@@ -239,11 +239,16 @@ class OriginFetchError(ChannelStreamError):
     `HistoryFetchError` and return `history_fetch_failed`.
     """
 
-    def __init__(self, message: str, *, code: Optional[str] = None):
+    def __init__(self, message: str, *, code: Optional[str] = None,
+                 throttled: bool = False, retry_after: Optional[float] = None):
         super().__init__(message)
         # "" / None when the cause carried no Slack code. `None` is NOT a taxonomy match and
         # therefore FAILS CLOSED, which is the allowlist's default.
         self.code = code
+        # Slack THROTTLED the origin read (HistoryFetchThrottled, kept through the wrapping): a
+        # transient failure the bot recovers from itself, with Slack's last Retry-After.
+        self.throttled = throttled
+        self.retry_after = retry_after
 
 
 class SidecarPinMismatch(ChannelStreamError):
@@ -619,12 +624,14 @@ class PinnedTuple:
 class SharedPageCounts(NamedTuple):
     history: int
     reply: int
+    reply_cache_hits: int = 0
 
 
 class PageCounts(NamedTuple):
     history: int                  # each read from its own FetchBudget.pages_used
-    reply: int
+    reply: int                    # Slack calls THIS build made — cache and shared reads excluded
     origin: int
+    reply_cache_hits: int = 0     # roots served by the reply cache or a shared in-flight fetch
 
 
 @dataclass(frozen=True)
@@ -1987,6 +1994,7 @@ def _emit_stream_render(result: StreamBuildResult, *, turn_id: Optional[str],
             turn_id=turn_id, origin_thread_ts=origin_root_ts, trigger_ts=trigger_ts,
             reselected=result.reselected, anchor_advanced=result.anchor_advanced,
             history_pages=result.pages.history, reply_pages=result.pages.reply,
+            reply_cache_hits=result.pages.reply_cache_hits,
             origin_pages=result.pages.origin, build_seq=build_seq,
             **result.stream.stream_render_fields())
     except Exception as e:  # noqa: BLE001
@@ -2116,7 +2124,8 @@ async def fetch_origin_thread(client: Any, channel_id: str, origin_root_ts: Opti
                                empty_fallback=True, deadline_at=budget.deadline_at)
         raise OriginFetchError(
             f"origin thread {channel_id}/{origin_root_ts} could not be read completely: {e}",
-            code=code) from e
+            code=code, throttled=isinstance(e, HistoryFetchThrottled),
+            retry_after=getattr(e, "retry_after", None)) from e
 
     await prime_bot_actor_ids(client, raw)
     messages = _dedup(_normalize_page(client, raw, channel_id=channel_id,
@@ -2202,6 +2211,7 @@ async def build_channel_pin(prepared: PreparedTurn, *, client: Any, db: Any,
     candidates: List[NormalizedMessage] = []
     chrome_ts: set = set()
     reached_floor = True
+    cache_hits = 0        # roots the reply cache (or a shared in-flight fetch) answered
 
     # STEP 3a — F NEWER THAN H. A floor above H selects nothing, so there is no window to fetch:
     # the history walk, stage-2 discovery and the reply fan-out are ALL skipped. Only the history
@@ -2278,6 +2288,13 @@ async def build_channel_pin(prepared: PreparedTurn, *, client: Any, db: Any,
         # history events AND zero discovery candidates. Keying it on the empty walk alone
         # skipped the read above and lost the very reply the index had recorded.
         roots = _discovery_roots(candidates, discovery, h)
+        # THE REPLY CACHE (message_processor/reply_cache.py). Each root's version key: the
+        # parent's latest_reply/reply_count off the history page, and the index's pinned event ts.
+        parents = {m.ts: (m.latest_reply, m.reply_count) for m in candidates
+                   if not m.is_reply and (m.reply_count or m.latest_reply)}
+        activity_versions = dict(discovery.get("activity_roots") or {})
+        dirty_roots = frozenset(str(r) for r in (discovery.get("dirty_roots") or ()))
+        replies_cache = reply_cache.cache()
         if roots:
             semaphore = asyncio.Semaphore(max(1, int(config.reply_fetch_concurrency)))
 
@@ -2289,13 +2306,29 @@ async def build_channel_pin(prepared: PreparedTurn, *, client: Any, db: Any,
                              | {m.thread_root_ts for m in candidates if m.thread_root_ts})
 
             async def _one(root_ts: str) -> Tuple[str, Optional[List[NormalizedMessage]]]:
-                async with semaphore:
-                    try:
-                        return root_ts, await _fetch_replies(
+                nonlocal cache_hits
+                latest_reply, reply_count = parents.get(root_ts, (None, None))
+                key: reply_cache.ReplyKey = (latest_reply, reply_count,
+                                             activity_versions.get(root_ts))
+
+                async def _fetch() -> List[NormalizedMessage]:
+                    async with semaphore:
+                        return await _fetch_replies(
                             client, channel_id=channel_id, team_id=team_id, root_ts=root_ts,
                             floor_ts=effective_floor, floor_inclusive=True, high=h,
                             budget=reply_budget)
-                    except Exception as e:  # noqa: BLE001 — re-raised unless it is THE case
+
+                try:
+                    messages, source = await replies_cache.get(
+                        channel_id, root_ts, key, floor_ts=effective_floor, high=h,
+                        dirty=root_ts in dirty_roots, fetch=_fetch)
+                    if source != reply_cache.SOURCE_FETCHED:
+                        cache_hits += 1
+                        # Read over another build's window: narrowed to this one's.
+                        messages = [m for m in messages
+                                    if in_window(m.ts, effective_floor, True, h)]
+                    return root_ts, messages
+                except Exception as e:  # noqa: BLE001 — re-raised unless it is THE case
                         # THREAD_NOT_FOUND ON AN UNSEEN ROOT: DROP, DON'T DIE. The code comes
                         # from the same wrap order §2e's taxonomy uses, never from a string
                         # match. An unseen root is old — a fresh one would sit in history — so
@@ -2331,6 +2364,8 @@ async def build_channel_pin(prepared: PreparedTurn, *, client: Any, db: Any,
                     await _clear_dirty(db, team_id=team_id, channel_id=channel_id,
                                        root_ts=root_ts, event_ts=indexed[root_ts])
             candidates = _dedup(candidates)
+        # The channel keeps the roots of its most recent window and nothing older.
+        replies_cache.retain(channel_id, roots)
 
     # READ 2a — THE RENDER PIN over the PERIPHERY candidate identities.
     raw = await db.read_channel_sidecars_for_async(
@@ -2372,7 +2407,8 @@ async def build_channel_pin(prepared: PreparedTurn, *, client: Any, db: Any,
         capability_profile_hash=capability_profile_hash,
         tool_schema_version=tool_schema_version,
         pages=SharedPageCounts(history=history_budget.pages_used,
-                               reply=reply_budget.pages_used))
+                               reply=reply_budget.pages_used,
+                               reply_cache_hits=cache_hits))
 
 
 def _select_floor(eligible: Sequence[NormalizedMessage], *, floor_read: Optional[str],
@@ -2654,9 +2690,12 @@ async def build_channel_stream(*, client: Any, db: Any, team_id: str, channel_id
     result = StreamBuildResult(
         stream=stream, reselected=shared.reselected, anchor_advanced=anchor_advanced,
         pages=PageCounts(history=shared.pages.history, reply=shared.pages.reply,
-                         origin=origin_pages))
+                         origin=origin_pages,
+                         reply_cache_hits=shared.pages.reply_cache_hits))
     _emit_stream_render(result, turn_id=turn_id, origin_root_ts=origin_root_ts,
                         trigger_ts=trigger_ts)
+    # Slack answered this channel's fetches: any throttled turn here waiting on that re-runs.
+    fail_cards.fetch_succeeded(channel_id)
     return result
 
 
@@ -2709,11 +2748,14 @@ async def build_reconsideration_snapshot(*, client: Any, db: Any, team_id: str, 
     stream = serialize_stream(pinned)
 
     # No anchor persist, no actor-tail reconcile, no `_emit_stream_render` — the snapshot reads
-    # the world and writes nothing durable about having done so.
+    # the world and writes nothing durable about having done so. (A throttled turn waiting on
+    # this channel's next good fetch is in-memory signalling, not a durable write.)
+    fail_cards.fetch_succeeded(channel_id)
     return StreamBuildResult(
         stream=stream, reselected=shared.reselected, anchor_advanced=False,
         pages=PageCounts(history=shared.pages.history, reply=shared.pages.reply,
-                         origin=origin_pages))
+                         origin=origin_pages,
+                         reply_cache_hits=shared.pages.reply_cache_hits))
 
 
 def _freeze_sidecars(payload: Optional[Dict[str, Any]]) -> SidecarPin:

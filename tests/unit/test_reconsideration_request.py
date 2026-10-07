@@ -554,3 +554,152 @@ def test_wrapper_is_exposed_through_openai_base():
             is responses_api.STALE_RECONSIDERATION_RESPONSE_FORMAT)
     assert (openai_base.STALE_RECONSIDERATION_DECISION_SCHEMA
             is responses_api.STALE_RECONSIDERATION_DECISION_SCHEMA)
+
+
+# ------------------------------------------------------------------ burst follow-ups: redo + tooled
+
+
+def _prepared(**mode):
+    from message_processor.reconsideration import PreparedDecision
+
+    return PreparedDecision(
+        instructions="INSTR", api_items=[{"role": "user", "content": "stream"}],
+        params={"reasoning_effort": "medium", "verbosity": "low", "max_output_tokens": 512,
+                "temperature": 0.7, "prompt_cache_key": "chan:T1:C1"}, **mode)
+
+
+async def _decide_via_base(fake, prepared):
+    """Through the OpenAIClient wrapper (codex R1 #6), with the prepared pass's own mode."""
+    return await openai_base.OpenAIClient.create_reconsideration_decision(
+        fake, input_items=prepared.api_items, instructions=prepared.instructions,
+        model="gpt-5.6-sol", allow_redo=prepared.allow_redo, tools=prepared.tools,
+        **prepared.params)
+
+
+@pytest.mark.parametrize("mode", [{}, {"allow_redo": True},
+                                  {"tools": [{"type": "web_search"}]}])
+async def test_the_count_and_the_create_send_the_same_body_in_every_mode(mode):
+    """B8 / R2-3: one prepared object feeds both — the counted kwargs ARE the sent kwargs."""
+    prepared = _prepared(**mode)
+    payload = ({"decision": "skip", "text": None, "interim": None} if mode.get("allow_redo")
+               else {"decision": "skip", "text": None})
+    fake = _FakeAPI(response=_response(payload))
+    await _decide_via_base(fake, prepared)
+    counted = responses_api.build_reconsideration_create_kwargs(prepared, model="gpt-5.6-sol")
+    assert fake.calls[0] == counted
+
+
+async def test_a_request_that_does_not_offer_redo_is_byte_identical_to_today():
+    legacy = await _decide(_FakeAPI(response=_response({"decision": "skip", "text": None})))
+    assert legacy.interim is None and legacy.tools_used == ()
+    fake = _FakeAPI(response=_response({"decision": "skip", "text": None}))
+    await _decide_via_base(fake, _prepared())
+    assert fake.calls[0]["text"]["format"] == responses_api.STALE_RECONSIDERATION_RESPONSE_FORMAT
+    assert fake.calls[0]["tools"] == [] and "include" not in fake.calls[0]
+
+
+async def test_an_offered_redo_sends_the_redo_schema_and_keeps_its_interim():
+    fake = _FakeAPI(response=_response(
+        {"decision": "redo", "text": "stale words", "interim": "Re-checking with Kyiv too."}))
+    decision = await _decide_via_base(fake, _prepared(allow_redo=True))
+    assert fake.calls[0]["text"]["format"] == (
+        responses_api.STALE_RECONSIDERATION_REDO_RESPONSE_FORMAT)
+    assert fake.calls[0]["text"]["format"]["schema"]["properties"]["decision"]["enum"] == [
+        "post", "force_post", "skip", "redo"]
+    assert (decision.decision, decision.text) == ("redo", None)     # text on redo dropped
+    assert decision.interim == "Re-checking with Kyiv too."
+
+
+async def test_an_interim_on_any_other_decision_is_dropped():
+    fake = _FakeAPI(response=_response(
+        {"decision": "post", "text": "revised", "interim": "should not post"}))
+    decision = await _decide_via_base(fake, _prepared(allow_redo=True))
+    assert (decision.decision, decision.text, decision.interim) == ("post", "revised", None)
+    assert any("interim" in warning for warning in fake.warnings)
+
+
+@pytest.mark.parametrize("payload,allow_redo", [
+    ({"decision": "redo", "text": None}, False),                    # redo never offered
+    ({"decision": "redo", "text": None, "interim": None}, False),   # wrong key set too
+    ({"decision": "post", "text": None}, True),                     # offered mode needs interim
+])
+async def test_the_parse_requires_the_modes_exact_shape(payload, allow_redo):
+    fake = _FakeAPI(response=_response(payload))
+    with pytest.raises(responses_api.ReconsiderationDecisionError) as exc:
+        await _decide_via_base(fake, _prepared(allow_redo=allow_redo))
+    assert exc.value.detail == "schema_invalid"
+
+
+async def test_the_tooled_pass_sends_the_hosted_tools_and_harvests_what_completed():
+    output = [
+        SimpleNamespace(type="web_search_call", status="completed",
+                        action=SimpleNamespace(type="search", query="kyiv weather now",
+                                               sources=None)),
+        SimpleNamespace(type="web_search_call", status="failed", action=None),
+        SimpleNamespace(type="mcp_call", status="completed", server_label="menus",
+                        error=None, output="42 items"),
+        SimpleNamespace(type="mcp_call", status="completed", server_label="broken",
+                        error="boom", output=None),
+        SimpleNamespace(type="message", content=[SimpleNamespace(
+            type="output_text", annotations=[],
+            text=json.dumps({"decision": "post", "text": "Kyiv 9°C, London 14°C."}))]),
+    ]
+    fake = _FakeAPI(response=SimpleNamespace(status="completed", incomplete_details=None,
+                                             output=output, usage=None))
+    tools = [{"type": "web_search"}, {"type": "mcp", "server_label": "menus"}]
+    decision = await _decide_via_base(fake, _prepared(tools=tools))
+
+    params = fake.calls[0]
+    assert params["tools"] == tools
+    assert params["include"] == ["web_search_call.results"]
+    assert params["text"]["format"] == responses_api.STALE_RECONSIDERATION_RESPONSE_FORMAT
+    assert (decision.decision, decision.text) == ("post", "Kyiv 9°C, London 14°C.")
+    assert decision.tools_used == ("web_search", "menus")
+    assert {r["tool_name"] for r in decision.tool_results} == {"web_search", "menus"}
+
+
+@pytest.mark.parametrize("text", [None, "   "])
+async def test_a_tooled_post_without_text_is_schema_invalid(text):
+    """R2-4: there is no draft to fall back to."""
+    fake = _FakeAPI(response=_response({"decision": "post", "text": text}))
+    with pytest.raises(responses_api.ReconsiderationDecisionError) as exc:
+        await _decide_via_base(fake, _prepared(tools=[{"type": "web_search"}]))
+    assert exc.value.detail == "schema_invalid"
+
+
+def test_the_redo_explanation_rides_the_item_only_when_offered():
+    from message_processor.reconsideration import reconsideration_item
+
+    base = reconsideration_item(1, "the draft", "[Alice ts=10.0] hi")
+    assert reconsideration_item(1, "the draft", "[Alice ts=10.0] hi", allow_redo=False) == base
+    offered = reconsideration_item(1, "the draft", "[Alice ts=10.0] hi", allow_redo=True)
+    assert prompts.RECONSIDERATION_REDO in offered["content"]
+    assert prompts.RECONSIDERATION_REDO not in base["content"]
+    # B7: every tool-free pass carries the honesty rule.
+    assert "never re-attach the draft's findings" in base["content"]
+
+
+def test_hosted_only_assembly_offers_exactly_the_hosted_tools():
+    """R2-3: web search as the user set it and the given hosted list on the wire; no sandbox,
+    no canvases, no local tools, no tool contract."""
+    ctx = _ctx(_everything_on_config())
+    processor = _processor()
+    registry = MagicMock()
+    hosted = [{"type": "web_search"}, {"type": "mcp", "server_label": "menus"}]
+    request = channel_request.assemble_channel_request(
+        processor=processor, client=SimpleNamespace(bot_user_id="U_BOT"), ctx=ctx,
+        model="gpt-5.5", tools=hosted, request_config={"enable_web_search": True},
+        contract_suffix="[CONTRACT]", registry=registry, tool_mode="hosted_only")
+
+    assert request.tools == hosted
+    call = processor._get_system_prompt.call_args
+    assert call.args[6] is True                                 # web search, as set
+    assert call.kwargs["code_interpreter_enabled"] is False
+    assert call.kwargs["tools_available"] is False
+    assert call.kwargs["tools_structurally_withheld"] is False
+    developer = request.input_items[-1]["content"]
+    assert "model: gpt-5.5" in developer
+    assert "web search: available" in developer
+    assert "code interpreter" not in developer
+    assert "[CONTRACT]" not in developer
+    registry.schemas.assert_not_called()

@@ -225,10 +225,14 @@ def test_the_gate_keeps_its_own_reasoning_effort():
 # ----------------------------------------------------------------- the prompt
 
 @pytest.mark.asyncio
-async def test_the_prompt_carries_every_source_in_order_with_who_and_where():
+async def test_the_prompt_carries_every_source_in_order_with_who_and_where(monkeypatch):
     """The cohort is the input. Each source appears once, oldest first, with sender and topology —
     the facts that decide whether a burst is one thought or two people talking, and exactly what
     the old flattened "earlier in this burst: …" prose lost."""
+    from config import config
+
+    # The context block disabled: the developer prompt is the bare binary-gate prompt.
+    monkeypatch.setattr(config, "participation_gate_context_messages", 0, raising=False)
     sources = (
         SourceMessage(ts="1700000001.000100", text="quick q about the export",
                       sender_id="U1", sender_name="Peter", sender_type="human"),

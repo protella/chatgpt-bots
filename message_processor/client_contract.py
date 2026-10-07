@@ -289,7 +289,7 @@ class BaseClient(ABC, LoggerMixin):
         pass
     
     async def handle_error(self, channel_id: str, thread_id: str, error: str,
-                           lease: Any = None, receipts: Any = None):
+                           lease: Any = None, receipts: Any = None) -> Optional[str]:
         """Default error handler.
 
         `lease` (stale guard): an error notice is TERMINAL — on a turn with no thinking surface
@@ -307,8 +307,11 @@ class BaseClient(ABC, LoggerMixin):
         formatted_error = self.format_error_message(error)
         # Spec §4: an error notice is a system_notice, stamped here — the one producer of
         # this surface — whatever ledger it settles under.
-        await self.send_message_async(channel_id, thread_id, formatted_error, lease=lease,
-                                      receipts=receipts, receipt_class="system_notice")
+        # Returns the notice's ts (None when nothing landed), so a fail-closed card can be found
+        # and taken down again once the conversation works (message_processor/fail_cards.py).
+        return await self.send_message_async(channel_id, thread_id, formatted_error,
+                                             lease=lease, receipts=receipts,
+                                             receipt_class="system_notice")
     
     def format_error_message(self, error: str) -> str:
         """Format error messages for display (can be overridden by platform-specific clients)"""

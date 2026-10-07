@@ -679,13 +679,34 @@ def reconsideration_profile(thread_config: Optional[Dict[str, Any]], *,
     return profile
 
 
+# `assemble_channel_request(tool_mode=...)`: the reconsideration's tooled pass (burst follow-ups
+# R2-3) offers the turn's HOSTED tools and nothing else.
+TOOL_MODE_HOSTED_ONLY = "hosted_only"
+
+
+def hosted_only_profile(thread_config: Optional[Dict[str, Any]], *,
+                        model: Optional[str]) -> Dict[str, Any]:
+    """The tooled pass's capability profile (burst follow-ups R2-3): a non-mutating COPY of the
+    pinned profile with web search and MCP exactly as the turn had them, and everything that is
+    not a hosted tool the pass offers turned off — the sandbox, canvases, image generation —
+    with `model` set to the one called, so the instructions, the capability suffix and the hash
+    describe the request actually sent."""
+    profile = dict(thread_config or {})
+    profile["enable_code_interpreter"] = False
+    profile["enable_canvas_tools"] = False
+    profile["image_model"] = None
+    profile["model"] = model
+    return profile
+
+
 def assemble_channel_request(*, processor: Any, client: Any, ctx: ChannelTurnContext,
                              model: Optional[str], tools: Optional[List[Dict[str, Any]]],
                              request_config: Optional[Dict[str, Any]],
                              contract_suffix: Optional[str],
                              registry: Any = None,
                              reply_destination: Optional[str] = None,
-                             no_tools: bool = False) -> ChannelRequest:
+                             no_tools: bool = False,
+                             tool_mode: Optional[str] = None) -> ChannelRequest:
     """Assemble ONE channel turn's request. Both text handlers converge here.
 
     `model` and `tools` are the only fork-local inputs: a timeout retry sends a different model
@@ -699,7 +720,15 @@ def assemble_channel_request(*, processor: Any, client: Any, ctx: ChannelTurnCon
     request that genuinely offers no tool. The instructions and suffix also drop the web-search
     line: the normalized profile's `False` is ours, not the user's setting, and rendering it as
     one told a user search was off right after the draft had searched.
+
+    `tool_mode="hosted_only"` is the tooled reconsideration pass (burst follow-ups R2-3): the
+    profile goes through `hosted_only_profile`, `registry` and `contract_suffix` are forced to
+    None, and `tools` — the caller's hosted list — is sent as given. The instructions and the
+    capability suffix then describe exactly those hosted tools: web search as the user set it,
+    no sandbox, no local tool etiquette.
     """
+    if tool_mode is not None and tool_mode != TOOL_MODE_HOSTED_ONLY:
+        raise ValueError(f"unknown channel tool_mode {tool_mode!r}")
     if no_tools:
         profile = reconsideration_profile(ctx.thread_config, model=model)
         ctx = replace(ctx, thread_config=profile)
@@ -707,6 +736,13 @@ def assemble_channel_request(*, processor: Any, client: Any, ctx: ChannelTurnCon
         registry = None
         contract_suffix = None
         tools = []
+    elif tool_mode == TOOL_MODE_HOSTED_ONLY:
+        profile = hosted_only_profile(ctx.thread_config, model=model)
+        ctx = replace(ctx, thread_config=profile)
+        request_config = profile
+        registry = None
+        contract_suffix = None
+        tools = list(tools or [])
     stream = ctx.stream
     instructions = _channel_instructions(processor, client, ctx, registry=registry,
                                          tools_structurally_withheld=no_tools)

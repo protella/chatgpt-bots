@@ -849,6 +849,22 @@ class BotConfig:
     # PARTICIPATION_DEBOUNCE_SECONDS above, and there is deliberately no second time constant.
     # Eviction can lose nothing anyone said: the map holds timestamps, never messages.
     participation_activity_lru_max: int = field(default_factory=lambda: int(os.getenv("PARTICIPATION_ACTIVITY_LRU_MAX", "1024")))
+    # --- Gate recent context (message_processor/gate_context.py) ---
+    # A short "what was just said" block for the wake gate, read from an in-memory per-channel
+    # ring fed by inbound message events and by our own accepted replies. No Slack call on the
+    # gate path: a cold ring (restart, quiet channel) renders an empty block and the gate decides
+    # exactly as it does without one. The channel-count bound reuses
+    # PARTICIPATION_ACTIVITY_LRU_MAX above.
+    # How many recent messages the gate is shown. 0 disables the block entirely (and the two
+    # context sentences in the gate prompt), which keeps the gate request byte-identical to the
+    # request without context. 8 and the 400-char cap below are the A/B's winning setting
+    # (burst follow-ups §A4: real prod decisions, gpt-6-luna, 3 reps).
+    participation_gate_context_messages: int = field(default_factory=lambda: int(os.getenv("PARTICIPATION_GATE_CONTEXT_MESSAGES", "8")))
+    # Per-message text cap (chars) inside that block.
+    participation_gate_context_chars: int = field(default_factory=lambda: int(os.getenv("PARTICIPATION_GATE_CONTEXT_CHARS", "400")))
+    # Per-channel ring capacity — a resource cap, not a behaviour tunable. Keep it at or above
+    # PARTICIPATION_GATE_CONTEXT_MESSAGES; 0 stops recording.
+    participation_gate_context_max: int = field(default_factory=lambda: int(os.getenv("PARTICIPATION_GATE_CONTEXT_MAX", "40")))
     # F52: an EDIT to a recent human message can also drive a reply. A forgotten @mention ADDED
     # by an edit routes as an addressed wake (Slack fires no app_mention for edits); every other
     # channel edit goes through the participation engine's full typo-vs-meaning judgment, so a

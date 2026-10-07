@@ -245,6 +245,194 @@ def test_newer_responding_ts_counts_a_suppressed_lease_and_dedups_across_scopes(
     assert me.newer_responding_ts() == ["101.0", "102.0", "103.0"]
 
 
+def test_newer_deciding_ts_names_newer_open_leases_that_are_not_responding():
+    """Burst follow-ups R1-B 4: a newer turn still in its gate (or waiting on the lock) may yet
+    own an answer, so redo is withheld while one is open."""
+    marks = ConversationWatermarks()
+    me = marks.begin_turn(_msg("100.0"))
+    deciding = marks.begin_turn(_msg("101.0"))
+    running = marks.begin_turn(_msg("102.0"))
+    running.responding = True
+    gone = marks.begin_turn(_msg("103.0"))
+    gone.close()
+    assert deciding.ceiling_ts == "101.0"
+    assert me.newer_deciding_ts() == ["101.0"]
+    deciding.close()
+    assert me.newer_deciding_ts() == []
+
+
+def test_validate_suppression_checks_identity_and_changes_nothing():
+    """Burst follow-ups R2-1: the interim's only lease API. It passes for this lease's live
+    suppression and leaves the lease suppressed; anything else raises ValueError."""
+    marks = ConversationWatermarks()
+    lease = marks.begin_turn(_msg("100.0"))
+    other = marks.begin_turn(_msg("100.0", sender="U2"))
+    marks.begin_turn(_msg("101.0"))
+    with pytest.raises(StaleSendSuppressed) as caught:
+        lease.authorize("final_post")
+    lease.validate_suppression(caught.value)
+    assert lease.state == SUPPRESSED and lease._force_waiver is False
+
+    marks.begin_turn(_msg("101.5", thread="100.0", sender="U2"))
+    with pytest.raises(StaleSendSuppressed) as foreign:
+        other.authorize("final_post")
+    with pytest.raises(ValueError):
+        lease.validate_suppression(foreign.value)            # another lease's exception
+    lease.close()
+    with pytest.raises(ValueError):
+        lease.validate_suppression(caught.value)             # closed
+    fresh = marks.begin_turn(_msg("200.0", thread="200.0"))
+    with pytest.raises(ValueError):
+        fresh.validate_suppression(caught.value)             # not suppressed at all
+
+
+@pytest.mark.asyncio
+async def test_a_same_sender_newer_turn_preempts_only_an_older_quiet_pending_turn():
+    """EARLY STAND-DOWN: the newer turn starting to answer cancels the same person's older
+    turns that have shown nothing — and nothing else: not another sender's, not a committed or
+    suppressed one, not one already ending or with something visible, never a newer one."""
+    marks = ConversationWatermarks()
+    parked = asyncio.Event()
+
+    def _turn_task():
+        return asyncio.ensure_future(parked.wait())
+
+    quiet = marks.begin_turn(_msg("100.0"))
+    stranger = marks.begin_turn(_msg("100.1", thread="100.0", sender="U2"))
+    committed = marks.begin_turn(_msg("100.2"))
+    committed.commit()
+    suppressed = marks.begin_turn(_msg("100.3"))
+    suppressed.state, suppressed._ever_suppressed = SUPPRESSED, True
+    rearmed = marks.begin_turn(_msg("100.4"))
+    rearmed._ever_suppressed = True                 # PENDING again, but the runner's
+    ending = marks.begin_turn(_msg("100.5"))
+    ending.ending = True
+    visible = marks.begin_turn(_msg("100.6"))
+    visible.turn = SimpleNamespace(visible_action_committed=True, reaction_committed=False,
+                                   destinations=[], edits=[])
+    leases = [quiet, stranger, committed, suppressed, rearmed, ending, visible]
+    me = marks.begin_turn(_msg("101.0"))
+    later = marks.begin_turn(_msg("102.0"))
+    for lease in (*leases, later):
+        lease.task = _turn_task()
+
+    assert me.preempt_older_same_sender() == ["100.0"]
+    await asyncio.sleep(0)
+    assert quiet.preempted_by == "101.0" and quiet.task.cancelled()
+    for lease in (*leases[1:], later):
+        assert lease.preempted_by is None and not lease.task.done()
+    assert me.preempt_older_same_sender() == []            # once only
+    parked.set()
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_a_turn_mid_slack_mutation_is_never_preempted():
+    """R4 #2: Slack may accept the post while the lease is still PENDING. A turn inside a
+    transport mutation is skipped until the mutation (and its accounting) is over."""
+    from message_processor.stale_send_guard import visible_mutation
+
+    marks = ConversationWatermarks()
+    accepting = asyncio.Event()
+    release = asyncio.Event()
+
+    @visible_mutation
+    async def _post():
+        accepting.set()
+        await release.wait()
+
+    older = marks.begin_turn(_msg("100.0"))
+    older.task = asyncio.ensure_future(_post())
+    await accepting.wait()
+    newer = marks.begin_turn(_msg("101.0"))
+    assert newer.preempt_older_same_sender() == []
+    assert older.preempted_by is None and not older.task.done()
+    assert older.preempt_requested_by == "101.0"           # deferred, not dropped
+    release.set()
+    await older.task
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_landing_in_the_drain_still_releases_the_conversation_lock():
+    """R4 #1: the lease is marked ending before cleanup, and the lock release survives a
+    cancellation that lands in the drain — or every later message would queue forever."""
+    from message_processor.client_contract import Message
+    from message_processor.base import MessageProcessor
+    from message_processor.turn_runtime import TurnRuntime
+
+    draining = asyncio.Event()
+
+    class _Proc:
+        process_message = MessageProcessor.process_message
+
+        def __init__(self):
+            from message_processor.thread_manager import AsyncThreadStateManager
+            self.thread_manager = AsyncThreadStateManager(db=None)
+            self.db = None
+
+        def log_info(self, *a, **k): pass
+        def log_debug(self, *a, **k): pass
+        def log_warning(self, *a, **k): pass
+        def log_error(self, *a, **k): pass
+
+        async def _dispatch_pending_batch(self, *a, **k):
+            draining.set()
+            await asyncio.Event().wait()
+
+        async def _notify_drain_failure(self, *a, **k): return None
+
+    async def _raise(*a, **k):
+        raise StaleSendSuppressed(scope=("top", "C1", "U1"), last_seen_ts="100.0",
+                                  observed_latest_ts="101.0", surface="final_post")
+
+    proc = _Proc()
+    proc._get_or_rebuild_thread_state = _raise
+    proc.get_or_create_channel_thread_state = _raise
+    message = Message(text="q", user_id="U1", channel_id="C1", thread_id="100.0",
+                      metadata={"ts": "100.0", "sender_id": "U1"})
+    turn = TurnRuntime.for_message(message, channel_post_allowed=False)
+    turn.send_lease = ConversationWatermarks().begin_turn(message)
+    task = asyncio.ensure_future(proc.process_message(message, client=MagicMock(),
+                                                      thinking_id=None, turn=turn))
+    await draining.wait()
+    assert turn.send_lease.ending is True
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert proc.thread_manager.is_thread_processing("100.0", "C1") is False
+
+
+@pytest.mark.asyncio
+async def test_a_turn_that_started_a_tool_is_never_preempted():
+    """Eligibility, not armor: once a turn admits a tool call its work may run on in tasks of
+    its own, so only a turn still in its first model call stands down."""
+    from message_processor.turn_runtime import TurnRuntime
+
+    marks = ConversationWatermarks()
+    parked = asyncio.Event()
+    tooled = marks.begin_turn(_msg("100.0"))
+    drafting = marks.begin_turn(_msg("100.5"))
+    for lease in (tooled, drafting):
+        lease.turn = TurnRuntime()
+        lease.turn.send_lease = lease
+        lease.task = asyncio.ensure_future(parked.wait())
+    tooled.turn.open_tool_flight(call_id="c1", tool_name="fetch_url", fingerprint="f",
+                                 timeout=5.0)
+    assert tooled.tools_started and not drafting.tools_started
+
+    newer = marks.begin_turn(_msg("101.0"))
+    assert newer.preempt_older_same_sender() == ["100.5"]
+    await asyncio.sleep(0)
+    assert drafting.task.cancelled() and not tooled.task.done()
+    parked.set()
+    await tooled.task
+
+
+def test_begin_turn_records_the_sender_and_no_task_outside_a_loop():
+    lease = ConversationWatermarks().begin_turn(_msg("100.0", sender="U7"))
+    assert (lease.sender_id, lease.task, lease.preempted_by) == ("U7", None, None)
+
+
 # ------------------------------------------------------------------------- what this turn owns
 
 def test_absorbing_a_batched_source_keeps_the_turn_current():

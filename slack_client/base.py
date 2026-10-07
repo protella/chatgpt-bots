@@ -5,6 +5,7 @@ from slack_bolt.async_app import AsyncApp
 
 from message_processor.client_contract import BaseClient
 from config import config
+from message_processor import reply_cache
 from slack_client.markdown_converter import MarkdownConverter
 from database import DatabaseManager
 from slack_client.settings_modal import SettingsModal
@@ -72,6 +73,9 @@ class SlackBot(SlackMessageEventsMixin,  # type: ignore[misc]
     def __init__(self, message_handler: Optional[Callable] = None):
         super().__init__("SlackBot")
         self.app = AsyncApp(token=config.slack_bot_token)
+        # Our own posts, edits, deletes, streams and reactions drop the reply-cache entries they
+        # touch — Bolt never shows us our own events, so this is the one place they are seen.
+        reply_cache.install_on_client(self.app.client)
         self.handler = None
         self.message_handler = message_handler  # Callback for processing messages
         self.markdown_converter = MarkdownConverter(platform="slack")

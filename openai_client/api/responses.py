@@ -12,6 +12,7 @@ from openai_client.container_errors import (demote_container_tools, is_container
                                             mark_adoption_blocked, mark_container_wedged,
                                             persistent_container_ids)
 from message_processor.prompts import (MEMORY_EXTRACTION_SYSTEM_PROMPT, TOOL_RESULT_SUMMARIZE_PROMPT,
+                                       WAKE_CLASSIFIER_CONTEXT_PROMPT,
                                        WAKE_CLASSIFIER_SYSTEM_PROMPT)
 
 
@@ -2092,7 +2093,9 @@ async def create_streaming_response_with_tools(
         _close_attempt_error(attempt_sink, attempts, usage_captured)
 
 async def classify_wake(self, *, sources: Any,
-                        channel_steering_text: Optional[str] = None) -> Optional[bool]:
+                        channel_steering_text: Optional[str] = None,
+                        recent_context: Optional[str] = None,
+                        inflight_lines: Optional[str] = None) -> Optional[bool]:
     """THE gate call: one utility-model request, one boolean out.
 
     Returns True/False as the model decided, or **None** when it produced nothing usable — an API
@@ -2112,10 +2115,22 @@ async def classify_wake(self, *, sources: Any,
     object out of the prose". The old rich classifier parsed the first {...} it could find, which
     meant a truncated reply could still yield an action field with none of the checks around it.
     A boolean is exactly the kind of output a schema can guarantee.
+
+    Burst follow-ups Part A: `recent_context` (the rendered `gate_context` block) and
+    `inflight_lines` (one line per turn writing a reply right now) go AHEAD of the messages, in
+    that order, each as its own paragraph — the layout the A/B measured. The two context
+    sentences join the developer prompt whenever the block is enabled
+    (PARTICIPATION_GATE_CONTEXT_MESSAGES > 0), even on a cold ring. Disabled and empty, the
+    request is byte-identical to the one without context.
     """
     blocks = [_render_wake_source(s, index=i, total=len(sources))
               for i, s in enumerate(sources)]
     prompt = "Messages to decide about, oldest first:\n\n" + "\n\n".join(blocks)
+    # Verbatim — the renderer owns the format; only a blank part is left out.
+    preamble = [part for part in (recent_context, inflight_lines) if part and part.strip()]
+    if preamble:
+        prompt = "\n\n".join(preamble) + "\n\n" + prompt
+    context_enabled = int(getattr(config, "participation_gate_context_messages", 0) or 0) > 0
     steering = (channel_steering_text or "").strip()
     if steering:
         # Verbatim, as its own labelled section. Nothing may re-render or reorder this block: the
@@ -2135,7 +2150,8 @@ async def classify_wake(self, *, sources: Any,
     request_params = {
         "model": config.utility_model,
         "input": [
-            {"role": "developer", "content": WAKE_CLASSIFIER_SYSTEM_PROMPT},
+            {"role": "developer", "content": (WAKE_CLASSIFIER_CONTEXT_PROMPT if context_enabled
+                                              else WAKE_CLASSIFIER_SYSTEM_PROMPT)},
             {"role": "user", "content": prompt},
         ],
         # Reasoning tokens bill against this cap, so the floor has to cover the THINKING and not
@@ -2285,6 +2301,27 @@ STALE_RECONSIDERATION_RESPONSE_FORMAT: Dict[str, Any] = {
     "schema": STALE_RECONSIDERATION_DECISION_SCHEMA,
 }
 
+# Burst follow-ups B8: the decision schema when `redo` is OFFERED. A fourth option, and an
+# `interim` line that only `redo` may carry. A request that does not offer redo sends the schema
+# above, unchanged.
+STALE_RECONSIDERATION_REDO_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["decision", "text", "interim"],
+    "properties": {
+        "decision": {"enum": ["post", "force_post", "skip", "redo"]},
+        "text": {"type": ["string", "null"]},
+        "interim": {"type": ["string", "null"]},
+    },
+}
+
+STALE_RECONSIDERATION_REDO_RESPONSE_FORMAT: Dict[str, Any] = {
+    "type": "json_schema",
+    "name": "stale_reconsideration_redo_decision",
+    "strict": True,
+    "schema": STALE_RECONSIDERATION_REDO_SCHEMA,
+}
+
 
 @dataclass(frozen=True)
 class ReconsiderationDecision:
@@ -2295,8 +2332,13 @@ class ReconsiderationDecision:
     against the current draft (stripped) is the RUNNER's job, not this layer's.
     """
 
-    decision: str            # "post" | "force_post" | "skip"
+    decision: str            # "post" | "force_post" | "skip" | "redo" (only when offered)
     text: Optional[str]
+    # Burst follow-ups: the line `redo` may post at once (None otherwise), and — on the tooled
+    # pass only — the hosted tools it completed, as names and as captured results.
+    interim: Optional[str] = None
+    tools_used: Tuple[str, ...] = ()
+    tool_results: Tuple[Dict[str, Any], ...] = ()
 
 
 class ReconsiderationDecisionError(Exception):
@@ -2311,28 +2353,66 @@ class ReconsiderationDecisionError(Exception):
         self.detail = detail
 
 
-def _parse_reconsideration_payload(raw: str) -> Optional[Tuple[str, Optional[str]]]:
-    """The strict schema's payload, or None on ANY shape the schema forbids.
+def _parse_reconsideration_payload(raw: str, *, allow_redo: bool = False
+                                   ) -> Optional[Tuple[str, Optional[str], Optional[str]]]:
+    """The strict schema's payload as (decision, text, interim), or None on ANY shape the
+    schema forbids.
 
-    Keys must be exactly {decision, text} (additionalProperties is false and both are
-    required), the decision must be one of the three options, and text must be a string or a
-    real JSON null — nothing is coerced, exactly as `_parse_wake` refuses to guess. The ENTIRE
-    stripped text must be the JSON document: a strict structured output never carries prose
-    around it, so surrounding content is schema-invalid, never salvaged by brace-hunting.
+    Keys must be exactly the mode's set — {decision, text}, or {decision, text, interim} when
+    redo was offered (additionalProperties is false and all are required) — the decision must
+    be one of the mode's options (`redo` only when offered), and text/interim must be a string
+    or a real JSON null — nothing is coerced, exactly as `_parse_wake` refuses to guess. The
+    ENTIRE stripped text must be the JSON document: a strict structured output never carries
+    prose around it, so surrounding content is schema-invalid, never salvaged by brace-hunting.
     """
     text = (raw or "").strip()
     try:
         payload = json.loads(text)
     except (ValueError, TypeError):
         return None
-    if not isinstance(payload, dict) or set(payload.keys()) != {"decision", "text"}:
+    keys = {"decision", "text", "interim"} if allow_redo else {"decision", "text"}
+    if not isinstance(payload, dict) or set(payload.keys()) != keys:
         return None
     decision, draft = payload["decision"], payload["text"]
-    if decision not in ("post", "force_post", "skip"):
+    interim = payload.get("interim")
+    options = ("post", "force_post", "skip", "redo") if allow_redo else ("post", "force_post",
+                                                                         "skip")
+    if decision not in options:
         return None
     if draft is not None and not isinstance(draft, str):
         return None
-    return decision, draft
+    if interim is not None and not isinstance(interim, str):
+        return None
+    return decision, draft, interim
+
+
+def _completed_hosted_tools(response: Any) -> Tuple[Tuple[str, ...], Tuple[Dict[str, Any], ...]]:
+    """The hosted tools a tooled reconsideration pass completed: names in first-use order
+    (`web_search`, an MCP server's label) and the results captured the way a turn captures them
+    (`_capture_web_search` / `_capture_mcp_result`). A call that failed or never finished is not
+    a tool the reply used."""
+    names: List[str] = []
+    results: List[Dict[str, Any]] = []
+    for item in (getattr(response, "output", None) or []):
+        item_type = getattr(item, "type", None)
+        status = getattr(item, "status", None)
+        finished = status is None or str(status) == "completed"
+        if item_type == "web_search_call":
+            if not finished:
+                continue
+            if "web_search" not in names:
+                names.append("web_search")
+            _capture_web_search(results, item)
+        elif item_type == "mcp_call":
+            if not finished or getattr(item, "error", None):
+                continue
+            label = getattr(item, "server_label", None) or "mcp"
+            if label not in names:
+                names.append(str(label))
+            _capture_mcp_result(results, item, getattr(item, "server_label", None))
+        elif item_type == "message":
+            _capture_web_search(results, item)
+    return tuple(names), tuple(results)
 
 
 def _reconsideration_create_kwargs(*, input_items: List[Dict[str, Any]],
@@ -2341,8 +2421,16 @@ def _reconsideration_create_kwargs(*, input_items: List[Dict[str, Any]],
                                    verbosity: Optional[str] = None,
                                    max_output_tokens: Optional[int] = None,
                                    temperature: Optional[float] = None,
-                                   prompt_cache_key: Optional[str] = None) -> Dict[str, Any]:
-    """The reconsideration decision's exact `responses.create` body, `text.format` included."""
+                                   prompt_cache_key: Optional[str] = None,
+                                   allow_redo: bool = False,
+                                   tools: Optional[List[Dict[str, Any]]] = None
+                                   ) -> Dict[str, Any]:
+    """The reconsideration decision's exact `responses.create` body, `text.format` included.
+
+    `allow_redo` selects the redo schema (burst follow-ups B8). `tools` not None is the TOOLED
+    pass (R2-3): the turn's hosted tools ride the request, with the web-search passages asked
+    for exactly as a turn asks for them, under the ordinary three-option schema. Neither set,
+    the body is byte-identical to the original decision request."""
     request_params = _build(
         model=model,
         input_items=input_items,
@@ -2353,20 +2441,25 @@ def _reconsideration_create_kwargs(*, input_items: List[Dict[str, Any]],
         temperature=temperature,
         top_p=None,
         store=False,
-        tools=[],
+        tools=list(tools) if tools is not None else [],
+        include=_request_includes(None, [], tools) if tools else None,
         prompt_cache_key=prompt_cache_key,
         layout="channel",
     )
-    request_params.setdefault("text", {})["format"] = dict(STALE_RECONSIDERATION_RESPONSE_FORMAT)
+    response_format = (STALE_RECONSIDERATION_REDO_RESPONSE_FORMAT
+                       if allow_redo and tools is None
+                       else STALE_RECONSIDERATION_RESPONSE_FORMAT)
+    request_params.setdefault("text", {})["format"] = dict(response_format)
     return request_params
 
 
 def build_reconsideration_create_kwargs(prepared: Any, *, model: Optional[str]) -> Dict[str, Any]:
     """PURE: the final kwargs `create_reconsideration_decision` would send for one prepared pass
-    (R3-6). `prepared` is the runner's PreparedDecision — `instructions`, `api_items` and the
+    (R3-6). `prepared` is the runner's PreparedDecision — `instructions`, `api_items`, the
     per-turn `params` (reasoning_effort, verbosity, max_output_tokens, temperature,
-    prompt_cache_key). The runner counts THIS dict at its `request_build` boundary, so the number
-    it decides on describes the request the decision call actually sends."""
+    prompt_cache_key), and the pass's mode: `allow_redo` and, on the tooled pass, `tools`. The
+    runner counts THIS dict at its `request_build` boundary, and hands the same mode to the
+    create, so the number it decides on describes the request the call actually sends."""
     params = dict(getattr(prepared, "params", None) or {})
     return _reconsideration_create_kwargs(
         input_items=list(getattr(prepared, "api_items", None) or []),
@@ -2374,7 +2467,9 @@ def build_reconsideration_create_kwargs(prepared: Any, *, model: Optional[str]) 
         reasoning_effort=params.get("reasoning_effort"), verbosity=params.get("verbosity"),
         max_output_tokens=params.get("max_output_tokens"),
         temperature=params.get("temperature"),
-        prompt_cache_key=params.get("prompt_cache_key"))
+        prompt_cache_key=params.get("prompt_cache_key"),
+        allow_redo=bool(getattr(prepared, "allow_redo", False)),
+        tools=getattr(prepared, "tools", None))
 
 
 async def create_reconsideration_decision(
@@ -2390,8 +2485,17 @@ async def create_reconsideration_decision(
     prompt_cache_key: Optional[str] = None,
     attempt_sink: Optional[Any] = None,
     on_attempt_open: Optional[Callable[[Optional[int]], Any]] = None,
+    allow_redo: bool = False,
+    tools: Optional[List[Dict[str, Any]]] = None,
 ) -> ReconsiderationDecision:
     """The mandated structured-decision call over a stale draft (STALE_RECONSIDERATION §4d).
+
+    Burst follow-ups: `allow_redo` offers the fourth decision (B8) — `redo` when not offered is
+    schema-invalid, an `interim` on anything but `redo` is dropped (logged), and text on `redo`
+    is dropped. `tools` not None makes this the TOOLED pass (R2-3/R2-4): the hosted tools run
+    inside this one call, `post`/`force_post` must carry non-empty text (anything else is
+    schema-invalid — there is no draft to fall back to), and the completed hosted tools come
+    back on the decision.
 
     RESPONDER-model semantics, not utility-model: the request is assembled by the same builder
     every responder call uses (`_build_request_params`, channel layout), so the sampling rules
@@ -2410,11 +2514,13 @@ async def create_reconsideration_decision(
     output, with the failed attempt closed under that detail; API and timeout errors propagate
     unchanged and the `finally` twin closes the attempt as the exception in flight.
     """
+    tooled = tools is not None
+    redo_offered = allow_redo and not tooled
     request_params = _reconsideration_create_kwargs(
         input_items=input_items, instructions=instructions, model=model,
         reasoning_effort=reasoning_effort, verbosity=verbosity,
         max_output_tokens=max_output_tokens, temperature=temperature,
-        prompt_cache_key=prompt_cache_key)
+        prompt_cache_key=prompt_cache_key, allow_redo=redo_offered, tools=tools)
 
     attempts: List[Any] = []
     usage_captured: Dict[str, Any] = {}
@@ -2481,19 +2587,34 @@ async def create_reconsideration_decision(
         if not out.strip():
             raise _fail("empty")
 
-        parsed = _parse_reconsideration_payload(out)
+        parsed = _parse_reconsideration_payload(out, allow_redo=redo_offered)
         if parsed is None:
             raise _fail("schema_invalid")
-        decision, draft = parsed
+        decision, draft, interim = parsed
         if draft is not None and not draft.strip():
             draft = None                       # whitespace-only ≡ null (§4d)
-        if decision == "skip" and draft is not None:
+        if interim is not None and not interim.strip():
+            interim = None
+        if tooled and decision in ("post", "force_post") and draft is None:
+            # The tooled pass replaces a discarded draft; a post with nothing to say has
+            # nothing to fall back to (R2-4).
+            raise _fail("schema_invalid", "tooled reconsideration posted without text")
+        if decision in ("skip", "redo") and draft is not None:
             # The anomaly is logged; the text itself never is (§4d).
             self.log_warning(
-                "reconsideration decision 'skip' arrived carrying text; the text is ignored")
+                f"reconsideration decision {decision!r} arrived carrying text; the text is "
+                "ignored")
             draft = None
+        if decision != "redo" and interim is not None:
+            self.log_warning(
+                f"reconsideration decision {decision!r} arrived carrying an interim; it is "
+                "ignored")
+            interim = None
+        tools_used, tool_results = (_completed_hosted_tools(response) if tooled
+                                    else ((), ()))
         _close_attempt(attempt_sink, attempts, status="ok", usage=usage_captured)
-        return ReconsiderationDecision(decision=decision, text=draft)
+        return ReconsiderationDecision(decision=decision, text=draft, interim=interim,
+                                       tools_used=tools_used, tool_results=tool_results)
     finally:
         _close_attempt_error(attempt_sink, attempts, usage_captured)
 

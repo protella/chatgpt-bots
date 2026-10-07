@@ -8084,7 +8084,9 @@ class DatabaseManager(LoggerMixin):
         """READ 1 STAGE 2. DISCOVERY ONLY — nothing here is ever rendered.
 
         Returns `{"activity_roots": {root_ts: pinned event ts | None},
-                  "receipt_roots": (root_ts, ...)}`.
+                  "receipt_roots": (root_ts, ...), "dirty_roots": (root_ts, ...)}`.
+        `dirty_roots` names the activity roots still marked dirty — a root whose replies the
+        reply cache must never serve until a fetch clears it.
 
         **`activity_roots` IS A MAPPING, not a set**, and the value is what compare-and-clear
         compares against: the event ts THIS read pinned for that root
@@ -8110,6 +8112,7 @@ class DatabaseManager(LoggerMixin):
                     f"AND CAST({column} AS REAL) <= CAST(:high AS REAL)")
 
         activity_roots: Dict[str, Optional[str]] = {}
+        dirty_roots: List[str] = []
         receipt_roots: List[str] = []
         async with self._stream_conn() as db:
             await db.execute("BEGIN DEFERRED")
@@ -8120,7 +8123,7 @@ class DatabaseManager(LoggerMixin):
                 # above this turn's frontier cannot appear in its stream.
                 async with db.execute(
                     f"""
-                    SELECT root_ts, last_observed_reply_ts, last_index_event_ts
+                    SELECT root_ts, last_observed_reply_ts, last_index_event_ts, dirty
                     FROM channel_thread_activity
                     WHERE team_id = :team AND channel_id = :ch
                       AND ((dirty = 1
@@ -8140,6 +8143,8 @@ class DatabaseManager(LoggerMixin):
                         pinned = row["last_index_event_ts"] or row["last_observed_reply_ts"]
                         activity_roots[str(row["root_ts"])] = (
                             str(pinned) if pinned is not None else None)
+                        if row["dirty"]:
+                            dirty_roots.append(str(row["root_ts"]))
 
                 # Our own posts name the threads we are already part of. Predicated into the
                 # SAME window as everything else, by the ts of the message each receipt
@@ -8163,7 +8168,8 @@ class DatabaseManager(LoggerMixin):
                 except Exception:
                     pass
                 raise
-        return {"activity_roots": activity_roots, "receipt_roots": tuple(receipt_roots)}
+        return {"activity_roots": activity_roots, "receipt_roots": tuple(receipt_roots),
+                "dirty_roots": tuple(dirty_roots)}
 
     async def read_channel_sidecars_for_async(self, team_id: str, channel_id: str,
                                               message_ts: Sequence[str],

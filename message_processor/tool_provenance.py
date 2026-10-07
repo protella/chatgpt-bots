@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Dict, List, Optional, Sequence, cast
 
 from config import config
 from openai_client.api.responses import WEB_SEARCH_PASSAGE_MARKER
@@ -63,6 +63,38 @@ ATTRIBUTION_HIDDEN_TOOLS = {"code_interpreter"}
 def visible_attribution_tools(tools_used) -> List[str]:
     """The tools worth telling the user about: external data sources, not internal plumbing."""
     return [t for t in (tools_used or []) if t not in ATTRIBUTION_HIDDEN_TOOLS]
+
+
+def tools_attribution_note(attribution_tools: Sequence[str], failed_display: str) -> str:
+    """The `_Tools Used: …_` footer, in the exact wording the text handlers append ("" when
+    there is nothing to say): the successful sources, plus any MCP server that failed."""
+    if attribution_tools:
+        if failed_display:
+            return f"\n\n_Tools Used: {', '.join(attribution_tools)} (failed: {failed_display})_"
+        return f"\n\n_Tools Used: {', '.join(attribution_tools)}_"
+    if failed_display:
+        return (f"\n\n_MCP server '{failed_display}' could not be reached. Response generated "
+                "without external tools._")
+    return ""
+
+
+def reattribute_reply(text: str, tools_used: List[str], tool_results: List[Any],
+                      extra_tools: Sequence[str], extra_results: Sequence[Any], *,
+                      failed_display: str, show: bool) -> str:
+    """A tooled reconsideration's reply, attributed (burst follow-ups R3-5): its completed
+    hosted tools are merged INTO the site's own accumulators (in place, deduplicated — a re-race
+    re-delivers through the same closure), and the footer is re-rendered from them for the text
+    that replaces the draft. `show=False` is a top-level channel reply, which carries none."""
+    for name in extra_tools:
+        if name and name not in tools_used:
+            tools_used.append(str(name))
+    for result in extra_results:
+        if result not in tool_results:
+            tool_results.append(result)
+    body = strip_used_tools_footer(text)
+    if not show:
+        return body
+    return body + tools_attribution_note(visible_attribution_tools(tools_used), failed_display)
 
 # Budgets (F7, now env-backed per F14): entries/turn (config.tool_provenance_max_entries,
 # default 20), gist chars (config.tool_provenance_gist_chars, default 80), annotation line

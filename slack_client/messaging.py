@@ -19,8 +19,8 @@ import message_processor.prompts as prompts
 from message_processor.client_contract import HistoryFetchError, Message
 from config import (SUPPORTED_CHAT_MODELS, config, dev_epoch_fence_requested,
                     pipeline_status_markers, valid_emoji_name)
-from message_processor import participation_telemetry
-from message_processor.stale_send_guard import StaleSendSuppressed
+from message_processor import gate_context, participation_telemetry
+from message_processor.stale_send_guard import StaleSendSuppressed, visible_mutation
 from message_processor.turn_runtime import (DEST_KIND_CORRECTION_ANNOUNCEMENT,
                                             EDIT_STATE_COMMITTED, EditRecord, EffectRevoked,
                                             LaunchNotRecorded, mark_tool_launched, run_effect)
@@ -277,6 +277,37 @@ def _note_first_accept(callback: Optional[Callable[[str], None]], ts: Optional[s
         return
     try:
         callback(ts)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _gate_ring_reply(owner: Any, channel_id: Optional[str], thread_ts: Optional[str],
+                     ts: Optional[str], text: Optional[str]) -> None:
+    """Remember one of our accepted replies in the wake gate's recent-context ring.
+
+    Bolt drops our own message events, so the transport is the only place that knows what the
+    assistant just said. A gist — the text this call already had in hand, capped downstream —
+    and bookkeeping never breaks a send, so any failure is swallowed."""
+    try:
+        gate_context.record_assistant_reply(
+            channel_id, thread_ts, ts, text, sender_id=getattr(owner, "bot_user_id", None))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _gate_ring_edit(channel_id: Optional[str], ts: Optional[str], text: str) -> None:
+    """Our own edit landed: the ring's copy of that reply takes the new words."""
+    try:
+        gate_context.replace_text(channel_id, ts, text)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _gate_ring_forget(channel_id: Optional[str], ts: Optional[str]) -> None:
+    """A message of ours is gone from the room, so it is gone from the ring. Removing a ts the
+    ring never held (a thinking placeholder, a status card) is a no-op."""
+    try:
+        gate_context.remove(channel_id, ts)
     except Exception:  # noqa: BLE001
         pass
 
@@ -587,6 +618,7 @@ class NativeStreamSession:
         self._in_fence: bool = False
         self._in_inline: bool = False
 
+    @visible_mutation
     async def start(self, initial_text: str = "", lease: Any = None) -> bool:
         """`lease` (stale guard): chat.startStream MINTS the reply message, so this is a first
         answer surface. Checked before the call, never after — once a stream is up, the rest of
@@ -683,6 +715,7 @@ class NativeStreamSession:
         rewrite = _mention_rewriter(self._owner)
         return "".join(chunk if is_code else rewrite(chunk) for chunk, is_code in segments)
 
+    @visible_mutation
     async def update(self, cumulative_text: str) -> bool:
         """Append the new tail of ``cumulative_text`` since the last update."""
         if not self.active or self.ts is None:
@@ -706,6 +739,7 @@ class NativeStreamSession:
             self.active = False
             return False
 
+    @visible_mutation
     async def finish(self, final_text: Optional[str] = None, blocks=None) -> bool:
         if self.ts is None:
             return False
@@ -726,6 +760,10 @@ class NativeStreamSession:
                 kwargs["blocks"] = blocks
             await self._client.chat_stopStream(**kwargs)
             self.active = False
+            # The stream is a reply surface from its first byte; what it holds once stopped is
+            # the part as delivered. Partial appends are never recorded — only this.
+            _gate_ring_reply(self._owner, self._channel, self._thread, self.ts,
+                             self._sent + tail)
             return True
         except Exception as e:  # noqa: BLE001
             if self._log:
@@ -1157,6 +1195,7 @@ class SlackMessagingMixin(_Host):
     # complete; slim has neither, so a posting site added later does NOT automatically inherit the
     # fence. The helpers are `_epoch_authorize` / `_epoch_refused` at module scope above.
 
+    @visible_mutation
     async def send_message(self, channel_id: str, thread_id: str, text: str,
                            blocks: Optional[list] = None,
                            meta_out: Optional[dict] = None,
@@ -1295,6 +1334,8 @@ class SlackMessagingMixin(_Host):
                     channel_id, posted_ts, receipts=receipts, receipt_kind=receipt_kind,
                     receipt_class=receipt_class,
                     thread_root_ts=thread_id, site="send_message")
+                if receipt_class == "assistant_reply" and posted_ts:
+                    _gate_ring_reply(self, channel_id, thread_id, posted_ts, formatted_text)
                 # Report footer attachment only AFTER Slack returns a ts — a post that never
                 # landed hasn't attached anything, and the separate footer must still fire.
                 _set_attached(composed is not None and bool(posted_ts))
@@ -1361,6 +1402,9 @@ class SlackMessagingMixin(_Host):
                                 receipt_kind=receipt_kind, receipt_class=receipt_class,
                                 thread_root_ts=thread_id,
                                 site="send_message_split")
+                            if receipt_class == "assistant_reply":
+                                _gate_ring_reply(self, channel_id, thread_id,
+                                                 result.get("ts"), chunk)
                             posted = True
                             break
                         except SlackApiError as chunk_error:
@@ -1526,6 +1570,7 @@ class SlackMessagingMixin(_Host):
         """
         return fence_safe_chunks(text, self.MAX_MESSAGE_LENGTH - 150)
 
+    @visible_mutation
     async def send_message_get_ts(self, channel_id: str, thread_id: str, text: str,
                                   lease: Any = None,
                                   surface: str = "legacy_seed",
@@ -1632,6 +1677,7 @@ class SlackMessagingMixin(_Host):
             self.log_warning(f"Could not re-resolve bot identity: {e}")
         return bool(getattr(self, "self_team_id", None) and getattr(self, "bot_user_id", None))
 
+    @visible_mutation
     async def send_image(self, channel_id: str, thread_id: str, image_data: bytes, filename: str,
                          caption: str = "", meta_out: Optional[dict] = None,
                          receipts: Any = None, *,
@@ -1797,6 +1843,7 @@ class SlackMessagingMixin(_Host):
             if remaining > 0:
                 await asyncio.sleep(min(delay, remaining))
 
+    @visible_mutation
     async def send_file(self, channel_id: str, thread_id: str, file_data,
                         filename: str, title: Optional[str] = None,
                         initial_comment: str = "",
@@ -1854,6 +1901,7 @@ class SlackMessagingMixin(_Host):
             self.log_error(f"Unexpected error uploading file '{filename}': {e}")
             return None
 
+    @visible_mutation
     async def send_thinking_indicator(self, channel_id: str, thread_id: str,
                                       receipts: Any = None, *,
                                       receipt_class: Optional[str]) -> Optional[str]:
@@ -1902,6 +1950,7 @@ class SlackMessagingMixin(_Host):
             self.log_error(f"Error sending thinking indicator: {e}")
             return None
 
+    @visible_mutation
     async def delete_message(self, channel_id: str, message_id: str) -> bool:
         """Delete a message from Slack"""
         try:
@@ -1909,11 +1958,13 @@ class SlackMessagingMixin(_Host):
                 channel=channel_id,
                 ts=message_id
             )
+            _gate_ring_forget(channel_id, message_id)
             return True
         except SlackApiError as e:
             self.log_debug(f"Could not delete message: {e}")
             return False
 
+    @visible_mutation
     async def update_message(self, channel_id: str, message_id: str, text: str,
                              lease: Any = None,
                              surface: str = "error_notice",
@@ -1963,6 +2014,7 @@ class SlackMessagingMixin(_Host):
             self.log_error(f"Could not update message: {e}")
             return False
 
+    @visible_mutation
     async def post_status_card(self, channel_id: str, thread_id: str, text: str,
                                blocks: list, username: Optional[str] = None,
                                receipts: Any = None, *,
@@ -1997,6 +2049,7 @@ class SlackMessagingMixin(_Host):
             self.log_warning(f"Status card post failed: {e}")
             return None
 
+    @visible_mutation
     async def update_status_card(self, channel_id: str, ts: str, text: str,
                                  blocks: list, receipts: Any = None) -> CardWriteResult:
         """F30.1: update a blocks status card in place. `text` MUST stay CONSTANT across
@@ -2271,6 +2324,7 @@ class SlackMessagingMixin(_Host):
             self.app.client, channel_id, thread_id, logger=self.log_debug,
             team_id=getattr(self, "self_team_id", None), user_id=user_id, owner=self)
 
+    @visible_mutation
     async def set_assistant_status(self, channel_id: str, thread_id: str,
                                    status: Optional[str] = None,
                                    loading_messages: Optional[List[str]] = None) -> bool:
@@ -2332,6 +2386,7 @@ class SlackMessagingMixin(_Host):
             self.log_debug(f"assistant setStatus error: {e}")
             return False
 
+    @visible_mutation
     async def clear_assistant_status(self, channel_id: str, thread_id: str) -> bool:
         """Clear the assistant status: bare status="" with NO loading_messages (the API
         rejects an empty array and treats "" as the clear signal). Needed explicitly for
@@ -2367,6 +2422,7 @@ class SlackMessagingMixin(_Host):
             self.log_error(f"Unexpected error adding reaction :{name}: {e}")
             return False, False
 
+    @visible_mutation
     async def react(self, channel_id: str, message_ts: str, emoji: str) -> bool:
         """Add an emoji reaction to a message (Phase 4). ``emoji`` may include or omit colons.
 
@@ -2375,6 +2431,7 @@ class SlackMessagingMixin(_Host):
         ok, _added = await self._react_add(channel_id, message_ts, emoji)
         return ok
 
+    @visible_mutation
     async def unreact(self, channel_id: str, message_ts: str, emoji: str) -> bool:
         """Remove one of the BOT'S OWN reactions (F38). Slack scopes reactions.remove to the
         authenticated user, so this can never strip a human's emoji off a message.
@@ -3029,6 +3086,7 @@ class SlackMessagingMixin(_Host):
             self._settle_removal_slot(channel_id, ts, emoji, token, ok)
         return ok
 
+    @visible_mutation
     async def remove_owned_reaction(self, lease: Optional[dict]) -> bool:
         """The turn produced nothing: take the reaction back off.
 
@@ -3062,6 +3120,7 @@ class SlackMessagingMixin(_Host):
         except Exception:  # noqa: BLE001
             return False
 
+    @visible_mutation
     async def _reserve_and_react(self, channel_id: str, ts: str, emoji: str) -> dict:
         """F6 reservation for a PERMANENT reaction — one the caller never takes back.
 
@@ -3071,6 +3130,7 @@ class SlackMessagingMixin(_Host):
         self.settle_reaction_lease(lease)
         return result
 
+    @visible_mutation
     async def _reserve_and_react_owned(self, channel_id: str, ts: str, emoji: str) -> tuple:
         """F6 reservation + F38 lease. Returns (result, lease).
 
@@ -3942,6 +4002,7 @@ class SlackMessagingMixin(_Host):
                                 posted)
         record.state = EDIT_STATE_COMMITTED
         record.error = None
+        _gate_ring_edit(channel_id, message_ts, replacement)
         return {"ok": True, "message_ts": message_ts, "announcement_ts": posted,
                 "announcement_posted": True, "edited": True}
 
@@ -4229,6 +4290,7 @@ class SlackMessagingMixin(_Host):
                     if err == "message_not_found":
                         # Confirmed absent — the end state asked for. The receipt still
                         # describes a post that is not there, so it goes too.
+                        _gate_ring_forget(channel_id, message_ts)
                         await self._drop_own_message_receipt(channel_id, message_ts)
                         return {"ok": True, "deleted": False, "message_ts": message_ts,
                                 "message": "That message was already gone."}
@@ -4243,6 +4305,7 @@ class SlackMessagingMixin(_Host):
                                         "may or may not still be there. Check before trying "
                                         "again.")}
                 # CONFIRMED gone (chat_delete raises otherwise): the receipt goes with it.
+                _gate_ring_forget(channel_id, message_ts)
                 await self._drop_own_message_receipt(channel_id, message_ts)
                 return {"ok": True, "deleted": True, "message_ts": message_ts,
                         "message": "That message is permanently deleted."}
@@ -4347,6 +4410,7 @@ class SlackMessagingMixin(_Host):
             }
         return {"ok": True}
 
+    @visible_mutation
     async def update_message_streaming(self, channel_id: str, message_id: str, text: str,
                                        lease: Any = None,
                                        surface: str = "legacy_update",
@@ -4531,6 +4595,7 @@ class SlackMessagingMixin(_Host):
             ]
         return self._build_response_footer_blocks(model)
 
+    @visible_mutation
     async def maybe_post_response_footer(self, message, response, receipts: Any = None) -> None:
         """Trailing chrome under a final text response — surface-dependent:
 

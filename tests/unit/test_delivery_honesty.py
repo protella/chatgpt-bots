@@ -483,7 +483,7 @@ async def _channel_turn_with_a_prior_timeout(*, admission_fails: bool, had_timeo
                                             trigger_text: str = "what happened to the Q3 numbers",
                                             gate_sources=(), reply=None,
                                             reply_destination=None, addressed: bool = True,
-                                            dm: bool = False):
+                                            dm: bool = False, gate_woke: bool = True):
     """Drive the real process_message for a CHANNEL turn that owes prose, and report
     (the order of the steps that matter, the response, what admission saw).
 
@@ -571,7 +571,8 @@ async def _channel_turn_with_a_prior_timeout(*, admission_fails: bool, had_timeo
                      "silence_capable": False, "routing_posture": "addressed_to_assistant"})
     else:
         # The live shape of the incident: a gate wake on channel traffic nobody put to us.
-        meta.update({"wake_source": "ambient", "gate_required": True, "gate_woke": True,
+        meta.update({"wake_source": "ambient", "gate_required": not dm and gate_woke,
+                     "gate_woke": gate_woke,
                      "silence_capable": True, "routing_posture": "channel_activity"})
     if gate_sources:
         meta["gate_sources"] = list(gate_sources)
@@ -873,3 +874,377 @@ def test_a_reply_alongside_a_cross_thread_post_still_remembers_the_reply():
     joined = _memory_join(bot, turn, _channel_message())
     assert joined == "answered here"
     assert "over there" not in (joined or "")
+
+
+# ------------------- burst follow-ups C: Slack throttled us — a note, and the bot re-runs it
+
+
+async def _throttled_channel_turn(meta: Dict[str, Any]) -> Any:
+    """The real process_message for a channel turn whose history fetch Slack throttled."""
+    from unittest.mock import patch
+
+    from message_processor.base import MessageProcessor
+    from slack_client.history_fetch import HistoryFetchThrottled
+
+    with patch("message_processor.base.AsyncThreadStateManager"), \
+         patch("message_processor.base.OpenAIClient"):
+        processor = MessageProcessor()
+    processor.db = None
+    processor.thread_manager.acquire_thread_lock = AsyncMock(return_value=True)
+    processor.thread_manager.release_thread_lock = AsyncMock()
+    processor.get_or_create_channel_thread_state = AsyncMock(  # type: ignore[method-assign]
+        side_effect=HistoryFetchThrottled("channel replies failed after 3 attempt(s): 429",
+                                          retry_after=7.0))
+    message = Message(text="and british pounds too", user_id="U1", channel_id="C1",
+                      thread_id="10.0", metadata={"ts": "10.0", "sender_type": "human", **meta})
+    return await processor.process_message(message, MagicMock(), None, turn=TurnRuntime())
+
+
+_WOKEN = {"wake_source": "ambient", "gate_required": True, "gate_woke": True,
+          "silence_capable": True, "routing_posture": "channel_activity"}
+_UNWOKEN = {"wake_source": "thread_continuation", "gate_required": False,
+            "silence_capable": True, "membership_wake": True, "strict_continuation": False,
+            "routing_posture": "thread_activity"}
+
+
+@pytest.mark.asyncio
+async def test_a_throttled_turn_nobody_woke_stays_silent_with_no_rerun():
+    response = await _throttled_channel_turn(_UNWOKEN)
+    assert response.metadata.get("suppress_error_post") is True
+    assert "fail_retry" not in response.metadata
+
+
+@pytest.mark.asyncio
+async def test_a_gate_woken_throttled_turn_posts_the_note_and_schedules_the_rerun(monkeypatch):
+    """C1/C2: the note in the conversation's voice — no "try again" — and the re-run registered
+    behind Slack's Retry-After."""
+    from main import ChatBotV2
+    from message_processor import fail_cards, participation_telemetry
+
+    response = await _throttled_channel_turn(_WOKEN)
+    assert response.metadata.get("fail_retry") == {"retry_after": 7.0}
+    assert response.content == fail_cards.TRANSIENT_NOTE and "try again" not in response.content
+
+    rows: list = []
+    monkeypatch.setattr(participation_telemetry, "record",
+                        lambda event, **fields: rows.append({"event": event, **fields}))
+    bot = ChatBotV2.__new__(ChatBotV2)
+    bot.processor = None
+    client = MagicMock()
+    client.send_message = AsyncMock(return_value="note.1")
+    message = Message(text="q", user_id="U1", channel_id="C1", thread_id="10.0",
+                      metadata={"ts": "10.0", "sender_id": "U1", **_WOKEN})
+    turn = TurnRuntime(reply_thread_id="10.0")
+    turn.turn_error = "history_fetch_failed"
+    await bot._note_and_schedule_rerun(message, client, turn, None, 7.0)
+
+    assert client.send_message.await_args.args[2] == fail_cards.TRANSIENT_NOTE
+    assert turn.fail_card == "posted"
+    failure = fail_cards.registry.find("C1", "10.0")
+    assert failure is not None and failure.card_ts == "note.1" and failure.timer is not None
+    assert [r["state"] for r in rows if r["event"] == "fail_retry"] == ["scheduled"]
+
+
+def _delivered(trigger_ts: str, sender: str = "U1", thread: str = "10.0"):
+    message = Message(text="q", user_id=sender, channel_id="C1", thread_id=thread,
+                      metadata={"ts": trigger_ts, "sender_id": sender})
+    turn = TurnRuntime()
+    turn.mark_destination_committed(first_ts="77.0", kind="reply", text="the answer",
+                                    channel_id="C1", thread_root_ts=thread)
+    return message, turn
+
+
+def _registered_failure(client):
+    from main import ChatBotV2
+    from message_processor import fail_cards
+    from message_processor.stale_send_guard import scopes_for_message
+
+    bot = ChatBotV2.__new__(ChatBotV2)
+    bot.processor = None
+    handled: list = []
+
+    async def _handler(message, _client):
+        handled.append(message)
+
+    client.message_handler = _handler
+    failed = Message(text="q", user_id="U1", channel_id="C1", thread_id="10.0",
+                     metadata={"ts": "10.0", "sender_id": "U1", **_WOKEN})
+    failure = fail_cards.PendingFailure(
+        scope=fail_cards.scope_key("C1", "10.0", "10.0"), channel_id="C1", trigger_ts="10.0",
+        sender_id="U1", cause="history_fetch_failed", card_ts="note.1",
+        start=bot._rerun_starter(failed, client), scopes=scopes_for_message(failed))
+    fail_cards.registry.register(failure, retry_after=None)
+    return failure, handled
+
+
+@pytest.mark.asyncio
+async def test_the_rerun_replies_and_the_note_comes_down(monkeypatch):
+    """C2/C3: the channel's next good fetch re-runs the trigger as the normal, ungated turn;
+    its delivered reply deletes the note and writes fail_card_cleared."""
+    from main import ChatBotV2
+    from message_processor import fail_cards, participation_telemetry
+
+    rows: list = []
+    monkeypatch.setattr(participation_telemetry, "record",
+                        lambda event, **fields: rows.append({"event": event, **fields}))
+    client = MagicMock()
+    client.delete_message = AsyncMock(return_value=True)
+    client._drop_own_message_receipt = AsyncMock()
+    failure, handled = _registered_failure(client)
+
+    fail_cards.fetch_succeeded("C1")
+    await asyncio.sleep(0)
+    assert len(handled) == 1
+    rerun = handled[0]
+    assert rerun.metadata["ts"] == "10.0"
+    assert rerun.metadata["gate_required"] is False                 # not re-gated
+    assert rerun.metadata[fail_cards.FAIL_RETRY_RERUN] is True
+
+    rerun_message, rerun_turn = _delivered("10.0")
+    await ChatBotV2._settle_throttled_failures(rerun_message, client, rerun_turn)
+    client.delete_message.assert_awaited_once_with("C1", "note.1")
+    assert fail_cards.registry.find("C1", "10.0") is None
+    states = [r["state"] for r in rows if r["event"] == "fail_retry"]
+    assert states == ["scheduled", "started"]
+    assert [r["card_ts"] for r in rows if r["event"] == "fail_card_cleared"] == ["note.1"]
+
+
+@pytest.mark.asyncio
+async def test_a_newer_same_sender_reply_covers_the_rerun_and_takes_the_note_down(monkeypatch):
+    from main import ChatBotV2
+    from message_processor import fail_cards, participation_telemetry
+
+    rows: list = []
+    monkeypatch.setattr(participation_telemetry, "record",
+                        lambda event, **fields: rows.append({"event": event, **fields}))
+    client = MagicMock()
+    client.delete_message = AsyncMock(return_value=True)
+    client._drop_own_message_receipt = AsyncMock()
+    failure, handled = _registered_failure(client)
+
+    other_message, other_turn = _delivered("10.8", sender="U2",    # someone else: not covering
+                                           thread="10.8")
+    await ChatBotV2._settle_throttled_failures(other_message, client, other_turn)
+    client.delete_message.assert_not_awaited()
+
+    newer_message, newer_turn = _delivered("10.9", thread="10.9")  # the same person, newer
+    await ChatBotV2._settle_throttled_failures(newer_message, client, newer_turn)
+    client.delete_message.assert_awaited_once_with("C1", "note.1")
+    fail_cards.fetch_succeeded("C1")
+    await asyncio.sleep(0)
+    assert handled == [], "a covered failure never re-runs"
+    covered = [r for r in rows if r["event"] == "fail_retry" and r["state"] == "covered"]
+    assert covered and covered[0]["covered_by"] == "10.9"
+
+
+@pytest.mark.asyncio
+async def test_a_rerun_that_ends_in_a_non_throttled_error_takes_its_note_down(monkeypatch):
+    """Gap ruling: the note never outlives its re-run. A re-run ending without a reply and
+    without a throttled re-register (here: a non-throttled error) deletes the note and logs the
+    outcome."""
+    from main import ChatBotV2
+    from message_processor import fail_cards, participation_telemetry
+
+    rows: list = []
+    monkeypatch.setattr(participation_telemetry, "record",
+                        lambda event, **fields: rows.append({"event": event, **fields}))
+    client = MagicMock()
+    client.delete_message = AsyncMock(return_value=True)
+    client._drop_own_message_receipt = AsyncMock()
+    failure, handled = _registered_failure(client)
+    fail_cards.fetch_succeeded("C1")
+    await asyncio.sleep(0)
+    rerun = handled[0]
+
+    bot = ChatBotV2.__new__(ChatBotV2)
+    turn = TurnRuntime()
+    turn.turn_error = "stream_data_invalid"
+    await bot._end_rerun(rerun, client, turn, Response(type="error", content="x"), "error")
+
+    client.delete_message.assert_awaited_once_with("C1", "note.1")
+    assert fail_cards.registry.find("C1", "10.0") is None
+    cleared = [r for r in rows if r["event"] == "fail_card_cleared"]
+    assert cleared and cleared[0]["outcome"] == "error" and cleared[0]["card_ts"] == "note.1"
+
+
+
+# ------------------- codex review of A/B/C — one test per finding
+
+
+@pytest.fixture
+def events(monkeypatch):
+    from message_processor import participation_telemetry
+
+    captured: list = []
+
+    def _record(event, *, channel_id=None, trigger_ts=None, **fields):
+        captured.append({"event": event, "channel_id": channel_id, "trigger_ts": trigger_ts,
+                         **fields})
+
+    monkeypatch.setattr(participation_telemetry, "record", _record)
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_a_request_after_an_invalidation_never_shares_the_old_flight():
+    """#1: an edit lands while a shared fetch is in flight — a request made after it fetches
+    fresh, and the old flight's result is neither shared with it nor stored."""
+    from message_processor.reply_cache import ReplyCache
+
+    cache = ReplyCache()
+    release = asyncio.Event()
+    calls: list = []
+    key = ("1.5", 1, None)
+
+    async def _fetch():
+        calls.append(len(calls))
+        if len(calls) == 1:
+            await release.wait()
+            return [SimpleNamespace(ts="1.5", text="old")]
+        return [SimpleNamespace(ts="1.5", text="new")]
+
+    first = asyncio.ensure_future(cache.get("C1", "1.0", key, floor_ts="0", high="9.0",
+                                            dirty=False, fetch=_fetch))
+    await asyncio.sleep(0)
+    cache.forget("C1", "1.5")                       # the reply is edited mid-fetch
+    second = asyncio.ensure_future(cache.get("C1", "1.0", key, floor_ts="0", high="9.0",
+                                             dirty=False, fetch=_fetch))
+    await asyncio.sleep(0)
+    release.set()
+    old, _ = await first
+    fresh, source = await second
+    assert old[0].text == "old" and fresh[0].text == "new" and source == "fetched"
+    assert len(calls) == 2
+    _, again = await cache.get("C1", "1.0", key, floor_ts="0", high="9.0", dirty=False,
+                               fetch=_fetch)
+    assert again == "cache"                           # what landed is the FRESH fetch
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_closing_a_lease_releases_its_task_mapping():
+    """#2: the task→lease map has weak keys but the lease holds its task strongly — a closed
+    lease must not keep a finished turn's task alive."""
+    from message_processor import stale_send_guard
+    from message_processor.stale_send_guard import ConversationWatermarks
+
+    marks = ConversationWatermarks()
+    lease = marks.begin_turn(Message(text="q", user_id="U1", channel_id="C1", thread_id="1.0",
+                                     metadata={"ts": "1.0", "sender_id": "U1"}))
+    task = asyncio.current_task()
+    assert stale_send_guard._TASK_LEASES.get(task) is lease
+    lease.close()
+    assert stale_send_guard._TASK_LEASES.get(task) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("admitted", [False, True])
+async def test_a_covered_rerun_is_rejected_or_stood_down(admitted, events, monkeypatch):
+    """#3: a cover reaches a re-run already dispatched. Not yet admitted: rejected before
+    admission (no lease, no turn). Admitted: the normal stand-down."""
+    from main import ChatBotV2
+    from message_processor import fail_cards
+    from message_processor.stale_send_guard import scopes_for_message
+    from tests.unit.test_reconsideration import _main_bot, _main_client
+
+    bot = _main_bot()
+    drafting = asyncio.Event()
+
+    async def _process(message, client, thinking_id=None, turn=None):
+        drafting.set()
+        await asyncio.Event().wait()
+
+    bot.processor.process_message = AsyncMock(side_effect=_process)
+    bot.processor._schedule_async_call = lambda coro: asyncio.ensure_future(coro)
+    client = _main_client(AsyncMock(return_value="1.0"))
+    client.message_handler = bot.handle_message
+    client.delete_message = AsyncMock(return_value=True)
+    failed = Message(text="q", user_id="U1", channel_id="C1", thread_id="10.0",
+                     metadata={"ts": "10.0", "sender_id": "U1", **_WOKEN})
+    failure = fail_cards.PendingFailure(
+        scope="C1:top", channel_id="C1", trigger_ts="10.0", sender_id="U1",
+        cause="history_fetch_failed", card_ts="note.1",
+        start=bot._rerun_starter(failed, client), scopes=scopes_for_message(failed))
+    fail_cards.registry.register(failure, retry_after=None)
+    fail_cards.registry.fire(failure)
+    if admitted:
+        await drafting.wait()
+    covering, covering_turn = _delivered("10.9", thread="10.9")
+    await ChatBotV2._settle_throttled_failures(covering, client, covering_turn)
+    await asyncio.wait({failure.rerun_task}, timeout=5)
+    assert failure.rerun_task.done() and not failure.rerun_task.cancelled()
+    if admitted:
+        assert [o["kind"] for o in events if o["event"] == "turn_outcome"] == ["superseded"]
+    else:
+        bot.processor.process_message.assert_not_called()
+        assert not [o for o in events if o["event"] == "turn_start"]
+    assert bot.watermarks.tracked_scopes == 0
+
+
+@pytest.mark.asyncio
+async def test_a_cover_landing_while_the_note_posts_takes_the_note_straight_down(monkeypatch):
+    """#4: ownership is kept through the post — a cover that resolves the failure while the
+    note is in flight leaves no orphan; the accepted note is deleted at once."""
+    from main import ChatBotV2
+    from message_processor import fail_cards
+
+    bot = ChatBotV2.__new__(ChatBotV2)
+    bot.processor = None
+    client = MagicMock()
+    client.delete_message = AsyncMock(return_value=True)
+    client._drop_own_message_receipt = AsyncMock()
+
+    async def _send(*args, **kwargs):
+        covering, covering_turn = _delivered("10.9", thread="10.9")
+        await ChatBotV2._settle_throttled_failures(covering, client, covering_turn)
+        return "note.1"
+
+    client.send_message = AsyncMock(side_effect=_send)
+    message = Message(text="q", user_id="U1", channel_id="C1", thread_id="10.0",
+                      metadata={"ts": "10.0", "sender_id": "U1", **_WOKEN})
+    turn = TurnRuntime(reply_thread_id="10.0")
+    turn.turn_error = "history_fetch_failed"
+    await bot._note_and_schedule_rerun(message, client, turn, None, 7.0)
+    client.delete_message.assert_awaited_once_with("C1", "note.1")
+    assert fail_cards.registry.find("C1", "10.0") is None
+
+
+@pytest.mark.asyncio
+async def test_a_same_sender_reply_under_the_failed_root_covers_a_top_level_failure(monkeypatch):
+    """#5: coverage uses the stale guard's overlapping scopes — the failed top-level trigger's
+    thread scope includes a reply under its root."""
+    from main import ChatBotV2
+    from message_processor import fail_cards
+
+    client = MagicMock()
+    client.delete_message = AsyncMock(return_value=True)
+    client._drop_own_message_receipt = AsyncMock()
+    _registered_failure(client)                                  # top-level 10.0 by U1
+    reply, reply_turn = _delivered("10.9", thread="10.0")        # U1's reply under 10.0
+    await ChatBotV2._settle_throttled_failures(reply, client, reply_turn)
+    client.delete_message.assert_awaited_once_with("C1", "note.1")
+    assert fail_cards.registry.find("C1", "10.0") is None
+
+
+@pytest.mark.asyncio
+async def test_a_throttled_origin_read_takes_the_transient_recovery_path():
+    """#6: the origin read's throttle survives its OriginFetchError wrapping, Retry-After and
+    all, and routes into the note-and-re-run path."""
+    from unittest.mock import patch
+
+    from message_processor.base import MessageProcessor
+    from message_processor.channel_stream import OriginFetchError
+
+    with patch("message_processor.base.AsyncThreadStateManager"), \
+         patch("message_processor.base.OpenAIClient"):
+        processor = MessageProcessor()
+    processor.db = None
+    processor.thread_manager.acquire_thread_lock = AsyncMock(return_value=True)
+    processor.thread_manager.release_thread_lock = AsyncMock()
+    processor.get_or_create_channel_thread_state = AsyncMock(  # type: ignore[method-assign]
+        side_effect=OriginFetchError("origin thread could not be read: 429", code="",
+                                     throttled=True, retry_after=11.0))
+    message = Message(text="q", user_id="U1", channel_id="C1", thread_id="10.0",
+                      metadata={"ts": "10.0", "sender_type": "human", **_WOKEN})
+    response = await processor.process_message(message, MagicMock(), None, turn=TurnRuntime())
+    assert response.metadata.get("fail_retry") == {"retry_after": 11.0}

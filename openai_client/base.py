@@ -17,6 +17,8 @@ from .api import token_count as token_count_api
 from .api import tool_loop as tool_loop_api
 from .api import vision as vision_api
 from .api.responses import (STALE_RECONSIDERATION_DECISION_SCHEMA,
+                            STALE_RECONSIDERATION_REDO_RESPONSE_FORMAT,
+                            STALE_RECONSIDERATION_REDO_SCHEMA,
                             STALE_RECONSIDERATION_RESPONSE_FORMAT,
                             ReconsiderationDecision, ReconsiderationDecisionError)
 from .utilities import ImageData
@@ -753,6 +755,8 @@ class OpenAIClient(LoggerMixin):
         prompt_cache_key: Optional[str] = None,
         attempt_sink: Optional[Any] = None,
         on_attempt_open: Optional[Callable[[Optional[int]], Any]] = None,
+        allow_redo: bool = False,
+        tools: Optional[List[Dict[str, Any]]] = None,
     ) -> ReconsiderationDecision:
         """The stale-reconsideration structured decision (STALE_RECONSIDERATION §4d).
 
@@ -762,7 +766,9 @@ class OpenAIClient(LoggerMixin):
         `API_TIMEOUT_READ`. `on_attempt_open(seq)` fires after the attempt opens and before the
         request; a raising callback never blocks the call. Raises
         `ReconsiderationDecisionError` (detail: refusal/incomplete/empty/schema_invalid) when
-        no usable decision came back."""
+        no usable decision came back. `allow_redo` offers the redo decision; `tools` (not None)
+        makes it the tooled pass over the turn's hosted tools (burst follow-ups B8/R2-3) —
+        the same mode `build_reconsideration_create_kwargs` counts."""
         return await responses_api.create_reconsideration_decision(
             self,
             input_items=input_items,
@@ -775,6 +781,8 @@ class OpenAIClient(LoggerMixin):
             prompt_cache_key=prompt_cache_key,
             attempt_sink=attempt_sink,
             on_attempt_open=on_attempt_open,
+            allow_redo=allow_redo,
+            tools=tools,
         )
 
     async def count_input_tokens(
@@ -788,11 +796,16 @@ class OpenAIClient(LoggerMixin):
         *,
         sources: Any,
         channel_steering_text: Optional[str] = None,
+        recent_context: Optional[str] = None,
+        inflight_lines: Optional[str] = None,
     ) -> Optional[bool]:
         """THE gate call: one bit. True/False as the model decided, or None when it produced
-        nothing usable — which the engine turns into a decline, never into a decision."""
+        nothing usable — which the engine turns into a decline, never into a decision.
+        `recent_context` / `inflight_lines` are the gate's recent-context block and in-flight
+        lines (burst follow-ups Part A); empty with the block disabled = today's request."""
         return await responses_api.classify_wake(
-            self, sources=sources, channel_steering_text=channel_steering_text)
+            self, sources=sources, channel_steering_text=channel_steering_text,
+            recent_context=recent_context, inflight_lines=inflight_lines)
 
     async def extract_memory(
         self,
@@ -1081,4 +1094,5 @@ class OpenAIClient(LoggerMixin):
 
 __all__ = ["OpenAIClient", "ImageData", "attach_cache_breakpoint",
            "ReconsiderationDecision", "ReconsiderationDecisionError",
-           "STALE_RECONSIDERATION_DECISION_SCHEMA", "STALE_RECONSIDERATION_RESPONSE_FORMAT"]
+           "STALE_RECONSIDERATION_DECISION_SCHEMA", "STALE_RECONSIDERATION_RESPONSE_FORMAT",
+           "STALE_RECONSIDERATION_REDO_SCHEMA", "STALE_RECONSIDERATION_REDO_RESPONSE_FORMAT"]

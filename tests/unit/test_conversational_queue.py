@@ -83,6 +83,95 @@ class TestQueuePrimitives:
         assert manager.is_thread_processing("111.0", "C123") is False
 
 
+# --- Burst follow-ups R2-2 / R3-1: what a Phase Q catch-up already owns ---
+
+def _scoped(ts, *, thread=None, sender="U1", channel="C123"):
+    """A queued message carrying the identity the stale guard scopes by."""
+    message = _msg(f"m{ts}", user=sender, channel=channel, thread=thread or ts, ts=ts)
+    message.metadata["sender_id"] = sender
+    return message
+
+
+class TestPendingInScope:
+    TURN_SCOPES = (("thread", "C123", "100.0"), ("top", "C123", "U1"))
+
+    def test_queued_newer_messages_in_an_overlapping_scope_are_owned(self, manager):
+        manager.enqueue_pending("C123:100.0", _scoped("101.0", thread="100.0", sender="U2"))
+        manager.enqueue_pending("C123:102.0", _scoped("102.0"))                 # same sender, top
+        manager.enqueue_pending("C123:103.0", _scoped("103.0", sender="U9"))     # someone else
+        manager.enqueue_pending("C999:104.0", _scoped("104.0", channel="C999"))  # other channel
+        assert manager.pending_ts_in_scope("C123", self.TURN_SCOPES, "100.0") == [
+            "101.0", "102.0"]
+        assert manager.pending_in_scope("C123", self.TURN_SCOPES, "100.0") is True
+        assert manager.pending_in_scope("C123", self.TURN_SCOPES, "102.0") is False  # not newer
+
+    def test_a_popped_batch_stays_owned_until_its_trigger_is_admitted(self, manager):
+        key = "C123:100.0"
+        manager.enqueue_pending(key, _scoped("101.0", thread="100.0", sender="U2"))
+        manager.enqueue_pending(key, _scoped("102.0", thread="100.0", sender="U3"))
+        batch = manager.pop_pending_batch(key, 10)
+        assert manager.pending_count(key) == 0
+        assert manager.pending_in_scope("C123", self.TURN_SCOPES, "100.0") is True
+        manager.bind_dispatch(batch[-1], batch)
+        manager.end_dispatch_for(batch[-1])                      # begin_turn on the trigger
+        assert manager.pending_in_scope("C123", self.TURN_SCOPES, "100.0") is False
+
+    def test_an_older_dispatch_never_releases_a_newer_dispatch_of_the_same_trigger(
+            self, manager):
+        """R4 #5: the trigger lost the lock race, was requeued and re-dispatched; the first
+        dispatch's ending must not release the second's ownership."""
+        key = "C123:100.0"
+        trigger = _scoped("101.0", thread="100.0", sender="U2")
+        manager.enqueue_pending(key, trigger)
+        first = manager.bind_dispatch(trigger, manager.pop_pending_batch(key, 10))
+        manager.end_dispatch_for(trigger)                    # admitted, then requeued
+        manager.enqueue_pending(key, trigger)
+        second = manager.bind_dispatch(trigger, manager.pop_pending_batch(key, 10))
+        assert first is not second
+        manager.end_dispatch_for(trigger, first)             # the old task finally ends
+        assert manager.pending_in_scope("C123", self.TURN_SCOPES, "100.0") is True
+        manager.end_dispatch_for(trigger, second)
+        assert manager.pending_in_scope("C123", self.TURN_SCOPES, "100.0") is False
+
+    @pytest.mark.asyncio
+    async def test_a_drain_with_no_handler_releases_what_it_popped(self, manager):
+        key = "C123:100.0"
+        manager.enqueue_pending(key, _scoped("101.0", thread="100.0", sender="U2"))
+        proc = _drain_proc(manager)
+        client = Mock(spec=[])                                   # no message_handler
+        with patch.object(config, "queue_drain_linger_seconds", 0.0):
+            await proc._dispatch_pending_batch(_msg("done"), client, key)
+        assert manager.pending_in_scope("C123", self.TURN_SCOPES, "100.0") is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("ending", ["cancelled_before_start", "raised"])
+    async def test_a_scheduled_catch_up_releases_the_batch_however_it_ends(self, manager,
+                                                                         ending):
+        """The task's done-callback releases ownership — including a cancellation before its
+        first step, which no `finally` inside the task could see."""
+        import asyncio
+        from message_processor.utilities import MessageUtilitiesMixin
+
+        key = "C123:100.0"
+        manager.enqueue_pending(key, _scoped("101.0", thread="100.0", sender="U2"))
+        manager.get_thread_async = AsyncMock(return_value=Mock())
+        proc = _drain_proc(manager)
+        proc._schedule_async_call = MessageUtilitiesMixin._schedule_async_call.__get__(proc)
+        client = Mock()
+        client.message_handler = AsyncMock(side_effect=RuntimeError("refused before admission"))
+        with patch.object(config, "queue_drain_linger_seconds", 0.0):
+            await proc._dispatch_pending_batch(_msg("done"), client, key)
+        assert manager.pending_in_scope("C123", self.TURN_SCOPES, "100.0") is True
+        (task,) = proc._background_tasks
+        if ending == "cancelled_before_start":
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)                                   # let done-callbacks run
+        assert manager.pending_in_scope("C123", self.TURN_SCOPES, "100.0") is False
+        assert client.message_handler.await_count == (0 if ending == "cancelled_before_start"
+                                                      else 1)
+
+
 # --- Contention path: process_message enqueues + returns silent 'queued' ---
 
 class _StubProcessor:
@@ -122,11 +211,23 @@ class TestContentionPath:
 
 # --- Drain/dispatch hook ---
 
+def _start_scheduled(coro):
+    """Stand-in for `_schedule_async_call`: take the catch-up's FIRST step, which is where the
+    handler is now invoked (so its call is recorded), then discard the coroutine — the stub
+    handlers here are plain Mocks and nothing awaits their result."""
+    try:
+        coro.send(None)
+    except (StopIteration, TypeError):
+        pass
+    finally:
+        coro.close()
+
+
 def _drain_proc(manager):
     proc = _StubProcessor(manager)
     proc._format_user_content_with_username = lambda content, m: f"{m.metadata.get('username')}: {content}"
     proc._add_message_with_token_management = Mock()
-    proc._schedule_async_call = Mock()
+    proc._schedule_async_call = Mock(side_effect=_start_scheduled)
     return proc
 
 

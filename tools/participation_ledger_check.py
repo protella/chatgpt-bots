@@ -56,18 +56,21 @@ ENVELOPE_FIELDS = ("v", "at", "session", "gate_contract", "event")
 
 # `visible_action.kind`, reused verbatim by `turn_outcome.kind` — a turn and its gate attempt
 # describe the same room, and two vocabularies for one question would make the rows uncomparable.
+# `superseded` (early stand-down) carries `preempted_by` — the newer same-sender turn's ceiling.
 KINDS = frozenset({
     "reply", "delivery_failed", "silence", "reaction_only", "detached", "queued",
     "interrupted", "error", "error_unhandled", "aborted", "empty", "none",
-    "stale_suppressed",
+    "stale_suppressed", "superseded",
 })
 TURN_SURFACES = frozenset({"channel", "dm"})
 # turn_outcome.destinations[] — DestinationRecord.as_payload(). `correction_announcement`
 # (v10) is the executor-synthesized disclosure post of an edit_own_message transaction,
 # recorded as a committed destination (DEST_KIND_CORRECTION_ANNOUNCEMENT in turn_runtime).
 DESTINATION_STATES = frozenset({"observed", "committed"})
+# `reconsider_interim` (burst follow-ups R2-5) is the short note a reconsideration posts before it
+# re-answers with the turn's hosted tools.
 DESTINATION_KINDS = frozenset({"reply", "stream", "split", "post_to_thread", "reconciled",
-                               "correction_announcement"})
+                               "correction_announcement", "reconsider_interim"})
 RECEIPT_OPS = frozenset({
     "register", "promote", "finalize", "demote", "transfer", "delete", "reconcile_finalize",
     "pending_resolve",
@@ -89,14 +92,15 @@ RECONSIDER_ERRORS = frozenset({
 # how a contract drifts out from under the tool that is supposed to be grading it.
 RECONSIDER_START_FIELDS = frozenset(ENVELOPE_FIELDS) | {
     "turn_id", "channel_id", "trigger_ts", "attempt_id", "pass", "scope", "observed_latest_ts",
-    "model_attempt_seq", "newer_responder_count",
+    "model_attempt_seq", "newer_responder_count", "tooled", "recheck",
 }
 RECONSIDER_OUTCOME_FIELDS = frozenset(ENVELOPE_FIELDS) | {
     "turn_id", "channel_id", "trigger_ts", "attempt_id", "outcome", "passes", "forced", "error",
+    "redone",
 }
 # The nested `turn_outcome.reconsider` copy — ReconsiderFacts.as_payload() verbatim, so its key
-# grammar is closed too: these four and nothing else, with inapplicable keys OMITTED, never null.
-RECONSIDER_NESTED_FIELDS = frozenset({"outcome", "passes", "forced", "error"})
+# grammar is closed too: these five and nothing else, with inapplicable keys OMITTED, never null.
+RECONSIDER_NESTED_FIELDS = frozenset({"outcome", "passes", "forced", "error", "redone"})
 
 # v10 — turn_outcome.edits[], one entry per EditRecord (Docs/specs/EDIT_OWN_MESSAGE.md §7,
 # lifecycle per §11.6). The nested grammar is CLOSED and null-free, and the lifecycle is
@@ -461,6 +465,24 @@ def _check_turn_outcome(row: Row, report: Report) -> None:
     # producer that survived the excision, and both are worth failing on.
     _check_vocabulary(row, report, "error", TURN_ERRORS, "turn_outcome_bad_error",
                       required=False)
+    # A fail-closed row says whether its card reached the room; only a fail-closed row does.
+    if "fail_card" in row.obj:
+        if row.obj.get("fail_card") not in ("posted", "silent"):
+            report.fail("turn_outcome_bad_fail_card", row,
+                        f"fail_card={row.obj.get('fail_card')!r} not in {{posted, silent}}")
+        elif "error" not in row.obj:
+            report.fail("turn_outcome_bad_fail_card", row,
+                        "fail_card on a row with no fail-closed `error` code")
+    # Early stand-down: `preempted_by` rides exactly the `superseded` rows, as a ts string.
+    superseded = row.obj.get("kind") == "superseded"
+    preempted_by = row.obj.get("preempted_by")
+    if superseded and not isinstance(preempted_by, str):
+        report.fail("turn_outcome_bad_preempted_by", row,
+                    f"kind=superseded with preempted_by={preempted_by!r} — a stand-down names "
+                    f"the turn that superseded it")
+    elif not superseded and "preempted_by" in row.obj:
+        report.fail("turn_outcome_bad_preempted_by", row,
+                    f"preempted_by on kind={row.obj.get('kind')!r} — it rides only superseded")
     # v9. The nested reconsideration facts, when a reconsideration ran. Nested values survive
     # record()'s top-level drop-None, so a null INSIDE this object is an emitter defect.
     if "reconsider" in row.obj:
@@ -477,7 +499,7 @@ def _check_turn_outcome(row: Row, report: Report) -> None:
                 if key not in RECONSIDER_NESTED_FIELDS:
                     report.fail("turn_outcome_reconsider_malformed", row,
                                 f"reconsider carries unknown key {key!r} — the nested grammar "
-                                f"is closed (outcome, passes, forced, error)")
+                                f"is closed (outcome, passes, forced, error, redone)")
                 elif facts.get(key) is None:
                     report.fail("turn_outcome_reconsider_malformed", row,
                                 f"reconsider.{key} is null — inapplicable keys are omitted, "
@@ -648,6 +670,13 @@ def _check_stream_render(row: Row, report: Report) -> None:
             report.fail("stream_render_bad_count", row,
                         f"{field}={value!r} is not a non-negative int")
 
+    # Optional: rows written before the reply cache carry no `reply_cache_hits`.
+    if "reply_cache_hits" in row.obj:
+        value = row.obj.get("reply_cache_hits")
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            report.fail("stream_render_bad_count", row,
+                        f"reply_cache_hits={value!r} is not a non-negative int")
+
     for field in STREAM_RENDER_VERSIONS:
         if field not in row.obj:
             continue
@@ -730,6 +759,16 @@ def _check_reconsider_conditionals(row: Row, report: Report, obj: Dict[str, Any]
     elif required and outcome == "error_dropped":
         report.fail(name, row, f"{where}error_dropped has no {'error'!r} — the runner always "
                                f"has a §4f subtype, so a drop that names none says nothing")
+    # Burst follow-ups R2-5: `redone` rides only an invocation that ran its tooled pass (a join
+    # fact, checked in `_check_reconsiderations`); here, its shape — a bool, and True only when
+    # something was delivered.
+    if "redone" in obj:
+        redone = obj.get("redone")
+        if not isinstance(redone, bool):
+            report.fail(name, row, f"{where}redone={redone!r} is not a bool")
+        elif redone and outcome not in ("posted_asis", "posted_revised"):
+            report.fail(name, row, f"{where}redone=True on outcome={outcome!r} — the tooled "
+                                   f"pass's text can only have been delivered on a posted outcome")
 
 
 def _check_unknown_fields(row: Row, report: Report, allowed: frozenset, name: str) -> None:
@@ -770,6 +809,19 @@ def _check_reconsider_start(row: Row, report: Report) -> None:
     if "newer_responder_count" in row.obj and not _typed(newer, int):
         report.fail("reconsider_start_bad_field", row,
                     f"newer_responder_count={newer!r} is not an int")
+    # Burst follow-ups R2-5: written `true` on the tooled pass and omitted on every other one.
+    if "tooled" in row.obj and row.obj.get("tooled") is not True:
+        report.fail("reconsider_start_bad_field", row,
+                    f"tooled={row.obj.get('tooled')!r} — the field is written true on the "
+                    f"tooled pass and omitted otherwise")
+    # R3-2: written `true` on the tool-free pass that re-decides after an ownership recheck.
+    if "recheck" in row.obj and row.obj.get("recheck") is not True:
+        report.fail("reconsider_start_bad_field", row,
+                    f"recheck={row.obj.get('recheck')!r} — the field is written true on the "
+                    f"recheck pass and omitted otherwise")
+    if row.obj.get("recheck") is True and row.obj.get("tooled") is True:
+        report.fail("reconsider_start_bad_field", row,
+                    "a pass cannot be both the tooled pass and a tool-free recheck")
 
 
 def _check_reconsider_outcome(row: Row, report: Report) -> None:
@@ -835,7 +887,27 @@ def _as_int(value: Any) -> Optional[int]:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
+def _check_fail_card_cleared(row: Row, report: Report) -> None:
+    """A fail-closed card taken down by a later reply: it must name the card it removed."""
+    if not isinstance(row.obj.get("card_ts"), str) or not row.obj.get("card_ts"):
+        report.fail("fail_card_cleared_bad_field", row,
+                    f"card_ts={row.obj.get('card_ts')!r} is not a message ts")
+
+
+def _check_fail_retry(row: Row, report: Report) -> None:
+    """The bot's re-run of a throttled trigger: one of three states, and `covered` names the
+    reply that covered it."""
+    state = row.obj.get("state")
+    if state not in ("scheduled", "started", "covered"):
+        report.fail("fail_retry_bad_state", row,
+                    f"state={state!r} not in {{scheduled, started, covered}}")
+    elif state == "covered" and not isinstance(row.obj.get("covered_by"), str):
+        report.fail("fail_retry_bad_state", row, "a covered retry names no covering trigger")
+
+
 PAYLOAD_CHECKS = {
+    "fail_card_cleared": _check_fail_card_cleared,
+    "fail_retry": _check_fail_retry,
     "turn_start": _check_turn_start,
     "turn_outcome": _check_turn_outcome,
     "stream_render": _check_stream_render,
@@ -1099,8 +1171,11 @@ def _check_model_attempts(joins: Joins, report: Report, *, fragments: set) -> No
 
 def _check_reconsiderations(joins: Joins, report: Report, *, fragments: set) -> None:
     """The v9 join invariants, all on turn_id: pass numbers contiguous from 1; a turn's
-    `reconsider_start` count never exceeds its `stale_send` count (every pass exists because a
-    suppression event preceded it, and each suppression event writes exactly one row); at most
+    tool-free `reconsider_start` rows never outnumber its `stale_send` rows (every such pass
+    exists because a suppression event preceded it, and each suppression event writes exactly
+    one row — the tooled pass and the ownership recheck, at most one of each per turn, are the
+    burst follow-ups R3-4 exceptions);
+    `redone` rides exactly the invocations with a tooled pass; at most
     one `reconsider_outcome` per turn (the once-per-turn gate makes a second invocation
     impossible, so a duplicate is a defect in any file, fragment or not); and an outcome's
     `passes` EQUALS the number of `reconsider_start` rows joined to that turn — the field is a
@@ -1140,12 +1215,46 @@ def _check_reconsiderations(joins: Joins, report: Report, *, fragments: set) -> 
         if sorted(set(numbers)) != expected:
             report.fail("reconsider_pass_not_contiguous", starts[0],
                         f"turn_id={turn_id} has passes {sorted(numbers)}, expected {expected}")
+        # Burst follow-ups R3-4: the tooled pass and the ownership recheck (R3-2) re-decide the
+        # suppression an earlier pass was made on and write no stale_send row of their own, so
+        # the starts-vs-suppressions invariant counts the other passes; at most ONE of each.
+        tooled = [r for r in starts if r.obj.get("tooled") is True]
+        rechecks = [r for r in starts if r.obj.get("recheck") is True]
+        if len(tooled) > 1:
+            report.fail("reconsider_tooled_pass_duplicate", tooled[-1],
+                        f"turn_id={turn_id} has {len(tooled)} tooled passes — at most one per "
+                        f"invocation")
+        if len(rechecks) > 1:
+            report.fail("reconsider_recheck_pass_duplicate", rechecks[-1],
+                        f"turn_id={turn_id} has {len(rechecks)} recheck passes — a redo is "
+                        f"decided at most once per invocation")
+        ordinary = len([r for r in starts if r.obj.get("tooled") is not True
+                        and r.obj.get("recheck") is not True])
         suppressions = len(joins.stale_sends.get(turn_id, []))
-        if len(starts) > suppressions:
+        if ordinary > suppressions:
             report.fail("reconsider_start_exceeds_stale_send", starts[-1],
-                        f"turn_id={turn_id} has {len(starts)} reconsider_start rows but only "
-                        f"{suppressions} stale_send row(s) — every pass exists because a "
-                        f"suppression event preceded it")
+                        f"turn_id={turn_id} has {ordinary} reconsider_start rows that are "
+                        f"neither tooled nor a recheck but only {suppressions} stale_send "
+                        f"row(s) — every such pass exists because a suppression event preceded "
+                        f"it")
+        # A recheck follows the redo decision or the tooled pass of the SAME suppression: the
+        # pass right before it exists and carries the same evidence, and when the invocation
+        # ran a tooled pass the recheck is the pass straight after it (a redo decision that
+        # failed its recheck never reaches a tooled pass).
+        by_number = {r.obj.get("pass"): r for r in starts}
+        for recheck in rechecks:
+            number = recheck.obj.get("pass")
+            before = by_number.get(number - 1) if isinstance(number, int) else None
+            follows = (before is not None
+                       and before.obj.get("recheck") is not True
+                       and before.obj.get("scope") == recheck.obj.get("scope")
+                       and before.obj.get("observed_latest_ts")
+                       == recheck.obj.get("observed_latest_ts")
+                       and (not tooled or before.obj.get("tooled") is True))
+            if not follows:
+                report.fail("reconsider_recheck_without_redo", recheck,
+                            f"turn_id={turn_id} recheck pass {number!r} does not follow a redo "
+                            f"decision or the tooled pass of the same suppression")
     for turn_id, outcomes in sorted(joins.reconsider_outcomes.items()):
         if len(outcomes) > 1:
             report.fail("reconsider_outcome_duplicate", outcomes[-1],
@@ -1161,6 +1270,13 @@ def _check_reconsiderations(joins: Joins, report: Report, *, fragments: set) -> 
         # report the same defect twice under a name that suggests a different one.
         passes = _as_int(outcomes[0].obj.get("passes"))
         started = len(joins.reconsider_starts.get(turn_id, []))
+        ran_tooled = any(r.obj.get("tooled") is True
+                         for r in joins.reconsider_starts.get(turn_id, []))
+        if ("redone" in outcomes[0].obj) != ran_tooled:
+            report.fail("reconsider_outcome_redone_mismatch", outcomes[0],
+                        f"turn_id={turn_id} {'carries' if not ran_tooled else 'lacks'} "
+                        f"`redone` but {'ran no' if not ran_tooled else 'ran a'} tooled pass — "
+                        f"the field rides exactly the invocations that re-answered with tools")
         if passes is not None and passes >= 0 and passes != started:
             report.fail("reconsider_outcome_passes_mismatch", outcomes[0],
                         f"turn_id={turn_id} records passes={passes} but {started} "

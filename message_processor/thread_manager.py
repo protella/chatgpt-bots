@@ -5,10 +5,11 @@ Manages conversation state, locks, and memory for each Slack thread
 import time
 import asyncio
 from collections import deque
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, cast
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, cast
 from dataclasses import dataclass, field
 from logger import LoggerMixin
 from config import config
+from message_processor.stale_send_guard import Scope, is_newer, scopes_for_message, ts_key
 
 # Mid-run steering (update_background_job). A LIFETIME cap, counted on the entry and never
 # decremented: capping the pending backlog instead would let a job absorb hundreds of notes
@@ -367,6 +368,14 @@ class AsyncThreadStateManager(LoggerMixin):
         # corresponding enqueue, and the drain pops while STILL HOLDING the lock, so
         # no message can slip between "queue looks empty" and "lock released".
         self._pending_queues: Dict[str, deque] = {}
+        # Messages popped for a catch-up that has not been admitted yet (burst follow-ups R3-1):
+        # between `pop_pending_batch` and the trigger's `begin_turn` a drained message is in no
+        # queue and holds no lease, yet a turn already owns it. id(message) -> message, plus the
+        # batch each trigger carries, so admission releases the whole batch at once. Every pop is a
+        # GENERATION (a private token): a trigger that lost the lock race is requeued and popped
+        # again, and the older dispatch's ending must not release the newer one's ownership.
+        self._in_dispatch: Dict[int, Tuple[Any, object]] = {}
+        self._dispatch_batches: Dict[int, Tuple[object, List[Any]]] = {}
         self.log_info(f"AsyncThreadStateManager initialized {'with' if db else 'without'} database")
 
     # --- Phase Q: pending-message queue (busy rejection retired) ---
@@ -407,7 +416,69 @@ class AsyncThreadStateManager(LoggerMixin):
             batch.append(queue.popleft())
         if not queue:
             self._pending_queues.pop(thread_key, None)
+        # Owned from this instant until the catch-up is admitted or dropped (R3-1).
+        generation = object()
+        for message in batch:
+            self._in_dispatch[id(message)] = (message, generation)
         return batch
+
+    def end_dispatch(self, messages: Iterable[Any],
+                     generation: Optional[object] = None) -> None:
+        """Release in-dispatch ownership of these messages — a drop, a missing handler, a failed
+        drain. With `generation`, only entries still held by THAT dispatch. Idempotent."""
+        for message in messages:
+            entry = self._in_dispatch.get(id(message))
+            if entry is not None and (generation is None or entry[1] is generation):
+                self._in_dispatch.pop(id(message), None)
+            binding = self._dispatch_batches.get(id(message))
+            if binding is not None and (generation is None or binding[0] is generation):
+                self._dispatch_batches.pop(id(message), None)
+
+    def bind_dispatch(self, trigger: Any, batch: Iterable[Any]) -> Optional[object]:
+        """The catch-up `trigger` now answers `batch`: its admission releases all of them.
+        Returns the dispatch's generation, for a release that must not outlive it."""
+        entry = self._in_dispatch.get(id(trigger))
+        generation = entry[1] if entry is not None else object()
+        self._dispatch_batches[id(trigger)] = (generation, list(batch))
+        return generation
+
+    def end_dispatch_for(self, trigger: Any, generation: Optional[object] = None) -> None:
+        """The catch-up trigger was admitted (`begin_turn`) or its dispatch ended: release the
+        batch it carried, and the trigger itself. Admission (no `generation`) releases whatever
+        dispatch is current; a dispatch's own ending releases only its generation — never a newer
+        dispatch of the same requeued trigger. Idempotent; a no-op for an ordinary message."""
+        binding = self._dispatch_batches.get(id(trigger))
+        if binding is not None and (generation is None or binding[0] is generation):
+            self._dispatch_batches.pop(id(trigger), None)
+            self.end_dispatch([trigger, *binding[1]], binding[0])
+        else:
+            self.end_dispatch([trigger], generation)
+
+    def pending_ts_in_scope(self, channel_id: Optional[str], scopes: Iterable[Scope],
+                            after_ts: Optional[str]) -> List[str]:
+        """The ts of every queued or in-dispatch message in this channel that shares a stale-guard
+        scope with `scopes` and is newer than `after_ts` — messages a Phase Q catch-up already
+        owns. Synchronous and in-memory."""
+        wanted = set(scopes)
+        if not channel_id or not wanted:
+            return []
+        prefix = f"{channel_id}:"
+        candidates: List[Any] = [m for key, queue in self._pending_queues.items()
+                                 if key.startswith(prefix) for m in queue]
+        candidates.extend(message for message, _generation in self._in_dispatch.values())
+        found: Dict[str, None] = {}
+        for message in candidates:
+            if getattr(message, "channel_id", None) != channel_id:
+                continue
+            ts = (getattr(message, "metadata", None) or {}).get("ts")
+            if ts and is_newer(ts, after_ts) and wanted & set(scopes_for_message(message)):
+                found[str(ts)] = None
+        return sorted(found, key=ts_key)
+
+    def pending_in_scope(self, channel_id: Optional[str], scopes: Iterable[Scope],
+                         after_ts: Optional[str]) -> bool:
+        """Does a queued or in-dispatch message newer than `after_ts` share one of `scopes`?"""
+        return bool(self.pending_ts_in_scope(channel_id, scopes, after_ts))
 
     def mark_needs_refresh(self, thread_key: str):
         """Flag a thread whose warm state is now incomplete (e.g. a busy-rejected

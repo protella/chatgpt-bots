@@ -9,12 +9,13 @@ from typing import Any, Optional, cast
 
 import openai
 from message_processor.client_contract import BaseClient, ChannelStreamError, HistoryFetchError, Message, Response
+from slack_client.history_fetch import HistoryFetchThrottled
 from message_processor.thread_manager import AsyncThreadStateManager
 from openai_client import OpenAIClient
 from config import config
 from logger import LoggerMixin
 from slack_client import admission_watermark
-from . import channel_steering, image_catalog, participation_telemetry, routing_facts
+from . import channel_steering, fail_cards, image_catalog, participation_telemetry, routing_facts
 from .containers import ContainerManager
 from .context_meter import ContextIrreducible, ContextOverLimit
 from .message_timestamps import stamp_content
@@ -66,6 +67,12 @@ def _measure_note(thread_state: Any, thread_config: Any) -> str:
         return f" | Tokens: {int(measure[0]):,}" if measure is not None else ""
     except Exception:  # noqa: BLE001 — a log suffix never costs the turn
         return ""
+
+
+async def _run_dispatch(handler: Any, trigger: Any, client: Any) -> None:
+    """The scheduled catch-up. The handler's coroutine is created HERE, once the task runs, so a
+    task cancelled before its first step leaves no un-awaited coroutine behind."""
+    await handler(trigger, client)
 
 
 def _reply_text_pending(response: Optional[Response]) -> bool:
@@ -217,6 +224,9 @@ class MessageProcessor(ThreadManagementMixin,
             # get here. main.py's outer finally clears it.
             if send_lease is not None:
                 send_lease.responding = True
+                # EARLY STAND-DOWN: the same person's older turns that have shown nothing yet
+                # stop now, rather than drafting, being refused and rebuilding to reconsider.
+                send_lease.preempt_older_same_sender()
 
             # H, pinned HERE and never refreshed (spec §1). This is the first instant at which the
             # turn genuinely exists — the lock is held, the queue is this turn's, and nothing has
@@ -840,6 +850,14 @@ class MessageProcessor(ThreadManagementMixin,
                 "rate-limiting). Your message wasn't processed — please try again in a moment."
             )
 
+            # THROTTLED is transient, and the bot owns the recovery (message_processor/
+            # fail_cards.py): when somebody asked — addressed, or woken by the gate — main.py
+            # posts one short note and re-runs this trigger itself once Slack lets up. Nobody is
+            # told to try again. Unasked, it stays silent with no re-run, like its siblings.
+            if isinstance(e, HistoryFetchThrottled):
+                return self._throttled_response(message, channel_turn, thread_key,
+                                                e.retry_after)
+
             # The fourth fail-closed code, and the same rule as its three siblings below: with
             # nobody for the card to be for, the outcome is recorded and nothing is said.
             if not self._fail_closed_notice_warranted(message, channel_turn):
@@ -880,6 +898,11 @@ class MessageProcessor(ThreadManagementMixin,
             if turn is not None:
                 turn.turn_error = code
             self.log_error(f"Channel stream unavailable for {thread_key} ({code}): {e}")
+            # An origin read Slack THROTTLED is the same transient failure as a throttled
+            # periphery read, and recovers the same way (message_processor/fail_cards.py).
+            if getattr(e, "throttled", False) is True:
+                return self._throttled_response(message, channel_turn, thread_key,
+                                                getattr(e, "retry_after", None))
             elapsed = time.time() - request_start_time
             self.log_info("")
             self.log_info("=" * 100)
@@ -999,8 +1022,12 @@ class MessageProcessor(ThreadManagementMixin,
             # A turn with nothing left to post is no longer a live reply attempt — cleared
             # BEFORE the drain and lock release await, so a stale older turn's reconsideration
             # doesn't defer to an answer that will never come.
-            if send_lease is not None and not reply_pending:
-                send_lease.responding = False
+            if send_lease is not None:
+                # No early stand-down may cancel into this cleanup: the lock release below
+                # must run, or every later message in the conversation queues forever.
+                send_lease.ending = True
+                if not reply_pending:
+                    send_lease.responding = False
             # The turn is over: an accepted context measure at the threshold may now trigger the
             # after-turn compaction (CONTEXT_METER §3.7); later measures trigger as they land.
             meter = getattr(turn, "context_meter", None)
@@ -1014,19 +1041,23 @@ class MessageProcessor(ThreadManagementMixin,
             # during the linger enqueue (lock held) and join the same batch. Must never
             # prevent the lock release below.
             try:
-                await self._dispatch_pending_batch(message, client, thread_key)
-            except Exception as drain_error:
-                self.log_error(f"Pending-queue drain failed for {thread_key}: {drain_error}", exc_info=True)
-                await self._notify_drain_failure(message, client, thread_key)
-            # Always release the thread lock, even on timeout
-            try:
-                await self.thread_manager.release_thread_lock(
-                    message.thread_id,
-                    message.channel_id
-                )
-            except Exception as lock_error:
-                # Even if release fails, log it but don't crash
-                self.log_error(f"Error releasing thread lock for {thread_key}: {lock_error}", exc_info=True)
+                try:
+                    await self._dispatch_pending_batch(message, client, thread_key)
+                except Exception as drain_error:
+                    self.log_error(f"Pending-queue drain failed for {thread_key}: {drain_error}", exc_info=True)
+                    await self._notify_drain_failure(message, client, thread_key)
+            finally:
+                # Always release the thread lock — even on timeout, and even when a cancellation
+                # lands in the drain above. Shielded, so a cancellation during the release itself
+                # cannot leave the lock held.
+                try:
+                    await asyncio.shield(self.thread_manager.release_thread_lock(
+                        message.thread_id,
+                        message.channel_id
+                    ))
+                except Exception as lock_error:
+                    # Even if release fails, log it but don't crash
+                    self.log_error(f"Error releasing thread lock for {thread_key}: {lock_error}", exc_info=True)
 
     @staticmethod
     def _turn_error_message(e: BaseException, message: Message) -> str:
@@ -1098,6 +1129,33 @@ class MessageProcessor(ThreadManagementMixin,
         if not channel_turn:
             return True
         return (routing_facts.addressed_wake(message)
+                and not routing_facts.sender_is_bot(message))
+
+    def _throttled_response(self, message: Message, channel_turn: bool, thread_key: str,
+                            retry_after: Optional[float]) -> Response:
+        """A fail-closed turn Slack THROTTLED. Somebody asked: main.py posts the note and the bot
+        re-runs the trigger once Slack lets up. Nobody asked: silent, no re-run."""
+        if not self._fail_card_warranted(message, channel_turn):
+            self.log_info(
+                f"Throttled fetch on an unaddressed channel turn in {thread_key} — outcome "
+                "recorded, nothing posted, no re-run")
+            return Response(type="error", content=fail_cards.TRANSIENT_NOTE,
+                            metadata={"suppress_error_post": True})
+        return Response(type="error", content=fail_cards.TRANSIENT_NOTE,
+                        metadata={"fail_retry": {"retry_after": retry_after}})
+
+    @staticmethod
+    def _fail_card_warranted(message: Message, channel_turn: bool) -> bool:
+        """The THROTTLED note's audience (owner decision, burst follow-ups C1): everyone the
+        notice above is for, plus a person whose message the participation gate WOKE — the gate
+        judged it wants an answer — and the bot's own re-run of such a message. Every other
+        unaddressed failure stays silent, with no re-run."""
+        if not channel_turn:
+            return True
+        meta = getattr(message, "metadata", None) or {}
+        asked = (meta.get(routing_facts.GATE_WOKE) is True
+                 or meta.get(fail_cards.FAIL_RETRY_RERUN) is True)
+        return ((routing_facts.addressed_wake(message) or asked)
                 and not routing_facts.sender_is_bot(message))
 
     @staticmethod
@@ -1646,206 +1704,224 @@ class MessageProcessor(ThreadManagementMixin,
         batch = manager.pop_pending_batch(thread_key, int(getattr(config, "queue_max_batch", 10)))
         if not batch:
             return
+        # The popped messages are owned by this drain until the catch-up is admitted (R3-1): a
+        # stale older turn's reconsideration must not answer them in the meantime. Every way
+        # out below that is NOT a scheduled catch-up releases them.
+        try:
 
-        # F52 double-answer fix (queue-drop backstop): drop a queued PRE-EDIT participation
-        # dispatch whose message was since edited and handled by the edit path. Such a dispatch
-        # slipped into the busy queue before the engine supersession landed; carried forward it
-        # RE-RUNS the gate on stale text and posts a duplicate (live 2026-07-16). It is identified
-        # by being gate-routed for a ts the edit path registered, WITHOUT the surviving edit's
-        # marker (the edit's own engine re-dispatch carries it and is kept). Addressed
-        # (app_mention/DM) turns and ordinary different messages are not gate-routed and are
-        # never touched; a genuinely different queued message has a different ts.
-        marker_getter = getattr(client, "edit_dispatch_marker", None)
-        if callable(marker_getter):
-            kept = []
-            for queued_msg in batch:
-                try:
-                    meta = queued_msg.metadata or {}
-                    ts = meta.get("ts")
-                    if meta.get("gate_required") and ts is not None:
-                        surviving = marker_getter(queued_msg.channel_id, ts)
-                        if surviving is not None and meta.get("edit_reply_marker") != surviving:
-                            self.log_info(
-                                f"Dropping stale pre-edit participation dispatch (ts={ts}) "
-                                f"superseded by an edit on {thread_key}")
-                            continue
-                except Exception as drop_err:  # noqa: BLE001 — never let the check lose a message
-                    self.log_warning(f"Edit-stale drop check failed: {drop_err}")
-                kept.append(queued_msg)
-            batch = kept
-            if not batch:
+            # F52 double-answer fix (queue-drop backstop): drop a queued PRE-EDIT participation
+            # dispatch whose message was since edited and handled by the edit path. Such a dispatch
+            # slipped into the busy queue before the engine supersession landed; carried forward it
+            # RE-RUNS the gate on stale text and posts a duplicate (live 2026-07-16). It is identified
+            # by being gate-routed for a ts the edit path registered, WITHOUT the surviving edit's
+            # marker (the edit's own engine re-dispatch carries it and is kept). Addressed
+            # (app_mention/DM) turns and ordinary different messages are not gate-routed and are
+            # never touched; a genuinely different queued message has a different ts.
+            marker_getter = getattr(client, "edit_dispatch_marker", None)
+            if callable(marker_getter):
+                kept = []
+                for queued_msg in batch:
+                    try:
+                        meta = queued_msg.metadata or {}
+                        ts = meta.get("ts")
+                        if meta.get("gate_required") and ts is not None:
+                            surviving = marker_getter(queued_msg.channel_id, ts)
+                            if surviving is not None and meta.get("edit_reply_marker") != surviving:
+                                self.log_info(
+                                    f"Dropping stale pre-edit participation dispatch (ts={ts}) "
+                                    f"superseded by an edit on {thread_key}")
+                                manager.end_dispatch([queued_msg])
+                                continue
+                    except Exception as drop_err:  # noqa: BLE001 — never let the check lose a message
+                        self.log_warning(f"Edit-stale drop check failed: {drop_err}")
+                    kept.append(queued_msg)
+                batch = kept
+                if not batch:
+                    return
+
+            handler = getattr(client, "message_handler", None)
+            if handler is None:
+                # No re-dispatch path (exotic client) — the messages exist in Slack;
+                # flag a transcript refetch so the next turn recovers them in context.
+                manager.mark_needs_refresh(thread_key)
+                self.log_warning(f"No message_handler to drain {len(batch)} queued message(s) on {thread_key}")
+                manager.end_dispatch(batch)
                 return
 
-        handler = getattr(client, "message_handler", None)
-        if handler is None:
-            # No re-dispatch path (exotic client) — the messages exist in Slack;
-            # flag a transcript refetch so the next turn recovers them in context.
-            manager.mark_needs_refresh(thread_key)
-            self.log_warning(f"No message_handler to drain {len(batch)} queued message(s) on {thread_key}")
-            return
-
-        trigger = batch[-1]
-        # The batch members whose turns this one is about to absorb. Each closed its own gate
-        # attempt with `queued`, and until now nothing said WHICH later turn covered them — the
-        # trigger is linked by parent_attempt_id (it is re-gated as the same Message), the rest
-        # were simply folded in and lost. Staged here, where the sources are known, and written
-        # by the successor turn, which alone knows what it became.
-        #
-        # A member may ALSO be carrying sources it inherited from an earlier drain and never
-        # answered (it was queued again before its turn ran). Those travel with it: an ungated
-        # member mints no attempt, so if its inheritance stopped here nothing downstream could
-        # ever say who covered those messages.
-        absorbed = []
-        for absorbed_msg in batch[:-1]:
-            absorbed.extend(participation_telemetry.take_staged_links(absorbed_msg))
-            attempt_id = participation_telemetry.attempt_id_for(absorbed_msg)
-            if attempt_id:
-                absorbed.append(attempt_id)
-        participation_telemetry.stage_queue_links(trigger, absorbed)
-        # THE BATCH ITSELF, as typed sources for the trigger's gate. Without this the redispatch
-        # gate sees one message and decides for all of them, so a no-wake throws away everything
-        # that queued behind it — messages that are in Slack, and now in this thread's state, but
-        # that nobody ever answers. The gate should judge the batch it is actually standing in
-        # front of.
-        #
-        # And if any of them had ALREADY earned a turn, there is nothing left to judge: the
-        # requirement is cleared and the responder decides what to say. (Both matter — the first
-        # covers ambient messages nobody has ruled on, the second covers an @mention that had the
-        # bad luck to queue behind one.)
-        from .participation import source_from_message
-        if routing_facts.absorb_owed_answer(trigger, batch[:-1]):
-            # This turn is an ungated route now, so the trigger must stop carrying the attempt
-            # from its earlier gated pass — that attempt is CLOSED, and left in place it would
-            # attribute this turn's reactions to it and swallow this turn's terminal event
-            # entirely. The detached id joins the absorbed sources so it still says what became
-            # of it.
-            detached = participation_telemetry.detach_attempt(trigger)
-            if detached:
-                participation_telemetry.stage_queue_links(trigger, [detached])
-        if isinstance(trigger.metadata, dict) and len(batch) > 1:
-            trigger.metadata["carried_gate_sources"] = tuple(
-                source_from_message(m) for m in batch[:-1])
-        # T2-10: earlier messages' image parts + attachment failures are collected here and
-        # carried to the trigger turn — images so the model can actually SEE them (not just
-        # their catalogued description), failures so a dropped file is acknowledged.
-        batched_image_inputs: list = []
-        batched_unsupported_files: list = []
-        # [r5-2] A CHANNEL catch-up may not spend a single Responses call before its turn is
-        # admitted, and BOTH of the batch's attachment side effects are Responses calls: the
-        # document summary and the image description. So on a channel batch they are staged here
-        # and carried into the admitted turn, which runs them once the request has been measured
-        # and accepted. A DM has no admission step, so it keeps running both inline, verbatim.
-        channel_batch = TextHandlerMixin._turn_surface(finished_message) == SURFACE_CHANNEL
-        batched_deferred_documents: list = []
-        batched_catalog_groups: list = []
-        if len(batch) > 1:
-            # Append the earlier messages to warm state now (we hold the lock, the
-            # state is current). The trigger message is NOT appended — its own turn
-            # does that, exactly like any normal message.
-            thread_state = await manager.get_thread_async(
-                finished_message.thread_id, finished_message.channel_id
-            )
-            if thread_state is not None:
-                # F10: earlier batch messages' attachments used to be dropped — only text was
-                # appended, so their DOCUMENTS got no save_document row and were unreachable by
-                # read_document/mount_file (and their images rode only ambient dual-write). Resolve
-                # the per-thread code-interpreter setting once, and ONLY when some earlier message
-                # actually carries attachments (the common no-attachment batch stays cheap), so the
-                # attachment pipeline below makes the same native-vs-local call the trigger would.
-                batch_ci_enabled = None
-                if any(qm.attachments for qm in batch[:-1]):
-                    batch_thread_config = await config.get_thread_config_async(
-                        overrides=thread_state.config_overrides,
-                        user_id=finished_message.user_id,
-                        db=self.db,
-                        channel_id=finished_message.channel_id,
-                        channel_turn=channel_batch,
-                    )
-                    batch_ci_enabled = batch_thread_config.get(
-                        'enable_code_interpreter', config.enable_code_interpreter)
-                for queued_msg in batch[:-1]:
-                    try:
-                        content = self._format_user_content_with_username(queued_msg.text or "", queued_msg)
-                        # F10: run the SAME attachment pipeline the trigger turn runs, keyed on this
-                        # message's own ts so documents persist under the right source and images are
-                        # catalogued. Fold the document summaries into this message's appended content
-                        # so the model sees them in context too (the trigger's enhanced_text pattern).
-                        if queued_msg.attachments:
-                            q_image_inputs, q_document_inputs, q_unsupported = await self._process_attachments(
-                                queued_msg, client,
-                                code_interpreter_enabled=batch_ci_enabled,
-                                defer_document_summaries=channel_batch)
-                            if q_document_inputs:
-                                if channel_batch:
-                                    # Staged, not summarized [r5-2]. The fold is skipped with it:
-                                    # what it would render now is an excerpt (there is no summary
-                                    # yet), into ThreadState.messages — a list the channel request
-                                    # never sends. The document's real destination is its ledger
-                                    # row, and that is written when the turn finalizes it.
-                                    batched_deferred_documents.extend(q_document_inputs)
-                                else:
-                                    content = self._build_message_with_documents(content, q_document_inputs)
-                            if q_image_inputs:
-                                # Catalogue a durable description AND carry the raw parts to the
-                                # trigger turn so the model actually sees the images (T2-10).
-                                if channel_batch:
-                                    batched_catalog_groups.append(
-                                        ((queued_msg.metadata or {}).get("ts"),
-                                         list(q_image_inputs)))
-                                else:
-                                    self._schedule_async_call(image_catalog.catalog_uploads(
-                                        self, thread_key, q_image_inputs,
-                                        (queued_msg.metadata or {}).get("ts")))
-                                batched_image_inputs.extend(q_image_inputs)
-                            if q_unsupported:
-                                batched_unsupported_files.extend(q_unsupported)
-                        self._add_message_with_token_management(
-                            thread_state, "user", content,
-                            db=self.db, thread_key=thread_key,
-                            message_ts=(queued_msg.metadata or {}).get("ts"),
+            trigger = batch[-1]
+            # The batch members whose turns this one is about to absorb. Each closed its own gate
+            # attempt with `queued`, and until now nothing said WHICH later turn covered them — the
+            # trigger is linked by parent_attempt_id (it is re-gated as the same Message), the rest
+            # were simply folded in and lost. Staged here, where the sources are known, and written
+            # by the successor turn, which alone knows what it became.
+            #
+            # A member may ALSO be carrying sources it inherited from an earlier drain and never
+            # answered (it was queued again before its turn ran). Those travel with it: an ungated
+            # member mints no attempt, so if its inheritance stopped here nothing downstream could
+            # ever say who covered those messages.
+            absorbed = []
+            for absorbed_msg in batch[:-1]:
+                absorbed.extend(participation_telemetry.take_staged_links(absorbed_msg))
+                attempt_id = participation_telemetry.attempt_id_for(absorbed_msg)
+                if attempt_id:
+                    absorbed.append(attempt_id)
+            participation_telemetry.stage_queue_links(trigger, absorbed)
+            # THE BATCH ITSELF, as typed sources for the trigger's gate. Without this the redispatch
+            # gate sees one message and decides for all of them, so a no-wake throws away everything
+            # that queued behind it — messages that are in Slack, and now in this thread's state, but
+            # that nobody ever answers. The gate should judge the batch it is actually standing in
+            # front of.
+            #
+            # And if any of them had ALREADY earned a turn, there is nothing left to judge: the
+            # requirement is cleared and the responder decides what to say. (Both matter — the first
+            # covers ambient messages nobody has ruled on, the second covers an @mention that had the
+            # bad luck to queue behind one.)
+            from .participation import source_from_message
+            if routing_facts.absorb_owed_answer(trigger, batch[:-1]):
+                # This turn is an ungated route now, so the trigger must stop carrying the attempt
+                # from its earlier gated pass — that attempt is CLOSED, and left in place it would
+                # attribute this turn's reactions to it and swallow this turn's terminal event
+                # entirely. The detached id joins the absorbed sources so it still says what became
+                # of it.
+                detached = participation_telemetry.detach_attempt(trigger)
+                if detached:
+                    participation_telemetry.stage_queue_links(trigger, [detached])
+            if isinstance(trigger.metadata, dict) and len(batch) > 1:
+                trigger.metadata["carried_gate_sources"] = tuple(
+                    source_from_message(m) for m in batch[:-1])
+            # T2-10: earlier messages' image parts + attachment failures are collected here and
+            # carried to the trigger turn — images so the model can actually SEE them (not just
+            # their catalogued description), failures so a dropped file is acknowledged.
+            batched_image_inputs: list = []
+            batched_unsupported_files: list = []
+            # [r5-2] A CHANNEL catch-up may not spend a single Responses call before its turn is
+            # admitted, and BOTH of the batch's attachment side effects are Responses calls: the
+            # document summary and the image description. So on a channel batch they are staged here
+            # and carried into the admitted turn, which runs them once the request has been measured
+            # and accepted. A DM has no admission step, so it keeps running both inline, verbatim.
+            channel_batch = TextHandlerMixin._turn_surface(finished_message) == SURFACE_CHANNEL
+            batched_deferred_documents: list = []
+            batched_catalog_groups: list = []
+            if len(batch) > 1:
+                # Append the earlier messages to warm state now (we hold the lock, the
+                # state is current). The trigger message is NOT appended — its own turn
+                # does that, exactly like any normal message.
+                thread_state = await manager.get_thread_async(
+                    finished_message.thread_id, finished_message.channel_id
+                )
+                if thread_state is not None:
+                    # F10: earlier batch messages' attachments used to be dropped — only text was
+                    # appended, so their DOCUMENTS got no save_document row and were unreachable by
+                    # read_document/mount_file (and their images rode only ambient dual-write). Resolve
+                    # the per-thread code-interpreter setting once, and ONLY when some earlier message
+                    # actually carries attachments (the common no-attachment batch stays cheap), so the
+                    # attachment pipeline below makes the same native-vs-local call the trigger would.
+                    batch_ci_enabled = None
+                    if any(qm.attachments for qm in batch[:-1]):
+                        batch_thread_config = await config.get_thread_config_async(
+                            overrides=thread_state.config_overrides,
+                            user_id=finished_message.user_id,
+                            db=self.db,
+                            channel_id=finished_message.channel_id,
+                            channel_turn=channel_batch,
                         )
-                    except Exception as append_error:
-                        self.log_warning(f"Failed to append queued message to state: {append_error}")
-        # Mark the trigger so the UI can show a catch-up status for multi-message batches.
-        if trigger.metadata is None:
-            trigger.metadata = {}
-        trigger.metadata["queued_batch_size"] = len(batch)
-        # This redispatch IS a coalescing window that already closed: the linger above held the lock
-        # while stragglers piled in, and the pop took every one of them. Waiting the participation
-        # debounce again on the far side coalesces nothing and delays a batch that has been waiting
-        # since before the previous turn ended, so the gate skips its sleep for this turn. Explicit
-        # rather than inferred from `carried_gate_sources`, which is stamped only for a batch of
-        # more than one and would leave the single-message drain paying the full debounce for
-        # nothing. Stamped here, where the trigger's metadata is guaranteed to exist.
-        trigger.metadata["queue_drained"] = True
-        # T2-10: hand the trigger turn the earlier messages' image parts and attachment failures.
-        # process_message folds the images into this turn's multipart content (respecting the
-        # per-turn cap) and routes the failures through the failed-files notice.
-        if batched_image_inputs:
-            trigger.metadata["batched_image_inputs"] = batched_image_inputs
-        if batched_unsupported_files:
-            trigger.metadata["batched_unsupported_files"] = batched_unsupported_files
-        # [r5-2] The two Responses calls this drain refused to make. The catch-up turn runs them
-        # once its request has been admitted; if admission refuses it, they never run at all —
-        # which is the contract, not a gap: a refused turn must not have spent anything.
-        if batched_deferred_documents:
-            trigger.metadata["batched_deferred_documents"] = batched_deferred_documents
-        if batched_catalog_groups:
-            trigger.metadata["batched_catalog_uploads"] = batched_catalog_groups
-        # [r6-3] The FILE payloads of the absorbed messages. Slack may not have propagated them
-        # into the window this turn fetches, and a cohort member the fetch missed would then have
-        # its question answered with its own attachment unreadable — so the ids are carried off the
-        # live events we are already holding and merged into the turn's canonical files. Channel
-        # only: nothing on a DM turn reads them.
-        if channel_batch and len(batch) > 1:
-            from message_processor.channel_request import stage_cohort_file_payloads
-            stage_cohort_file_payloads(
-                trigger.metadata,
-                [((queued_msg.metadata or {}).get("ts"), queued_msg.attachments or [])
-                 for queued_msg in batch[:-1]])
+                        batch_ci_enabled = batch_thread_config.get(
+                            'enable_code_interpreter', config.enable_code_interpreter)
+                    for queued_msg in batch[:-1]:
+                        try:
+                            content = self._format_user_content_with_username(queued_msg.text or "", queued_msg)
+                            # F10: run the SAME attachment pipeline the trigger turn runs, keyed on this
+                            # message's own ts so documents persist under the right source and images are
+                            # catalogued. Fold the document summaries into this message's appended content
+                            # so the model sees them in context too (the trigger's enhanced_text pattern).
+                            if queued_msg.attachments:
+                                q_image_inputs, q_document_inputs, q_unsupported = await self._process_attachments(
+                                    queued_msg, client,
+                                    code_interpreter_enabled=batch_ci_enabled,
+                                    defer_document_summaries=channel_batch)
+                                if q_document_inputs:
+                                    if channel_batch:
+                                        # Staged, not summarized [r5-2]. The fold is skipped with it:
+                                        # what it would render now is an excerpt (there is no summary
+                                        # yet), into ThreadState.messages — a list the channel request
+                                        # never sends. The document's real destination is its ledger
+                                        # row, and that is written when the turn finalizes it.
+                                        batched_deferred_documents.extend(q_document_inputs)
+                                    else:
+                                        content = self._build_message_with_documents(content, q_document_inputs)
+                                if q_image_inputs:
+                                    # Catalogue a durable description AND carry the raw parts to the
+                                    # trigger turn so the model actually sees the images (T2-10).
+                                    if channel_batch:
+                                        batched_catalog_groups.append(
+                                            ((queued_msg.metadata or {}).get("ts"),
+                                             list(q_image_inputs)))
+                                    else:
+                                        self._schedule_async_call(image_catalog.catalog_uploads(
+                                            self, thread_key, q_image_inputs,
+                                            (queued_msg.metadata or {}).get("ts")))
+                                    batched_image_inputs.extend(q_image_inputs)
+                                if q_unsupported:
+                                    batched_unsupported_files.extend(q_unsupported)
+                            self._add_message_with_token_management(
+                                thread_state, "user", content,
+                                db=self.db, thread_key=thread_key,
+                                message_ts=(queued_msg.metadata or {}).get("ts"),
+                            )
+                        except Exception as append_error:
+                            self.log_warning(f"Failed to append queued message to state: {append_error}")
+            # Mark the trigger so the UI can show a catch-up status for multi-message batches.
+            if trigger.metadata is None:
+                trigger.metadata = {}
+            trigger.metadata["queued_batch_size"] = len(batch)
+            # This redispatch IS a coalescing window that already closed: the linger above held the lock
+            # while stragglers piled in, and the pop took every one of them. Waiting the participation
+            # debounce again on the far side coalesces nothing and delays a batch that has been waiting
+            # since before the previous turn ended, so the gate skips its sleep for this turn. Explicit
+            # rather than inferred from `carried_gate_sources`, which is stamped only for a batch of
+            # more than one and would leave the single-message drain paying the full debounce for
+            # nothing. Stamped here, where the trigger's metadata is guaranteed to exist.
+            trigger.metadata["queue_drained"] = True
+            # T2-10: hand the trigger turn the earlier messages' image parts and attachment failures.
+            # process_message folds the images into this turn's multipart content (respecting the
+            # per-turn cap) and routes the failures through the failed-files notice.
+            if batched_image_inputs:
+                trigger.metadata["batched_image_inputs"] = batched_image_inputs
+            if batched_unsupported_files:
+                trigger.metadata["batched_unsupported_files"] = batched_unsupported_files
+            # [r5-2] The two Responses calls this drain refused to make. The catch-up turn runs them
+            # once its request has been admitted; if admission refuses it, they never run at all —
+            # which is the contract, not a gap: a refused turn must not have spent anything.
+            if batched_deferred_documents:
+                trigger.metadata["batched_deferred_documents"] = batched_deferred_documents
+            if batched_catalog_groups:
+                trigger.metadata["batched_catalog_uploads"] = batched_catalog_groups
+            # [r6-3] The FILE payloads of the absorbed messages. Slack may not have propagated them
+            # into the window this turn fetches, and a cohort member the fetch missed would then have
+            # its question answered with its own attachment unreadable — so the ids are carried off the
+            # live events we are already holding and merged into the turn's canonical files. Channel
+            # only: nothing on a DM turn reads them.
+            if channel_batch and len(batch) > 1:
+                from message_processor.channel_request import stage_cohort_file_payloads
+                stage_cohort_file_payloads(
+                    trigger.metadata,
+                    [((queued_msg.metadata or {}).get("ts"), queued_msg.attachments or [])
+                     for queued_msg in batch[:-1]])
 
-        self.log_info(f"Draining {len(batch)} queued message(s) on {thread_key} into one catch-up turn")
-        self._schedule_async_call(handler(trigger, client))
+            self.log_info(f"Draining {len(batch)} queued message(s) on {thread_key} into one catch-up turn")
+            # Admission (`begin_turn`) releases the batch. The task's done-callback releases it on
+            # every other end — a raise, a refusal before admission, and a cancellation even
+            # before the task's first step, which no `finally` inside it would ever see (R3-1).
+            generation = manager.bind_dispatch(trigger, batch)
+            task = self._schedule_async_call(_run_dispatch(handler, trigger, client))
+            if isinstance(task, asyncio.Future):
+                task.add_done_callback(
+                    lambda _t: manager.end_dispatch_for(trigger, generation))
+            else:
+                manager.end_dispatch_for(trigger, generation)   # ran to completion (no loop)
+        except BaseException:
+            manager.end_dispatch(batch)
+            raise
 
     async def cleanup(self):
         """Clean up resources and close clients."""

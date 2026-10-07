@@ -100,17 +100,20 @@ class FakeDecider:
     async def __call__(self, *, input_items, instructions=None, model=None,
                        reasoning_effort=None, verbosity=None, max_output_tokens=None,
                        temperature=None, prompt_cache_key=None, attempt_sink=None,
-                       on_attempt_open=None) -> ReconsiderationDecision:
+                       on_attempt_open=None, allow_redo=False,
+                       tools=None) -> ReconsiderationDecision:
         self.calls.append(dict(
             input_items=input_items, instructions=instructions, model=model,
             reasoning_effort=reasoning_effort, verbosity=verbosity,
             max_output_tokens=max_output_tokens, temperature=temperature,
-            prompt_cache_key=prompt_cache_key))
+            prompt_cache_key=prompt_cache_key, allow_redo=allow_redo, tools=tools))
         attempt = attempt_sink.open(model) if attempt_sink is not None else None
         seq = getattr(attempt, "attempt_seq", None)
         if on_attempt_open is not None:
             on_attempt_open(seq)
         step = self.script.pop(0)
+        if callable(step) and not isinstance(step, BaseException):
+            step = step()          # a step that changes the world while the model "thinks"
         if isinstance(step, BaseException):
             if attempt_sink is not None:
                 attempt_sink.close(attempt, status="error",
@@ -2786,3 +2789,602 @@ async def test_stale_send_rows_on_success_and_give_up_are_single_owner(events, m
     with pytest.raises(StaleSendSuppressed):
         await rig2.run(rig2.accepting_deliver())
     assert len(_named(events, "stale_send")) == 1
+
+
+# =============================================================================== redo (burst follow-ups)
+#
+# R1-B/R2/R3: when no newer message has an owner of its own, the decision pass may answer
+# `redo` (+ an interim). The interim posts through its own receipted send; a TOOLED pass then
+# re-answers with the turn's hosted tools over the same snapshot, and its text takes the
+# ordinary rearm → deliver path, carrying the hosted tools it completed.
+
+HOSTED = [{"type": "web_search"}]
+
+
+def _redo(interim: Optional[str] = "Re-checking with the new cities too.") -> ReconsiderationDecision:
+    return ReconsiderationDecision(decision="redo", text=None, interim=interim)
+
+
+def _tooled(decision: str = "post", text: Optional[str] = "Kyiv 9°C, London 14°C.",
+            tools: Tuple[str, ...] = ("web_search",)) -> ReconsiderationDecision:
+    return ReconsiderationDecision(
+        decision=decision, text=text, tools_used=tools,
+        tool_results=tuple({"tool_name": t, "output": f"{t} evidence"} for t in tools))
+
+
+class _RedoRig(_Rig):
+    """A suppressed channel turn whose racer was gate-slept (its lease closed), so nothing newer
+    has an owner and redo is on the table."""
+
+    def __init__(self, monkeypatch, *, script: List[Any], interim_fails: bool = False):
+        super().__init__(monkeypatch, script=script)
+        from message_processor.thread_manager import AsyncThreadStateManager
+
+        self.manager = AsyncThreadStateManager(db=None)
+        self.processor.thread_manager = self.manager
+        self.processor._build_tools_array = MagicMock(return_value=list(HOSTED))
+        self.interims: List[Dict[str, Any]] = []
+        self.deliveries: List[Dict[str, Any]] = []
+        rig = self
+
+        async def _send(channel_id, thread_id, text, *, meta_out=None, receipts=None,
+                        receipt_class=None, **kw):
+            assert "lease" not in kw, "the interim never takes the answer's lease (R2-1)"
+            if interim_fails:
+                raise RuntimeError("slack said no")
+            rig.interims.append({"thread": thread_id, "text": text, "class": receipt_class})
+            return "50.5"
+
+        self.client = SimpleNamespace(bot_user_id="UBOT", send_message=_send)
+
+    def race_slept(self, ts: str = NEWER_TS) -> None:
+        """A newer reply whose turn ran and closed — the gate slept it."""
+        self.raced.append(ts)
+        self.marks.begin_turn(_msg(ts=ts, thread=TRIGGER_TS, sender="U2")).close()
+
+    def race_owned(self, ts: str = "12.0", *, responding: bool) -> None:
+        """A newer reply whose own turn is still open — responding, or still deciding."""
+        self.raced.append(ts)
+        self.marks.begin_turn(_msg(ts=ts, thread=TRIGGER_TS, sender="U3")).responding = (
+            responding)
+
+    def deliver(self, ts: str = "99.9"):
+        async def _deliver(text: str, extra_tools=None, extra_results=()) -> Optional[str]:
+            self.lease.authorize("final_post")
+            self.deliveries.append({"text": text, "extra_tools": extra_tools,
+                                    "extra_results": tuple(extra_results)})
+            self.lease.commit()
+            return ts
+        return _deliver
+
+    async def run(self, deliver, suppressed=None):
+        exc = suppressed if suppressed is not None else self.suppress()
+        return await reconsider_stale_draft(
+            processor=self.processor, client=self.client, message=self.message,
+            turn=self.turn, lease=self.lease, suppressed=exc, draft=self.draft,
+            deliver=deliver)
+
+
+@pytest.mark.asyncio
+async def test_redo_posts_the_interim_then_delivers_the_tooled_answer_with_its_tools(
+        events, monkeypatch):
+    from message_processor.prompts import RECONSIDERATION_REDO
+    from message_processor.turn_runtime import DEST_KIND_RECONSIDER_INTERIM
+
+    rig = _RedoRig(monkeypatch, script=[_redo(), _tooled()])
+    rig.race_slept()
+    ts = await rig.run(rig.deliver())
+
+    assert ts == "99.9"
+    # The decision pass offered redo; the tooled pass carried the hosted tools.
+    first, second = rig.decider.calls
+    assert first["allow_redo"] is True and first["tools"] is None
+    assert RECONSIDERATION_REDO in first["input_items"][-1]["content"]
+    assert second["tools"] == HOSTED and second["allow_redo"] is False
+    assert "the draft answer" not in second["input_items"][-1]["content"]
+    # The interim: its own receipted send, committed as an interim destination.
+    assert rig.interims == [{"thread": TRIGGER_TS, "text": "Re-checking with the new cities too.",
+                             "class": "assistant_reply"}]
+    interim = [d for d in rig.turn.committed_destinations
+               if d.kind == DEST_KIND_RECONSIDER_INTERIM]
+    assert [d.first_ts for d in interim] == ["50.5"]
+    # The answer: the tooled text, with the hosted tools it completed.
+    assert rig.deliveries == [{"text": "Kyiv 9°C, London 14°C.", "extra_tools": ("web_search",),
+                               "extra_results": ({"tool_name": "web_search",
+                                                  "output": "web_search evidence"},)}]
+    assert "web_search" in rig.turn.provenance_external_tools
+    facts = rig.turn.reconsider
+    assert (facts.outcome, facts.passes, facts.redone) == ("posted_revised", 2, True)
+    starts = _named(events, "reconsider_start")
+    assert [s.get("tooled") for s in starts] == [None, True]
+    assert len(_named(events, "stale_send")) == 1     # the tooled pass is no new suppression
+    assert _named(events, "reconsider_outcome")[0]["redone"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", ["responding", "deciding", "queued"])
+async def test_redo_is_not_offered_while_a_newer_message_has_an_owner(owner, events,
+                                                                      monkeypatch):
+    from message_processor.prompts import RECONSIDERATION_REDO
+
+    rig = _RedoRig(monkeypatch, script=[_decision("skip", None)])
+    rig.race_slept()
+    if owner in ("responding", "deciding"):
+        rig.race_owned(responding=owner == "responding")
+    else:
+        rig.manager.enqueue_pending(f"{CH}:{TRIGGER_TS}",
+                                    _msg(ts="12.0", thread=TRIGGER_TS, sender="U3"))
+    with pytest.raises(StaleSendSuppressed):
+        await rig.run(rig.deliver())
+    call = rig.decider.calls[0]
+    assert call["allow_redo"] is False
+    assert RECONSIDERATION_REDO not in call["input_items"][-1]["content"]
+    assert rig.turn.reconsider.redone is None
+
+
+@pytest.mark.asyncio
+async def test_a_failed_interim_still_runs_the_tooled_pass(events, monkeypatch):
+    rig = _RedoRig(monkeypatch, script=[_redo(), _tooled()], interim_fails=True)
+    rig.race_slept()
+    await rig.run(rig.deliver())
+    assert rig.interims == []
+    assert [d["text"] for d in rig.deliveries] == ["Kyiv 9°C, London 14°C."]
+    assert rig.turn.reconsider.outcome == "posted_revised"
+
+
+@pytest.mark.asyncio
+async def test_an_owner_appearing_after_the_redo_decision_re_decides_without_redo(
+        events, monkeypatch):
+    """Check (b), R3-2: no interim, and one more tool-free decision — never a blind skip."""
+    rig = _RedoRig(monkeypatch, script=[])
+
+    def _redo_while_a_responder_starts():
+        rig.race_owned(responding=True)
+        return _redo()
+
+    rig.decider.script = [_redo_while_a_responder_starts, _decision("post", None)]
+    rig.race_slept()
+    await rig.run(rig.deliver())
+
+    assert rig.interims == []
+    first, second = rig.decider.calls
+    assert first["allow_redo"] is True
+    assert second["allow_redo"] is False and second["tools"] is None
+    assert "12.0" in second["input_items"][-1]["content"]          # newer-owner guidance
+    assert rig.deliveries[0] == {"text": "the draft answer", "extra_tools": None,
+                                 "extra_results": ()}
+    assert (rig.turn.reconsider.outcome, rig.turn.reconsider.redone) == ("posted_asis", None)
+    assert [s.get("recheck") for s in _named(events, "reconsider_start")] == [None, True]
+
+
+@pytest.mark.asyncio
+async def test_an_owner_appearing_during_the_tooled_pass_re_decides_over_its_text(
+        events, monkeypatch):
+    """Check (c), R3-2: the tooled text becomes the draft a tool-free pass decides on."""
+    rig = _RedoRig(monkeypatch, script=[])
+
+    def _tooled_while_a_turn_starts_deciding():
+        rig.race_owned(responding=False)
+        return _tooled()
+
+    rig.decider.script = [_redo(), _tooled_while_a_turn_starts_deciding,
+                          _decision("post", None)]
+    rig.race_slept()
+    await rig.run(rig.deliver())
+
+    third = rig.decider.calls[2]
+    assert third["tools"] is None and third["allow_redo"] is False
+    assert "Kyiv 9°C, London 14°C." in third["input_items"][-1]["content"]
+    assert rig.deliveries[0]["text"] == "Kyiv 9°C, London 14°C."
+    assert rig.deliveries[0]["extra_tools"] == ("web_search",)
+    facts = rig.turn.reconsider
+    assert (facts.outcome, facts.passes, facts.redone) == ("posted_revised", 3, True)
+    starts = _named(events, "reconsider_start")
+    assert [(s.get("tooled"), s.get("recheck")) for s in starts] == [
+        (None, None), (True, None), (None, True)]
+
+
+@pytest.mark.asyncio
+async def test_redo_is_not_offered_when_the_turn_has_no_hosted_tool(events, monkeypatch):
+    """Ruling 3: no web search and no MCP server left — the request keeps the non-redo shape."""
+    rig = _RedoRig(monkeypatch, script=[_decision("skip", None)])
+    rig.processor._build_tools_array = MagicMock(return_value=None)
+    rig.race_slept()
+    with pytest.raises(StaleSendSuppressed):
+        await rig.run(rig.deliver())
+    assert rig.decider.calls[0]["allow_redo"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_tooled_skip_ends_skipped_and_says_nothing_was_redone(events, monkeypatch):
+    rig = _RedoRig(monkeypatch, script=[_redo(interim=None), _tooled("skip", None, ())])
+    rig.race_slept()
+    with pytest.raises(StaleSendSuppressed):
+        await rig.run(rig.deliver())
+    assert rig.deliveries == [] and rig.interims == []
+    assert (rig.turn.reconsider.outcome, rig.turn.reconsider.redone) == ("skipped", False)
+
+
+def test_a_dm_surface_offers_redo_only_with_its_hosted_rendering_pinned():
+    """R1-B 5: DMs too — re-asked under the hosted-only instructions pinned with the turn."""
+    from message_processor.dm_reconsideration import DMReconsiderSurface, DMTurnContext
+    from message_processor.prompts import RECONSIDERATION_REDO
+
+    processor = MagicMock()
+    processor._build_tools_array.return_value = list(HOSTED)
+    turn = TurnRuntime.for_message(_msg(channel=DM), channel_post_allowed=False)
+    ctx = DMTurnContext(channel_id=DM, trigger_ts=TRIGGER_TS, origin_root_ts=TRIGGER_TS,
+                        trigger_text="weather?", requester_name="Dana Whitfield",
+                        instructions="DM-PROMPT", tool_free_instructions="DM-TOOL-FREE",
+                        hosted_only_instructions="DM-HOSTED-ONLY")
+    surface = DMReconsiderSurface(processor=processor, client=None, message=None, turn=turn,
+                                  ctx=ctx)
+    surface.model = "gpt-6-astra"
+    assert surface.supports_tooled is True
+    decision = surface.build_request(dm_surface_snapshot(), pass_number=1, draft="d",
+                                     allow_redo=True)
+    assert decision.allow_redo is True
+    assert RECONSIDERATION_REDO in decision.api_items[-1]["content"]
+    tooled = surface.build_tooled_request(dm_surface_snapshot(), pass_number=2)
+    assert tooled.instructions == "DM-HOSTED-ONLY" and tooled.tools == HOSTED
+
+    unpinned = DMReconsiderSurface(processor=processor, client=None, message=None, turn=turn,
+                                   ctx=DMTurnContext(channel_id=DM, trigger_ts=TRIGGER_TS,
+                                                     origin_root_ts=TRIGGER_TS, trigger_text="",
+                                                     requester_name="x", instructions="p"))
+    assert unpinned.supports_tooled is False
+
+
+def test_a_committed_interim_makes_a_skipped_turn_a_visible_reply():
+    """codex R1 #8: the room saw this turn's own words."""
+    from main import ChatBotV2
+    from message_processor.turn_runtime import DEST_KIND_RECONSIDER_INTERIM
+
+    turn = TurnRuntime.for_message(_msg(), channel_post_allowed=False)
+    assert ChatBotV2._stale_terminal_kind(None, turn, _msg()) == "stale_suppressed"
+    turn.mark_destination_committed(first_ts="50.5", kind=DEST_KIND_RECONSIDER_INTERIM,
+                                    text="Re-checking.", channel_id=CH,
+                                    thread_root_ts=TRIGGER_TS)
+    assert ChatBotV2._stale_terminal_kind(None, turn, _msg()) == "reply"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_tooled_call_still_reports_redone_and_grades_clean(events, monkeypatch,
+                                                                          tmp_path):
+    """A tooled pass that opened and then failed is on the record (`tooled: true`), so its
+    outcome carries `redone: false` — and the ledger the invocation wrote passes the checker."""
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    rig = _RedoRig(monkeypatch, script=[_redo(interim=None),
+                                        ReconsiderationDecisionError("refusal")])
+    rig.race_slept()
+    with pytest.raises(StaleSendSuppressed):
+        await rig.run(rig.deliver())
+    facts = rig.turn.reconsider
+    assert (facts.outcome, facts.error, facts.redone) == ("error_dropped", "model_failure", False)
+    outcome = _named(events, "reconsider_outcome")[0]
+    assert outcome["redone"] is False
+
+    envelope = {"v": 10, "session": "S", "gate_contract": "binary-v1"}
+    turn_id = rig.turn.turn_id
+    rows = [dict(envelope, at=1.0, event="session_start", build="abc"),
+            dict(envelope, at=2.0, event="turn_start", channel_id=CH, trigger_ts=TRIGGER_TS,
+                 turn_id=turn_id, surface="channel", gated=False)]
+    for index, event in enumerate(e for e in events if e["event"] in (
+            "stale_send", "reconsider_start", "reconsider_outcome")):
+        rows.append(dict(envelope, at=3.0 + index,
+                         **{k: v for k, v in event.items() if v is not None}))
+    rows += [dict(envelope, at=9.0, event="turn_outcome", channel_id=CH, trigger_ts=TRIGGER_TS,
+                  turn_id=turn_id, kind="stale_suppressed", detached_started=False,
+                  stream_build_present=False, destinations=[], edits=[],
+                  reconsider=facts.as_payload()),
+             dict(envelope, at=10.0, event="session_end")]
+    ledger = tmp_path / "participation.jsonl"
+    ledger.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    checker = Path(__file__).resolve().parents[2] / "tools" / "participation_ledger_check.py"
+    result = subprocess.run([sys.executable, str(checker), str(ledger), "--json"],
+                            capture_output=True, text=True, cwd=str(tmp_path))
+    payload = json.loads(result.stdout)
+    assert result.returncode == 0, payload
+
+
+@pytest.mark.asyncio
+async def test_redo_is_not_offered_once_the_fuse_cannot_fit_its_follow_up_passes(
+        events, monkeypatch):
+    """Redo needs two more slots (the tooled pass and a possible recheck): offered through pass
+    3, never on pass 4 or 5 — a redo chosen there would post an interim and then trip the fuse."""
+    rig = _RedoRig(monkeypatch, script=[_decision("post", None)] * 4 + [_decision("skip", None)])
+    rig.race_slept()
+    races = iter(["12.0", "13.0", "14.0", "15.0"])
+
+    async def _re_racing(text: str, extra_tools=None, extra_results=()) -> Optional[str]:
+        rig.race_slept(next(races))
+        rig.lease.authorize("final_post")          # refused: the next pass begins
+        return "99.9"
+
+    with pytest.raises(StaleSendSuppressed):
+        await rig.run(_re_racing)
+    assert [c["allow_redo"] for c in rig.decider.calls] == [True, True, True, False, False]
+
+
+# =============================================================================== early stand-down
+
+
+@pytest.mark.asyncio
+async def test_a_preempted_turn_stands_down_quietly_and_shutdown_still_cancels(events,
+                                                                               monkeypatch):
+    """The same person's newer turn begins answering: the older one, still drafting with nothing
+    shown, ends `superseded` — 👀 retracted, nothing posted, no error notice, lease closed — and
+    returns normally. A cancellation with no preemption behind it (shutdown) still propagates."""
+    for preempt in (True, False):
+        bot = _main_bot()
+        message = _main_message()
+        started = asyncio.Event()
+        turns: List[TurnRuntime] = []
+
+        async def _process(message, client, thinking_id=None, turn=None, _turns=turns,
+                           _started=started):
+            _turns.append(turn)
+            turn.ack_lease = {"emoji": "eyes"}
+            _started.set()
+            await asyncio.Event().wait()                 # drafting, indefinitely
+
+        bot.processor.process_message = AsyncMock(side_effect=_process)
+        sent: List[Any] = []
+
+        async def _send(*args, _sent=sent, **kwargs):
+            _sent.append(args)
+            return "1.0"
+
+        client = _main_client(_send)
+        client.remove_owned_reaction = AsyncMock(return_value=True)
+        task = asyncio.ensure_future(bot.handle_message(message, client))
+        await started.wait()
+        if not preempt:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert turns[0].send_lease._closed
+            continue
+        newer = bot.watermarks.begin_turn(Message(
+            text="no wait", user_id="U1", channel_id=CH, thread_id="12.0",
+            metadata={"ts": "12.0", "sender_id": "U1"}))
+        assert newer.preempt_older_same_sender() == [TRIGGER_TS]
+        await task
+        assert not task.cancelled()
+        lease = turns[0].send_lease
+        assert lease._closed and lease.preempted_by == "12.0"
+        client.remove_owned_reaction.assert_awaited_once()
+        client.handle_error.assert_not_awaited()
+        assert sent == []
+        outcome = _named(events, "turn_outcome")[0]
+        assert (outcome["kind"], outcome["preempted_by"]) == ("superseded", "12.0")
+        newer.close()
+        assert bot.watermarks.tracked_scopes == 0
+
+
+@pytest.mark.asyncio
+async def test_a_turn_cancelled_while_awaiting_a_cancelled_progress_task_propagates():
+    """The progress updater's OWN cancellation is swallowed; one aimed at the turn (shutdown,
+    a stand-down) arriving during that await is not."""
+    from message_processor.handlers.text import await_cancelled_progress
+
+    async def _slow_to_stop():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.05)            # cleanup on its way out
+            raise
+
+    async def _turn(progress):
+        progress.cancel()
+        await await_cancelled_progress(progress)
+        return "carried on"
+
+    quiet = asyncio.ensure_future(_slow_to_stop())
+    await asyncio.sleep(0)
+    assert await _turn(quiet) == "carried on"           # its own cancellation: swallowed
+
+    progress = asyncio.ensure_future(_slow_to_stop())
+    await asyncio.sleep(0)
+    turn = asyncio.ensure_future(_turn(progress))
+    await asyncio.sleep(0.01)                           # the turn is awaiting the updater
+    turn.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_turn_never_leaves_its_progress_updater_running():
+    """R4 #3: the updater edits Slack on a timer; every exit of the streaming handler stops it
+    and waits for it, a cancellation included."""
+    from message_processor.handlers import text as text_module
+    from message_processor.handlers.text import stop_progress_updater
+
+    edits: List[int] = []
+
+    async def _updater():
+        while True:
+            edits.append(1)
+            await asyncio.sleep(0.001)
+
+    async def _turn(progress):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await stop_progress_updater(progress)
+
+    progress = asyncio.ensure_future(_updater())
+    turn = asyncio.ensure_future(_turn(progress))
+    await asyncio.sleep(0.01)
+    turn.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+    assert progress.done()
+    settled = len(edits)
+    await asyncio.sleep(0.01)
+    assert len(edits) == settled                       # nothing edits Slack any more
+    source = inspect.getsource(
+        text_module.TextHandlerMixin._handle_streaming_text_response)
+    assert "await stop_progress_updater(progress_task)" in source
+
+
+@pytest.mark.asyncio
+async def test_a_stand_down_between_the_indicator_and_the_responder_removes_the_indicator(
+        events, monkeypatch):
+    """R4 #4: the cancel lands in the catch-up status update, right after the thinking
+    indicator was posted — the stand-down still deletes that exact message."""
+    bot = _main_bot()
+    message = _main_message()
+    message.metadata["queued_batch_size"] = 2               # the catch-up update runs
+    updating = asyncio.Event()
+
+    async def _update(*args, **kwargs):
+        updating.set()
+        await asyncio.Event().wait()
+
+    client = _main_client(AsyncMock(return_value="1.0"))
+    client.send_thinking_indicator = AsyncMock(return_value="TH.1")
+    client.update_message = _update
+    task = asyncio.ensure_future(bot.handle_message(message, client))
+    await updating.wait()
+    newer = bot.watermarks.begin_turn(Message(
+        text="no wait", user_id="U1", channel_id=CH, thread_id="12.0",
+        metadata={"ts": "12.0", "sender_id": "U1"}))
+    assert newer.preempt_older_same_sender() == [TRIGGER_TS]
+    await task
+    assert not task.cancelled()
+    client.delete_message.assert_any_await(CH, "TH.1")
+    bot.processor.process_message.assert_not_called()
+    assert _named(events, "turn_outcome")[0]["kind"] == "superseded"
+    newer.close()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_during_the_stand_down_cleanup_waits_for_it_once_and_propagates(
+        events, monkeypatch):
+    """A second cancellation interrupting the shielded chrome cleanup starts no second cleanup;
+    it waits for the one already running and then propagates, so shutdown proceeds."""
+    bot = _main_bot()
+    message = _main_message()
+    message.metadata["queued_batch_size"] = 2
+    updating, deleting, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def _update(*args, **kwargs):
+        updating.set()
+        await asyncio.Event().wait()
+
+    async def _delete(*args, **kwargs):
+        deleting.set()
+        await release.wait()
+        return True
+
+    client = _main_client(AsyncMock(return_value="1.0"))
+    client.send_thinking_indicator = AsyncMock(return_value="TH.1")
+    client.update_message = _update
+    client.delete_message = AsyncMock(side_effect=_delete)
+    task = asyncio.ensure_future(bot.handle_message(message, client))
+    await updating.wait()
+    newer = bot.watermarks.begin_turn(Message(
+        text="no wait", user_id="U1", channel_id=CH, thread_id="12.0",
+        metadata={"ts": "12.0", "sender_id": "U1"}))
+    assert newer.preempt_older_same_sender() == [TRIGGER_TS]
+    await deleting.wait()                               # the one cleanup is running
+    task.cancel()                                       # shutdown
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert client.delete_message.await_count == 1
+    assert _named(events, "turn_outcome")[0]["kind"] == "superseded"
+    newer.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("activity", ["hosted_search", "local_flight"])
+async def test_only_a_local_tool_makes_a_turn_ineligible_for_stand_down(activity, events,
+                                                                        monkeypatch):
+    """A hosted search runs inside the turn's own stream, and its 👀 is claimed in the turn's
+    own task — so that turn still stands down, and the claim comes off with it. A local tool
+    runs in a task of its own: that turn is never preempted."""
+    bot = _main_bot()
+    message = _main_message()
+    working = asyncio.Event()
+    turns: List[TurnRuntime] = []
+
+    async def _process(message, client, thinking_id=None, turn=None):
+        turns.append(turn)
+        if activity == "hosted_search":
+            turn.note_external_tools(["web_search"])     # the hosted 'started' event
+            await turn.claim_work(client, message)       # the first search's 👀
+        else:
+            turn.open_tool_flight(call_id="c1", tool_name="fetch_url", fingerprint="f",
+                                  timeout=5.0)
+        working.set()
+        await asyncio.Event().wait()
+
+    bot.processor.process_message = AsyncMock(side_effect=_process)
+    client = _main_client(AsyncMock(return_value="1.0"))
+    client._reserve_and_react_owned = AsyncMock(return_value=({"ok": True}, {"ts": "eyes"}))
+    client.remove_owned_reaction = AsyncMock(return_value=True)
+    task = asyncio.ensure_future(bot.handle_message(message, client))
+    await working.wait()
+    newer = bot.watermarks.begin_turn(Message(
+        text="no wait", user_id="U1", channel_id=CH, thread_id="12.0",
+        metadata={"ts": "12.0", "sender_id": "U1"}))
+    if activity == "hosted_search":
+        assert turns[0].ack_lease is not None
+        assert newer.preempt_older_same_sender() == [TRIGGER_TS]
+        await task
+        client.remove_owned_reaction.assert_awaited_once()
+        assert _named(events, "turn_outcome")[0]["kind"] == "superseded"
+    else:
+        assert turns[0].send_lease.tools_started is True
+        assert newer.preempt_older_same_sender() == []
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    newer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_turn_mid_claim_stands_down_right_after_the_claim_completes(events,
+                                                                           monkeypatch):
+    """Deferred preemption: the newer same-sender turn starts while this one is placing its 👀;
+    the stand-down waits for that mutation to land, then happens — and takes the 👀 back."""
+    from message_processor.stale_send_guard import visible_mutation
+
+    bot = _main_bot()
+    message = _main_message()
+    claiming, release = asyncio.Event(), asyncio.Event()
+
+    @visible_mutation
+    async def _reserve(channel_id, ts, emoji):
+        claiming.set()
+        await release.wait()
+        return {"ok": True}, {"ts": "eyes"}
+
+    async def _process(message, client, thinking_id=None, turn=None):
+        await turn.claim_work(client, message)          # the first search's 👀
+        await asyncio.Event().wait()                    # …then the model call
+
+    bot.processor.process_message = AsyncMock(side_effect=_process)
+    client = _main_client(AsyncMock(return_value="1.0"))
+    client._reserve_and_react_owned = _reserve
+    client.remove_owned_reaction = AsyncMock(return_value=True)
+    task = asyncio.ensure_future(bot.handle_message(message, client))
+    await claiming.wait()
+    newer = bot.watermarks.begin_turn(Message(
+        text="no wait", user_id="U1", channel_id=CH, thread_id="12.0",
+        metadata={"ts": "12.0", "sender_id": "U1"}))
+    assert newer.preempt_older_same_sender() == []      # mid-mutation: deferred
+    release.set()
+    await task
+    assert not task.cancelled()
+    client.remove_owned_reaction.assert_awaited_once()
+    outcome = _named(events, "turn_outcome")[0]
+    assert (outcome["kind"], outcome["preempted_by"]) == ("superseded", "12.0")
+    newer.close()

@@ -928,7 +928,9 @@ def _absorbed_mention_meta():
 async def test_a_fail_closed_turn_speaks_only_where_somebody_asked(wake, meta, posts):
     """Nobody asked. A channel turn that fails closed on an AMBIENT wake — a gate wake, or a
     thread we are merely a member of — records its outcome and posts nothing: the card would
-    interrupt a conversation we were never asked into to announce our own plumbing.
+    interrupt a conversation we were never asked into to announce our own plumbing. (A THROTTLED
+    history fetch is the one exception, and it is not a card: a gate-woken turn gets a short
+    note and the bot re-runs it — message_processor/fail_cards.py.)
 
     Four things do have somebody to tell. An @mention and a name in the text are people talking
     to us; a STRICT 1:1 continuation is a person carrying on what is effectively a private

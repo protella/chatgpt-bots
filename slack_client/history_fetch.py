@@ -45,6 +45,17 @@ class HistoryPageError(HistoryFetchError):
         self.retry_after = retry_after
 
 
+class HistoryFetchThrottled(HistoryFetchError):
+    """Slack throttled the fetch (429 / `ratelimited`) and the retries ran out — attempts or
+    budget. TRANSIENT: the same request will succeed once Slack lets up, so a turn that failed on
+    it is retried rather than abandoned (message_processor/fail_cards.py). `retry_after` is the
+    last Retry-After Slack gave, when it gave one."""
+
+    def __init__(self, message: str, *, retry_after: Optional[float] = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 class HistoryPageInvalid(HistoryFetchError):
     """A page Slack ANSWERED that is not the shape a page is.
 
@@ -245,6 +256,8 @@ async def fetch_page(method: Callable[..., Awaitable[Any]], params: Dict[str, An
     `sleeper` lets the bootstrap park with its sweep claim held and its heartbeat bumped
     instead of a bare asyncio.sleep.
     """
+    throttled = False
+    throttle_after: Optional[float] = None
     tries = max(1, int(config.fetch_retry_attempts if attempts is None else attempts))
     sleep = sleeper or asyncio.sleep
     if budget is not None:
@@ -276,6 +289,11 @@ async def fetch_page(method: Callable[..., Awaitable[Any]], params: Dict[str, An
             code = slack_error_code(e)
             if code and code != "ratelimited" and delay is None:
                 raise HistoryPageError(f"{label} refused: {code}", code=code) from e
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if code == "ratelimited" or status == 429:
+                throttled = True
+                if delay is not None:
+                    throttle_after = delay
         except Exception as e:  # noqa: BLE001
             last = e
             delay = None
@@ -295,9 +313,14 @@ async def fetch_page(method: Callable[..., Awaitable[Any]], params: Dict[str, An
         if budget is not None:
             remaining = budget.remaining_seconds()
             if remaining <= 0 or wait > remaining:
-                raise HistoryFetchError(
-                    f"{label} retry would outlive the fetch budget") from last
+                message = f"{label} retry would outlive the fetch budget"
+                if throttled:
+                    raise HistoryFetchThrottled(message, retry_after=throttle_after) from last
+                raise HistoryFetchError(message) from last
         await sleep(wait)
+    if throttled:
+        raise HistoryFetchThrottled(f"{label} failed after {tries} attempt(s): {last}",
+                                    retry_after=throttle_after) from last
     raise HistoryFetchError(f"{label} failed after {tries} attempt(s): {last}") from last
 
 
