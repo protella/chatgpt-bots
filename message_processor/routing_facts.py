@@ -228,26 +228,30 @@ def absorb_owed_answer(trigger: Any, absorbed: Any) -> bool:
     see all of it — decides what to say. The gate is not consulted a second time about a question
     that was already settled."""
     meta = getattr(trigger, "metadata", None)
-    if not isinstance(meta, dict) or meta.get(GATE_REQUIRED) is not True:
+    if not isinstance(meta, dict):
         return False
-    if not any(owes_answer(m) for m in (absorbed or [])):
-        return False
-    meta[GATE_REQUIRED] = False
-    meta[GATE_WOKE] = False
-    # And the OBLIGATION travels with the answer, not just the permission to run. An absorbed
-    # @mention owes WORDS: the trigger was ambient, so it arrived here silence-capable, and
-    # leaving it that way lets the responder end this turn with `no_response_needed` on a batch
-    # containing a message somebody addressed to us directly. That is the original bug wearing a
-    # different hat — the reply is still lost, just one layer further down.
+    absorbed = list(absorbed or [])
+    # The OBLIGATION travels with the answer, whether or not the gate needs clearing. An absorbed
+    # @mention owes WORDS: a trigger that was ambient — or an ungated thread continuation — arrives
+    # here silence-capable, and leaving it that way lets the responder end this turn with
+    # `no_response_needed` on a batch containing a message somebody addressed to us directly. That
+    # is the original bug wearing a different hat — the reply is still lost, one layer further down.
     #
     # An absorbed message that a GATE woke on is different and keeps silence_capable True: it was
     # never addressed to us, and the responder — which can see the whole conversation, where the
     # gate saw one moment — is entitled to conclude there is nothing worth adding.
-    if any(owes_words(m) for m in absorbed):
+    owes = any(owes_words(m) for m in absorbed)
+    if owes and meta.get(SILENCE_CAPABLE) is not False:
         meta[SILENCE_CAPABLE] = False
         logger.info(
             "Queued batch carries a message addressed to us — the catch-up turn owes words")
-    else:
+    if meta.get(GATE_REQUIRED) is not True:
+        return False
+    if not any(owes_answer(m) for m in absorbed):
+        return False
+    meta[GATE_REQUIRED] = False
+    meta[GATE_WOKE] = False
+    if not owes:
         logger.info(
             "Queued batch carries an answer already owed — the catch-up turn runs without "
             "re-gating")

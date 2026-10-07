@@ -402,6 +402,22 @@ class AsyncThreadStateManager(LoggerMixin):
         self.log_debug(f"Queued message for busy conversation {thread_key} (pending={len(queue)})")
         return True
 
+    def requeue_superseded(self, thread_key: str, message: Any, by_ts: Optional[str]) -> bool:
+        """A turn stood down by a follow-up queued in THIS conversation rejoins the queue ahead
+        of it — the oldest member of the next batch. Its warm-state copy, if its turn got that
+        far, is dropped so the drain appends it once, in order. False (and nothing changes) when
+        `by_ts` is not queued here: then something else covered it."""
+        queue = self._pending_queues.get(thread_key)
+        if not queue or not any((m.metadata or {}).get("ts") == by_ts for m in queue):
+            return False
+        queue.appendleft(message)
+        ts = (message.metadata or {}).get("ts")
+        thread = self._threads.get(thread_key)
+        if thread is not None and ts is not None:
+            thread.messages[:] = [m for m in thread.messages
+                                  if (m.get("metadata") or {}).get("ts") != ts]
+        return True
+
     def pending_count(self, thread_key: str) -> int:
         return len(self._pending_queues.get(thread_key) or ())
 
@@ -997,11 +1013,16 @@ class AsyncThreadStateManager(LoggerMixin):
                     return False  # Lock is already held
                 await lock.acquire()
 
-            # Successfully acquired lock
-            thread = await self.get_or_create_thread_async(thread_ts, channel_id, user_id)
-            thread.is_processing = True
-            # Record lock acquisition time for watchdog
-            await self._lock_manager.record_acquisition(thread_key)
+            # Successfully acquired lock. A cancellation before the caller's cleanup owns it (an
+            # early stand-down) must not leave it held.
+            try:
+                thread = await self.get_or_create_thread_async(thread_ts, channel_id, user_id)
+                # Record lock acquisition time for watchdog
+                await self._lock_manager.record_acquisition(thread_key)
+                thread.is_processing = True
+            except BaseException:
+                lock.release()
+                raise
             self.log_debug(f"Acquired async lock for thread {thread_key}")
             return True
 

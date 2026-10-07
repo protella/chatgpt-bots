@@ -995,3 +995,518 @@ async def test_a_queued_messages_file_is_authorized_by_the_catch_up_turn(manager
     assert ctx.canonical_files["F9"]["filename"] == "data.csv"
     assert ctx.canonical_files["F9"]["message_ts"] == "15.0"      # fetchable at its real coordinates
     assert [ref.id for source in ctx.cohort_sources for ref in source.files] == ["F9"]
+
+
+
+# --- A burst of DMs, end to end through the real process_message and its cleanup ---
+
+DM = "D08XYZ"
+DM_KEY = f"{DM}:111.0"
+
+
+def _dm(ts):
+    """A DM in the conversation keyed DM_KEY, from the one sender (U1)."""
+    return _scoped(ts, thread="111.0", channel=DM)
+
+
+@pytest.fixture
+def dm_env():
+    with patch.object(config, "queue_drain_linger_seconds", 0.0), \
+         patch("message_processor.base.channel_steering.load_snapshot",
+               new=AsyncMock(return_value=None)), \
+         patch("message_processor.base.channel_steering.stamp"):
+        yield
+
+
+def _burst_proc(manager, reply):
+    """The REAL process_message on a DM; `reply(message)` stands in for the model turn. Returns
+    the processor, its client, and what each catch-up turn returned."""
+    from unittest.mock import MagicMock
+
+    from message_processor.client_contract import Response
+
+    with patch("message_processor.base.AsyncThreadStateManager"), \
+         patch("message_processor.base.OpenAIClient"):
+        proc = MessageProcessor()
+    proc.db = None
+    proc.thread_manager = manager
+
+    def _state(*a, **k):
+        return manager.get_thread("111.0", DM)            # created by the lock acquisition
+
+    async def _handle(_content, _state, _client, message, *a, **k):
+        await reply(message)
+        return Response(type="text", content="ok")
+
+    proc._get_or_rebuild_thread_state = AsyncMock(side_effect=_state)
+    proc._process_attachments = AsyncMock(return_value=([], [], []))
+    proc._handle_text_response = AsyncMock(side_effect=_handle)
+    client = MagicMock()
+    client.triggers = []
+    catch_up: list = []
+
+    async def _handler(trigger, _client):
+        client.triggers.append(trigger)
+        catch_up.append(await proc.process_message(trigger, _client, None))
+
+    client.message_handler = _handler
+    return proc, client, catch_up
+
+
+async def _leased(proc, client, marks, message, leases):
+    """One turn as main.py runs it: a send lease opened in the turn's own task."""
+    from message_processor.turn_runtime import TurnRuntime
+
+    lease = leases[message.metadata["ts"]] = marks.begin_turn(message)
+    turn = TurnRuntime.for_message(message)
+    turn.send_lease, lease.turn = lease, turn
+    try:
+        return await proc.process_message(message, client, None, turn=turn)
+    finally:
+        lease.close()
+
+
+async def _settle(proc, catch_up):
+    import asyncio
+    for _ in range(50):
+        if catch_up:
+            break
+        await asyncio.sleep(0)
+    await asyncio.gather(*list(getattr(proc, "_background_tasks", ())), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["clean", "cancelled_in_release"])
+async def test_the_catch_up_turn_is_admitted_after_the_finished_turn_releases_the_lock(
+        manager, dm_env, ending):
+    """Turn 1 runs, a follow-up queues behind it, and turn 1's drain hands it to a catch-up. That
+    turn must find the lock FREE and run — one that starts before the release finds it held,
+    re-enqueues itself, and nobody is left to drain it. Also when the ending turn is cancelled
+    during its lock release: the release still completes and the catch-up still starts."""
+    import asyncio
+
+    queued, answered = [], []
+
+    async def _reply(message):
+        if message.text == "m111.0":
+            # A follow-up lands while this turn holds the lock: it queues.
+            queued.append(await proc.process_message(_dm("112.0"), client, None))
+        answered.append(message.text)
+
+    proc, client, catch_up = _burst_proc(manager, _reply)
+    release = manager.release_thread_lock
+    releasing = asyncio.Event()
+    finish_release = asyncio.Event()
+
+    async def _slow_release(*a, **k):
+        releasing.set()
+        await finish_release.wait()
+        await release(*a, **k)
+
+    if ending == "cancelled_in_release":
+        manager.release_thread_lock = _slow_release
+
+    turn = asyncio.ensure_future(proc.process_message(_dm("111.0"), client, None))
+    if ending == "cancelled_in_release":
+        await releasing.wait()
+        turn.cancel()                                      # an early stand-down in cleanup
+        await asyncio.gather(turn, return_exceptions=True)
+        assert turn.cancelled()
+        finish_release.set()
+    else:
+        await turn
+    await _settle(proc, catch_up)
+
+    assert [r.type for r in queued] == ["queued"]
+    assert [r.type for r in catch_up] == ["text"], "the catch-up re-queued instead of running"
+    assert answered == ["m111.0", "m112.0"]
+    assert manager.pending_count(DM_KEY) == 0
+    assert manager.is_thread_processing("111.0", DM) is False
+
+
+@pytest.mark.asyncio
+async def test_a_message_arriving_as_the_turn_ends_with_nothing_queued_is_still_answered(
+        manager, dm_env):
+    """The drain found nothing queued, so no catch-up exists. A message already runnable at that
+    instant must not slip in between the last pending check and the unlock — it would queue
+    behind a turn that has already decided there is nothing left to drain."""
+    import asyncio
+
+    answered, late = [], []
+
+    async def _reply(message):
+        if message.text == "m111.0":
+            late.append(asyncio.ensure_future(proc.process_message(_dm("112.0"), client, None)))
+        answered.append(message.text)
+
+    proc, client, catch_up = _burst_proc(manager, _reply)
+    await proc.process_message(_dm("111.0"), client, None)
+    (follow_up,) = late
+    response = await follow_up
+    await _settle(proc, catch_up)
+
+    assert response.type == "text", "the follow-up queued with nobody left to drain it"
+    assert answered == ["m111.0", "m112.0"]
+    assert manager.pending_count(DM_KEY) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_started", [False, True])
+async def test_a_same_sender_follow_up_stands_down_the_running_turn_if_eligible(
+        manager, dm_env, tool_started):
+    """Threads and DMs get the top-level behavior: the same sender's follow-up queues behind the
+    running turn and stands it down, and ONE catch-up answers both. A turn with a local tool in
+    flight is not eligible — it finishes, and the catch-up answers the rest."""
+    import asyncio
+
+    from message_processor.stale_send_guard import ConversationWatermarks
+
+    marks, leases = ConversationWatermarks(), {}
+    in_model, go = asyncio.Event(), asyncio.Event()
+    answered = []
+
+    async def _reply(message):
+        if message.text == "m111.0":
+            in_model.set()
+            await go.wait()                               # the model call
+        answered.append(message.text)
+
+    proc, client, catch_up = _burst_proc(manager, _reply)
+    first = asyncio.ensure_future(_leased(proc, client, marks, _dm("111.0"), leases))
+    await in_model.wait()
+    if tool_started:
+        leases["111.0"].tools_started = True
+    queued = await asyncio.ensure_future(_leased(proc, client, marks, _dm("112.0"), leases))
+    go.set()
+    await asyncio.gather(first, return_exceptions=True)
+    await _settle(proc, catch_up)
+
+    assert queued.type == "queued"
+    assert [r.type for r in catch_up] == ["text"]
+    if tool_started:
+        assert leases["111.0"].preempted_by is None and first.result().type == "text"
+        assert answered == ["m111.0", "m112.0"]
+    else:
+        assert leases["111.0"].preempted_by == "112.0" and first.cancelled()
+        assert answered == ["m112.0"]                     # one reply, from the catch-up
+    assert manager.is_thread_processing("111.0", DM) is False
+
+
+@pytest.mark.asyncio
+async def test_a_turn_still_acquiring_the_lock_is_never_stood_down_by_a_queued_follow_up(
+        manager, dm_env):
+    """A turn holding the lock but not yet inside the cleanup that releases it must not be
+    cancelled by a queued follow-up: it would never release or drain. It runs, the catch-up
+    answers the follow-up — and a cancellation in that window releases the lock regardless."""
+    import asyncio
+
+    from message_processor.stale_send_guard import ConversationWatermarks
+
+    marks, leases = ConversationWatermarks(), {}
+    answered = []
+
+    async def _reply(message):
+        answered.append(message.text)
+
+    proc, client, catch_up = _burst_proc(manager, _reply)
+    acquiring, go = asyncio.Event(), asyncio.Event()
+    create = manager.get_or_create_thread_async
+
+    async def _slow_create(*a, **k):
+        if not go.is_set():
+            acquiring.set()
+            await go.wait()
+        return await create(*a, **k)
+
+    manager.get_or_create_thread_async = _slow_create
+    first = asyncio.ensure_future(_leased(proc, client, marks, _dm("111.0"), leases))
+    await acquiring.wait()                                # lock held, cleanup not yet armed
+    queued = await asyncio.ensure_future(_leased(proc, client, marks, _dm("112.0"), leases))
+    assert queued.type == "queued" and leases["111.0"].preempted_by is None
+    go.set()
+    assert (await first).type == "text"
+    await _settle(proc, catch_up)
+    assert [r.type for r in catch_up] == ["text"]
+    assert answered == ["m111.0", "m112.0"]
+
+    acquiring.clear()
+    go.clear()
+    acquire = asyncio.ensure_future(manager.acquire_thread_lock("111.0", DM))
+    await acquiring.wait()
+    acquire.cancel()
+    await asyncio.gather(acquire, return_exceptions=True)
+    assert manager.is_thread_processing("111.0", DM) is False
+
+
+@pytest.mark.asyncio
+async def test_a_stood_down_message_joins_the_catch_up_as_its_oldest_member(manager, dm_env):
+    """The stood-down turn's message is not merely context the catch-up might fetch: it rejoins
+    the queue ahead of the follow-up and is drained like any queued message — once, in order,
+    even though its own turn had already put it in warm state."""
+    import asyncio
+
+    from message_processor.stale_send_guard import ConversationWatermarks
+
+    marks, leases = ConversationWatermarks(), {}
+    in_model = asyncio.Event()
+
+    async def _reply(message):
+        if message.text == "m111.0":
+            state = manager.get_thread("111.0", DM)
+            proc._add_message_with_token_management(state, "user", "U1: m111.0",
+                                                    message_ts="111.0")
+            in_model.set()
+            await asyncio.Event().wait()                  # the model call; stood down here
+
+    proc, client, catch_up = _burst_proc(manager, _reply)
+    first = asyncio.ensure_future(_leased(proc, client, marks, _dm("111.0"), leases))
+    await in_model.wait()
+    await asyncio.ensure_future(_leased(proc, client, marks, _dm("112.0"), leases))
+    await asyncio.gather(first, return_exceptions=True)
+    await _settle(proc, catch_up)
+
+    (trigger,) = client.triggers
+    assert trigger.text == "m112.0" and trigger.metadata["queued_batch_size"] == 2
+    warm = manager.get_thread("111.0", DM).messages
+    assert [(m.get("metadata") or {}).get("ts") for m in warm] == ["111.0"]
+
+
+@pytest.mark.asyncio
+async def test_a_stood_down_mention_hands_its_words_and_file_to_an_ungated_successor(manager):
+    """A channel-thread @mention stood down by the same sender's thread continuation: the
+    continuation is ungated and silence-capable, so the catch-up could have ended in silence on
+    a direct request. The mention's obligation and its file ride the catch-up regardless."""
+    from message_processor.routing_facts import GATE_REQUIRED, SILENCE_CAPABLE
+
+    key = "C1:10.0"
+    manager.get_thread_async = AsyncMock(return_value=None)
+    csv = {"type": "file", "name": "data.csv", "id": "F9", "mimetype": "text/csv",
+           "url": "https://files.slack.com/files-pri/T1-F9/data.csv", "size": 12}
+    mention = _attach_msg("<@UBOT> what do these say?", attachments=[csv], user="U1",
+                          channel="C1", thread="10.0", ts="15.0")
+    mention.metadata.update({GATE_REQUIRED: False, SILENCE_CAPABLE: False})
+    follow_up = _msg("and the totals?", channel="C1", thread="10.0", ts="20.0")
+    follow_up.metadata.update({GATE_REQUIRED: False, SILENCE_CAPABLE: True})
+    manager.enqueue_pending(key, follow_up)
+    assert manager.requeue_superseded(key, mention, "20.0") is True
+    assert manager.requeue_superseded(key, mention, "99.0") is False   # covered elsewhere
+
+    drain = _drain_proc(manager)
+    client = Mock()
+    client.message_handler = Mock()
+    with patch("message_processor.base.asyncio.sleep", new=AsyncMock()):
+        await drain._dispatch_pending_batch(_msg("done", channel="C1", thread="10.0"), client, key)
+
+    trigger = client.message_handler.call_args.args[0]
+    assert trigger is follow_up and trigger.metadata["queued_batch_size"] == 2
+    assert trigger.metadata[SILENCE_CAPABLE] is False, "the mention's words were dropped"
+    assert "batched_file_refs" in trigger.metadata, "the mention's file never reached the turn"
+
+
+@pytest.mark.asyncio
+async def test_a_turn_taking_its_lock_is_never_stood_down_by_the_channel_path(manager, dm_env):
+    """A newer same-sender turn elsewhere (the channel path's preemption) must not cancel a turn
+    that holds its lock but has not reached the cleanup that releases it and drains: a reply
+    queued behind that turn would sit there forever."""
+    import asyncio
+
+    from message_processor.stale_send_guard import ConversationWatermarks
+
+    marks, leases = ConversationWatermarks(), {}
+    answered = []
+
+    async def _reply(message):
+        answered.append(message.text)
+
+    proc, client, catch_up = _burst_proc(manager, _reply)
+    acquiring, go = asyncio.Event(), asyncio.Event()
+    create = manager.get_or_create_thread_async
+
+    async def _slow_create(*a, **k):
+        if not go.is_set():
+            acquiring.set()
+            await go.wait()
+        return await create(*a, **k)
+
+    manager.get_or_create_thread_async = _slow_create
+    first = asyncio.ensure_future(_leased(proc, client, marks, _dm("111.0"), leases))
+    await acquiring.wait()                                 # lock held, cleanup not yet armed
+    other = _scoped("112.0", thread="111.0", sender="U2", channel=DM)
+    assert (await asyncio.ensure_future(
+        _leased(proc, client, marks, other, leases))).type == "queued"
+
+    async def _newer_elsewhere():
+        newer = marks.begin_turn(_scoped("113.0", channel=DM))   # same sender, own conversation
+        try:
+            return newer.preempt_older_same_sender()
+        finally:
+            newer.close()
+
+    assert await asyncio.ensure_future(_newer_elsewhere()) == []
+    go.set()
+    assert (await first).type == "text"
+    await _settle(proc, catch_up)
+    assert [r.type for r in catch_up] == ["text"]
+    assert answered == ["m111.0", "m112.0"]
+
+
+@pytest.mark.asyncio
+async def test_a_turn_stood_down_mid_rebuild_leaves_the_catch_up_to_fetch_history(
+        manager, dm_env):
+    """After a restart the conversation's state is cold. A turn stood down while still rebuilding
+    it must not let the drain's appends make that state look warm: the catch-up fetches the
+    history, or it answers with only the burst and none of the conversation before it."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from message_processor.stale_send_guard import ConversationWatermarks
+
+    marks, leases = ConversationWatermarks(), {}
+    proc, client, catch_up = _burst_proc(manager, AsyncMock())
+    rebuilding, fetched = asyncio.Event(), []
+
+    async def _state(message, *a, **k):
+        if message.text == "m111.0":
+            rebuilding.set()
+            await asyncio.Event().wait()                  # the Slack fetch; stood down here
+        warm = manager.get_thread("111.0", DM)
+        fetched.append(not warm.messages or manager.consume_needs_refresh(DM_KEY))
+        return SimpleNamespace(had_timeout=False, messages=[], thread_ts="111.0", channel_id=DM,
+                               root_author=("U1", "human"), config_overrides={},
+                               participants={}, current_model=None, has_trimmed_messages=False)
+
+    proc._get_or_rebuild_thread_state = _state
+    first = asyncio.ensure_future(_leased(proc, client, marks, _dm("111.0"), leases))
+    await rebuilding.wait()
+    await asyncio.ensure_future(_leased(proc, client, marks, _dm("112.0"), leases))
+    await asyncio.gather(first, return_exceptions=True)
+    await _settle(proc, catch_up)
+
+    assert leases["111.0"].preempted_by == "112.0"
+    assert fetched == [True], "the catch-up trusted a cold state the drain had appended to"
+
+
+@pytest.mark.asyncio
+async def test_a_second_stand_down_keeps_what_the_first_catch_up_inherited(manager):
+    """A (with a file) is absorbed into B's catch-up; B is then stood down by C. C's catch-up
+    must still carry A as a source and A's file payload — not just B's own."""
+    from message_processor.channel_request import cohort_sources_from_message
+
+    key = "C1:10.0"
+    manager.get_thread_async = AsyncMock(return_value=None)
+    csv = {"type": "file", "name": "data.csv", "id": "F9", "mimetype": "text/csv",
+           "url": "https://files.slack.com/files-pri/T1-F9/data.csv", "size": 12}
+    first = _attach_msg("here are the numbers", attachments=[csv], user="U1",
+                        channel="C1", thread="10.0", ts="15.0")
+    second = _msg("what do they say?", channel="C1", thread="10.0", ts="20.0")
+    third = _msg("and the totals?", channel="C1", thread="10.0", ts="25.0")
+    drain = _drain_proc(manager)
+    client = Mock()
+    client.message_handler = Mock()
+    done = _msg("done", channel="C1", thread="10.0")
+    with patch("message_processor.base.asyncio.sleep", new=AsyncMock()):
+        manager.enqueue_pending(key, first)
+        manager.enqueue_pending(key, second)
+        await drain._dispatch_pending_batch(done, client, key)          # B's catch-up
+        manager.enqueue_pending(key, third)
+        assert manager.requeue_superseded(key, second, "25.0") is True  # B stood down by C
+        await drain._dispatch_pending_batch(second, client, key)        # C's catch-up
+
+    trigger = client.message_handler.call_args.args[0]
+    assert trigger is third
+    assert {s.ts for s in cohort_sources_from_message(trigger)} == {"15.0", "20.0"}
+    files = {e["ts"]: e["attachments"] for e in trigger.metadata["batched_file_refs"]}
+    assert files["15.0"][0]["id"] == "F9", "the first message's file was dropped"
+
+
+@pytest.mark.asyncio
+async def test_a_follow_up_the_full_queue_rejected_never_stands_the_turn_down(manager, dm_env):
+    """A follow-up dropped by a full queue is not going to be answered by any catch-up, so it
+    must not stand the running turn down — that would lose both."""
+    import asyncio
+
+    from message_processor.stale_send_guard import ConversationWatermarks
+
+    marks, leases = ConversationWatermarks(), {}
+    in_model, go = asyncio.Event(), asyncio.Event()
+
+    async def _reply(message):
+        if message.text == "m111.0":
+            in_model.set()
+            await go.wait()
+
+    proc, client, catch_up = _burst_proc(manager, _reply)
+    with patch.object(config, "queue_max_pending", 1):
+        first = asyncio.ensure_future(_leased(proc, client, marks, _dm("111.0"), leases))
+        await in_model.wait()
+        manager.enqueue_pending(DM_KEY, _scoped("111.5", thread="111.0", sender="U2", channel=DM))
+        await asyncio.ensure_future(_leased(proc, client, marks, _dm("112.0"), leases))
+        assert leases["111.0"].preempted_by is None
+        go.set()
+        assert (await first).type == "text"
+        await _settle(proc, catch_up)
+    assert [t.text for t in client.triggers] == ["m111.5"]
+
+
+@pytest.mark.asyncio
+async def test_a_refetch_missing_the_stood_down_message_still_carries_it(manager, dm_env):
+    """Cold DM: A is stood down before its history loaded, so the catch-up refetches — and Slack's
+    snapshot does not have A yet. A's question still reaches the model: put back once, in ts
+    order, after the history that came before it."""
+    import asyncio
+
+    from message_processor.client_contract import Response
+    from message_processor.stale_send_guard import ConversationWatermarks
+
+    marks, leases = ConversationWatermarks(), {}
+    proc, client, catch_up = _burst_proc(manager, AsyncMock())
+    rebuilding, seen = asyncio.Event(), []
+
+    async def _state(message, *a, **k):
+        if message.text == "m111.0":
+            rebuilding.set()
+            await asyncio.Event().wait()                  # the Slack fetch; stood down here
+        warm = manager.get_thread("111.0", DM)
+        assert manager.consume_needs_refresh(DM_KEY)
+        warm.messages.clear()                             # the refetch: A has not propagated
+        warm.add_message("user", "U1: earlier", message_ts="100.0")
+        return warm
+
+    async def _handle(_content, state, *a, **k):
+        seen.append([((m.get("metadata") or {}).get("ts"), m["content"].split("] ")[-1])
+                     for m in state.messages])
+        return Response(type="text", content="ok")
+
+    proc._get_or_rebuild_thread_state = _state
+    proc._handle_text_response = AsyncMock(side_effect=_handle)
+    first = asyncio.ensure_future(_leased(proc, client, marks, _dm("111.0"), leases))
+    await rebuilding.wait()
+    await asyncio.ensure_future(_leased(proc, client, marks, _dm("112.0"), leases))
+    await asyncio.gather(first, return_exceptions=True)
+    await _settle(proc, catch_up)
+
+    assert seen == [[("100.0", "U1: earlier"), ("111.0", "U1: m111.0")]]
+
+
+@pytest.mark.asyncio
+async def test_a_requeued_catch_up_trigger_keeps_the_history_it_already_carried(manager):
+    """Catch-up B carries A's history, loses the lock race and queues again behind C. The next
+    drain keeps B as trigger: A's saved history must survive alongside C's."""
+    key = DM_KEY
+    state = Mock()
+    state.config_overrides = {}
+    manager.get_thread_async = AsyncMock(return_value=state)
+    drain = _drain_proc(manager)
+    client = Mock()
+    client.message_handler = Mock()
+    a, b, c = _dm("111.0"), _dm("112.0"), _dm("113.0")
+    with patch("message_processor.base.asyncio.sleep", new=AsyncMock()):
+        manager.enqueue_pending(key, a)
+        manager.enqueue_pending(key, b)
+        await drain._dispatch_pending_batch(_dm("110.0"), client, key)    # B carries A
+        manager.enqueue_pending(key, c)
+        manager.enqueue_pending(key, b)                                    # B lost the race
+        await drain._dispatch_pending_batch(_dm("110.5"), client, key)
+
+    assert client.message_handler.call_args.args[0] is b
+    assert [ts for ts, _content in b.metadata["batched_history"]] == ["111.0", "113.0"]

@@ -210,6 +210,9 @@ class TurnSendLease:
     # Set when the turn reaches its own cleanup. A turn already ending is never preempted: a
     # cancellation landing in its finally would skip the very cleanup a stand-down relies on.
     ending: bool = False
+    # Set while the turn is taking its conversation lock: a cancel there lands after the lock is
+    # held but before the cleanup that releases it and drains its queue, so it is never preempted.
+    acquiring: bool = False
     # Set synchronously when the turn admits its first tool call (a local flight, a hosted tool,
     # a work claim). Such a turn may have spawned work that outlives a cancel of its own task,
     # so it is never preempted — eligibility, not armor.
@@ -369,7 +372,7 @@ class TurnSendLease:
                 found[other.ceiling_ts] = None
         return sorted(found, key=ts_key)
 
-    def preempt_older_same_sender(self) -> List[str]:
+    def preempt_older_same_sender(self, responding_only: bool = False) -> List[str]:
         """EARLY STAND-DOWN: this turn is now actually answering, so stop every OLDER turn of the
         SAME sender in a shared scope that has put nothing in the room yet. Returns the ceilings
         it preempted.
@@ -379,13 +382,16 @@ class TurnSendLease:
         detached producer or background job, no reaction, no edit — and whose task is not this
         one. A different sender is never preempted: cross-author thread replies keep today's
         suppress-and-reconsider path. Synchronous; the cancelled turn ends through its own
-        cleanup, which reads `preempted_by` to know why."""
+        cleanup, which reads `preempted_by` to know why. `responding_only`: only a turn that holds
+        its conversation lock and is inside the cleanup that releases it (a queued follow-up's
+        stand-down — a turn cancelled before that cleanup would strand the queue)."""
         if self._watermarks is None or not self.sender_id or self.ceiling_ts is None:
             return []
         current = _current_task()
         preempted: List[str] = []
         for other in self._watermarks.leases_for(self.scopes):
             if (other is self or other.sender_id != self.sender_id
+                    or (responding_only and not other.responding)
                     or other.ceiling_ts is None
                     or not is_newer(self.ceiling_ts, other.ceiling_ts)
                     or not other._preemptable()):
@@ -408,7 +414,7 @@ class TurnSendLease:
         tool started, PENDING and never suppressed, and nothing shown — a 👀 claim aside, which
         its stand-down takes back."""
         return (not self._closed and self.preempted_by is None and not self.ending
-                and not self.tools_started and self.state == PENDING
+                and not self.acquiring and not self.tools_started and self.state == PENDING
                 and not self._ever_suppressed and not _has_visible_effects(self.turn))
 
     def _stand_down(self, by: str, task: Any) -> None:

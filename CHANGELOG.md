@@ -8,6 +8,11 @@ All notable changes to this project will be documented in this file.
 
 ### 🐛 Fixed
 
+- **Quick follow-ups in threads and DMs get one complete answer.** Inside a thread or a DM, a
+  follow-up sent while the bot was still working used to wait in line; the bot could post a partial
+  answer and leave the rest unanswered. Now a newer message from the same person stops the reply
+  that hasn't been posted yet, and one reply answers everything — the same way top-level channel
+  messages already worked.
 - **Quick follow-ups no longer go unanswered.** Sending two or three messages in a row in a busy
   channel could leave the bot silent: every message made it re-read every thread in the channel
   from Slack, and Slack started refusing. The bot now remembers threads that haven't changed and

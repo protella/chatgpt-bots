@@ -20,7 +20,7 @@ from .containers import ContainerManager
 from .context_meter import ContextIrreducible, ContextOverLimit
 from .message_timestamps import stamp_content
 from .thread_management import ThreadManagementMixin
-from .stale_send_guard import StaleSendSuppressed
+from .stale_send_guard import StaleSendSuppressed, ts_key
 from .turn_runtime import TurnRuntime
 from .handlers.text import TextHandlerMixin, pinned_thread_config
 from .handlers.image_gen import ImageJobMixin
@@ -69,10 +69,38 @@ def _measure_note(thread_state: Any, thread_config: Any) -> str:
         return ""
 
 
-async def _run_dispatch(handler: Any, trigger: Any, client: Any) -> None:
+async def _run_dispatch(handler: Any, trigger: Any, client: Any,
+                        lock_released: Optional["asyncio.Future[None]"] = None) -> None:
     """The scheduled catch-up. The handler's coroutine is created HERE, once the task runs, so a
-    task cancelled before its first step leaves no un-awaited coroutine behind."""
+    task cancelled before its first step leaves no un-awaited coroutine behind. With
+    `lock_released`, it waits for the finished turn's lock release first — otherwise it would
+    find the lock still held and re-enqueue itself with nobody left to drain it."""
+    if lock_released is not None:
+        await lock_released
     await handler(trigger, client)
+
+
+def _restore_batched_history(processor: Any, thread_state: Any, message: Message,
+                             thread_key: str) -> None:
+    """A catch-up's batch members the drain appended to warm state, put back if a refetch
+    replaced that state with a Slack snapshot that does not have them yet — once each (by
+    ts), in ts order, exactly as the drain appended them."""
+    carried = (message.metadata or {}).get("batched_history") or ()
+    if not carried:
+        return
+    messages = thread_state.messages
+    present = {(m.get("metadata") or {}).get("ts") for m in messages}
+    for ts, content in carried:
+        if ts is None or ts in present:
+            continue
+        present.add(ts)
+        processor._add_message_with_token_management(
+            thread_state, "user", content, db=processor.db, thread_key=thread_key, message_ts=ts)
+        entry = messages.pop()
+        at = next((i for i, m in enumerate(messages)
+                   if ts_key((m.get("metadata") or {}).get("ts") or 0) > ts_key(ts)),
+                  len(messages))
+        messages.insert(at, entry)
 
 
 def _reply_text_pending(response: Optional[Response]) -> bool:
@@ -166,6 +194,10 @@ class MessageProcessor(ThreadManagementMixin,
 
         # Check if thread is busy
         lock_acquired = False
+        send_lease = getattr(turn, "send_lease", None)
+        if send_lease is not None:
+            # Not preemptible until the try below, whose finally releases the lock and drains.
+            send_lease.acquiring = True
         try:
             lock_acquired = await self.thread_manager.acquire_thread_lock(
                 message.thread_id,
@@ -175,6 +207,9 @@ class MessageProcessor(ThreadManagementMixin,
         except Exception as lock_error:
             self.log_error(f"Lock acquisition failed with error: {lock_error}", exc_info=True)
             raise
+        finally:
+            if send_lease is not None:
+                send_lease.acquiring = False   # no await between here and the try below
 
         if not lock_acquired:
             # Phase Q: conversational queueing — never reject. The message joins the
@@ -185,14 +220,22 @@ class MessageProcessor(ThreadManagementMixin,
             # gate-ignored messages never queue. If the queue is full, enqueue_pending
             # drops the message and flags a transcript refetch (Slack still has it).
             elapsed = time.time() - request_start_time
+            enqueued = False
             try:
-                self.thread_manager.enqueue_pending(thread_key, message)
+                enqueued = self.thread_manager.enqueue_pending(thread_key, message)
             except Exception as queue_error:
                 self.log_error(f"Enqueue failed for {thread_key}: {queue_error}", exc_info=True)
                 try:
                     self.thread_manager.mark_needs_refresh(thread_key)
                 except Exception:
                     pass
+            # EARLY STAND-DOWN in a thread or DM: a same-sender follow-up cannot start a turn of
+            # its own here, so it stops the running one now (same eligibility as the channel
+            # path) and that turn's cleanup drains both into one catch-up. Only a turn already
+            # RESPONDING — inside the region whose finally releases the lock and drains — and only
+            # once this message is actually queued (a full queue drops it from warm state).
+            if send_lease is not None and enqueued is True:
+                send_lease.preempt_older_same_sender(responding_only=True)
             self.log_info("")
             self.log_info("="*100)
             self.log_info(f"REQUEST END | Thread: {thread_key} | Status: QUEUED | Time: {elapsed:.2f}s")
@@ -213,10 +256,12 @@ class MessageProcessor(ThreadManagementMixin,
 
         channel_turn = TextHandlerMixin._turn_surface(message) == SURFACE_CHANNEL
         h_pin = None
-        send_lease = getattr(turn, "send_lease", None)
         # True only when the turn returns reply text main.py still has to post; every other
         # ending clears `responding` before the drain below.
         reply_pending = False
+        # The DM history this turn reads is fully built (warm, or rebuilt to completion). A stand-
+        # down before that leaves a cold or partial state the drain must not make look warm.
+        history_ready = channel_turn
 
         try:
             # The lock is held, so this turn is now actually producing a reply: a stale older
@@ -286,6 +331,8 @@ class MessageProcessor(ThreadManagementMixin,
                     client,
                     thinking_id
                 )
+                history_ready = True
+                _restore_batched_history(self, thread_state, message, thread_key)
 
             # F3: if the root author is still unknown and THIS message is the thread root
             # (a new top-level message whose warm state skipped the rebuild), the sender is
@@ -1040,24 +1087,46 @@ class MessageProcessor(ThreadManagementMixin,
             # message can jump ahead of the queued backlog and (b) stragglers arriving
             # during the linger enqueue (lock held) and join the same batch. Must never
             # prevent the lock release below.
+            lock_released: "asyncio.Future[None]" = asyncio.get_running_loop().create_future()
             try:
+                if send_lease is not None and send_lease.preempted_by is not None:
+                    # Stood down by a follow-up queued HERE: this message rejoins the queue as its
+                    # oldest member, so the catch-up answers it like any queued message (sources,
+                    # files, obligations, ownership). A no-op when it was covered elsewhere.
+                    self.thread_manager.requeue_superseded(
+                        thread_key, message, send_lease.preempted_by)
+                    if not history_ready:
+                        # The catch-up rebuilds from Slack instead of trusting what the drain
+                        # appends to a cold or half-built state.
+                        self.thread_manager.mark_needs_refresh(thread_key)
                 try:
-                    await self._dispatch_pending_batch(message, client, thread_key)
+                    await self._dispatch_pending_batch(message, client, thread_key, lock_released)
                 except Exception as drain_error:
                     self.log_error(f"Pending-queue drain failed for {thread_key}: {drain_error}", exc_info=True)
                     await self._notify_drain_failure(message, client, thread_key)
             finally:
                 # Always release the thread lock — even on timeout, and even when a cancellation
                 # lands in the drain above. Shielded, so a cancellation during the release itself
-                # cannot leave the lock held.
+                # cannot leave the lock held. Started EAGERLY: it runs inline up to its first real
+                # suspension (none, uncontended), so no message can queue between the drain's last
+                # pending check and the unlock with nobody left to drain it. The catch-up starts
+                # when the release is done (its done-callback), so a cancellation here cannot
+                # strand the drained batch either.
                 try:
-                    await asyncio.shield(self.thread_manager.release_thread_lock(
+                    release = asyncio.Task(self.thread_manager.release_thread_lock(
                         message.thread_id,
                         message.channel_id
-                    ))
+                    ), loop=asyncio.get_running_loop(), eager_start=True)
+                    def _lock_released(_release: "asyncio.Future[None]") -> None:
+                        if not lock_released.done():
+                            lock_released.set_result(None)
+                    release.add_done_callback(_lock_released)
+                    await asyncio.shield(release)
                 except Exception as lock_error:
                     # Even if release fails, log it but don't crash
                     self.log_error(f"Error releasing thread lock for {thread_key}: {lock_error}", exc_info=True)
+                    if not lock_released.done():
+                        lock_released.set_result(None)   # a drained catch-up never waits forever
 
     @staticmethod
     def _turn_error_message(e: BaseException, message: Message) -> str:
@@ -1671,7 +1740,8 @@ class MessageProcessor(ThreadManagementMixin,
             sections.append(section)
         return "\n\n".join(sections)
 
-    async def _dispatch_pending_batch(self, finished_message: Message, client: BaseClient, thread_key: str):
+    async def _dispatch_pending_batch(self, finished_message: Message, client: BaseClient, thread_key: str,
+                                      lock_released: Optional["asyncio.Future[None]"] = None):
         """Phase Q: after a turn finishes (lock still held), drain the conversation's
         pending queue into ONE batched catch-up turn and re-dispatch it through the
         normal message pipeline.
@@ -1688,8 +1758,9 @@ class MessageProcessor(ThreadManagementMixin,
         - The re-dispatch is a background task through client.message_handler (the
           same entry Slack events use), so the batch turn gets the full normal flow:
           thinking indicator, streaming, footer, participation stats. It starts after
-          this turn releases the lock; if a brand-new message wins the lock race
-          first, the batch trigger simply re-enqueues — nothing is ever lost.
+          this turn releases the lock (`lock_released`, resolved by the release); if a
+          brand-new message wins the lock race first, the batch trigger simply
+          re-enqueues — nothing is ever lost.
         - Messages left beyond QUEUE_MAX_BATCH drain on the following turn via this
           same hook (loop-until-empty is emergent, no dedicated loop needed).
         """
@@ -1788,7 +1859,11 @@ class MessageProcessor(ThreadManagementMixin,
                     participation_telemetry.stage_queue_links(trigger, [detached])
             if isinstance(trigger.metadata, dict) and len(batch) > 1:
                 trigger.metadata["carried_gate_sources"] = tuple(
-                    source_from_message(m) for m in batch[:-1])
+                    source
+                    for m in batch[:-1]
+                    for source in (*((m.metadata or {}).get("gate_sources") or ()),
+                                   *((m.metadata or {}).get("carried_gate_sources") or ()))
+                ) + tuple(source_from_message(m) for m in batch[:-1])
             # T2-10: earlier messages' image parts + attachment failures are collected here and
             # carried to the trigger turn — images so the model can actually SEE them (not just
             # their catalogued description), failures so a dropped file is acknowledged.
@@ -1802,6 +1877,16 @@ class MessageProcessor(ThreadManagementMixin,
             channel_batch = TextHandlerMixin._turn_surface(finished_message) == SURFACE_CHANNEL
             batched_deferred_documents: list = []
             batched_catalog_groups: list = []
+            # A member that was itself a catch-up trigger (requeued after a stand-down) carries
+            # what ITS drain absorbed: forwarded, or a second stand-down would drop it.
+            # The DM history entries this drain appends, kept on the trigger too: a refetch that
+            # replaces warm state with a Slack snapshot still missing them must not lose them.
+            batched_history: list = []
+            for member in batch[:-1]:
+                inherited = member.metadata or {}
+                batched_image_inputs.extend(inherited.get("batched_image_inputs") or ())
+                batched_unsupported_files.extend(inherited.get("batched_unsupported_files") or ())
+                batched_history.extend(inherited.get("batched_history") or ())
             if len(batch) > 1:
                 # Append the earlier messages to warm state now (we hold the lock, the
                 # state is current). The trigger message is NOT appended — its own turn
@@ -1868,6 +1953,9 @@ class MessageProcessor(ThreadManagementMixin,
                                 db=self.db, thread_key=thread_key,
                                 message_ts=(queued_msg.metadata or {}).get("ts"),
                             )
+                            if not channel_batch:
+                                batched_history.append(
+                                    ((queued_msg.metadata or {}).get("ts"), content))
                         except Exception as append_error:
                             self.log_warning(f"Failed to append queued message to state: {append_error}")
             # Mark the trigger so the UI can show a catch-up status for multi-message batches.
@@ -1889,6 +1977,12 @@ class MessageProcessor(ThreadManagementMixin,
                 trigger.metadata["batched_image_inputs"] = batched_image_inputs
             if batched_unsupported_files:
                 trigger.metadata["batched_unsupported_files"] = batched_unsupported_files
+            if batched_history:
+                # A requeued trigger keeps what its earlier drain saved (by ts, in ts order).
+                merged = {ts: content for ts, content in reversed(
+                    [*(trigger.metadata.get("batched_history") or ()), *batched_history])}
+                trigger.metadata["batched_history"] = sorted(
+                    merged.items(), key=lambda item: ts_key(item[0]))
             # [r5-2] The two Responses calls this drain refused to make. The catch-up turn runs them
             # once its request has been admitted; if admission refuses it, they never run at all —
             # which is the contract, not a gap: a refused turn must not have spent anything.
@@ -1902,18 +1996,23 @@ class MessageProcessor(ThreadManagementMixin,
             # live events we are already holding and merged into the turn's canonical files. Channel
             # only: nothing on a DM turn reads them.
             if channel_batch and len(batch) > 1:
-                from message_processor.channel_request import stage_cohort_file_payloads
+                from message_processor.channel_request import (COHORT_FILE_PAYLOADS_KEY,
+                                                               stage_cohort_file_payloads)
                 stage_cohort_file_payloads(
                     trigger.metadata,
-                    [((queued_msg.metadata or {}).get("ts"), queued_msg.attachments or [])
-                     for queued_msg in batch[:-1]])
+                    [(entry.get("ts"), entry.get("attachments") or [])
+                     for queued_msg in batch[:-1]
+                     for entry in (queued_msg.metadata or {}).get(COHORT_FILE_PAYLOADS_KEY) or ()
+                     if isinstance(entry, dict)]
+                    + [((queued_msg.metadata or {}).get("ts"), queued_msg.attachments or [])
+                       for queued_msg in batch[:-1]])
 
             self.log_info(f"Draining {len(batch)} queued message(s) on {thread_key} into one catch-up turn")
             # Admission (`begin_turn`) releases the batch. The task's done-callback releases it on
             # every other end — a raise, a refusal before admission, and a cancellation even
             # before the task's first step, which no `finally` inside it would ever see (R3-1).
             generation = manager.bind_dispatch(trigger, batch)
-            task = self._schedule_async_call(_run_dispatch(handler, trigger, client))
+            task = self._schedule_async_call(_run_dispatch(handler, trigger, client, lock_released))
             if isinstance(task, asyncio.Future):
                 task.add_done_callback(
                     lambda _t: manager.end_dispatch_for(trigger, generation))
