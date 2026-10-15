@@ -12,6 +12,11 @@ All notable changes to this project will be documented in this file.
   fixes), `pypdf` (6.20.1), `concurrent-log-handler`, `python-dotenv`, `pytz` and test tooling.
   No behavior changes.
 
+### 🔒 Security
+
+- **`multidict` 6.9.1** — patches a reference leak (Dependabot alert #30) in a transitive
+  dependency of `aiohttp`.
+
 ## [3.4.0] - 2026-10-07
 
 ### 🐛 Fixed
