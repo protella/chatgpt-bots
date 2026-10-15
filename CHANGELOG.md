@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.4.1] - 2026-10-15
+
+### 🔧 Changed
+
+- **Dependencies updated:** the OpenAI SDK (3.29.0), `slack-sdk` (3.45.0, Socket Mode reconnect
+  fixes), `pypdf` (6.20.1), `concurrent-log-handler`, `python-dotenv`, `pytz` and test tooling.
+  No behavior changes.
+
 ## [3.4.0] - 2026-10-07
 
 ### 🐛 Fixed
