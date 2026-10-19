@@ -1783,9 +1783,9 @@ truststore==0.10.4 \
     # via
     #   httpcore2
     #   httpx2
-types-croniter==6.2.4.20260711 \
-    --hash=sha256:601b68139a47fe1b2177f433132cc81fd91155f3059a49c5cb63404c389dff01 \
-    --hash=sha256:807793e109f4e0d51ec18f6277a1a5f1d133e425ac6bee3a7c3254ab1793e0ea
+types-croniter==6.2.4.20261006 \
+    --hash=sha256:1aff83e76866cd01abbe3bb3b18b27f038d65a097b5995bdcc11a658d972cfa0 \
+    --hash=sha256:7c2bccf800beed6f52ec89f5f8f23b2c0b0cd9c941f059c2a7405de0e62fb54b
     # via -r requirements.in
 typing-extensions==4.16.0 \
     --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8 \
