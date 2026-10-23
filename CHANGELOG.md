@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.4.2] - 2026-10-22
+
+### 🔒 Security
+
+- **Pillow 13.0.0** — patches 39 Dependabot alerts in image decoding and encoding (heap overflows,
+  use-after-free, decompression-bomb bypasses and DoS loops), 4 of them critical.
+- **aiohttp 3.14.5** (with `yarl` 1.25.1) — patches 8 alerts (request smuggling, memory and
+  descriptor exhaustion, cookie scope) in the HTTP layer under Slack Socket Mode.
+- **pypdf 6.21.2** — patches 4 alerts (memory and runtime blow-ups on crafted PDFs).
+
+### 🔧 Changed
+
+- **OpenAI SDK 3.37.0** and test tooling updates. No behavior changes.
+
 ## [3.4.1] - 2026-10-15
 
 ### 🔧 Changed
