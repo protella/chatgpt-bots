@@ -17,7 +17,7 @@ import copy
 import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Mapping, Optional, cast
 
 from config import config
 from logger import setup_logger
@@ -330,6 +330,42 @@ def _call_fingerprint(name: str, args: Dict[str, Any]) -> str:
     except Exception:  # noqa: BLE001
         payload = repr(args)
     return hashlib.sha256(f"{name}\x00{payload}".encode("utf-8")).hexdigest()
+
+
+# Calls that change ONE canvas, and so run one at a time, in the model's call order, per canvas.
+# Slack refuses a concurrent `canvases.edit` on one canvas (`canvas_editing_locked`), and a later
+# change in the same step may depend on an earlier one landing first.
+_CANVAS_CHAINED_TOOLS = frozenset({"edit_canvas", "delete_canvas"})
+
+
+def _canvas_chain_key(call: Dict[str, Any]) -> Optional[str]:
+    """The canvas a chained call changes, or None for an ordinary call (unparseable args too)."""
+    if call.get("name") not in _CANVAS_CHAINED_TOOLS:
+        return None
+    args = call.get("arguments")
+    if isinstance(args, str):
+        try:
+            args = json.loads(args or "{}")
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(args, dict):
+        return None
+    canvas_id = args.get("canvas_id")
+    if not isinstance(canvas_id, str) or not canvas_id.strip():
+        return None
+    return canvas_id.strip()
+
+
+def _result_ok(result: Any) -> bool:
+    """The same notion as `tool_loop._call_ok`, which imports this module and so cannot be
+    imported here: successful unless it explicitly says ok=False."""
+    return not (isinstance(result, dict) and result.get("ok") is False)
+
+
+def _not_run_result() -> Dict[str, Any]:
+    return {"ok": False, "error": "not_run",
+            "message": ("Not run: an earlier change to this canvas in the same step failed. "
+                        "Re-read the canvas, then continue with the remaining changes.")}
 
 
 class ToolRegistry:
@@ -797,15 +833,56 @@ class ToolRegistry:
     async def dispatch_all(self, ctx: ToolContext, calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Run a round's calls in parallel; result order matches ``calls``.
 
+        Except changes to a canvas: every `edit_canvas` / `delete_canvas` on one canvas joins
+        that canvas's chain and runs strictly after the one before it, in call order. Chains for
+        different canvases and all other calls still run concurrently. Each call goes through
+        `dispatch` when its turn comes, so its own timeout starts when it starts, not while it
+        waits. A failed call stops its chain: the rest are not run and say so.
+
         The call's own id rides along, because THIS is the seam a duplicate dispatch would arrive
         at: the loop hands the ids it already has, and the registry decides whether the work has
         been done before."""
         self._restamp_trusted_roots(ctx)
         self._restamp_edit_targets(ctx)
-        return list(await asyncio.gather(
-            *(self.dispatch(ctx, c.get("name", ""), c.get("arguments"), c.get("call_id"))
-              for c in calls)
-        ))
+        results: List[Optional[Dict[str, Any]]] = [None] * len(calls)
+        ordinary: List[int] = []
+        chains: Dict[str, List[int]] = {}
+        for i, call in enumerate(calls):
+            key = _canvas_chain_key(call)
+            if key is None:
+                ordinary.append(i)
+            else:
+                chains.setdefault(key, []).append(i)
+
+        async def run_one(i: int) -> Dict[str, Any]:
+            c = calls[i]
+            result = await self.dispatch(ctx, c.get("name", ""), c.get("arguments"),
+                                         c.get("call_id"))
+            results[i] = result
+            return result
+
+        async def run_chain(indices: List[int]) -> None:
+            for n, i in enumerate(indices):
+                if not _result_ok(await run_one(i)):
+                    for rest in indices[n + 1:]:
+                        results[rest] = _not_run_result()
+                    return
+
+        # Owned as tasks: when one raises (a suppressed send), a chain must not go on to start
+        # its next edit after the turn has settled. The still-running ones are cancelled and
+        # waited for before the original exception goes up; a call already in flight keeps its
+        # flight's own lifecycle.
+        tasks: List["asyncio.Task[Any]"] = [asyncio.create_task(run_one(i)) for i in ordinary]
+        tasks += [asyncio.create_task(run_chain(indices)) for indices in chains.values()]
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        return cast(List[Dict[str, Any]], results)
 
 
 def serialize_tool_result(result: Any) -> str:

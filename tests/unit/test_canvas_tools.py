@@ -1,10 +1,14 @@
 """F36 — canvas tools: create, read, edit, list."""
+import asyncio
 import inspect
-from unittest.mock import AsyncMock, MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from slack_sdk.errors import SlackApiError
 
 from message_processor import canvas_tools as ct
+from message_processor.stale_send_guard import StaleSendSuppressed
 from message_processor.tool_registry import ToolContext, ToolRegistry
 
 
@@ -1762,3 +1766,155 @@ class TestAnAnchorMustNameSomething:
         assert ct._list_block_around(markdown, "- ") is None
         # ...while a real anchor still finds its list.
         assert ct._list_block_around(markdown, "beta") == ["alpha", "beta"]
+
+
+# ------------------------------------------------------------------ serial canvas chains (B1–B3)
+
+def _chain_registry(executor):
+    """A registry whose canvas tools and one ordinary tool all run `executor(name, args)`."""
+    reg = ToolRegistry()
+    for name in ("edit_canvas", "delete_canvas", "search_slack"):
+        async def run(ctx, args, _name=name):
+            return await executor(_name, args)
+        reg.register({"type": "function", "name": name, "parameters": {}}, run)
+    return reg
+
+
+def _edit(canvas_id, tag):
+    return {"name": "edit_canvas", "call_id": tag,
+            "arguments": f'{{"canvas_id": "{canvas_id}", "tag": "{tag}"}}'}
+
+
+@pytest.mark.unit
+class TestCanvasEditsRunInOrder:
+    async def test_same_canvas_calls_run_in_call_order_even_when_the_first_is_slower(self):
+        events = []
+
+        async def executor(name, args):
+            events.append(("start", args["tag"]))
+            if args["tag"] == "a":
+                await asyncio.sleep(0.02)
+            events.append(("end", args["tag"]))
+            return {"ok": True, "tag": args["tag"]}
+
+        out = await _chain_registry(executor).dispatch_all(
+            ToolContext(channel_id="C1", thread_ts="1.0"),
+            [_edit("F1", "a"), _edit("F1", "b"), _edit("F1", "c")])
+
+        assert events == [("start", "a"), ("end", "a"), ("start", "b"), ("end", "b"),
+                          ("start", "c"), ("end", "c")]
+        assert [r["tag"] for r in out] == ["a", "b", "c"]
+
+    async def test_different_canvases_and_an_ordinary_call_overlap(self):
+        started = []
+        everyone_started = asyncio.Event()
+
+        async def executor(name, args):
+            started.append(args.get("tag") or name)
+            if len(started) == 3:
+                everyone_started.set()
+            # Sequential execution would leave the first caller waiting here alone.
+            await asyncio.wait_for(everyone_started.wait(), timeout=2)
+            return {"ok": True}
+
+        out = await _chain_registry(executor).dispatch_all(
+            ToolContext(channel_id="C1", thread_ts="1.0"),
+            [_edit("F1", "a"), _edit("F2", "b"),
+             {"name": "search_slack", "call_id": "s", "arguments": "{}"}])
+
+        assert sorted(started) == ["a", "b", "search_slack"]
+        assert all(r["ok"] is True for r in out)
+
+    async def test_a_failed_call_stops_its_chain_and_the_rest_say_not_run(self):
+        ran = []
+
+        async def executor(name, args):
+            tag = args.get("tag") or name
+            ran.append(tag)
+            if tag == "a2":
+                return {"ok": False, "error": "section_not_found"}
+            return {"ok": True, "tag": tag}
+
+        out = await _chain_registry(executor).dispatch_all(
+            ToolContext(channel_id="C1", thread_ts="1.0"),
+            [_edit("F1", "a1"), _edit("F1", "a2"), _edit("F2", "b1"), _edit("F1", "a3"),
+             {"name": "search_slack", "call_id": "s", "arguments": "{}"}])
+
+        assert "a3" not in ran
+        assert out[0] == {"ok": True, "tag": "a1"}
+        assert out[1]["error"] == "section_not_found"
+        assert out[2] == {"ok": True, "tag": "b1"}
+        assert out[3]["ok"] is False and out[3]["error"] == "not_run"
+        assert out[4] == {"ok": True, "tag": "search_slack"}
+
+    async def test_a_raising_sibling_stops_the_chain_before_its_next_edit(self):
+        ran = []
+
+        async def executor(name, args):
+            tag = args.get("tag") or name
+            ran.append(tag)
+            if name == "search_slack":
+                raise StaleSendSuppressed()
+            await asyncio.sleep(0.02)
+            return {"ok": True}
+
+        with pytest.raises(StaleSendSuppressed):
+            await _chain_registry(executor).dispatch_all(
+                ToolContext(channel_id="C1", thread_ts="1.0"),
+                [_edit("F1", "a"), _edit("F1", "b"),
+                 {"name": "search_slack", "call_id": "s", "arguments": "{}"}])
+        await asyncio.sleep(0.05)  # longer than edit a would have taken
+
+        assert "b" not in ran
+
+
+@pytest.mark.unit
+class TestCanvasEditingLockedIsRetried:
+    async def test_locked_then_success_is_retried_and_ok(self):
+        ctx, web = _ctx()
+        web.canvases_edit = AsyncMock(side_effect=[
+            SlackApiError("locked", {"ok": False, "error": "canvas_editing_locked"}),
+            {"ok": True}])
+        with patch("message_processor.canvas_tools.asyncio.sleep", new=AsyncMock()) as slept:
+            out = await ct.execute_edit_canvas(
+                ctx, {"canvas_id": "F123", "operation": "append", "markdown": "more"})
+
+        assert out["ok"] is True
+        assert web.canvases_edit.await_count == 2
+        slept.assert_awaited_once_with(0.5)
+
+    async def test_a_different_error_is_not_retried(self):
+        ctx, web = _ctx()
+        web.canvases_edit = AsyncMock(side_effect=SlackApiError(
+            "nope", {"ok": False, "error": "canvas_not_found"}))
+        with patch("message_processor.canvas_tools.asyncio.sleep", new=AsyncMock()) as slept:
+            out = await ct.execute_edit_canvas(
+                ctx, {"canvas_id": "F123", "operation": "append", "markdown": "more"})
+
+        assert out["ok"] is False and out["error"] == "edit_failed"
+        assert web.canvases_edit.await_count == 1
+        slept.assert_not_awaited()
+
+    async def test_retries_run_until_the_deadline_and_never_start_after_it(self):
+        ctx, web = _ctx()
+        ctx.tool_deadline = 100.0
+        clock = {"now": 90.0}
+        attempts = []
+
+        async def locked(**kwargs):
+            attempts.append(clock["now"])
+            raise SlackApiError("locked", {"ok": False, "error": "canvas_editing_locked"})
+
+        async def fake_sleep(seconds):
+            clock["now"] += seconds
+
+        web.canvases_edit = AsyncMock(side_effect=locked)
+        with patch.object(ct, "time", SimpleNamespace(monotonic=lambda: clock["now"])), \
+                patch("message_processor.canvas_tools.asyncio.sleep",
+                      new=AsyncMock(side_effect=fake_sleep)) as slept:
+            out = await ct.execute_edit_canvas(
+                ctx, {"canvas_id": "F123", "operation": "append", "markdown": "more"})
+
+        assert out["ok"] is False and out["error"] == "edit_failed"
+        assert attempts == [90.0, 90.5, 91.5, 93.5, 97.5]
+        assert [c.args[0] for c in slept.await_args_list] == [0.5, 1, 2, 4, 2.5]

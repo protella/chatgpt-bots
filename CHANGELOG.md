@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.4.3] - 2026-10-26
+
+### 🐛 Fixed
+
+- **Research jobs no longer forget what they found.** Between steps, the bot dropped the text of
+  its own web searches (and MCP results), so a job could lose its findings, restart its plan and
+  search the same things for over an hour. Each step's search results now carry into the next.
+  Chat replies that search across several steps get the same fix.
+- **Large canvas edits finish.** Several changes to one canvas used to fire at once: Slack refused
+  some as "editing locked" and the bot's per-step call limit refused the rest, leaving the edit half
+  done. Changes to a canvas now apply one at a time, in order, until all are made; canvas reads and
+  edits no longer count against the call limits, and a brief Slack edit lock is retried.
+
+### 🔧 Changed
+
+- **Dependencies updated:** `pandas` 3.1.0, `striprtf`, `concurrent-log-handler` and test tooling.
+  No behavior changes.
+
 ## [3.4.2] - 2026-10-22
 
 ### 🔒 Security

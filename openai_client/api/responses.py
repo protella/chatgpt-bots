@@ -736,21 +736,71 @@ def _request_includes(function_call_sink: Optional[List[Dict[str, Any]]],
       * `reasoning.encrypted_content` — a stateless tool loop (store=False) must round-trip
         reasoning items between rounds, so the function-call sink implies it.
       * `web_search_call.results` — the ~200-word passages the model actually read, asked
-        for only when result memory is being collected AND a web-search tool is on the
-        request. Asking for it without the tool is a wasted parameter.
+        for when a web-search tool is on the request AND either result memory is being
+        collected or this is a tool-loop round. The loop carries the passages into the next
+        round's input (see `_capture_hosted_carry`): a round with no reasoning item otherwise
+        leaves the next one no record of what its searches found. Asking for it without the
+        tool is a wasted parameter.
 
     Returning None when nothing applies keeps the request byte-identical to before this
     existed for every call that neither loops tools nor searches."""
     includes: List[str] = []
     if function_call_sink is not None:
         includes.append("reasoning.encrypted_content")
-    if mcp_results_sink is not None:
+    if mcp_results_sink is not None or function_call_sink is not None:
         for tool in tools or []:
             tool_type = tool.get("type") if isinstance(tool, dict) else getattr(tool, "type", None)
             if isinstance(tool_type, str) and tool_type.startswith("web_search"):
                 includes.append("web_search_call.results")
                 break
     return includes or None
+
+
+def _web_search_evidence(item: Any) -> Optional[str]:
+    """One `web_search_call`'s evidence line: what the action did, then the passages it read
+    after :data:`WEB_SEARCH_PASSAGE_MARKER`. None when the action records nothing. Shared by
+    result memory (:func:`_capture_web_search`) and the tool loop's round carry
+    (:func:`_capture_hosted_carry`), so the two can never format a search differently."""
+    evidence = _web_search_action_evidence(item)
+    if not evidence:
+        return None
+    passages = _web_search_results(item)
+    if passages:
+        evidence = f"{evidence}{WEB_SEARCH_PASSAGE_MARKER}" + " || ".join(passages)
+    return evidence
+
+
+def _capture_hosted_carry(hosted_carry_sink: Optional[List[str]], item: Any) -> None:
+    """Collect one round's hosted-tool findings for the tool loop to carry into the next round.
+
+    The stateless loop (store=False) replays only reasoning items and local call pairs, so a
+    hosted `web_search_call` / `mcp_call` and what it returned vanish from the next round's
+    input — and on a round with no reasoning item nothing else records them either (prod: a
+    research job re-ran its searches for 161 rounds). Independent of result memory on purpose:
+    `mcp_results_sink` is the caller's persisted provenance and must keep receiving exactly what
+    it always has, while this sink is round-local and never persisted. Same text the result
+    memory reads: :func:`_web_search_evidence` for a search, the completed output for an MCP
+    call (errored or empty calls skipped, as in :func:`_capture_mcp_result`). No-ops when the
+    sink is None; never raises."""
+    if hosted_carry_sink is None:
+        return
+    try:
+        item_type = getattr(item, "type", None)
+        if item_type == "web_search_call":
+            evidence = _web_search_evidence(item)
+            if evidence:
+                hosted_carry_sink.append(evidence)
+        elif item_type == "mcp_call":
+            if getattr(item, "error", None):
+                return
+            output = getattr(item, "output", None)
+            if not output:
+                return
+            server_label = getattr(item, "server_label", None) or "mcp"
+            hosted_carry_sink.append(f"{server_label}/{getattr(item, 'name', None)}: {output}")
+    except Exception:
+        # Carry capture must never interfere with response processing
+        pass
 
 
 def _capture_web_search(mcp_results_sink: Optional[List[Dict[str, Any]]], item: Any) -> None:
@@ -787,11 +837,8 @@ def _capture_web_search(mcp_results_sink: Optional[List[Dict[str, Any]]], item: 
         return
     try:
         if getattr(item, "type", None) == "web_search_call":
-            evidence = _web_search_action_evidence(item)
+            evidence = _web_search_evidence(item)
             if evidence:
-                passages = _web_search_results(item)
-                if passages:
-                    evidence = f"{evidence}{WEB_SEARCH_PASSAGE_MARKER}" + " || ".join(passages)
                 mcp_results_sink.append({"tool_name": "web_search", "output": evidence})
             return
         sources = _url_citations(item)
@@ -1010,6 +1057,7 @@ async def create_text_response_with_tools(
     service_tier_eligible: bool = False,
     meter: Optional[Any] = None,
     round_index: int = 0,
+    hosted_carry_sink: Optional[List[str]] = None,
 ) -> str:
     """
     Create text response with tools (e.g., web search)
@@ -1028,6 +1076,8 @@ async def create_text_response_with_tools(
         function_call_sink: Optional list; completed local function_call items
             ({"call_id","name","arguments"}) are appended for the tool loop
         tool_choice: Optional tool_choice override (e.g. "none" when the loop caps out)
+        hosted_carry_sink: Optional list; the tool loop's round-local record of what this
+            round's hosted tools found (see `_capture_hosted_carry`)
 
     Returns:
         Generated text response
@@ -1048,7 +1098,7 @@ async def create_text_response_with_tools(
         tool_choice=tool_choice,
         # Stateless tool loop: reasoning items must round-trip between rounds, which
         # requires their encrypted content when store=False. Web-search passages ride the
-        # same parameter when result memory is on — see _request_includes.
+        # same parameter for result memory and the loop's round carry — see _request_includes.
         include=_request_includes(function_call_sink, mcp_results_sink, tools),
         prompt_cache_key=prompt_cache_key,
         prompt_cache_options=prompt_cache_options,
@@ -1099,12 +1149,14 @@ async def create_text_response_with_tools(
                     # F12: capture the completed call's output text (MCP results are external
                     # derived artifacts, safe to persist). Skip errored/empty calls.
                     _capture_mcp_result(mcp_results_sink, item, server_label)
+                    _capture_hosted_carry(hosted_carry_sink, item)
                 elif item_type == "web_search_call":
                     if "web_search" not in tools_actually_used:
                         tools_actually_used.append("web_search")
                     # F12: the query — the bare name alone leaves a later turn nothing to
                     # recall about its own search.
                     _capture_web_search(mcp_results_sink, item)
+                    _capture_hosted_carry(hosted_carry_sink, item)
                 elif item_type == "code_interpreter_call":
                     # F32: the model ran Python in the sandbox. Record the container so the
                     # caller can LIST the files it wrote.
@@ -1522,6 +1574,7 @@ async def create_streaming_response_with_tools(
     hidden_suppression_sink: Optional[List[BaseException]] = None,
     meter: Optional[Any] = None,
     round_index: int = 0,
+    hosted_carry_sink: Optional[List[str]] = None,
 ) -> str:
     """
     Create streaming text response with tools (e.g., web search)
@@ -1564,6 +1617,8 @@ async def create_streaming_response_with_tools(
             `_hidden_for`). ONE sink is threaded through every round of a tool loop, so a
             refusal hidden in round 1 keeps rounds 2..N silent too — and a generation failure
             in any of them re-raises the stored suppression instead of itself (ruling 5).
+        hosted_carry_sink: Optional list; the tool loop's round-local record of what this
+            round's hosted tools found (see `_capture_hosted_carry`)
 
     Returns:
         Complete generated text response
@@ -1588,7 +1643,7 @@ async def create_streaming_response_with_tools(
         parallel_tool_calls=True,
         # Stateless tool loop: reasoning items must round-trip between rounds, which
         # requires their encrypted content when store=False. Web-search passages ride the
-        # same parameter when result memory is on — see _request_includes.
+        # same parameter for result memory and the loop's round carry — see _request_includes.
         include=_request_includes(function_call_sink, mcp_results_sink, tools),
         prompt_cache_key=prompt_cache_key,
         prompt_cache_options=prompt_cache_options,
@@ -1865,6 +1920,7 @@ async def create_streaming_response_with_tools(
                             # the same query as durable evidence, or the next turn has only
                             # the bare tool name to reason from.
                             _capture_web_search(mcp_results_sink, item)
+                            _capture_hosted_carry(hosted_carry_sink, item)
                         elif item_type == 'mcp_call':
                             server_label = getattr(item, 'server_label', None)
                             tool_error = getattr(item, 'error', None)
@@ -1873,6 +1929,7 @@ async def create_streaming_response_with_tools(
                             # F12: capture the completed call's output text (skips errored/
                             # empty calls internally) for tool-result memory.
                             _capture_mcp_result(mcp_results_sink, item, server_label)
+                            _capture_hosted_carry(hosted_carry_sink, item)
                             # F30.1: surface the completed MCP call to the internal observer.
                             if not tool_error:
                                 await _emit_tool_event({"kind": "mcp", "server_label": server_label})
@@ -2907,7 +2964,7 @@ async def _create_text_response_with_tools_with_timeout(
         tool_choice=tool_choice,
         # Stateless tool loop: reasoning items must round-trip between rounds, which
         # requires their encrypted content when store=False. Web-search passages ride the
-        # same parameter when result memory is on — see _request_includes.
+        # same parameter for result memory and the loop's round carry — see _request_includes.
         include=_request_includes(function_call_sink, mcp_results_sink, tools),
         prompt_cache_key=prompt_cache_key,
         prompt_cache_options=prompt_cache_options,

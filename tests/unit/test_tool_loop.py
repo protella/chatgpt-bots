@@ -2249,3 +2249,160 @@ class TestSilenceTerminalRespectsTheRoundCap:
         assert out["terminal_action"] == "no_reply"
         # The terminal reserves one slot of the round cap; two siblings fit, seventeen never ran.
         assert len(executed) == 2, f"{len(executed)} siblings dispatched against a round cap of 3"
+
+
+class _HostedRoundsSelf(_Client):
+    """The REAL collectors over scripted API output: one list of output items per request.
+    A streaming request gets a finite event list ending in `response.completed`."""
+    def __init__(self, rounds):
+        self.rounds = rounds
+        self.requests = []
+
+    async def _safe_api_call(self, fn, operation_type=None, **params):
+        self.requests.append(params)
+        items = self.rounds[min(len(self.requests) - 1, len(self.rounds) - 1)]
+        if params.get("stream"):
+            return ([_ev("response.output_item.done", item=item) for item in items]
+                    + [_ev("response.completed")])
+        return SimpleNamespace(output=items, usage=None)
+
+    async def _safe_stream_iteration(self, stream, operation_type=None):
+        for e in stream:
+            yield e
+
+    @property
+    def client(self):
+        return SimpleNamespace(responses=SimpleNamespace(create=None))
+
+
+def _searched(query, passage):
+    return SimpleNamespace(type="web_search_call", status="completed",
+                           action=SimpleNamespace(type="search", query=query),
+                           results=[{"type": "text_result", "snippet": passage}])
+
+
+def _fc(call_id):
+    return SimpleNamespace(type="function_call", call_id=call_id, name="echo",
+                           arguments='{"x": 1}')
+
+
+async def _run_hosted(client, streaming):
+    kwargs = dict(messages=[{"role": "user", "content": "hi"}], tools=[{"type": "web_search"}],
+                  registry=_registry_with(), tool_context=ToolContext())
+    if streaming:
+        return await tool_loop.create_streaming_response_with_tool_loop(
+            client, stream_callback=lambda c: None, **kwargs)
+    return await tool_loop.create_text_response_with_tool_loop(client, **kwargs)
+
+
+@pytest.mark.asyncio
+class TestHostedFindingsCarryBetweenRounds:
+    """Prod, 2026-10-23: a research job ran 161 rounds and 400+ searches for a short blurb. The
+    stateless loop replays reasoning items and local call pairs only, so on a round with no
+    reasoning item nothing told the next round what its searches had found."""
+
+    @pytest.mark.parametrize("streaming", [False, True])
+    async def test_a_rounds_passages_reach_the_next_request(self, streaming):
+        client = _HostedRoundsSelf([
+            [_searched("kettle boiling point", "Orbital kettles boil at 91 degrees."), _fc("c1")],
+            [],
+        ])
+        await _run_hosted(client, streaming)
+
+        assert "web_search_call.results" in client.requests[0]["include"]
+        sent = client.requests[1]["input"]
+        output_at = next(i for i, m in enumerate(sent) if m.get("type") == "function_call_output")
+        carried = [i for i, m in enumerate(sent)
+                   if "Orbital kettles boil at 91 degrees." in str(m.get("content"))]
+        assert len(carried) == 1 and carried[0] > output_at
+        item = sent[carried[0]]
+        assert item["role"] == "user" and item["content"][0]["type"] == "input_text"
+
+    async def test_each_rounds_passages_are_carried_exactly_once(self):
+        client = _HostedRoundsSelf([
+            [_searched("first", "Passage from round one."), _fc("c1")],
+            [_searched("second", "Passage from round two."), _fc("c2")],
+            [],
+        ])
+        await _run_hosted(client, streaming=False)
+
+        sent = str(client.requests[2]["input"])
+        assert sent.count("Passage from round one.") == 1
+        assert sent.count("Passage from round two.") == 1
+
+    async def test_mcp_output_is_carried_the_same_way(self):
+        mcp = SimpleNamespace(type="mcp_call", server_label="acmedata", name="get_trends",
+                              output="Menu mentions up 12%.", error=None)
+        client = _HostedRoundsSelf([[mcp, _fc("c1")], []])
+        await _run_hosted(client, streaming=False)
+
+        sent = client.requests[1]["input"]
+        assert sent[-1]["role"] == "user"
+        assert "- acmedata/get_trends: Menu mentions up 12%." in sent[-1]["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+class TestCanvasCallsAreNotRationed:
+    """Prod, 2026-10-21: twelve `edit_canvas` calls in one round, six refused by the fan-out cap,
+    and the model told the user the edit was incomplete. One requested change is one call, so a
+    ration on canvas calls cuts real work off mid-edit."""
+
+    @pytest.mark.parametrize("with_free", [False, True])
+    @pytest.mark.parametrize("streaming", [False, True])
+    async def test_wide_and_long_canvas_edits_all_run(self, monkeypatch, streaming, with_free):
+        # Five canvas rounds against a round cap of three, 28 edits against a turn budget of 20,
+        # and rounds of 12 and 13 against a fan-out cap of 6. With a bookkeeping call riding
+        # each round, the round is billed as free-only and still nothing is cut.
+        monkeypatch.setattr(config, "max_tool_rounds", 3)
+        monkeypatch.setattr(config, "max_tool_calls_per_turn", 20)
+        monkeypatch.setattr(config, "max_tool_calls_per_round", 6)
+        executed = []
+
+        async def _edit(ctx, args):
+            executed.append(args)
+            return {"ok": True}
+
+        def _edits(prefix, n):
+            calls = [_call("edit_canvas", f"{prefix}{i}", '{"canvas_id": "F1"}')
+                     for i in range(n)]
+            return calls + ([_call("update_todos", f"{prefix}t")] if with_free else [])
+
+        rounds = [("", _edits("a", 12)), ("", _edits("b", 13)), ("", _edits("c", 1)),
+                  ("", _edits("d", 1)), ("", _edits("e", 1)), ("done", [])]
+        choices = []
+        last_input = []
+
+        async def fake_streaming(client, messages, tools, stream_callback, tool_callback=None,
+                                 function_call_sink=None, tool_choice=None, **params):
+            choices.append(tool_choice)
+            last_input[:] = messages
+            text, calls = rounds[min(len(choices) - 1, len(rounds) - 1)]
+            if tool_choice != "none" and function_call_sink is not None:
+                function_call_sink.extend(calls)
+            return text
+
+        registry = _registry_with("edit_canvas", _edit)
+        registry.register({"type": "function", "name": "update_todos",
+                           "parameters": {"type": "object"}}, _ok_exec())
+        free_tools = ["update_todos"] if with_free else None
+        if streaming:
+            monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
+                                fake_streaming)
+            out = await tool_loop.create_streaming_response_with_tool_loop(
+                _Client(), messages=[], tools=[], registry=registry, tool_context=ToolContext(),
+                stream_callback=lambda c: None, free_tools=free_tools)
+        else:
+            fake = _FakeRounds(rounds)
+            monkeypatch.setattr(tool_loop.responses_api, "create_text_response_with_tools", fake)
+            out = await tool_loop.create_text_response_with_tool_loop(
+                _Client(), messages=[], tools=[], registry=registry, tool_context=ToolContext(),
+                free_tools=free_tools)
+            choices = [inv["tool_choice"] for inv in fake.invocations]
+            last_input = fake.invocations[-1]["messages"]
+
+        assert out["text"] == "done"
+        assert len(executed) == 28
+        assert len(choices) == 6 and "none" not in choices
+        outputs = [m["output"] for m in last_input if m.get("type") == "function_call_output"]
+        assert len(outputs) == 28 + (5 if with_free else 0)
+        assert all('"ok": true' in o for o in outputs)

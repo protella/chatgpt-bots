@@ -630,8 +630,14 @@ def test_request_includes_is_none_when_neither_sink_is_collecting():
     assert _request_includes(None, None, [_WEB_TOOL]) is None
 
 
-def test_request_includes_asks_only_for_reasoning_without_the_results_sink():
-    assert _request_includes([], None, [_WEB_TOOL]) == ["reasoning.encrypted_content"]
+def test_request_includes_asks_for_passages_on_a_tool_loop_round_without_result_memory():
+    # The loop carries a round's passages into the next round, so a function-call sink and a
+    # web-search tool are enough to ask for them, result memory or not.
+    assert _request_includes([], None, [_WEB_TOOL]) == [
+        "reasoning.encrypted_content", "web_search_call.results"]
+    # Unchanged otherwise: no web-search tool, no passages.
+    assert _request_includes([], None, [{"type": "code_interpreter"}]) == [
+        "reasoning.encrypted_content"]
 
 
 def test_request_includes_asks_for_both_when_web_search_is_on_the_request():

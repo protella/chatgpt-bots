@@ -448,7 +448,8 @@
     },
     "tools__gpt-5.5__loop": {
       "include": [
-        "reasoning.encrypted_content"
+        "reasoning.encrypted_content",
+        "web_search_call.results"
       ],
       "input": [
         {
@@ -651,7 +652,8 @@
     },
     "tools__gpt-5.6-sol__loop": {
       "include": [
-        "reasoning.encrypted_content"
+        "reasoning.encrypted_content",
+        "web_search_call.results"
       ],
       "input": [
         {
@@ -914,7 +916,8 @@
     },
     "tools_stream__gpt-5.5__loop": {
       "include": [
-        "reasoning.encrypted_content"
+        "reasoning.encrypted_content",
+        "web_search_call.results"
       ],
       "input": [
         {
@@ -1123,7 +1126,8 @@
     },
     "tools_stream__gpt-5.6-sol__loop": {
       "include": [
-        "reasoning.encrypted_content"
+        "reasoning.encrypted_content",
+        "web_search_call.results"
       ],
       "input": [
         {
@@ -1329,7 +1333,8 @@
     },
     "tools_timeout__gpt-5.5__loop": {
       "include": [
-        "reasoning.encrypted_content"
+        "reasoning.encrypted_content",
+        "web_search_call.results"
       ],
       "input": [
         {
@@ -1532,7 +1537,8 @@
     },
     "tools_timeout__gpt-5.6-sol__loop": {
       "include": [
-        "reasoning.encrypted_content"
+        "reasoning.encrypted_content",
+        "web_search_call.results"
       ],
       "input": [
         {

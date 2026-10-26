@@ -245,6 +245,49 @@ async def _async(fn, **kwargs):
     return result
 
 
+# Slack's answer while another edit to the same canvas is still in progress, documented as
+# "retry later". The only error a canvas edit retries; the first wait doubles each time.
+_EDIT_LOCKED = "canvas_editing_locked"
+_EDIT_LOCKED_FIRST_DELAY = 0.5
+
+
+def _slack_error_code(e: Exception) -> str:
+    response = getattr(e, "response", None)
+    try:
+        code = response.get("error") if response is not None else None
+    except Exception:  # noqa: BLE001 — a response we cannot read has no code to retry on
+        return ""
+    return code if isinstance(code, str) else ""
+
+
+async def _canvases_edit(ctx: ToolContext, web: Any, *, canvas_id: str,
+                         changes: List[Dict[str, Any]]) -> Any:
+    """`canvases.edit`, retried while Slack says the canvas is locked by another edit.
+
+    No attempt count: the call's own execution time is the bound. The last wait is cut to what
+    remains, and no write is issued once the stamped deadline has passed — the lock error is
+    raised as it stands instead of a retry running on past the timeout."""
+    delay = _EDIT_LOCKED_FIRST_DELAY
+    while True:
+        try:
+            return await _async(web.canvases_edit, canvas_id=canvas_id, changes=changes)
+        except Exception as e:  # noqa: BLE001
+            if _slack_error_code(e) != _EDIT_LOCKED:
+                raise
+            deadline = getattr(ctx, "tool_deadline", None)
+            wait = delay
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                wait = min(delay, remaining)
+            logger.info(f"Canvas {canvas_id} is locked by another edit; retrying in {wait}s")
+            await asyncio.sleep(wait)
+            if deadline is not None and time.monotonic() >= deadline:
+                raise
+            delay *= 2
+
+
 async def _canvas_file(ctx: ToolContext, canvas_id: str) -> Optional[Dict[str, Any]]:
     """The canvas's file record — but ONLY if the canvas is really in THIS channel.
 
@@ -681,6 +724,9 @@ def get_edit_canvas_schema(thread_config: Optional[Dict[str, Any]] = None
             "the new cell content as markdown; quoting a row with | pipes matches nothing. Cells "
             "can be edited and cleared, but rows cannot be added or removed through this tool — "
             "say so instead of trying.\n\n"
+            "ONE CHANGE PER CALL. Several edit_canvas calls in one step are applied in order, one "
+            "after another. Check each result and keep going until every requested change is "
+            "made, then reply.\n\n"
             "READ THE CANVAS FIRST. `find_text` must be text you have actually seen in it. If it "
             "matches more than one block you will be told how many; pass `occurrence` to say which "
             "one you mean, counting from the top.\n\n"
@@ -809,6 +855,9 @@ def get_edit_canvas_schema_static(thread_config: Optional[Dict[str, Any]] = None
             "the new cell content as markdown; quoting a row with | pipes matches nothing. Cells "
             "can be edited and cleared, but rows cannot be added or removed through this tool — "
             "say so instead of trying.\n\n"
+            "ONE CHANGE PER CALL. Several edit_canvas calls in one step are applied in order, one "
+            "after another. Check each result and keep going until every requested change is "
+            "made, then reply.\n\n"
             "READ THE CANVAS FIRST. `find_text` must be text you have actually seen in it. If it "
             "matches more than one block you will be told how many; pass `occurrence` to say which "
             "one you mean, counting from the top.\n\n"
@@ -1162,9 +1211,10 @@ async def _rewrite_list(ctx: ToolContext, canvas_id: str, find_text: str, markdo
         return _err("list_not_found", "That list has no addressable items.")
 
     try:
-        await _async(web.canvases_edit, canvas_id=canvas_id,
-                     changes=[{"operation": "replace", "section_id": section_ids[0],
-                               "document_content": {"type": "markdown", "markdown": markdown}}])
+        await _canvases_edit(ctx, web, canvas_id=canvas_id,
+                             changes=[{"operation": "replace", "section_id": section_ids[0],
+                                       "document_content": {"type": "markdown",
+                                                            "markdown": markdown}}])
     except Exception as e:  # noqa: BLE001
         logger.error(f"canvases.edit (list rewrite) failed for {canvas_id}: {e}", exc_info=True)
         return _err("edit_failed", f"Slack refused the edit: {e}")
@@ -1174,8 +1224,8 @@ async def _rewrite_list(ctx: ToolContext, canvas_id: str, find_text: str, markdo
     stranded = 0
     for sid in section_ids[1:]:
         try:
-            await _async(web.canvases_edit, canvas_id=canvas_id,
-                         changes=[{"operation": "delete", "section_id": sid}])
+            await _canvases_edit(ctx, web, canvas_id=canvas_id,
+                                 changes=[{"operation": "delete", "section_id": sid}])
         except Exception as e:  # noqa: BLE001
             stranded += 1
             logger.error(f"Canvas {canvas_id}: could not delete superseded list item {sid}: {e}")
@@ -1300,7 +1350,9 @@ async def execute_edit_canvas(ctx: ToolContext, args: Dict[str, Any]) -> Dict[st
             "A canvas section is ONE block — a heading, a paragraph, or a single list item — so "
             "find_text must name one line, not a region. To rewrite a whole list, use "
             "operation='replace_list' with any single line of it as find_text; to change several "
-            "unrelated lines, call edit_canvas once per line.")
+            "unrelated lines, call edit_canvas once per line — one change per call. Several calls "
+            "in one step are applied in order, one after another; check each result and keep "
+            "going until every change is made.")
     # Slack keys every table CELL as its own section — there is no row section and no table
     # section — so a quoted row (`| Golden pipeline | Platform | ... |`) can never match. Seen
     # live: the model quoted a header row six times in one thread, each a section_not_found that
@@ -1382,7 +1434,7 @@ async def execute_edit_canvas(ctx: ToolContext, args: Dict[str, Any]) -> Dict[st
         return _err("bad_operation", f"Unknown operation {operation!r}.")
 
     try:
-        await _async(web.canvases_edit, canvas_id=canvas_id, changes=changes)
+        await _canvases_edit(ctx, web, canvas_id=canvas_id, changes=changes)
     except Exception as e:  # noqa: BLE001
         logger.error(f"canvases.edit failed for {canvas_id}: {e}", exc_info=True)
         return _err("edit_failed", f"Slack refused the edit: {e}")
