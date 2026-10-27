@@ -536,8 +536,17 @@ def _terminal_overrides(calls: List[Dict[str, Any]], terminal_call: Dict[str, An
 # canvas change is one call, so a dozen-cell update is a dozen calls, and any ration cut it off
 # mid-edit (prod, 2026-10-21: six refused, the model told the user the edit was incomplete). They
 # are not `free_tools` either — that path has its own burst cap. Dispatch runs one canvas's
-# edits one after another, so a wide edit round does not race itself on Slack.
+# edits one after another, so a wide edit round does not race itself on Slack. The one limit is
+# `config.max_canvas_calls_per_turn`, a generous backstop against a stuck loop that ends the turn
+# through the ordinary cap path; `_canvas_backstop_hit` logs it.
 _UNRATIONED_TOOLS = frozenset({"edit_canvas", "read_canvas"})
+
+
+def _canvas_backstop_hit(self: Any, before: int, after: int, cap: int) -> None:
+    """One WARNING, on the round that carried the turn's canvas calls across the backstop."""
+    if before < cap <= after:
+        self.log_warning(f"Canvas backstop hit: {after} canvas calls this turn (cap {cap}) — "
+                         "forcing final answer")
 
 
 _OVER_BUDGET_RESULT = {
@@ -856,16 +865,20 @@ async def create_text_response_with_tool_loop(
     free_calls = 0
     free_rounds_cap = max(1, config.max_tool_rounds * _FREE_ROUND_CEILING)
     free_calls_cap = max(1, config.max_tool_calls_per_turn * _FREE_ROUND_CEILING)
+    canvas_calls = 0    # counted only against the runaway backstop, never billed
     rescued = False     # the empty-cap-forced-final retry fires at most once per turn
 
     def _charge(calls: List[Dict[str, Any]], suppressed: Dict[int, Any]) -> None:
         """Bill a round. A round of PURE bookkeeping costs no round and no productive call;
         anything else is fully charged, though the free calls riding in a mixed round stay
         free. Only calls that actually RAN are billed — a suppressed one did no work."""
-        nonlocal rounds, total_calls, free_rounds, free_calls
+        nonlocal rounds, total_calls, free_rounds, free_calls, canvas_calls
         ran = [c for c in calls if id(c) not in suppressed]
         # Canvas calls are never billed: the round is charged for what else ran, if anything.
         rationed = [c for c in ran if c.get("name") not in _UNRATIONED_TOOLS]
+        before = canvas_calls
+        canvas_calls += len(ran) - len(rationed)
+        _canvas_backstop_hit(self, before, canvas_calls, config.max_canvas_calls_per_turn)
         if ran and not rationed:
             return                                  # a canvas-only round costs nothing
         ran = rationed
@@ -881,7 +894,8 @@ async def create_text_response_with_tool_loop(
     def _capped() -> bool:
         return (rounds >= config.max_tool_rounds
                 or total_calls >= config.max_tool_calls_per_turn
-                or free_rounds >= free_rounds_cap or free_calls >= free_calls_cap)
+                or free_rounds >= free_rounds_cap or free_calls >= free_calls_cap
+                or canvas_calls >= config.max_canvas_calls_per_turn)
 
     # F30: expose this turn's live input (stable reference — appended in place across rounds)
     # plus the developer prompt/model, so a detached job can snapshot the full context by copy.
@@ -1142,7 +1156,11 @@ async def create_streaming_response_with_tool_loop(
     terminal_names = {str(n) for n in (terminal_tools or ())}
     free_rounds_cap = max(1, rounds_cap * _FREE_ROUND_CEILING)
     free_calls_cap = max(1, calls_cap * _FREE_ROUND_CEILING)
-    budget = {"rounds": 0, "calls": 0, "free_rounds": 0, "free_calls": 0}
+    # The canvas backstop is a chat-turn guard like the caps above, so a job (NO_CAP) is not on
+    # it either. Jobs register no canvas tools today; this keeps the two from disagreeing if one
+    # ever does.
+    canvas_cap = NO_CAP if uncapped else config.max_canvas_calls_per_turn
+    budget = {"rounds": 0, "calls": 0, "free_rounds": 0, "free_calls": 0, "canvas_calls": 0}
     # Did THIS round run a hosted tool? Reset before every request, read by _charge.
     round_state = {"hosted_seen": False}
     _caller_tool_event_callback = params.get("tool_event_callback")
@@ -1193,6 +1211,9 @@ async def create_streaming_response_with_tool_loop(
         ran = [c for c in calls if id(c) not in suppressed]
         # Canvas calls are never billed: the round is charged for what else ran, if anything.
         rationed = [c for c in ran if c.get("name") not in _UNRATIONED_TOOLS]
+        before = budget["canvas_calls"]
+        budget["canvas_calls"] += len(ran) - len(rationed)
+        _canvas_backstop_hit(self, before, budget["canvas_calls"], canvas_cap)
         if ran and not rationed:
             return                                  # a canvas-only round costs nothing
         ran = rationed
@@ -1211,7 +1232,8 @@ async def create_streaming_response_with_tool_loop(
     def _capped() -> bool:
         return (budget["rounds"] >= rounds_cap or budget["calls"] >= calls_cap
                 or budget["free_rounds"] >= free_rounds_cap
-                or budget["free_calls"] >= free_calls_cap)
+                or budget["free_calls"] >= free_calls_cap
+                or budget["canvas_calls"] >= canvas_cap)
 
     def _should_force_final() -> bool:
         """Asked once per round, right after the round is charged: is this the last one?

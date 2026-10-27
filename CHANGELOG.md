@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.4.4] - 2026-10-27
+
+### 🔧 Changed
+
+- **Backstop for canvas work.** Canvas reads and edits stay outside the call limits, but a turn
+  that reaches 200 canvas calls (`MAX_CANVAS_CALLS_PER_TURN`) now stops and answers with what it
+  has, so a stuck loop cannot run forever. Real edits never come near it.
+
 ## [3.4.3] - 2026-10-26
 
 ### 🐛 Fixed

@@ -2406,3 +2406,52 @@ class TestCanvasCallsAreNotRationed:
         outputs = [m["output"] for m in last_input if m.get("type") == "function_call_output"]
         assert len(outputs) == 28 + (5 if with_free else 0)
         assert all('"ok": true' in o for o in outputs)
+
+    @pytest.mark.parametrize("streaming", [False, True])
+    async def test_a_stuck_canvas_loop_stops_at_the_backstop(self, monkeypatch, streaming):
+        monkeypatch.setattr(config, "max_tool_rounds", 20)
+        monkeypatch.setattr(config, "max_tool_calls_per_turn", 20)
+        monkeypatch.setattr(config, "max_canvas_calls_per_turn", 5)
+        executed = []
+
+        async def _read(ctx, args):
+            executed.append(args)
+            return {"ok": True}
+
+        choices = []
+
+        async def fake_streaming(client, messages, tools, stream_callback, tool_callback=None,
+                                 function_call_sink=None, tool_choice=None, **params):
+            choices.append(tool_choice)
+            assert len(choices) <= 10, "the backstop never ended the turn"
+            if tool_choice == "none":
+                return "here is where it stands"
+            if function_call_sink is not None:
+                n = len(choices)
+                function_call_sink.extend(
+                    _call("read_canvas", f"r{n}_{i}", '{"canvas_id": "F1"}') for i in range(2))
+            return ""
+
+        registry = _registry_with("read_canvas", _read)
+        if streaming:
+            monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
+                                fake_streaming)
+            out = await tool_loop.create_streaming_response_with_tool_loop(
+                _Client(), messages=[], tools=[], registry=registry, tool_context=ToolContext(),
+                stream_callback=lambda c: None)
+        else:
+            async def fake(client, messages, tools, return_metadata=True, function_call_sink=None,
+                           tool_choice=None, **params):
+                text = await fake_streaming(client, messages, tools, None,
+                                            function_call_sink=function_call_sink,
+                                            tool_choice=tool_choice)
+                return {"text": text, "tools_used": []}
+
+            monkeypatch.setattr(tool_loop.responses_api, "create_text_response_with_tools", fake)
+            out = await tool_loop.create_text_response_with_tool_loop(
+                _Client(), messages=[], tools=[], registry=registry, tool_context=ToolContext())
+
+        # Rounds of two: 2, 4, then 6 crosses the cap of 5 and the next request is the final.
+        assert len(executed) == 6
+        assert choices == [None, None, None, "none"]
+        assert out["text"] == "here is where it stands"

@@ -914,6 +914,10 @@ class BotConfig:
     # calls cap is the binding budget and the rounds cap is a runaway backstop only.
     max_tool_rounds: int = field(default_factory=lambda: int(os.getenv("MAX_TOOL_ROUNDS", "20")))
     max_tool_calls_per_turn: int = field(default_factory=lambda: int(os.getenv("MAX_TOOL_CALLS_PER_TURN", "20")))
+    # Canvas reads/edits are otherwise unrationed (one requested change is one call). This is a
+    # backstop against a stuck loop only — real edits never come near it. On cap the turn takes
+    # the same final tool_choice="none" round as above.
+    max_canvas_calls_per_turn: int = field(default_factory=lambda: int(os.getenv("MAX_CANVAS_CALLS_PER_TURN", "200")))
     # ...and a ceiling WITHIN one round on PRODUCTIVE calls, enforced BEFORE dispatch. A round's
     # calls run in parallel, so the turn cap alone stops only the NEXT round — by which time a
     # single response of 20 parallel searches has already run them all, spent the whole turn on
