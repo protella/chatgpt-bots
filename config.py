@@ -114,12 +114,13 @@ def pipeline_status(stage: str, default: str, **fmt) -> str:
 
 
 # Model knowledge cutoff dates
-# Supported models: gpt-6-astra (default), gpt-6.1-sol, gpt-6-luna, gpt-5.6-sol, gpt-5.6-terra,
+# Supported models: gpt-6-astra (default), gpt-6.1-sol, gpt-6.1-terra, gpt-6-luna, gpt-5.6-sol, gpt-5.6-terra,
 # gpt-5.6-luna, gpt-5.5 (gpt-6-luna doubles as the utility model)
 MODEL_KNOWLEDGE_CUTOFFS = {
     # GPT-6 Astra (April 2026 cutoff, 1.05M context window, released September 3, 2026)
     "gpt-6-astra": "April 30, 2026",
     "gpt-6.1-sol": "April 30, 2026",
+    "gpt-6.1-terra": "June 1, 2026",
     "gpt-6-luna": "May 18, 2026",
 
     # GPT-5.6 family (Feb 2026 cutoff, 1.05M context window, released July 9, 2026)
@@ -135,8 +136,8 @@ MODEL_KNOWLEDGE_CUTOFFS = {
 }
 
 # The full user-selectable model set (order = modal display order)
-SUPPORTED_CHAT_MODELS = ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna", "gpt-5.6-sol",
-                         "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"]
+SUPPORTED_CHAT_MODELS = ["gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna",
+                         "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"]
 
 # What OPENAI_SERVICE_TIER may say. `standard` is OUR name for "send no service_tier at all" —
 # the API's own default is the literal `"default"` and it does not accept `"standard"`, so the
@@ -144,8 +145,9 @@ SUPPORTED_CHAT_MODELS = ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna", "gpt-5.6-so
 # honored only on the models below; everything else pays standard rates for nothing.
 SUPPORTED_SERVICE_TIERS = ("standard", "fast")
 # All verified live: `service_tier="fast"` returns 200 on each (5.6-sol/astra 2026-09-08;
-# gpt-6-luna 2026-09-23; gpt-6.1-sol 2026-09-29; served tier echoes `fast`).
-FAST_SERVICE_TIER_MODELS = frozenset({"gpt-5.6-sol", "gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"})
+# gpt-6-luna 2026-09-23; gpt-6.1-sol 2026-09-29; gpt-6.1-terra 2026-10-28; served tier echoes `fast`).
+FAST_SERVICE_TIER_MODELS = frozenset({"gpt-5.6-sol", "gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra",
+                                      "gpt-6-luna"})
 
 # The image models a channel or a person may select. Promoted here from the literal that used to
 # live inside the personal modal so the modal's option list and the channel resolver's allowlist
@@ -165,7 +167,8 @@ SUPPORTED_VERBOSITIES = ("low", "medium", "high")
 # `minimal` 400 with "Supported values are: 'low', 'medium', 'high', 'xhigh', and 'max'".
 # GPT-6.1 Sol verified live 2026-09-29: Astra's exact ladder (`none` and `minimal` both 400).
 # GPT-6 Luna verified live 2026-09-23: it carries the 5.6 ladder (`none` legal, `minimal` 400),
-# so GPT6_EFFORTS is the Astra/6.1-Sol ladder, not the family's.
+# so GPT6_EFFORTS is the Astra/6.1-Sol ladder, not the family's. GPT-6.1 Terra verified live
+# 2026-10-28: Luna's shape (`none` legal, `minimal` 400, sampling only at `none`).
 GPT6_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 GPT56_EFFORTS = ["none", "low", "medium", "high", "xhigh", "max"]
 GPT55_EFFORTS = ["none", "low", "medium", "high", "xhigh"]
@@ -185,7 +188,7 @@ def _no_none_ladder(model: str) -> bool:
 
     ONE predicate, shared by `effort_ladder`, `clamp_effort` and `supports_sampling`. Astra and
     gpt-6.1-sol (verified live 2026-09-29: `none`/`minimal` 400, sampling 400) are the named
-    exceptions; Luna and any other `gpt-6-*` carry the full `none..max` ladder, so a
+    exceptions; Luna, 6.1 Terra and any other `gpt-6*` carry the full `none..max` ladder, so a
     `startswith("gpt-6")` test here would clamp their legal `none` away.
     """
     return (model or "").startswith(("gpt-6-astra", "gpt-6.1-sol"))
@@ -264,7 +267,7 @@ def supports_sampling(model: str, effort: str) -> bool:
     relying on a tolerated value is how the next release breaks us. GPT-6.1 Sol behaves
     identically (verified live 2026-09-29).
 
-    5.5, the 5.6 family and GPT-6 Luna (verified live 2026-09-23) accept them only at
+    5.5, the 5.6 family, GPT-6 Luna (verified live 2026-09-23) and GPT-6.1 Terra (2026-10-28) accept them only at
     `effort == "none"`; every other effort is a reasoning turn where temperature is forced to 1.0.
     """
     if _no_none_ladder(model):
@@ -912,8 +915,9 @@ class BotConfig:
     # one final round runs with tool_choice="none" so the model answers with what it has.
     # The rounds default matches the calls default: a round spends at least one call, so the
     # calls cap is the binding budget and the rounds cap is a runaway backstop only.
-    max_tool_rounds: int = field(default_factory=lambda: int(os.getenv("MAX_TOOL_ROUNDS", "20")))
-    max_tool_calls_per_turn: int = field(default_factory=lambda: int(os.getenv("MAX_TOOL_CALLS_PER_TURN", "20")))
+    # 50 = owner decision 2026-10-28 (was 20; a misrouted turn hit 20 on wasted searches).
+    max_tool_rounds: int = field(default_factory=lambda: int(os.getenv("MAX_TOOL_ROUNDS", "50")))
+    max_tool_calls_per_turn: int = field(default_factory=lambda: int(os.getenv("MAX_TOOL_CALLS_PER_TURN", "50")))
     # Canvas reads/edits are otherwise unrationed (one requested change is one call). This is a
     # backstop against a stuck loop only — real edits never come near it. On cap the turn takes
     # the same final tool_choice="none" round as above.
@@ -921,9 +925,10 @@ class BotConfig:
     # ...and a ceiling WITHIN one round on PRODUCTIVE calls, enforced BEFORE dispatch. A round's
     # calls run in parallel, so the turn cap alone stops only the NEXT round — by which time a
     # single response of 20 parallel searches has already run them all, spent the whole turn on
-    # round one, and left nothing for the answer. The number is derived, not picked: the turn
-    # budget above is 20, and a legitimate turn needs at least ~3 productive rounds to iterate
-    # (gather -> read -> answer), so 20/3 rounds down to 6. 6 also sits above
+    # round one, and left nothing for the answer. The number was derived when the turn budget
+    # was 20 (a legitimate turn needs ~3 productive rounds: gather -> read -> answer, so 20/3
+    # rounds down to 6) and is kept at 6 when the budget went to 50: it guards one round's
+    # parallel width, which the bigger budget does not change. 6 also sits above
     # SEARCH_REPLY_FETCH_CONCURRENCY (4), the tuned parallel-Slack-fetch width, so an honest
     # parallel scan is not crippled by it. Env-overridable so it can be retuned without a deploy.
     max_tool_calls_per_round: int = field(default_factory=lambda: max(1, int(os.getenv("MAX_TOOL_CALLS_PER_ROUND", "6"))))

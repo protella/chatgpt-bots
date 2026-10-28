@@ -241,6 +241,14 @@ class TestAstraModalLadder:
         assert values == GPT6_EFFORTS
         assert "none" not in values
 
+    def test_the_personal_effort_ladder_for_terra_keeps_none(self, modal):
+        # GPT-6.1 Terra carries Luna's ladder (probed 2026-10-28), so `none` stays on offer.
+        from config import GPT56_EFFORTS
+        blocks = modal._add_gpt55_settings({"reasoning_effort": "none"}, "gpt-6.1-terra")
+        block = next(b for b in blocks if b.get("block_id") == "reasoning_block_gpt54")
+        assert [o["value"] for o in block["accessory"]["options"]] == GPT56_EFFORTS
+        assert block["accessory"]["initial_option"]["value"] == "none"
+
     def test_a_stored_none_clamps_to_a_value_the_ladder_offers(self, modal):
         # The submit-time clamp already stops the 400; what this stops is the modal advertising
         # a choice it will silently overwrite.

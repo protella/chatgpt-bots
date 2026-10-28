@@ -448,6 +448,7 @@ def _settings_host():
         get_or_create_user_async=AsyncMock(return_value={"email": "u@example.com"}),
         create_default_user_preferences_async=AsyncMock(return_value={"model": "gpt-5.6-sol"}),
         get_channel_settings_async=AsyncMock(return_value=None),
+        get_thread_config_async=AsyncMock(return_value=None),
     )
     host.settings_modal = SimpleNamespace(
         build_settings_modal=AsyncMock(return_value={"type": "modal"}),
@@ -482,6 +483,33 @@ class TestOpenUserSettingsHandler:
         assert kwargs["user_id"] == "U1"
         assert kwargs["thread_id"] is None and kwargs["in_thread"] is False
         client.chat_postEphemeral.assert_not_awaited()
+
+    async def test_strip_in_a_thread_opens_thread_scope(self):
+        # The strip sits inside a conversation thread: the modal opens on that thread, with
+        # the thread's overrides layered over the user's prefs.
+        host = _settings_host()
+        host.db.get_thread_config_async = AsyncMock(return_value={"model": "gpt-6.1-terra"})
+        handler = host.app.actions["open_user_settings"]
+        client = SimpleNamespace(views_open=AsyncMock(return_value={"ok": True}),
+                                 chat_postEphemeral=AsyncMock())
+        body = _action_body()
+        body["container"]["thread_ts"] = "111.222"
+        await handler(ack=AsyncMock(), body=body, client=client)
+        kwargs = host.settings_modal.build_settings_modal.await_args.kwargs
+        assert kwargs["thread_id"] == "D123:111.222" and kwargs["in_thread"] is True
+        assert kwargs["current_settings"]["model"] == "gpt-6.1-terra"
+        host.db.get_thread_config_async.assert_awaited_once_with("D123:111.222")
+
+    async def test_thread_ts_falls_back_to_the_message(self):
+        host = _settings_host()
+        handler = host.app.actions["open_user_settings"]
+        client = SimpleNamespace(views_open=AsyncMock(return_value={"ok": True}),
+                                 chat_postEphemeral=AsyncMock())
+        body = _action_body()
+        body["message"] = {"ts": "111.999", "thread_ts": "111.222"}
+        await handler(ack=AsyncMock(), body=body, client=client)
+        kwargs = host.settings_modal.build_settings_modal.await_args.kwargs
+        assert kwargs["thread_id"] == "D123:111.222" and kwargs["in_thread"] is True
 
     async def test_failure_sends_ephemeral(self):
         host = _settings_host()

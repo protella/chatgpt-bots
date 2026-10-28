@@ -854,6 +854,8 @@ class TestGpt6Astra:
         # Luna, 5.5 and 5.6 accept both, but only on a non-reasoning turn.
         ("gpt-6-luna", "none", True),
         ("gpt-6-luna", "low", False),
+        ("gpt-6.1-terra", "none", True),      # probed 2026-10-28: Luna's rule
+        ("gpt-6.1-terra", "low", False),
         ("gpt-5.6-sol", "none", True),
         ("gpt-5.6-sol", "medium", False),
         ("gpt-5.5", "none", True),
@@ -864,7 +866,7 @@ class TestGpt6Astra:
         from config import supports_sampling
         assert supports_sampling(model, effort) is expected
 
-    @pytest.mark.parametrize("model", ["gpt-6-luna"])
+    @pytest.mark.parametrize("model", ["gpt-6-luna", "gpt-6.1-terra"])
     def test_luna_carries_the_full_ladder(self, model):
         from config import GPT56_EFFORTS, clamp_effort, effort_ladder
         assert effort_ladder(model) == GPT56_EFFORTS
@@ -876,6 +878,7 @@ class TestGpt6Astra:
         from config import MODEL_KNOWLEDGE_CUTOFFS
         assert MODEL_KNOWLEDGE_CUTOFFS["gpt-6-astra"] == "April 30, 2026"
         assert MODEL_KNOWLEDGE_CUTOFFS["gpt-6.1-sol"] == "April 30, 2026"
+        assert MODEL_KNOWLEDGE_CUTOFFS["gpt-6.1-terra"] == "June 1, 2026"
 
     def test_get_model_token_limit_takes_the_1_05m_branch(self, mock_env):
         config = BotConfig()
@@ -892,7 +895,7 @@ class TestFastTierPreference:
     def test_both_eligible_models_are_in_the_set(self):
         from config import FAST_SERVICE_TIER_MODELS
         assert FAST_SERVICE_TIER_MODELS == frozenset(
-            {"gpt-5.6-sol", "gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"})
+            {"gpt-5.6-sol", "gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna"})
         assert "gpt-5.6-luna" not in FAST_SERVICE_TIER_MODELS
         assert "gpt-5.5" not in FAST_SERVICE_TIER_MODELS
 

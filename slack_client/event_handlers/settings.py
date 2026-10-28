@@ -377,18 +377,25 @@ class SlackSettingsHandlersMixin(_Host):
         @self.app.action("open_user_settings")
         @track_ingress
         async def handle_open_user_settings(ack, body, client):
-            """DM feedback strip's '⚙️ <model>' button → open the global user settings
-            modal (same flow as the slash command).
+            """DM feedback strip's '⚙️ <model>' button → open the user settings modal scoped to
+            the thread the strip sits in ("This thread" preselected, Global one click away).
+
+            The strip always posts inside a conversation thread (the agent DM has no top level),
+            so the clicked message's thread is the conversation. A strip with no thread_ts
+            falls back to global, as before.
 
             trigger_ids expire in ~3s, so ack and views_open immediately.
             """
             await ack()
             trigger_id = body.get('trigger_id')
             user_id = (body.get('user') or {}).get('id')
-            channel_id = ((body.get('container') or {}).get('channel_id')
+            container = body.get('container') or {}
+            channel_id = (container.get('channel_id')
                           or (body.get('channel') or {}).get('id'))
             if not trigger_id or not user_id:
                 return
+            thread_ts = container.get('thread_ts') or (body.get('message') or {}).get('thread_ts')
+            thread_id = f"{channel_id}:{thread_ts}" if channel_id and thread_ts else None
             try:
                 current_settings = await self.db.get_user_preferences_async(user_id)
                 is_new_user = current_settings is None
@@ -396,16 +403,22 @@ class SlackSettingsHandlersMixin(_Host):
                     user_data = await self.db.get_or_create_user_async(user_id)
                     email = user_data.get('email') if user_data else None
                     current_settings = await self.db.create_default_user_preferences_async(user_id, email)
+                # Same merge as the thread-settings shortcut: thread overrides over user prefs.
+                if thread_id:
+                    thread_config = await self.db.get_thread_config_async(thread_id)
+                    if thread_config:
+                        current_settings = {**current_settings, **thread_config}
                 modal = await self.settings_modal.build_settings_modal(
                     user_id=user_id,
                     trigger_id=trigger_id,
                     current_settings=current_settings,
                     is_new_user=is_new_user,
-                    thread_id=None,   # strip button always edits global settings
-                    in_thread=False,
+                    thread_id=thread_id,
+                    in_thread=thread_id is not None,
                 )
                 await client.views_open(trigger_id=trigger_id, view=modal)
-                self.log_info(f"User settings modal opened for {user_id} (DM strip button)")
+                self.log_info(f"User settings modal opened for {user_id} (DM strip button, "
+                              f"thread={thread_id or 'none'})")
             except Exception as e:
                 self.log_error(f"Error opening user settings modal from DM strip: {e}")
                 # The user clicked a button — silence reads as a dead button.

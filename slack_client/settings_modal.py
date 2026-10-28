@@ -1675,6 +1675,7 @@ class SettingsModal(LoggerMixin):
             # and learn.chatgpt.com/docs/models, read 2026-09-09), shortened to fit a picker row.
             'gpt-6-astra': 'GPT-6 Astra (Most capable)',
             'gpt-6.1-sol': 'GPT-6.1 Sol (Complex work, near-Astra)',
+            'gpt-6.1-terra': 'GPT-6.1 Terra (Balanced, everyday work)',
             'gpt-6-luna': 'GPT-6 Luna (Fast and affordable)',
             'gpt-5.6-sol': 'GPT-5.6 Sol (Complex professional work)',
             'gpt-5.6-terra': 'GPT-5.6 Terra (Balanced, everyday work)',

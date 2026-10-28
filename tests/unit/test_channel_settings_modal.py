@@ -437,7 +437,9 @@ async def test_an_old_modal_submission_preserves_the_new_fields(capability_db):
 # stripping the gpt-6-sol / gpt-6-luna options from the model select reproduces 7f462261…1bb528.
 # RE-PINNED 2026-09-29 (gpt-6.1-sol replaces gpt-6-sol). The delta is the Sol picker row only:
 # substituting the old gpt-6-sol id and label back into this render reproduces 6db10da8…ea6531.
-_PERSONAL_MODAL_GOLDEN = "0d3b281e2f7a3eeeaef4f375912b94d82586d99b11133aecfcb39113ad17f1ac"
+# RE-PINNED 2026-10-28 (GPT-6.1 Terra added). The delta is the one new picker row only:
+# stripping the gpt-6.1-terra option from the model select reproduces 0d3b281e…ad17f1ac.
+_PERSONAL_MODAL_GOLDEN = "f3f52a6fdb735dafd3a8416a2613f004ec9420065ce8d001abacdbd155b042c5"
 
 
 @pytest.mark.asyncio

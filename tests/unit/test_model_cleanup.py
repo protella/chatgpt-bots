@@ -1,4 +1,4 @@
-"""Model lineup — gpt-6-astra, gpt-6.1-sol, gpt-6-luna, the GPT-5.6 family (sol/terra/luna) and gpt-5.5 are
+"""Model lineup — gpt-6-astra, gpt-6.1-sol, gpt-6.1-terra, gpt-6-luna, the GPT-5.6 family (sol/terra/luna) and gpt-5.5 are
 the selectable chat models; gpt-6-luna doubles as the utility model. Covers the supported-model
 surface (picker, validation, token limits) and the startup migrations/normalizers for
 stale user/thread model selections (one-time everyone->sol swap + every-startup clamp).
@@ -45,8 +45,8 @@ def modal():
 
 def test_knowledge_cutoffs_only_supported_models():
     assert set(MODEL_KNOWLEDGE_CUTOFFS) == {
-        "gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra",
-        "gpt-5.6-luna", "gpt-5.5", "default"
+        "gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna", "gpt-5.6-sol",
+        "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "default"
     }
 
 
@@ -58,8 +58,8 @@ def test_model_picker_offers_supported_lineup(modal):
     model_block = next(b for b in blocks if b.get("block_id") == "model_block")
     options = [o["value"] for o in model_block["accessory"]["options"]]
     assert options == SUPPORTED_CHAT_MODELS
-    assert options == ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna", "gpt-5.6-sol",
-                       "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"]
+    assert options == ["gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna",
+                       "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"]
 
 
 def test_modal_keeps_gpt55_selectable(modal):

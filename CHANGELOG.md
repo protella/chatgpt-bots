@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.4.5] - 2026-10-28
+
+### ✨ Added
+
+- **GPT-6.1 Terra** (`gpt-6.1-terra`) in the model picker: the balanced, everyday tier. It takes
+  the full `none`..`max` reasoning ladder, temperature/top_p only at `none`, and the fast service
+  tier. The default model is unchanged.
+
+### 🔧 Changed
+
+- **Thread settings are back within reach.** The ⚙️ model button under a DM reply now opens
+  settings for that conversation, with "This thread" preselected and Global one click away.
+- **Chat replies get more room for tools:** up to 50 tool calls (`MAX_TOOL_CALLS_PER_TURN`) and
+  50 rounds (`MAX_TOOL_ROUNDS`) per reply, up from 20.
+- **Dependencies updated:** `openai` 3.40.0 (adds GPT-6.1 Terra).
+
 ## [3.4.4] - 2026-10-27
 
 ### 🔧 Changed

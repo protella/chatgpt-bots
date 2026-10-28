@@ -66,8 +66,8 @@ class TestDefaults:
         # Astra leads: the list order is the modal's display order, and the workspace default
         # belongs at the top of it.
         assert SUPPORTED_CHAT_MODELS == [
-            "gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra",
-            "gpt-5.6-luna", "gpt-5.5"
+            "gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna", "gpt-5.6-sol",
+            "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"
         ]
 
     def test_ladders(self):
@@ -286,20 +286,24 @@ class TestGpt6RequestShape:
 
 
 class TestGpt6LunaRequestShape:
-    """Luna shares Astra's cache shape but 5.6's sampling rule (probed 2026-09-23)."""
+    """Luna shares Astra's cache shape but 5.6's sampling rule (probed 2026-09-23).
+    GPT-6.1 Terra has Luna's exact shape (probed 2026-10-28)."""
 
-    def test_luna_at_none_carries_temperature_and_top_p(self):
-        params = _build(model="gpt-6-luna", reasoning_effort="none", temperature=0.3, top_p=0.5)
+    @pytest.mark.parametrize("model", ["gpt-6-luna", "gpt-6.1-terra"])
+    def test_luna_at_none_carries_temperature_and_top_p(self, model):
+        params = _build(model=model, reasoning_effort="none", temperature=0.3, top_p=0.5)
         assert params["reasoning"] == {"effort": "none"}
         assert params["temperature"] == 0.3
         assert params["top_p"] == 0.5
 
-    def test_luna_at_low_carries_neither(self):
-        params = _build(model="gpt-6-luna", reasoning_effort="low", temperature=0.3, top_p=0.5)
+    @pytest.mark.parametrize("model", ["gpt-6-luna", "gpt-6.1-terra"])
+    def test_luna_at_low_carries_neither(self, model):
+        params = _build(model=model, reasoning_effort="low", temperature=0.3, top_p=0.5)
         assert "temperature" not in params and "top_p" not in params
 
-    def test_luna_cache_shape(self):
-        params = _build(model="gpt-6-luna", reasoning_effort="medium",
+    @pytest.mark.parametrize("model", ["gpt-6-luna", "gpt-6.1-terra"])
+    def test_luna_cache_shape(self, model):
+        params = _build(model=model, reasoning_effort="medium",
                         prompt_cache_key="thread-key", layout="channel")
         assert params["prompt_cache_key"] == "thread-key"
         assert params["prompt_cache_options"] == {"ttl": "30m"}
