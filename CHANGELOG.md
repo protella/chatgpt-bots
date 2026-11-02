@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.4.6] - 2026-11-02
+
+### 🔒 Security
+
+- **pypdf 6.21.4** — hardening against crafted PDFs (page-attribute and cross-reference limits,
+  loop detection, EOF checks in the xref trailer).
+
+### 🔧 Changed
+
+- **Dependencies updated:** `openai` 3.42.1, `slack-sdk` 3.46.0, `pytz` 2026.6, plus test and
+  type-stub tooling (`pytest` 9.2.0, `pytest-asyncio`, `pytest-env`, `pandas-stubs`). No behavior
+  changes.
+
 ## [3.4.5] - 2026-10-28
 
 ### ✨ Added
