@@ -2107,3 +2107,64 @@ class TestAbsorbedObligationsTravelWithTheAnswer:
 
         assert detached == closed
         assert closed in trigger.metadata[participation_telemetry.BATCHED_SOURCES_KEY]
+
+
+class TestNamesAssistant:
+    """A message put to someone else is theirs — unless dispatch's deterministic name check
+    (an @mention of us or a bot-name alias hit) also fired on it. The gate never learns the
+    assistant's name, so that fact has to reach it per message, and reach the responder too."""
+
+    def test_the_rendered_source_says_so_only_when_it_names_the_assistant(self):
+        from openai_client.api.responses import _render_wake_source
+
+        line = "This message names the assistant."
+        named = _source(text="Claude and you, have a look", sender_name="Dana Whitfield",
+                        names_assistant=True)
+        plain = _source(text="Claude, have a look", sender_name="Dana Whitfield")
+        assert line in _render_wake_source(named, index=0, total=1)
+        assert line not in _render_wake_source(plain, index=0, total=1)
+
+    def test_the_fingerprint_tells_the_two_apart(self):
+        fp = ParticipationEngine._cohort_fingerprint
+        assert fp((_source(),)) != fp((_source(names_assistant=True),))
+
+    def test_source_from_message_carries_the_name_hit(self):
+        from message_processor.participation import source_from_message
+
+        def _msg(meta):
+            return SimpleNamespace(text="hi", user_id="U1", thread_id="1.0",
+                                   metadata={"ts": "1.0", **meta})
+
+        assert source_from_message(_msg({"participation_name_hit": True})).names_assistant is True
+        assert source_from_message(_msg({})).names_assistant is False
+
+    def test_the_cohort_member_carries_it_and_the_quote_says_so(self):
+        from message_processor.channel_request import _quote_source, cohort_sources_from_message
+
+        msg = SimpleNamespace(metadata={"ts": "3.0", "gate_sources": (
+            _source(ts="1.0", text="over to you both", sender_name="Riley Reyes",
+                    names_assistant=True),
+            _source(ts="2.0", text="anyone?", sender_name="Riley Reyes"))})
+        named, plain = cohort_sources_from_message(msg)
+        assert named.names_assistant is True and plain.names_assistant is False
+        assert _quote_source(named) == "Riley Reyes (ts=1.0): over to you both (names you)"
+        assert "(names you)" not in _quote_source(plain)
+
+
+def test_the_prompt_leaves_a_message_put_to_someone_else_asleep():
+    """Restored after the binary-gate rebuild dropped it: a message opening with another
+    assistant's @mention woke the gate, and the responder answered as if "you" meant itself."""
+    from message_processor import prompts
+
+    rule = ("A message put to a different person or assistant — one that opens with or is "
+            "addressed to them, by @-mention or by name — is theirs, however well the assistant "
+            "could answer it; leave it asleep. Only a message marked as naming the assistant is "
+            "also partly its own.")
+    for p in (prompts.WAKE_CLASSIFIER_SYSTEM_PROMPT, prompts.WAKE_CLASSIFIER_CONTEXT_PROMPT):
+        assert rule in p
+    # Both context-variant insertions still land, once each.
+    for anchor in (prompts.WAKE_FOLLOWUP_ANCHOR, prompts.WAKE_CONTEXT_FRAMING_ANCHOR):
+        assert prompts.WAKE_CLASSIFIER_SYSTEM_PROMPT.count(anchor) == 1
+    ctx = prompts.WAKE_CLASSIFIER_CONTEXT_PROMPT
+    assert ctx.count(prompts.WAKE_FOLLOWUP_SENTENCE) == 1
+    assert ctx.count(prompts.WAKE_CONTEXT_FRAMING_SENTENCE) == 1

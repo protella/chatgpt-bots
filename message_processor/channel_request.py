@@ -122,6 +122,9 @@ class CohortSource:
     sender_id: Optional[str] = None
     attachment_names: Tuple[str, ...] = ()
     files: Tuple[FileRef, ...] = ()
+    # Dispatch's deterministic name check fired on this member (@mention or alias hit) — the
+    # one fact that makes a message put to someone else ALSO partly ours.
+    names_assistant: bool = False
 
 
 @dataclass(frozen=True)
@@ -455,7 +458,8 @@ def failed_attachments_note(items: Sequence[Tuple[str, str]]) -> str:
 def _quote_source(source: CohortSource) -> str:
     who = source.sender_name or source.sender_id or "unknown"
     body = (source.text or "").strip() or "(no text)"
-    return f"{who} (ts={source.ts}): {body}{_attachment_note(source.attachment_names)}"
+    named = " (names you)" if source.names_assistant else ""
+    return f"{who} (ts={source.ts}): {body}{named}{_attachment_note(source.attachment_names)}"
 
 
 def build_trigger_supplement(ctx: ChannelTurnContext, processor: Any) -> Optional[Dict[str, Any]]:
@@ -882,7 +886,8 @@ def cohort_source_from_message(message: Any, *, files: Sequence[FileRef] = ()) -
         ts=meta.get("ts"), text=getattr(message, "text", "") or "",
         sender_name=meta.get("user_real_name") or meta.get("username"),
         sender_id=getattr(message, "user_id", None),
-        attachment_names=tuple(n for n in names if n), files=tuple(files))
+        attachment_names=tuple(n for n in names if n), files=tuple(files),
+        names_assistant=meta.get("participation_name_hit") is True)
 
 
 COHORT_FILE_PAYLOADS_KEY = "batched_file_refs"
@@ -999,6 +1004,7 @@ def cohort_sources_from_message(message: Any) -> Tuple[CohortSource, ...]:
             ts=ts, text=text,
             sender_name=getattr(source, "sender_name", None),
             sender_id=getattr(source, "sender_id", None),
-            attachment_names=names, files=refs_by_ts.get(ts, ())))
+            attachment_names=names, files=refs_by_ts.get(ts, ()),
+            names_assistant=getattr(source, "names_assistant", False) is True))
     return tuple(out)
 

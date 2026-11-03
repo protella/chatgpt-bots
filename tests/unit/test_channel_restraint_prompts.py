@@ -335,6 +335,22 @@ def test_the_hand_off_sticks_and_sticks_only_inside_that_thread():
     assert "names or @-mentions you again in that thread" in s
 
 
+def test_a_trigger_put_to_someone_else_is_theirs_unless_it_also_names_you():
+    """The top-level paragraph never carried the addressee rule; a message opening with another
+    assistant's @mention was answered as if "you" meant this one. Both paragraphs carry the same
+    exception, keyed to the deterministic name check, so a dual-address message is still ours."""
+    c = CHANNEL_ACTIVITY_NO_REPLY_SUFFIX
+    assert "If it opens with or is put to a DIFFERENT person or agent" in c
+    assert "or an @-mention of them), it is theirs, not yours" in c
+    assert ("unless it, or another message this turn is answering, ALSO names or @-mentions "
+            "you") in c
+    assert "`woke on: name_mention`" in c
+    t = THREAD_ACTIVITY_NO_REPLY_SUFFIX
+    assert "the trigger identified there may not name you" in t
+    assert ("end with no_response_needed — unless it, or another message this turn is "
+            "answering, also names or @-mentions you") in t
+
+
 def test_the_no_placeholder_rule_survives():
     s = THREAD_ACTIVITY_NO_REPLY_SUFFIX
     assert "NEVER post a placeholder" in s

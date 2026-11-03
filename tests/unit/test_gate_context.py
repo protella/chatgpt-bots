@@ -386,8 +386,16 @@ def _cohort() -> Any:
                           sender_id="U1", sender_name=DANA, sender_type="human"),)
 
 
+# The assistant's own name, leading the user content whenever aliases are configured. Both
+# request-shape tests pin the aliases to ["ChatGPT"] so this literal is what they expect.
+_NAME_LINE = ("The assistant you are deciding for is called ChatGPT; anyone else named or "
+              "@-mentioned is a different party.")
+_MESSAGES_HEADER = "Messages to decide about, oldest first:\n\n"
+
+
 def _todays_request(sources: Any) -> Dict[str, Any]:
-    """The gate request exactly as it was before Part A, written out literally."""
+    """The gate request exactly as it was before Part A (plus the name line), written out
+    literally."""
     from config import clamp_effort
     from message_processor.prompts import WAKE_CLASSIFIER_SYSTEM_PROMPT
     from openai_client.api.responses import _render_wake_source
@@ -398,7 +406,7 @@ def _todays_request(sources: Any) -> Dict[str, Any]:
         "input": [
             {"role": "developer", "content": WAKE_CLASSIFIER_SYSTEM_PROMPT},
             {"role": "user",
-             "content": "Messages to decide about, oldest first:\n\n" + "\n\n".join(blocks)},
+             "content": _NAME_LINE + "\n\n" + _MESSAGES_HEADER + "\n\n".join(blocks)},
         ],
         "max_output_tokens": max(2048, config.utility_max_tokens),
         "store": False,
@@ -419,6 +427,7 @@ async def test_classify_wake_disabled_is_byte_identical_to_today(monkeypatch):
     from openai_client.api.responses import classify_wake
 
     monkeypatch.setattr(config, "participation_gate_context_messages", 0, raising=False)
+    monkeypatch.setattr(config, "bot_name_aliases", ["ChatGPT"], raising=False)
     llm = _CapturingLLM()
     sources = _cohort()
     assert await classify_wake(llm, sources=sources, recent_context="",
@@ -432,6 +441,7 @@ async def test_classify_wake_enabled_carries_context_inflight_and_both_sentences
     from openai_client.api.responses import classify_wake
 
     monkeypatch.setattr(config, "participation_gate_context_messages", 8, raising=False)
+    monkeypatch.setattr(config, "bot_name_aliases", ["ChatGPT"], raising=False)
     asked = GateContextEntry(ts="1700000000.000100", thread_ts=None, sender_id="U1",
                              sender_kind="human", text="weather in the capital?",
                              sender_name=DANA)
@@ -442,9 +452,12 @@ async def test_classify_wake_enabled_carries_context_inflight_and_both_sentences
     await classify_wake(llm, sources=sources, recent_context=recent, inflight_lines=inflight)
 
     today = _todays_request(sources)
-    # Order: context block, then the in-flight line, then today's "Messages to decide about".
+    # Order: the name line, then the context block, then the in-flight line, then today's
+    # "Messages to decide about".
+    messages = today["input"][1]["content"].removeprefix(_NAME_LINE + "\n\n")
+    assert messages.startswith(_MESSAGES_HEADER)
     assert llm.kwargs["input"][1]["content"] == (
-        recent + "\n\n" + inflight + "\n\n" + today["input"][1]["content"])
+        _NAME_LINE + "\n\n" + recent + "\n\n" + inflight + "\n\n" + messages)
     # The A3 sentence as its own bullet right after the first "Wake it when:" bullet, and the
     # framing sentence appended to the opening paragraph — nothing else in the prompt moves.
     followup = ("A message that corrects, narrows, adds to or follows up on something the "
@@ -463,6 +476,24 @@ async def test_classify_wake_enabled_carries_context_inflight_and_both_sentences
     # Everything but the input is today's request.
     assert {k: v for k, v in llm.kwargs.items() if k != "input"} == {
         k: v for k, v in today.items() if k != "input"}
+
+
+@pytest.mark.asyncio
+async def test_classify_wake_names_the_assistant_only_when_aliases_exist(monkeypatch):
+    """Without its own name the gate cannot tell "@Claude …" from a message to itself."""
+    from openai_client.api.responses import classify_wake
+
+    monkeypatch.setattr(config, "participation_gate_context_messages", 0, raising=False)
+    llm = _CapturingLLM()
+    monkeypatch.setattr(config, "bot_name_aliases", ["ChatGPT"], raising=False)
+    await classify_wake(llm, sources=_cohort())
+    assert llm.kwargs["input"][1]["content"].startswith(_NAME_LINE + "\n\n" + _MESSAGES_HEADER)
+
+    monkeypatch.setattr(config, "bot_name_aliases", [], raising=False)
+    await classify_wake(llm, sources=_cohort())
+    content = llm.kwargs["input"][1]["content"]
+    assert content.startswith(_MESSAGES_HEADER)
+    assert "The assistant you are deciding for" not in content
 
 
 @pytest.mark.asyncio

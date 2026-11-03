@@ -2179,12 +2179,17 @@ async def classify_wake(self, *, sources: Any,
     sentences join the developer prompt whenever the block is enabled
     (PARTICIPATION_GATE_CONTEXT_MESSAGES > 0), even on a cold ring. Disabled and empty, the
     request is byte-identical to the one without context.
+
+    The assistant's own name (`config.bot_name_aliases`) leads, ahead of all of it: without it,
+    "@Claude …" might be this assistant for all the gate can tell, and it woke for messages put
+    to another party even with the addressee rule in its prompt. No aliases, no line.
     """
     blocks = [_render_wake_source(s, index=i, total=len(sources))
               for i, s in enumerate(sources)]
     prompt = "Messages to decide about, oldest first:\n\n" + "\n\n".join(blocks)
     # Verbatim — the renderer owns the format; only a blank part is left out.
-    preamble = [part for part in (recent_context, inflight_lines) if part and part.strip()]
+    preamble = [part for part in (_wake_assistant_name_line(), recent_context, inflight_lines)
+                if part and part.strip()]
     if preamble:
         prompt = "\n\n".join(preamble) + "\n\n" + prompt
     context_enabled = int(getattr(config, "participation_gate_context_messages", 0) or 0) > 0
@@ -2294,6 +2299,23 @@ def _parse_wake(raw: str) -> Optional[bool]:
     return wake if isinstance(wake, bool) else None
 
 
+def _wake_assistant_name_line() -> str:
+    """Who the gate is deciding for, from `config.bot_name_aliases` — "" when there are none.
+
+    Non-empty aliases, de-duplicated, configured order kept: the first is the name, the rest ride
+    in parentheses."""
+    names: List[str] = []
+    for alias in (getattr(config, "bot_name_aliases", None) or ()):
+        name = str(alias or "").strip()
+        if name and name not in names:
+            names.append(name)
+    if not names:
+        return ""
+    called = names[0] + (f" (also {', '.join(names[1:])})" if len(names) > 1 else "")
+    return (f"The assistant you are deciding for is called {called}; anyone else named or "
+            "@-mentioned is a different party.")
+
+
 def _render_wake_source(source: Any, *, index: int, total: int) -> str:
     """One source message as labelled plain text for the gate prompt.
 
@@ -2322,6 +2344,10 @@ def _render_wake_source(source: Any, *, index: int, total: int) -> str:
     if source.attachments:
         lines.append("Attached (names and types only, contents not shown to you): "
                      + ", ".join(source.attachments))
+    # Dispatch's deterministic name check, told to the gate per message (it never learns the name).
+    # Nothing when false, so a request without a name hit is byte-identical to before.
+    if getattr(source, "names_assistant", False):
+        lines.append("This message names the assistant.")
     edit = source.edit or {}
     if edit:
         old = str(edit.get("old_text") or "").strip()

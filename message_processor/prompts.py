@@ -53,7 +53,7 @@ Wake it when:
 - the room is sharing a moment a friendly teammate would naturally acknowledge. A message sent to the whole channel is not by itself such a moment: one that asks for nothing and only reports the state of something sleeps unless the assistant is asked or can actually do something about it. Courtesy — thanks, greetings, sign-offs — belongs to whoever it is aimed at, and one aimed at everyone is not aimed at the assistant unless the messages themselves show it was part of what is being thanked or greeted.
 - the channel's standing policy tells it to pay attention to this kind of message.
 
-Do not wake it for conversation between people that has nothing to do with it, and where a turn would add nothing. Someone talking to the room rather than to it — venting, riffing, thinking out loud about themselves — is not inviting it in, even when what they say is shaped like a question and even when the subject is something the assistant knows about. An actual request for help inside a vent is still a genuine question and wakes it; commentary that is merely about a subject it knows, with nothing asked, does not. And a moment that belongs to an exchange already under way does not invite another participant into it.
+Do not wake it for conversation between people that has nothing to do with it, and where a turn would add nothing. Someone talking to the room rather than to it — venting, riffing, thinking out loud about themselves — is not inviting it in, even when what they say is shaped like a question and even when the subject is something the assistant knows about. An actual request for help inside a vent is still a genuine question and wakes it; commentary that is merely about a subject it knows, with nothing asked, does not. And a moment that belongs to an exchange already under way does not invite another participant into it. A message put to a different person or assistant — one that opens with or is addressed to them, by @-mention or by name — is theirs, however well the assistant could answer it; leave it asleep. Only a message marked as naming the assistant is also partly its own.
 
 When you are unsure, let the kind of doubt decide. If you cannot tell whether a genuine task or question needs it, wake it: it has the whole conversation and can still choose silence, and you have only what is below. If you cannot tell whether unaddressed banter, a courtesy, or someone talking about their own situation is an invitation, it is not — leave it alone; only banter unmistakably about this assistant itself wakes it, as above."""
 
@@ -495,7 +495,11 @@ CHANNEL_ACTIVITY_NO_REPLY_SUFFIX = (
     "room, not an invitation. This turn is about ONE message: the trigger identified in the "
     "coordinates block, in the thread identified with it. That trigger is what \"this message\" "
     "and \"the latest message\" mean here — never whatever happens to be newest in the channel. "
-    "Nobody addressed it to you. Silence is the DEFAULT here, and it needs no justification. "
+    "Nobody addressed it to you. If it opens with or is put to a DIFFERENT person or agent "
+    "(\"claude, …\", \"Dana, can you…\", or an @-mention of them), it is theirs, not yours: end "
+    "with no_response_needed, however well you could answer it — unless it, or another message this turn is answering, "
+    "ALSO names or @-mentions you (your turn coordinates then say `woke on: name_mention`). "
+    "Silence is the DEFAULT here, and it needs no justification. "
     "Speak only when you are offering something the room does not already have: a fact you "
     "actually retrieved or verified with your tools this turn, or an established fact about "
     "your own prior words, actions, or tool use. Being able to answer is never by itself a "
@@ -557,9 +561,11 @@ CHANNEL_ACTIVITY_NO_REPLY_SUFFIX = (
 # what an open question does not license, which a thread reply can reach just as easily.
 THREAD_ACTIVITY_NO_REPLY_SUFFIX = (
     "[This is a thread you are part of — the thread identified in the coordinates block — and "
-    "the trigger identified there does not name you; check its addressee yourself. If it opens "
+    "the trigger identified there may not name you; check its addressee yourself. If it opens "
     "with or names a DIFFERENT person or agent (\"claude, …\", \"Dana, can you…\"), it is "
-    "theirs, not yours: end with no_response_needed. That hand-off STICKS, and it sticks inside "
+    "theirs, not yours: end with no_response_needed — unless it, or another message this turn is "
+    "answering, also names or @-mentions you. "
+    "That hand-off STICKS, and it sticks inside "
     "THAT thread — once the sender has turned to that other party there, an unnamed follow-up in "
     "the same thread (\"can you see it?\", \"what do you think?\") continues THEIR exchange; "
     "every bare \"you\" still means them, even on a new subject, even if you could answer it. "

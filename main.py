@@ -710,6 +710,9 @@ class ChatBotV2:
                 # Burst follow-ups Part A: what was just said and what the assistant is writing
                 # right now, read from memory over the cohort being judged. None when disabled.
                 gate_context_builder=self._gate_context_builder(message),
+                # Dispatch's deterministic name check (@mention or alias hit). The gate never
+                # learns our name, so a message also put to us has to be marked as such.
+                names_assistant=(message.metadata or {}).get("participation_name_hit") is True,
             )
             gate_latency_ms = int((time.monotonic() - gate_started_at) * 1000)
             decision = evaluation.decision

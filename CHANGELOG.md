@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.4.7] - 2026-11-02
+
+### 🐛 Fixed
+
+- **The bot no longer answers messages meant for someone else.** In an always-on channel, a
+  message that opened with an @mention of another assistant (or a colleague) could still wake the
+  bot, which then answered as if the question were its own. The wake gate was never told the
+  bot's own name, so it could not tell "@Claude" was not itself. The gate now gets the bot's
+  configured names (`BOT_NAME_ALIASES`), a message put to a different person or assistant stays
+  theirs at both the gate and the reply step, and a message that also names or @mentions the bot
+  is still answered.
+
 ## [3.4.6] - 2026-11-02
 
 ### 🔒 Security

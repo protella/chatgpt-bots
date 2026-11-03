@@ -212,6 +212,10 @@ class SourceMessage:
     # Present only for an edit: what it said before, what it says now, and whether the assistant
     # had already replied. Intrinsic to THIS message — not general channel history.
     edit: Optional[Dict[str, Any]] = None
+    # True when dispatch's deterministic name check fired: a real @mention of us or a bot-name
+    # alias hit. The gate never learns the assistant's name, so it has to be told per message —
+    # it is what keeps a message put to someone else AND to us eligible.
+    names_assistant: bool = False
 
     @property
     def is_thread_reply(self) -> bool:
@@ -233,6 +237,7 @@ def source_from_message(message: Any) -> SourceMessage:
         sender_type=meta.get("sender_type"),
         thread_root_ts=getattr(message, "thread_id", None),
         attachments=tuple(meta.get("participation_attachments") or ()),
+        names_assistant=meta.get("participation_name_hit") is True,
     )
 
 
@@ -677,7 +682,7 @@ class ParticipationEngine:
         new one. Freezing the payload at speculation start makes the comparison a statement about
         what the model was actually shown, which is what it has to be."""
         return tuple((s.ts, s.text, s.sender_id, s.sender_name, s.sender_type, s.thread_root_ts,
-                      tuple(s.attachments), _freeze(s.edit)) for s in sources)
+                      tuple(s.attachments), _freeze(s.edit), s.names_assistant) for s in sources)
 
     @staticmethod
     def _is_captionless_image_cohort(sources: Sequence[SourceMessage]) -> bool:
@@ -807,7 +812,8 @@ class ParticipationEngine:
                        queue_drained: bool = False,
                        arrival: Optional[Arrival] = None,
                        attempt_id: Optional[str] = None,
-                       gate_context_builder: Optional[GateContextBuilder] = None
+                       gate_context_builder: Optional[GateContextBuilder] = None,
+                       names_assistant: bool = False
                        ) -> GateEvaluation:
         """Debounce, coalesce, ask once, return one bit.
 
@@ -857,7 +863,8 @@ class ParticipationEngine:
         source = SourceMessage(
             ts=str(ts), text=text or "", sender_id=sender_id, sender_name=sender_name,
             sender_type=sender_type, thread_root_ts=thread_root_ts,
-            attachments=tuple(attachments or ()), edit=edit_context)
+            attachments=tuple(attachments or ()), edit=edit_context,
+            names_assistant=names_assistant)
         # Enrolled BEFORE the await, so a survivor that arrives during our debounce finds us. The
         # raw payload rides along unread: this dispatch is the last holder of it, and if we lose our
         # own debounce the survivor's turn is the only place those files can still be authorized.
