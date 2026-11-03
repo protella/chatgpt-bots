@@ -455,3 +455,38 @@ class TestTurnErrorMessage:
         text = MessageProcessor._turn_error_message(
             Exception("failed to generate a response"), _msg())
         assert "Too Many Requests" not in text
+
+    _OVERLOADED = ("Our servers are currently overloaded. Please try again later. You can retry "
+                   "your request, or contact us through our help center if the error persists.")
+
+    @staticmethod
+    def _overloaded_card():
+        from config import config
+        return (f"{config.error_emoji} **OpenAI Is Overloaded**\n\nOpenAI's servers are "
+                "overloaded right now, so I couldn't answer. Please try again in a few minutes.")
+
+    def test_a_503_status_error_is_the_overloaded_card(self):
+        import httpx
+        import openai
+
+        request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+        error = openai.InternalServerError(f"Error code: 503 - {self._OVERLOADED}", body=None,
+                                           response=httpx.Response(503, request=request))
+        assert MessageProcessor._turn_error_message(error, _msg()) == self._overloaded_card()
+
+    def test_the_streaming_overload_error_is_the_overloaded_card(self):
+        # What the SDK raises from an SSE error event: a status-less APIError.
+        import httpx
+        import openai
+
+        request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+        error = openai.APIError(self._OVERLOADED, request,
+                                body={"message": self._OVERLOADED, "type": "server_error"})
+        assert getattr(error, "status_code", None) is None
+        assert MessageProcessor._turn_error_message(error, _msg()) == self._overloaded_card()
+
+    def test_a_generic_exception_is_still_the_generic_card(self):
+        from config import config
+        assert MessageProcessor._turn_error_message(Exception("boom"), _msg()) == (
+            f"{config.error_emoji} **Something Went Wrong**\n\nPlease try again. If this keeps "
+            "happening, try later.")

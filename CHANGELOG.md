@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.4.10] - 2026-11-03
+
+### 🐛 Fixed
+
+- **An OpenAI overload says so.** When OpenAI's servers are overloaded (and the one retry also
+  fails), a DM or a message addressed to the bot now gets "OpenAI Is Overloaded … please try again
+  in a few minutes" instead of the generic "Something Went Wrong".
+
 ## [3.4.9] - 2026-11-03
 
 ### 🐛 Fixed

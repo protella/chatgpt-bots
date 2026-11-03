@@ -1203,6 +1203,15 @@ class MessageProcessor(ThreadManagementMixin,
             # Real throttling, from the exception itself. Substrings lied both ways: "limit" caught
             # the patch 400 above, and "rate" matches "generate".
             error_message = f"{config.error_emoji} **Too Many Requests**\n\nOpenAI is busy. Please wait a minute and try again."
+        elif (getattr(e, "status_code", None) == 503
+              or (isinstance(e, openai.APIError)
+                  and "currently overloaded" in error_details.lower())):
+            # OpenAI's overload rejection, structurally like the 429 above. The text half is for
+            # the STREAMING shape: the SDK raises a status-less `APIError` from the SSE error event
+            # ("Our servers are currently overloaded…"), with no status code to read.
+            error_message = (
+                f"{config.error_emoji} **OpenAI Is Overloaded**\n\nOpenAI's servers are overloaded "
+                "right now, so I couldn't answer. Please try again in a few minutes.")
         elif "api" in error_details.lower() or "openai" in error_details.lower():
             error_message = f"{config.error_emoji} **Service Issue**\n\nOpenAI is having problems. Please try again shortly."
         else:
