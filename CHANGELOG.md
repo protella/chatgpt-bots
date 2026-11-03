@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.4.9] - 2026-11-03
+
+### 🐛 Fixed
+
+- **No error cards in conversations the bot wasn't asked into.** When a reply failed on a channel
+  message nobody addressed to the bot (an ambient wake, or a thread it was only a member of), it
+  posted "Something Went Wrong" anyway — so an OpenAI outage put a card under every channel
+  message it looked at. Those failures are now recorded and stay silent. DMs, @mentions, name
+  wakes and batches that owe someone an answer still get the card.
+- **One retry when OpenAI is overloaded.** A 503 "servers are overloaded" is re-sent once after a
+  short pause. Only that single request is retried, never the whole reply, and image generation
+  and edits are never retried, so nothing is posted or generated twice.
+
 ## [3.4.8] - 2026-11-03
 
 ### 🐛 Fixed

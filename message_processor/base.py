@@ -784,8 +784,10 @@ class MessageProcessor(ThreadManagementMixin,
                 # getattr above), which TimeoutError does not declare.
                 e.already_retried = True  # type: ignore[attr-defined]
 
-                # Update status to show retry
-                if thinking_id and hasattr(client, 'update_message'):
+                # Update status to show retry — never on a turn nobody addressed to us: that
+                # status is the first half of the card this turn must not post.
+                if (thinking_id and hasattr(client, 'update_message')
+                        and self._error_card_warranted(message, channel_turn)):
                     retry_msg = "OpenAI is slow to respond. Retrying with shorter timeout..."
                     try:
                         self._update_status(client, message.channel_id, thinking_id, retry_msg, emoji="⏳", thread_id=message.thread_id)
@@ -842,6 +844,17 @@ class MessageProcessor(ThreadManagementMixin,
             self.log_info(f"REQUEST END | Thread: {thread_key} | Status: TIMEOUT | Time: {elapsed:.2f}s{token_info}")
             self.log_info("="*100)
             self.log_info("")
+
+            # NOBODY ASKED — the same rule as the fail-closed codes below: an OpenAI outage must
+            # not post a card under every ambient channel message. The outcome is still recorded
+            # (the REQUEST END above, `had_timeout` here); the status rewrite and the card are not.
+            if not self._error_card_warranted(message, channel_turn):
+                if 'thread_state' in locals() and thread_state:
+                    thread_state.had_timeout = True
+                self.log_info(f"Timeout on an unaddressed channel turn in {thread_key} — "
+                              "outcome recorded, nothing posted")
+                return Response(type="error", content=TIMEOUT_MESSAGE,
+                                metadata={"suppress_error_post": True})
 
             # Update thinking message to show final timeout
             if thinking_id and hasattr(client, 'update_message'):
@@ -1018,6 +1031,14 @@ class MessageProcessor(ThreadManagementMixin,
             # Check for various timeout error types that weren't caught as TimeoutError
             if any(timeout_indicator in error_str.lower() or timeout_indicator in error_type.lower()
                    for timeout_indicator in ['timeout', 'readtimeout', 'connecttimeout']):
+                # Nobody asked: record the timeout, post nothing (see the TimeoutError handler).
+                if not self._error_card_warranted(message, channel_turn):
+                    if 'thread_state' in locals() and thread_state:
+                        thread_state.had_timeout = True
+                    self.log_info(f"Timeout on an unaddressed channel turn in {thread_key} — "
+                                  "outcome recorded, nothing posted")
+                    return Response(type="error", content=TIMEOUT_MESSAGE,
+                                    metadata={"suppress_error_post": True})
                 # Update thinking message to show timeout
                 if thinking_id and hasattr(client, 'update_message'):
                     timeout_msg = f"{config.error_emoji} {TIMEOUT_STATUS}"
@@ -1042,6 +1063,13 @@ class MessageProcessor(ThreadManagementMixin,
                 error_message = TIMEOUT_MESSAGE
                 self.log_warning(f"Request timeout (via string match) after {elapsed:.2f} seconds for thread {thread_key}")
             else:
+                # Nobody asked: an outage at the provider must not put "Something Went Wrong"
+                # under an ambient channel message. Recorded above; nothing is posted.
+                if not self._error_card_warranted(message, channel_turn):
+                    self.log_info(f"Error on an unaddressed channel turn in {thread_key} — "
+                                  "outcome recorded, nothing posted")
+                    return Response(type="error", content=self._turn_error_message(e, message),
+                                    metadata={"suppress_error_post": True})
                 # Update thinking message to show error
                 if thinking_id and hasattr(client, 'update_message'):
                     error_msg = f"{config.error_emoji} Something went wrong. Try again."
@@ -1199,6 +1227,16 @@ class MessageProcessor(ThreadManagementMixin,
             return True
         return (routing_facts.addressed_wake(message)
                 and not routing_facts.sender_is_bot(message))
+
+    @classmethod
+    def _error_card_warranted(cls, message: Message, channel_turn: bool) -> bool:
+        """The generic error/timeout card's audience: everyone the fail-closed notice is for, plus
+        any turn that OWES WORDS (`routing_facts.owes_words`: a DM, a real @mention, the
+        engine-off name wake, or a batch that absorbed one). The second half is what keeps a
+        queued human @mention's card when the batch's newest trigger is a bot — the notice rule
+        alone would read only the bot author and hide it."""
+        return (cls._fail_closed_notice_warranted(message, channel_turn)
+                or routing_facts.owes_words(message))
 
     def _throttled_response(self, message: Message, channel_turn: bool, thread_key: str,
                             retry_after: Optional[float]) -> Response:

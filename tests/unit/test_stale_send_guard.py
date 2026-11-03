@@ -1473,9 +1473,17 @@ async def test_the_timeout_notice_is_awaited_with_the_lease_not_scheduled(supers
 
         async def _dispatch_pending_batch(self, *a, **k): return None
 
+        _fail_closed_notice_warranted = staticmethod(
+            MessageProcessor._fail_closed_notice_warranted)
+        _error_card_warranted = classmethod(MessageProcessor._error_card_warranted.__func__)
+
     marks = ConversationWatermarks()
+    # An @mention: a channel turn nobody addressed posts no timeout notice at all, so the
+    # lease contract under test only exists on a turn somebody put to us.
     message = Message(text="q", user_id="U1", channel_id="C1", thread_id="100.0",
-                      metadata={"ts": "100.0", "sender_id": "U1"})
+                      metadata={"ts": "100.0", "sender_id": "U1", "sender_type": "human",
+                                "wake_source": "app_mention",
+                                "routing_posture": "addressed_to_assistant"})
     turn = TurnRuntime()
     turn.send_lease = marks.begin_turn(message)
     if superseded:

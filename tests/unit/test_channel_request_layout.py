@@ -964,6 +964,75 @@ async def test_a_fail_closed_turn_speaks_only_where_somebody_asked(wake, meta, p
     assert (response.metadata.get("suppress_error_post") is not True) is posts, wake
 
 
+_AMBIENT_META = {"wake_source": "ambient", "gate_required": True, "gate_woke": True,
+                 "silence_capable": True, "sender_type": "human",
+                 "routing_posture": "channel_activity"}
+_MENTION_META = {"wake_source": "app_mention", "gate_required": False,
+                 "silence_capable": False, "sender_type": "human",
+                 "routing_posture": "addressed_to_assistant"}
+_NAME_HIT_META = {"wake_source": "name_mention", "gate_required": True, "gate_woke": True,
+                  "silence_capable": True, "participation_name_hit": True,
+                  "sender_type": "human", "routing_posture": "channel_activity"}
+
+
+def _bot_trigger_absorbing_a_human_mention_meta():
+    """A queued human @mention folded into a batch whose NEWEST trigger is a peer bot's ambient
+    post — built by the real `absorb_owed_answer`, like `_absorbed_mention_meta`."""
+    from message_processor import routing_facts
+
+    trigger = _message(ts="10.0")
+    trigger.metadata.update({"wake_source": "ambient", "gate_required": True, "gate_woke": True,
+                             "silence_capable": True, "sender_type": "other_bot",
+                             "participation_sender_bot": True,
+                             "routing_posture": "channel_activity"})
+    mention = _message(ts="9.0")
+    mention.metadata.update({"wake_source": "app_mention", "gate_required": False,
+                             "silence_capable": False, "sender_type": "human",
+                             "routing_posture": "addressed_to_assistant"})
+    routing_facts.absorb_owed_answer(trigger, [mention])
+    return dict(trigger.metadata)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case,channel,meta,error,posts", [
+    ("ambient, generic error", "C1", _AMBIENT_META, RuntimeError("Error code: 503"), False),
+    ("ambient, timeout", "C1", _AMBIENT_META, TimeoutError("timed out"), False),
+    ("ambient, timeout by string", "C1", _AMBIENT_META, RuntimeError("ReadTimeout"), False),
+    ("@mention, generic error", "C1", _MENTION_META, RuntimeError("Error code: 503"), True),
+    ("name hit, timeout", "C1", _NAME_HIT_META, TimeoutError("timed out"), True),
+    ("DM, generic error", "D1", {}, RuntimeError("Error code: 503"), True),
+    ("bot trigger absorbing a human @mention", "C1",
+     _bot_trigger_absorbing_a_human_mention_meta(), RuntimeError("Error code: 503"), True),
+])
+async def test_an_error_on_a_turn_nobody_addressed_posts_nothing(case, channel, meta, error,
+                                                                 posts):
+    """Owner decision: an OpenAI outage must not put an error card under every ambient channel
+    message. The generic and timeout paths follow the fail-closed rule — the outcome is recorded,
+    nothing is posted and the thinking surface is not rewritten. DMs and addressed turns keep it."""
+    from message_processor.base import MessageProcessor
+
+    with patch("message_processor.base.AsyncThreadStateManager"), \
+         patch("message_processor.base.OpenAIClient"):
+        processor = MessageProcessor()
+    processor.db = None
+    processor.thread_manager.acquire_thread_lock = AsyncMock(return_value=True)
+    processor.thread_manager.release_thread_lock = AsyncMock()
+    processor.get_or_create_channel_thread_state = AsyncMock(side_effect=error)
+    processor._get_or_rebuild_thread_state = AsyncMock(side_effect=error)
+
+    message = _message(channel=channel, ts="10.0")
+    message.metadata.update(meta)
+    client = MagicMock()
+    client.update_message = AsyncMock()
+    with patch.object(config, "enable_channel_memory", False):
+        response = await processor.process_message(message, client, "TH1", turn=TurnRuntime())
+
+    assert response.type == "error", case
+    assert response.content, case
+    assert (response.metadata.get("suppress_error_post") is True) is (not posts), case
+    assert client.update_message.await_count == (1 if posts else 0), case
+
+
 @pytest.mark.parametrize("error_name,code,needle", [
     ("StreamTimestampError", "stream_data_invalid", "Can't Place This Channel's History"),
 ])

@@ -4,7 +4,7 @@ import asyncio
 from typing import Any, Callable, Dict, List, Optional
 
 import aiohttp
-from openai import AsyncOpenAI
+from openai import APIStatusError, AsyncOpenAI
 
 from config import (FAST_SERVICE_TIER_MODELS, clamp_effort, config,
                     supports_cache_breakpoints, supports_sampling)
@@ -57,6 +57,23 @@ def attach_cache_breakpoint(part: Dict[str, Any], model: Optional[str]) -> Dict[
             f"prompt_cache_breakpoint unsupported on {model}; part left unmarked")
         return part
     return {**part, "prompt_cache_breakpoint": {"mode": "explicit"}}
+
+
+# One re-send when OpenAI itself is overloaded (owner decision): the SDK's own retries stay off
+# (max_retries=0 below) so timeouts still fail fast. No tuned delay exists for this; 2s is the
+# pause. ONLY a 503 — OpenAI's "overloaded" rejection, refused before anything ran. A 500/502/504
+# can arrive after hosted tools (code interpreter, …) already executed, so re-sending one could
+# repeat a side effect; 4xx, timeouts, MCP 424s and context errors are never retried either.
+_SERVER_OVERLOAD_STATUS = 503
+_SERVER_OVERLOAD_RETRY_PAUSE_S = 2.0
+# Never re-sent at all: an image generation or edit is the side effect.
+_NO_RETRY_OPERATIONS = frozenset({"token_count", "image_generation", "image_edit"})
+
+
+def _is_server_overload(exc: BaseException) -> bool:
+    """OpenAI's 503 overload rejection — the one failure a single re-send can cure safely."""
+    return (isinstance(exc, APIStatusError)
+            and getattr(exc, "status_code", None) == _SERVER_OVERLOAD_STATUS)
 
 
 def _channel_input_items(input_items: List[Dict[str, Any]],
@@ -846,34 +863,61 @@ class OpenAIClient(LoggerMixin):
             f"read={config.api_timeout_read}s, chunk={config.api_timeout_streaming_chunk}s)"
         )
 
-        try:
-            # Use asyncio.wait_for for proper async timeout handling
-            result = await asyncio.wait_for(
-                api_method(*args, **kwargs),
-                timeout=timeout
-            )
-            return result
-        except asyncio.TimeoutError:
-            # A token count is a meter, not a turn: its failures are WARNINGs (CONTEXT_METER §3.1).
-            log_failure = self.log_warning if operation_type == "token_count" else self.log_error
-            log_failure(f"API call ({operation_type}) timed out after {timeout}s")
+        retried = False
+        while True:
+            try:
+                # Use asyncio.wait_for for proper async timeout handling
+                result = await asyncio.wait_for(
+                    api_method(*args, **kwargs),
+                    timeout=timeout
+                )
+                return result
+            except asyncio.TimeoutError:
+                raise self._timeout_error(operation_type, timeout)
+            except Exception as e:
+                # ONE re-send of this same request when OpenAI rejects it as overloaded (503 only;
+                # see _is_server_overload). Same round, same input, so nothing earlier in the turn
+                # repeats and nothing posts twice. The meter and image operations never retry. A
+                # stream is covered only up to its first event: a 5xx arrives here, when `create`
+                # opens it; a failure mid-stream surfaces from the iterator, outside this call.
+                if (not retried and _is_server_overload(e)
+                        and operation_type not in _NO_RETRY_OPERATIONS):
+                    retried = True
+                    self.log_warning(f"OpenAI {getattr(e, 'status_code', '5xx')} on "
+                                     f"{operation_type}; retrying once")
+                    await asyncio.sleep(_SERVER_OVERLOAD_RETRY_PAUSE_S)
+                    continue
+                classified = self._classified_error(e, operation_type, timeout)
+                if classified is e:
+                    raise
+                raise classified
+
+    def _timeout_error(self, operation_type: str, timeout: float) -> TimeoutError:
+        """The asyncio timeout, as the TimeoutError the turn's retry logic reads."""
+        # A token count is a meter, not a turn: its failures are WARNINGs (CONTEXT_METER §3.1).
+        log_failure = self.log_warning if operation_type == "token_count" else self.log_error
+        log_failure(f"API call ({operation_type}) timed out after {timeout}s")
+        # Create TimeoutError with operation_type attribute for smart retry logic
+        timeout_error = TimeoutError(f"OpenAI API call timed out after {timeout} seconds")
+        # Ad-hoc attribute the retry logic reads back off the exception.
+        timeout_error.operation_type = operation_type  # type: ignore[attr-defined]
+        return timeout_error
+
+    def _classified_error(self, e: Exception, operation_type: str,
+                          timeout: float) -> Exception:
+        """What a failed call raises: a timeout-shaped error as TimeoutError, anything else as
+        itself."""
+        error_msg = str(e).lower()
+        if "timeout" in error_msg or "timed out" in error_msg or "read timeout" in error_msg:
+            log_timeout = (self.log_warning if operation_type == "token_count"
+                           else self.log_error)
+            log_timeout(f"API call ({operation_type}) timed out after {timeout}s: {e}")
             # Create TimeoutError with operation_type attribute for smart retry logic
             timeout_error = TimeoutError(f"OpenAI API call timed out after {timeout} seconds")
             # Ad-hoc attribute the retry logic reads back off the exception.
             timeout_error.operation_type = operation_type  # type: ignore[attr-defined]
-            raise timeout_error
-        except Exception as e:
-            error_msg = str(e).lower()
-            if "timeout" in error_msg or "timed out" in error_msg or "read timeout" in error_msg:
-                log_timeout = (self.log_warning if operation_type == "token_count"
-                               else self.log_error)
-                log_timeout(f"API call ({operation_type}) timed out after {timeout}s: {e}")
-                # Create TimeoutError with operation_type attribute for smart retry logic
-                timeout_error = TimeoutError(f"OpenAI API call timed out after {timeout} seconds")
-                # Ad-hoc attribute the retry logic reads back off the exception.
-                timeout_error.operation_type = operation_type  # type: ignore[attr-defined]
-                raise timeout_error
-            raise
+            return timeout_error
+        return e
 
     async def generate_image(
         self,

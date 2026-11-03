@@ -308,3 +308,108 @@ class TestAsyncOpenAIClient:
 
         assert result == "Test streaming"
         assert chunks == ["Test ", "streaming"]
+
+
+def _api_error(status):
+    """A real SDK status error, as `responses.create` raises it."""
+    import httpx
+    import openai
+
+    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+    response = httpx.Response(status, request=request)
+    cls = openai.InternalServerError if status >= 500 else openai.BadRequestError
+    return cls(f"Error code: {status}", response=response, body=None)
+
+
+class TestServerOverloadRetry:
+    """Owner decision: an OpenAI 503 (overloaded, refused before anything ran) is re-sent ONCE,
+    at the single-request level — the same request, so nothing earlier in the turn repeats and
+    nothing posts twice."""
+
+    @pytest.fixture
+    def client(self):
+        with patch('openai_client.base.AsyncOpenAI') as mock, \
+             patch('openai_client.base._SERVER_OVERLOAD_RETRY_PAUSE_S', 0):
+            instance = AsyncMock()
+            instance.responses.create = AsyncMock()
+            mock.return_value = instance
+            yield OpenAIClient()
+
+    @pytest.mark.asyncio
+    async def test_a_503_then_success_is_retried_once(self, client):
+        api = AsyncMock(side_effect=[_api_error(503), "ok"])
+        assert await client._safe_api_call(api, operation_type="text_normal") == "ok"
+        assert api.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_two_503s_raise_after_exactly_two_calls(self, client):
+        import openai
+
+        api = AsyncMock(side_effect=[_api_error(503), _api_error(503), "never"])
+        with pytest.raises(openai.InternalServerError):
+            await client._safe_api_call(api, operation_type="text_normal")
+        assert api.await_count == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [500, 502, 504])
+    async def test_a_5xx_other_than_503_is_not_retried(self, client, status):
+        """A 500/502/504 can arrive after hosted tools already ran; re-sending could repeat them."""
+        import openai
+
+        api = AsyncMock(side_effect=[_api_error(status), "never"])
+        with pytest.raises(openai.InternalServerError):
+            await client._safe_api_call(api, operation_type="text_normal")
+        assert api.await_count == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ["image_generation", "image_edit"])
+    async def test_an_image_operation_is_never_retried(self, client, operation):
+        import openai
+
+        api = AsyncMock(side_effect=[_api_error(503), "never"])
+        with pytest.raises(openai.InternalServerError):
+            await client._safe_api_call(api, operation_type=operation)
+        assert api.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_a_400_is_not_retried(self, client):
+        import openai
+
+        api = AsyncMock(side_effect=[_api_error(400), "never"])
+        with pytest.raises(openai.BadRequestError):
+            await client._safe_api_call(api, operation_type="text_normal")
+        assert api.await_count == 1
+
+    @staticmethod
+    def _event(kind, delta=None):
+        ev = MagicMock()
+        ev.type = kind
+        if delta is not None:
+            ev.delta = delta
+        return ev
+
+    @pytest.mark.asyncio
+    async def test_a_stream_that_503s_before_its_first_event_is_retried(self, client):
+        async def stream():
+            yield self._event("response.output_text.delta", "hello")
+            yield self._event("response.done")
+
+        client.client.responses.create.side_effect = [_api_error(503), stream()]
+        result = await client.create_streaming_response(
+            messages=[{"role": "user", "content": "hi"}], stream_callback=lambda _c: None)
+        assert result == "hello"
+        assert client.client.responses.create.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_a_failure_mid_stream_is_not_retried(self, client):
+        async def stream():
+            yield self._event("response.output_text.delta", "partial")
+            raise _api_error(503)
+
+        import openai
+
+        client.client.responses.create.side_effect = [stream(), "never"]
+        with pytest.raises(openai.InternalServerError):
+            await client.create_streaming_response(
+                messages=[{"role": "user", "content": "hi"}], stream_callback=lambda _c: None)
+        assert client.client.responses.create.await_count == 1
