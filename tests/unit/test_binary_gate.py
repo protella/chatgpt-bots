@@ -2157,7 +2157,7 @@ def test_the_prompt_leaves_a_message_put_to_someone_else_asleep():
     from message_processor import prompts
 
     rule = ("A message put to a different person or assistant — one that opens with or is "
-            "addressed to them, by @-mention or by name — is theirs, however well the assistant "
+            "addressed to them, by mention or by name — is theirs, however well the assistant "
             "could answer it; leave it asleep. Only a message marked as naming the assistant is "
             "also partly its own.")
     for p in (prompts.WAKE_CLASSIFIER_SYSTEM_PROMPT, prompts.WAKE_CLASSIFIER_CONTEXT_PROMPT):

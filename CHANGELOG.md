@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.4.8] - 2026-11-03
+
+### 🐛 Fixed
+
+- **Channel replies are fast again.** The 3.4.7 wake-gate rule spelled out "@-mention", and an `@`
+  in the gate's instructions sent its requests down a much slower path at OpenAI (often 10-15s
+  instead of about 2s, with the same decision). The rule now says "mention"; what it decides is
+  unchanged.
+
 ## [3.4.7] - 2026-11-02
 
 ### 🐛 Fixed
