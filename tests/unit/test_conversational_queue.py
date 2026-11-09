@@ -178,6 +178,7 @@ class _StubProcessor:
     """Binds the REAL process_message onto a minimal harness."""
     process_message = MessageProcessor.process_message
     _dispatch_pending_batch = MessageProcessor._dispatch_pending_batch
+    _retire_covered_messages = MessageProcessor._retire_covered_messages
 
     def __init__(self, manager):
         self.thread_manager = manager
@@ -551,6 +552,84 @@ class TestBusyRetirement:
     def test_queued_type_exists_and_is_handled(self):
         assert 'type="queued"' in (REPO / "message_processor/base.py").read_text()
         assert '"queued"' in (REPO / "main.py").read_text()
+
+
+# --- A reconsidered reply that already answered queued messages retires them ---
+
+def _coverage(*ts, channel="C123", thread="111.0"):
+    from message_processor.turn_runtime import QueueCoverage
+    return QueueCoverage(covered_ts=frozenset(ts), channel_id=channel, thread_root_ts=thread,
+                         trigger_ts=thread, reply_ts="999.0")
+
+
+class TestCoveredRetirement:
+    @pytest.mark.asyncio
+    async def test_a_covered_message_with_an_attachment_is_kept_and_drained(self, manager):
+        key = "C123:111.0"
+        state = Mock()
+        state.config_overrides = {}
+        manager.get_thread_async = AsyncMock(return_value=state)
+        with_file = _attach_msg("see attached", attachments=[{"type": "file", "name": "q3.csv"}],
+                                user="Riley Reyes", ts="112.0")
+        manager.enqueue_pending(key, with_file)
+        proc = _drain_proc(manager)
+        client = Mock()
+        client.message_handler = Mock()
+        with patch.object(config, "queue_drain_linger_seconds", 0.0):
+            await proc._dispatch_pending_batch(_msg("done"), client, key,
+                                               coverage=_coverage("112.0"))
+        assert client.message_handler.call_args.args[0] is with_file
+
+    @pytest.mark.asyncio
+    async def test_covered_head_retires_and_the_uncovered_tail_still_dispatches(self, manager):
+        """The partition runs over the WHOLE queue before the bounded pop: covered entries at the
+        front never eat the batch the uncovered ones need."""
+        key = "C123:111.0"
+        manager.get_thread_async = AsyncMock(return_value=Mock())
+        for i in range(5):
+            manager.enqueue_pending(key, _msg(f"m{i}", ts=f"11{i}.0"))
+        proc = _drain_proc(manager)
+        client = Mock()
+        client.message_handler = Mock()
+        with patch.object(config, "queue_drain_linger_seconds", 0.0), \
+             patch.object(config, "queue_max_batch", 2):
+            await proc._dispatch_pending_batch(_msg("done"), client, key,
+                                               coverage=_coverage("110.0", "111.0", "112.0"))
+        trigger = client.message_handler.call_args.args[0]
+        assert trigger.text == "m4" and trigger.metadata["queued_batch_size"] == 2
+        appended = [c.args[2] for c in proc._add_message_with_token_management.call_args_list]
+        assert appended == ["U1: m3"]                    # only the surviving earlier member
+        assert manager.pending_count(key) == 0
+        retired_ts = {"110.0", "111.0", "112.0"}
+        assert not any((m.metadata or {}).get("ts") in retired_ts
+                       for m, _gen in manager._in_dispatch.values())
+
+    @pytest.mark.asyncio
+    async def test_a_retired_dm_message_flags_a_rebuild_instead_of_appending_after_the_reply(
+            self, manager):
+        """Warm DM history already ends with the covering reply; appending M2 after it would read
+        "M1 -> reply -> M2". The thread is flagged so the next turn rebuilds in Slack's order."""
+        from message_processor.thread_manager import ThreadState
+
+        key = "D08XYZ:111.0"
+        state = ThreadState(thread_ts="111.0", channel_id="D08XYZ")
+        state.add_message("user", "Tessa Tran: the first part?", message_ts="111.0")
+        state.add_message("assistant", "answers both parts", message_ts="113.0")
+        before = list(state.messages)
+        manager._threads[key] = state
+        manager.enqueue_pending(key, _msg("and the second part?", channel="D08XYZ",
+                                          username="Tessa Tran", ts="112.0"))
+        proc = _drain_proc(manager)
+        proc._add_message_with_token_management = (
+            lambda thread_state, role, content, **kw: thread_state.add_message(role, content, **kw))
+        client = Mock()
+        client.message_handler = Mock()
+        with patch.object(config, "queue_drain_linger_seconds", 0.0):
+            await proc._dispatch_pending_batch(_msg("done", channel="D08XYZ"), client, key,
+                                               coverage=_coverage("112.0", channel="D08XYZ"))
+        client.message_handler.assert_not_called()
+        assert state.messages == before                      # M2 not appended after the reply
+        assert manager.consume_needs_refresh(key) is True
 
 
 # --- F10: earlier batch messages' attachments are processed, not dropped ---

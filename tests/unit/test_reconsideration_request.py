@@ -463,9 +463,10 @@ async def test_reasoning_effort_pins_temperature_to_one_and_sends_the_mandated_e
         "schema": {
             "type": "object",
             "additionalProperties": False,
-            "required": ["decision", "text"],
+            "required": ["decision", "text", "answers_newer"],
             "properties": {"decision": {"enum": ["post", "force_post", "skip"]},
-                           "text": {"type": ["string", "null"]}},
+                           "text": {"type": ["string", "null"]},
+                           "answers_newer": {"type": "boolean"}},
         },
     }
     assert fake.timeouts == [config.api_timeout_read]

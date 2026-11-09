@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate a `participation.jsonl` ledger against telemetry contract CV10.
+"""Validate a `participation.jsonl` ledger against telemetry contract CV11.
 
 WHY THIS EXISTS. The P2 live battery decides whether a scenario passed by reading this ledger, so
 the ledger's structure is load-bearing evidence and not a debugging convenience. A join that
@@ -47,7 +47,9 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 # message_processor/participation_telemetry.py — keep the names identical so a diff is readable.
 # ===========================================================================================
 
-CONTRACT_VERSION = 10
+# v11 adds `queue_covered` (a queued message retired because a reconsidered reply answered it);
+# every v10 rule is unchanged.
+CONTRACT_VERSION = 11
 GATE_CONTRACT = "binary-v1"
 
 # On every line, at every version the emitter has ever written... except that `gate_contract`
@@ -905,8 +907,21 @@ def _check_fail_retry(row: Row, report: Report) -> None:
         report.fail("fail_retry_bad_state", row, "a covered retry names no covering trigger")
 
 
+def _check_queue_covered(row: Row, report: Report) -> None:
+    """A queued message retired because a reconsidered reply already answered it: the line must
+    name the message, the turn that covered it and the reply that did, and say why."""
+    for field in ("channel_id", "source_ts", "covering_trigger_ts", "reply_ts"):
+        if not isinstance(row.obj.get(field), str) or not row.obj.get(field):
+            report.fail("queue_covered_bad_field", row,
+                        f"{field}={row.obj.get(field)!r} is not a message ts / channel")
+    if row.obj.get("cause") != "reconsideration":
+        report.fail("queue_covered_bad_field", row,
+                    f"cause={row.obj.get('cause')!r} not in {{reconsideration}}")
+
+
 PAYLOAD_CHECKS = {
     "fail_card_cleared": _check_fail_card_cleared,
+    "queue_covered": _check_queue_covered,
     "fail_retry": _check_fail_retry,
     "turn_start": _check_turn_start,
     "turn_outcome": _check_turn_outcome,

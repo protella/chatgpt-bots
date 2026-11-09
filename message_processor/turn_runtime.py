@@ -401,6 +401,26 @@ class ReconsiderFacts:
         return payload
 
 
+@dataclass(frozen=True)
+class QueueCoverage:
+    """Evidence that this turn's reconsidered reply answered newer messages it reviewed — the
+    one thing that lets the turn's own queue drain retire those messages instead of answering
+    them again in a catch-up turn.
+
+    Written by the reconsideration runner only on a posted ending whose decision claimed
+    `answers_newer`; read once, by this turn's own drain. `covered_ts` is computed by runtime
+    code from the pass's serialized snapshot (inbound, newer than the trigger, in the lease's
+    scopes, minus every ts the pass was told another attempt owns) — never by the model.
+    `reply_ts` is the first surface delivered: the drain retires nothing unless that surface was
+    committed COMPLETE."""
+
+    covered_ts: FrozenSet[str]
+    channel_id: Optional[str]
+    thread_root_ts: Optional[str]
+    trigger_ts: Optional[str]
+    reply_ts: str
+
+
 # EDIT §7. The two states an EditRecord can be in. The record is created immediately after the
 # correction announcement is accepted (`announcement_only`); a successful chat.update mutates it
 # to `committed`; a post-announcement failure keeps `announcement_only` with the exact error.
@@ -484,6 +504,9 @@ class TurnRuntime:
     # non-None-ness IS the once-per-turn gate the interception wrappers consult, and
     # emit_turn_outcome attaches its as_payload() to the turn_outcome event.
     reconsider: Optional[ReconsiderFacts] = None
+    # Turn-local evidence that the reconsidered reply answered queued newer messages (see
+    # QueueCoverage). None on every turn whose reconsideration did not post such a reply.
+    queue_coverage: Optional[QueueCoverage] = None
     # The MCP servers this turn's latest request excluded after they failed. A reconsideration's
     # tooled pass offers the turn's hosted tools exactly as the turn had them, exclusions included.
     mcp_exclusions: FrozenSet[str] = frozenset()

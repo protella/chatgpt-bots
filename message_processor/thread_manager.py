@@ -20,6 +20,42 @@ _MAX_JOB_NOTES = 10
 _JOB_NOTE_CHARS = 1500
 
 
+# Metadata a queued message carries when it stands for MORE than its own words: inheritance from
+# an earlier drain (absorbed members' history, images, files, documents, catalog uploads and
+# queue-link ancestry), a requeued catch-up trigger, live file descriptors, or an edit
+# re-dispatch whose text may postdate anything a reviewer saw. Such a carrier is never retired.
+_CARRIER_KEYS = (
+    "carried_gate_sources", "batched_history", "batched_image_inputs",
+    "batched_unsupported_files", "batched_deferred_documents", "batched_catalog_uploads",
+    "participation_attachments", "edit_reply_marker", "queue_drained",
+)
+
+
+def plain_queued_message(message: Any) -> bool:
+    """Does this queued message stand for nothing but its own plain text? Only such a message may
+    be retired as already answered — anything carrying files, a wider gate cohort or payloads it
+    inherited would take that cargo down with it."""
+    from message_processor.channel_request import COHORT_FILE_PAYLOADS_KEY
+    from message_processor.participation_telemetry import BATCHED_SOURCES_KEY
+
+    if getattr(message, "attachments", None):
+        return False
+    meta = getattr(message, "metadata", None)
+    if not isinstance(meta, dict):
+        return meta is None
+    if any(meta.get(key) for key in (*_CARRIER_KEYS, COHORT_FILE_PAYLOADS_KEY,
+                                     BATCHED_SOURCES_KEY)):
+        return False
+    own = ts_key(meta.get("ts"))
+    for source in meta.get("gate_sources") or ():
+        # The gate's cohort always includes the message itself; anything beyond it — another
+        # message, a file, an edit — is more than this message's own words.
+        if (ts_key(getattr(source, "ts", None)) != own or getattr(source, "attachments", None)
+                or getattr(source, "edit", None)):
+            return False
+    return True
+
+
 @dataclass
 class ThreadState:
     """State for a single Slack thread"""
@@ -437,6 +473,35 @@ class AsyncThreadStateManager(LoggerMixin):
         for message in batch:
             self._in_dispatch[id(message)] = (message, generation)
         return batch
+
+    def retire_covered_pending(self, thread_key: str, covered_ts: Iterable[str]) -> List[Any]:
+        """Remove from this conversation's queue every message a posted reply already answered,
+        and return them in queue order; the survivors keep theirs.
+
+        A message is retired only when its ts is in `covered_ts` (numeric match) AND it stands for
+        nothing but its own plain text (`plain_queued_message`). Partitions the WHOLE queue, before
+        any pop, so a retired message is never registered as in dispatch. Synchronous == atomic on
+        the event loop, like the pop it precedes."""
+        queue = self._pending_queues.get(thread_key)
+        unknown = ts_key(None)
+        covered = {ts_key(ts) for ts in covered_ts} - {unknown}
+        if not queue or not covered:
+            return []
+        retired: List[Any] = []
+        survivors: deque = deque()
+        for message in queue:
+            ts = (getattr(message, "metadata", None) or {}).get("ts")
+            if ts and ts_key(ts) in covered and plain_queued_message(message):
+                retired.append(message)
+            else:
+                survivors.append(message)
+        if not retired:
+            return []
+        if survivors:
+            self._pending_queues[thread_key] = survivors
+        else:
+            self._pending_queues.pop(thread_key, None)
+        return retired
 
     def end_dispatch(self, messages: Iterable[Any],
                      generation: Optional[object] = None) -> None:

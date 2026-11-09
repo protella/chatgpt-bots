@@ -153,7 +153,7 @@ class SlackMessageEventsMixin(_Host):
 
         Shared by the mention/DM path (_handle_slack_message) and the channel-listening
         path (_handle_channel_message)."""
-        # Extract text; note whether the bot itself was @-mentioned BEFORE we strip mentions
+        # Extract text; note whether the bot itself was @-mentioned BEFORE we render mentions
         # (used by channel-listening logic), then resolve mentions for the model.
         text = event.get("text", "")
         mentioned_self = False

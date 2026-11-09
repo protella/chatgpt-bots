@@ -21,7 +21,7 @@ from .context_meter import ContextIrreducible, ContextOverLimit
 from .message_timestamps import stamp_content
 from .thread_management import ThreadManagementMixin
 from .stale_send_guard import StaleSendSuppressed, ts_key
-from .turn_runtime import TurnRuntime
+from .turn_runtime import QueueCoverage, TurnRuntime
 from .handlers.text import TextHandlerMixin, pinned_thread_config
 from .handlers.image_gen import ImageJobMixin
 from .utilities import MessageUtilitiesMixin
@@ -114,6 +114,19 @@ def _reply_text_pending(response: Optional[Response]) -> bool:
 
 # The one-line version for the status/thinking indicator, which has no room for the above.
 TIMEOUT_STATUS = "That took too long — I stopped waiting."
+
+
+def committed_queue_coverage(turn: Any) -> Optional[QueueCoverage]:
+    """The turn's reconsideration coverage, but only once the reply that earned it is a
+    COMMITTED, COMPLETE destination of that turn — a delivery that half-landed (or that its site
+    never committed) answered nobody's follow-up in full. None otherwise."""
+    coverage = getattr(turn, "queue_coverage", None)
+    if not isinstance(coverage, QueueCoverage):
+        return None
+    for record in getattr(turn, "destinations", None) or ():
+        if record.first_ts == coverage.reply_ts and record.committed and record.complete:
+            return coverage
+    return None
 
 
 class MessageProcessor(ThreadManagementMixin,
@@ -1128,7 +1141,9 @@ class MessageProcessor(ThreadManagementMixin,
                         # appends to a cold or half-built state.
                         self.thread_manager.mark_needs_refresh(thread_key)
                 try:
-                    await self._dispatch_pending_batch(message, client, thread_key, lock_released)
+                    await self._dispatch_pending_batch(
+                        message, client, thread_key, lock_released,
+                        coverage=committed_queue_coverage(turn))
                 except Exception as drain_error:
                     self.log_error(f"Pending-queue drain failed for {thread_key}: {drain_error}", exc_info=True)
                     await self._notify_drain_failure(message, client, thread_key)
@@ -1155,6 +1170,30 @@ class MessageProcessor(ThreadManagementMixin,
                     self.log_error(f"Error releasing thread lock for {thread_key}: {lock_error}", exc_info=True)
                     if not lock_released.done():
                         lock_released.set_result(None)   # a drained catch-up never waits forever
+
+    async def _retire_covered_messages(self, finished_message: Message, thread_key: str,
+                                       coverage: QueueCoverage) -> None:
+        """Retire the queued messages the finished turn's reconsidered reply already answered
+        (QueueCoverage): out of the queue before the pop, so they are never in dispatch and never
+        counted into a catch-up batch. A DM's warm history already holds the covering reply, and
+        appending a retired message after it would misorder the exchange (or duplicate one a
+        rebuild already has), so a DM is flagged to rebuild from Slack instead; a channel always
+        rebuilds from Slack."""
+        retired = self.thread_manager.retire_covered_pending(thread_key, coverage.covered_ts)
+        if not retired:
+            return
+        self.log_info(f"Retiring {len(retired)} queued message(s) on {thread_key}: the "
+                      f"reconsidered reply {coverage.reply_ts} already answered them")
+        for queued_msg in retired:
+            participation_telemetry.queue_covered(
+                getattr(queued_msg, "channel_id", None) or coverage.channel_id,
+                thread_root_ts=coverage.thread_root_ts,
+                source_ts=(queued_msg.metadata or {}).get("ts"),
+                covering_trigger_ts=coverage.trigger_ts, reply_ts=coverage.reply_ts,
+                cause="reconsideration",
+                attempt_id=participation_telemetry.attempt_id_for(queued_msg))
+        if TextHandlerMixin._turn_surface(finished_message) != SURFACE_CHANNEL:
+            self.thread_manager.mark_needs_refresh(thread_key)
 
     @staticmethod
     def _turn_error_message(e: BaseException, message: Message) -> str:
@@ -1788,7 +1827,8 @@ class MessageProcessor(ThreadManagementMixin,
         return "\n\n".join(sections)
 
     async def _dispatch_pending_batch(self, finished_message: Message, client: BaseClient, thread_key: str,
-                                      lock_released: Optional["asyncio.Future[None]"] = None):
+                                      lock_released: Optional["asyncio.Future[None]"] = None,
+                                      coverage: Optional[QueueCoverage] = None):
         """Phase Q: after a turn finishes (lock still held), drain the conversation's
         pending queue into ONE batched catch-up turn and re-dispatch it through the
         normal message pipeline.
@@ -1810,6 +1850,9 @@ class MessageProcessor(ThreadManagementMixin,
           re-enqueues — nothing is ever lost.
         - Messages left beyond QUEUE_MAX_BATCH drain on the following turn via this
           same hook (loop-until-empty is emergent, no dedicated loop needed).
+        - `coverage` (the finished turn's committed QueueCoverage): after the linger and before
+          the pop, queued plain-text messages its reconsidered reply already answered are
+          retired from the whole queue; the survivors drain as above, and none means no catch-up.
         """
         manager = self.thread_manager
         if manager.pending_count(thread_key) == 0:
@@ -1818,6 +1861,9 @@ class MessageProcessor(ThreadManagementMixin,
         linger = max(0.0, float(getattr(config, "queue_drain_linger_seconds", 1.0)))
         if linger:
             await asyncio.sleep(linger)
+
+        if coverage is not None:
+            await self._retire_covered_messages(finished_message, thread_key, coverage)
 
         batch = manager.pop_pending_batch(thread_key, int(getattr(config, "queue_max_batch", 10)))
         if not batch:

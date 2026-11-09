@@ -118,6 +118,7 @@ def test_dev_allowlisted_bot_id_classifies_human(monkeypatch):
 @pytest.mark.asyncio
 async def test_get_thread_history_sets_sender_metadata():
     b = _Bot()
+    b.bot_handle = "ChatGPT"
     messages = [
         {"ts": "1", "user": "U07HUMAN", "text": "<@U07SELF> hello"},          # human
         {"ts": "2", "bot_id": SELF_BOT_ID, "user": SELF_USER_ID, "text": "my reply"},  # self
@@ -134,7 +135,7 @@ async def test_get_thread_history_sets_sender_metadata():
     assert by_ts["1"].metadata["sender_type"] == "human"
     assert by_ts["1"].metadata["is_bot"] is False
     assert by_ts["1"].metadata["bot_name"] is None
-    assert by_ts["1"].text == "hello"  # mention stripped for humans
+    assert by_ts["1"].text == "@ChatGPT hello"  # our tag rendered readable, never raw
 
     # self
     assert by_ts["2"].metadata["sender_type"] == "self"
@@ -508,6 +509,91 @@ async def test_the_generic_update_path_posts_no_bot_object_mention():
     b = _Poster()
     assert await b.update_message("C1", "1.1", "<@B07STRANGER> spoke") is True
     assert b.app.client.chat_update.await_args.kwargs["text"] == "@bot spoke"
+
+
+# --- outbound: "@Name" in a native stream becomes a real mention ---
+
+PEER_USER_ID = "U07PEER"
+
+
+async def _named_stream(pieces):
+    """`_stream`, for a bot that knows its own handle and one peer assistant by name."""
+    b = _Poster()
+    b.bot_handle = "ChatGPT"
+    b.user_cache = {PEER_USER_ID: {"username": "Claude"}}
+    web = b.app.client
+    web.chat_startStream = AsyncMock(return_value={"ts": "1.1"})
+    web.chat_appendStream = AsyncMock(return_value={"ok": True})
+    web.chat_stopStream = AsyncMock(return_value={"ok": True})
+    session = b.begin_native_stream("C1", "1.0", user_id="U07HUMAN")
+    assert await session.start("") is True
+    cumulative = ""
+    for piece in pieces:
+        cumulative += piece
+        await session.update(cumulative)
+    await session.finish(cumulative)
+    # `_sent` tracks RAW input consumed, never the encoded output.
+    assert session._sent == cumulative
+    return "".join(
+        call.kwargs.get("markdown_text") or ""
+        for call in web.chat_appendStream.await_args_list + web.chat_stopStream.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_a_name_split_across_deltas_is_encoded_once():
+    streamed = await _named_stream(["Do you or @ChatGPT or @Cl", "aude have any idea?"])
+    assert streamed == f"Do you or <@{SELF_USER_ID}> or <@{PEER_USER_ID}> have any idea?"
+
+
+@pytest.mark.asyncio
+async def test_a_trailing_name_is_encoded_by_the_final_flush():
+    streamed = await _named_stream(["over to ", "@Claude"])
+    assert streamed == f"over to <@{PEER_USER_ID}>"
+
+
+@pytest.mark.asyncio
+async def test_an_email_is_never_encoded_even_across_deltas():
+    # The "@" opens the second delta, so only the carried-over "x" says it is an email.
+    streamed = await _named_stream(["write to x", "@Claude. or y@ChatGPT."])
+    assert streamed == "write to x@Claude. or y@ChatGPT."
+
+
+@pytest.mark.asyncio
+async def test_a_name_inside_code_stays_as_written():
+    streamed = await _named_stream(["`@Claude` vs @Claude."])
+    assert streamed == f"`@Claude` vs <@{PEER_USER_ID}>."
+
+
+@pytest.mark.asyncio
+async def test_a_part_roll_never_splits_a_held_name():
+    """A part that ends on a held "@Cl" must not resolve it at the roll (a "Cl" account would
+    steal the tag): the whole "@Claude" opens the next part, nothing lost or repeated."""
+    from message_processor.message_markers import part_prefix_markdown
+    from streaming.native_sink import NativeStreamCoordinator
+    b = _Poster()
+    b.bot_handle = "ChatGPT"
+    b.user_cache = {PEER_USER_ID: {"username": "Claude"}, "U07CL": {"username": "Cl"}}
+    web = b.app.client
+    web.chat_startStream = AsyncMock(side_effect=[{"ts": "1.1"}, {"ts": "1.2"}])
+    web.chat_appendStream = AsyncMock(return_value={"ok": True})
+    web.chat_stopStream = AsyncMock(return_value={"ok": True})
+    coord = NativeStreamCoordinator(b, "C1", "1.0", char_limit=200, user_id="U07HUMAN")
+    assert await coord.start() is True
+    head = "word " * 39
+    ok, overflow = await coord.update(head + "@Cl")
+    assert ok and overflow is None
+    ok, overflow = await coord.update(head + "@Claude has the answer.")
+    assert ok and overflow == "@Claude has the answer."
+    assert await coord.finalize(overflow) is True
+
+    parts: dict = {"1.1": "", "1.2": ""}
+    for call, ts in zip(web.chat_startStream.await_args_list, ("1.1", "1.2")):
+        parts[ts] += call.kwargs.get("markdown_text") or ""
+    for call in web.chat_appendStream.await_args_list + web.chat_stopStream.await_args_list:
+        parts[call.kwargs["ts"]] += call.kwargs.get("markdown_text") or ""
+    assert parts["1.1"] == head
+    assert parts["1.2"] == part_prefix_markdown(2) + f"<@{PEER_USER_ID}> has the answer."
+    assert "U07CL" not in parts["1.1"] + parts["1.2"]
 
 
 # --- role mapping contract (as implemented in thread_management rebuild) ---

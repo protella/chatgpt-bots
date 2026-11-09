@@ -720,3 +720,18 @@ def test_bot_with_real_user_id_lands_in_roster():
     txt2 = build_roster_text({"bot": "Bot", "U123": "Peter"}, bot_user_id="UBOT")
     assert "<@bot>" not in txt2
     assert "<@U123>" in txt2
+
+
+@pytest.mark.asyncio
+async def test_our_own_post_carrying_our_tag_never_dispatches(tag_only):
+    """Outbound tags of ourselves are real mentions now; our own post must still never wake us,
+    whether it arrives as a channel message or as the app_mention Slack fires for it."""
+    bot = _make_bot()
+    bot.db = MagicMock()
+    bot.db.get_user_preferences_async = AsyncMock(return_value={"settings_completed": True})
+    bot._get_channel_settings = AsyncMock(return_value=None)
+    bot._post_settings_button_if_new_thread = AsyncMock()
+    own = _evt(user="UBOT", bot_id="BBOT", text="Do you or <@UBOT> have any idea?")
+    await bot._handle_channel_message(own, bot.app.client)
+    await bot._handle_slack_message(dict(own), bot.app.client, wake_source="app_mention")
+    bot.message_handler.assert_not_called()

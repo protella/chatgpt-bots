@@ -30,14 +30,24 @@ def test_inbound_other_user_resolves_to_at_name():
     assert resolve_inbound_mentions(f"hey <@{PETER}> look", CACHE) == "hey @peter look"
 
 
-def test_inbound_self_mention_removed():
-    out = resolve_inbound_mentions(f"<@{BOT}> what's up", CACHE, bot_user_id=BOT)
-    assert out == "what's up"
+def test_inbound_self_mention_renders_our_handle():
+    out = resolve_inbound_mentions(f"<@{BOT}> what's up", CACHE, bot_user_id=BOT,
+                                   bot_handle="ChatGPT")
+    assert out == "@ChatGPT what's up"
 
 
 def test_inbound_self_and_other_mixed():
-    out = resolve_inbound_mentions(f"<@{BOT}> ask <@{PETER}> please", CACHE, bot_user_id=BOT)
-    assert "@peter" in out and BOT not in out
+    out = resolve_inbound_mentions(f"<@{BOT}> ask <@{PETER}> please", CACHE, bot_user_id=BOT,
+                                   bot_handle="ChatGPT")
+    assert out == "@ChatGPT ask @peter please"
+
+
+def test_inbound_dm_draft_keeps_both_tags_readable_with_an_empty_cache():
+    """A draft to proofread tags us and a peer assistant. Both tags are content: ours resolves
+    from the auth.test handle alone (no cache row), the peer from its cache row or label."""
+    text = f"fixt: Do you or <@{BOT}> or <@{CLAUDE}|Claude> have any idea?"
+    out = resolve_inbound_mentions(text, {}, bot_user_id=BOT, bot_handle="ChatGPT")
+    assert out == "fixt: Do you or @ChatGPT or @Claude have any idea?"
 
 
 def test_inbound_unknown_id_renders_addressee_marker():
@@ -121,6 +131,29 @@ def test_outbound_email_local_part_not_encoded():
     assert encode_outbound_mentions("mail bob@peter for info", NAME_TO_ID) == "mail bob@peter for info"
 
 
+def test_outbound_own_handle_and_mixed_case_peer_encode():
+    lut = {"ChatGPT": BOT, "Claude": CLAUDE}
+    assert encode_outbound_mentions("Do you or @chatgpt or @CLAUDE have any idea?", lut) == \
+        f"Do you or <@{BOT}> or <@{CLAUDE}> have any idea?"
+
+
+def test_outbound_trailing_punctuation_and_possessive_are_kept():
+    lut = {"Claude": CLAUDE}
+    assert encode_outbound_mentions("ask @Claude.", lut) == f"ask <@{CLAUDE}>."
+    assert encode_outbound_mentions("@Claude's take", lut) == f"<@{CLAUDE}>'s take"
+    assert encode_outbound_mentions("@Claude, thoughts?", lut) == f"<@{CLAUDE}>, thoughts?"
+
+
+def test_outbound_hyphen_is_part_of_the_name():
+    assert encode_outbound_mentions("ask @Claude-", {"Claude": CLAUDE}) == "ask @Claude-"
+
+
+def test_mixin_own_handle_wins_over_a_case_variant_cached_name():
+    stub = _FmtStub(user_cache={CLAUDE: {"username": "ChatGPT"}}, bot_user_id=BOT)
+    stub.bot_handle = "chatgpt"
+    assert stub.format_text("ask @chatgpt") == f"ask <@{BOT}>"
+
+
 def test_outbound_empty_map_strips_broken_brackets():
     assert encode_outbound_mentions("hi <@Some Name>", {}) == "hi Some Name"
     assert encode_outbound_mentions("hi @peter", {}) == "hi @peter"  # no map -> @tokens untouched
@@ -163,15 +196,23 @@ class _FmtStub(SlackFormattingMixin):
         self.markdown_converter = _FakeMD()
 
 
-def test_mixin_clean_mentions_resolves_and_drops_self():
+def test_mixin_clean_mentions_resolves_self_and_others():
     stub = _FmtStub(user_cache=CACHE, bot_user_id=BOT)
-    assert stub._clean_mentions(f"<@{BOT}> tell <@{PETER}> hi") == "tell @peter hi"
+    stub.bot_handle = "ChatGPT"
+    assert stub._clean_mentions(f"<@{BOT}> tell <@{PETER}> hi") == "@ChatGPT tell @peter hi"
+
+
+def test_mixin_name_map_carries_own_handle_without_a_cache_row():
+    stub = _FmtStub(user_cache={}, bot_user_id=BOT)
+    stub.bot_handle = "ChatGPT"
+    assert stub.format_text("Do you or @ChatGPT have any idea?") == \
+        f"Do you or <@{BOT}> have any idea?"
 
 
 def test_mixin_build_name_to_id_map():
     stub = _FmtStub(user_cache=CACHE)
     m = stub._build_name_to_id_map()
-    assert m["peter"] == PETER and m["Erin Evans"] == PETER and m["Claude"] == CLAUDE
+    assert m["peter"] == PETER and m["erin evans"] == PETER and m["claude"] == CLAUDE
 
 
 def test_mixin_encode_fast_path_no_at():

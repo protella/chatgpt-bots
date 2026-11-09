@@ -57,7 +57,8 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple, cast
+from typing import (Any, Awaitable, Callable, Dict, FrozenSet, List, Optional, Sequence, Set,
+                    Tuple, cast)
 
 from config import config
 from logger import setup_logger
@@ -70,9 +71,10 @@ from message_processor.channel_request import (TOOL_MODE_HOSTED_ONLY,
 from message_processor.channel_stream import build_reconsideration_snapshot
 from message_processor.context_meter import usable_limit
 from message_processor.stale_send_guard import (Scope, StaleSendSuppressed, TurnSendLease,
-                                                scopes_for, ts_key)
+                                                is_newer, scopes_for, ts_key)
 from message_processor.tool_registry import SURFACE_CHANNEL, SURFACE_DM
-from message_processor.turn_runtime import DEST_KIND_RECONSIDER_INTERIM, ReconsiderFacts
+from message_processor.turn_runtime import (DEST_KIND_RECONSIDER_INTERIM, QueueCoverage,
+                                           ReconsiderFacts)
 from message_processor.utilities import effective_request_model
 from slack_client.normalizer import TimestampError
 from openai_client.api.responses import build_reconsideration_create_kwargs
@@ -327,6 +329,33 @@ def reviewed_through_map(lease: TurnSendLease, stream: Any) -> Dict[Scope, str]:
     return reviewed
 
 
+def covered_newer_ts(lease: TurnSendLease, stream: Any, trigger_ts: Any,
+                     excluded: Sequence[str] = ()) -> FrozenSet[str]:
+    """The newer messages a posted `answers_newer` reply may claim to have answered — computed
+    by trusted runtime code, never by the model: every INBOUND item serialized in the pass's
+    snapshot (the same extraction set as `reviewed_through_map`), strictly newer than the
+    trigger, in one of the lease's scopes, minus every ts the pass was told another attempt
+    owns. Exact ts strings; every comparison is numeric (`ts_key`). A malformed ts is never
+    evidence."""
+    unknown = ts_key(None)
+    skip = {ts_key(ts) for ts in excluded}
+    scopes = set(lease.scopes)
+    covered: Set[str] = set()
+    for item in _snapshot_items(stream):
+        meta = item.metadata
+        ts = meta.get("ts")
+        if not ts or meta.get("sender_type") == "self":
+            continue
+        key = ts_key(ts)
+        if key == unknown or key in skip or not is_newer(ts, trigger_ts):
+            continue
+        member = scopes_for(meta.get("channel_id"), ts, meta.get("thread_root_ts"),
+                            meta.get("sender_id"))
+        if scopes & set(member):
+            covered.add(str(ts))
+    return frozenset(covered)
+
+
 # --------------------------------------------------------------------- surface adapters
 
 
@@ -574,6 +603,10 @@ async def reconsider_stale_draft(*, processor: Any, client: Any, message: Any, t
     draft_from_tooled = False     # the current draft is (derived from) the tooled pass's text
     draft_tools: Tuple[str, ...] = ()
     draft_results: Tuple[Dict[str, Any], ...] = ()
+    # The newer ts the CURRENT pass told the model another attempt owns — subtracted from any
+    # coverage its posted reply claims. The tooled pass re-decides over the redo's snapshot,
+    # whose own guidance was empty (redo is offered only while no newer message has an owner).
+    told_owned: Tuple[str, ...] = ()
 
     def _emit_suppression(exc: StaleSendSuppressed) -> None:
         """One `stale_send` row per suppression EVENT the runner handles (§5 single-owner rule),
@@ -605,6 +638,22 @@ async def reconsider_stale_draft(*, processor: Any, client: Any, message: Any, t
         return bool(hosted_reconsideration_tools(
             processor, turn, getattr(getattr(surface, "ctx", None), "thread_config", None),
             getattr(surface, "model", None), surface=kind))
+
+    def _note_coverage(reply_ts: str, stream: Any, owned: Sequence[str]) -> None:
+        """Turn-local evidence for this turn's drain (QueueCoverage). Never raises: a failure
+        here only means a queued follow-up gets its own catch-up, as it always did."""
+        if trigger_ts is None:
+            return      # with no trigger to be newer than, nothing is evidence
+        try:
+            covered = covered_newer_ts(lease, stream, trigger_ts, owned)
+            if covered:
+                turn.queue_coverage = QueueCoverage(
+                    covered_ts=covered, channel_id=channel_id,
+                    thread_root_ts=getattr(message, "thread_id", None),
+                    trigger_ts=trigger_ts, reply_ts=reply_ts)
+        except Exception as coverage_error:  # noqa: BLE001 — evidence is optional
+            logger.warning(f"Reconsideration coverage not recorded on {channel_id}: "
+                           f"{coverage_error}")
 
     def _give_up(error: str) -> StaleSendSuppressed:
         """§4f give-up: outcome `error_dropped` with the subtype, rethrow the newest suppression
@@ -654,6 +703,7 @@ async def reconsider_stale_draft(*, processor: Any, client: Any, message: Any, t
                 fresh_stream = redo_stream
                 reviewed = redo_reviewed
                 newer_count = 0
+                told_owned = ()
                 try:
                     prepared = surface.build_tooled_request(fresh_stream,
                                                             pass_number=pass_number)
@@ -692,6 +742,7 @@ async def reconsider_stale_draft(*, processor: Any, client: Any, message: Any, t
                     newer_responders = (newer_owner_ts(lease, processor, channel_id) if recheck
                                         else lease.newer_responding_ts())
                     newer_count = len(newer_responders)
+                    told_owned = tuple(newer_responders)
                     # Redo needs two more fuse slots: the tooled pass, and the recheck a newer
                     # owner may force after it — a redo that cannot finish is never offered.
                     allow_redo = (not redo_decided
@@ -880,6 +931,8 @@ async def reconsider_stale_draft(*, processor: Any, client: Any, message: Any, t
 
             outcome = ("posted_asis" if current_draft.strip() == initial_draft.strip()
                        else "posted_revised")
+            if getattr(decision, "answers_newer", False) is True:
+                _note_coverage(str(delivered_ts), fresh_stream, told_owned)
             # The posted outcome asserts PHYSICAL Slack acceptance of the first surface,
             # nothing more (r3-16); site bookkeeping proceeds normally after the return.
             _finish(outcome, forced=forced)
@@ -898,6 +951,6 @@ __all__ = ["RECONSIDER_FUSE_PASSES", "intercept_stale_send", "reconsider_stale_d
            "build_reconsideration_request", "build_tooled_reconsideration_request",
            "reconsideration_item", "tooled_reconsideration_item", "draft_fence",
            "tools_used_summary", "hosted_reconsideration_tools", "redo_offerable",
-           "newer_owner_ts", "post_reconsider_interim",
+           "newer_owner_ts", "post_reconsider_interim", "covered_newer_ts",
            "reviewed_through_map", "suppressing_ts_present", "select_reconsideration_model",
            "ChannelReconsiderSurface", "PreparedDecision", "surface_for"]

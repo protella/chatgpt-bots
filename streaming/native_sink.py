@@ -29,6 +29,10 @@ from message_processor.message_markers import (
     entity_safe_cut,
     part_prefix_markdown,
 )
+from slack_client.formatting.text import split_streamable_name_mention
+
+# A character that continues an "@Name" token (the outbound encoder's token class).
+_NAME_CHARS = frozenset(".'-_")
 
 
 def find_stream_split(text: str, limit: int, floor: int = 0) -> int:
@@ -170,7 +174,18 @@ class NativeStreamCoordinator:
 
     async def _roll(self, raw_text: str) -> Tuple[bool, Optional[str]]:
         """Close the current part and open the next one."""
-        split = find_stream_split(raw_text, self.char_limit, floor=self._sent_raw_len())
+        # A held "@Na" may still become "@Name": finishing the part would resolve the half it
+        # has. It goes back to the buffer, and the split never lands inside a name, so the whole
+        # token opens the next part instead.
+        withdraw = getattr(self.session, "withdraw_held_name", None)
+        if callable(withdraw):
+            withdraw()
+        floor = self._sent_raw_len()
+        split = find_stream_split(raw_text, self.char_limit, floor=floor)
+        if 0 < split < len(raw_text) and (raw_text[split].isalnum() or raw_text[split] in _NAME_CHARS):
+            release, candidate = split_streamable_name_mention(raw_text[:split])
+            if candidate and release and len(release) >= floor:
+                split = len(release)
         first = raw_text[:split]
         if not await self.session.update(self.base + first):
             self.failed = True

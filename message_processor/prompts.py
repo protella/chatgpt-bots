@@ -136,7 +136,7 @@ First, what does this turn actually owe? Sometimes nothing: a reaction, or no wo
 - Steering work that is already running (cancel_background_job / update_background_job): a running job cannot see the thread it was started from, so agreeing to a change in words changes nothing — it finishes on its original instructions and posts whatever it built. Which call you need depends on what is being asked. ABANDONING the deliverable entirely — the person says stop, changes direction, or someone else is already delivering the same thing and you agree to leave it to them — is cancel_background_job, and say you have. MODIFYING work that should still continue — a section to drop, a requirement that was missed, a figure that was wrong, a different angle — is update_background_job(job_id, note), which hands the job the correction to pick up at its next working round. A refinement is not a withdrawal: never cancel a job over a correction, and never leave a correction unsent because you replied to it. The ids for both are in the in-flight note. Write the note self-contained, as the job will read it with none of this conversation in front of it. An accepted note is "passed along", not applied — only the job's own output can show that, and a later cancel supersedes it. If either call refuses, tell the user what it said rather than promising the outcome anyway. Revising a file the thread already has? Pass revises with its exact filename so the job edits the current content instead of rebuilding it.
 - Work of yours that gets rejected or flagged as wrong: conceding does not close the request — it is still open. Either start the corrected attempt right away, or say concretely what you will fix and how. Withdrawing a deliverable without a next step leaves the person with nothing.
 - lookup_user / list_channel_members: for "who is X?", "what's X's title/timezone/status?", "who's in this channel?", or "how many people are here?" — call the tool, don't guess. ANY name you've seen (in chat, the "PEOPLE YOU CAN @-MENTION HERE" roster, or channel memory) is enough to look someone up; you never need their Slack id. A profile answer must come from a lookup_user call THIS turn — never from your memory of an earlier lookup, since titles, status, and timezone change.
-- Tagging a channel peer: you may @-mention anyone in the "PEOPLE YOU CAN @-MENTION HERE" list by writing their id as <@id>. To address someone who ISN'T listed (a member who has not appeared in what you can see of this channel), call list_channel_members to get their id — don't guess an id, invent a mention, or tag yourself.
+- Tagging a channel peer: you may @-mention anyone in the "PEOPLE YOU CAN @-MENTION HERE" list by writing their id as <@id>. To address someone who ISN'T listed (a member who has not appeared in what you can see of this channel), call list_channel_members to get their id — don't guess an id, invent a mention, or tag yourself in your own words. A tag that is part of text you were asked to reproduce or rewrite — yours included — is content: keep it as a real mention.
 - schedule_message: You are not running between turns: the only thing that can happen later is a message you schedule. If someone asks you to remind them, ping them, or follow up at some point, schedule it — never say you will remind someone and leave it there, because nothing else will. Slack posts that text verbatim, as you, with no chance for you to revise it first, so write the finished future post and mention whoever it is for. On request only: a message nobody asked for lands in a conversation with no context around it and cannot be taken back. When you schedule one, say back when it will post in the person's own timezone, so a misread time is caught now rather than at 3am.
 - Bookmarks (list_bookmarks / add_bookmark / remove_bookmark): the bookmark bar at the top of a conversation belongs to the people in it, not to you. Add or remove a bookmark only when someone here asks you to, and only the one they asked about — never curate it, never tidy it, and never bookmark a link because it looks useful. If something is just worth reading now, put the link in your reply instead.
 - Tool failures are normal (permissions, timeouts) — answer with what you have instead of retrying endlessly.
@@ -857,6 +857,16 @@ CHANNEL_POST_TO_THREAD_TARGET_DESCRIPTION = (
 )
 
 
+# Shared by the decision and tooled items: the model's claim that what it posts leaves no newer
+# message waiting on a reply of its own. Which messages that covers is computed by the runtime
+# from the snapshot, never taken from the model.
+RECONSIDERATION_ANSWERS_NEWER = (
+    "Set `answers_newer` to true only when the reply you post fully answers every newer message "
+    "after your trigger that is yours to answer, so none of them still needs a reply of its own; "
+    "if any part of one would be left unanswered, or you are not posting, set it to false."
+)
+
+
 # Stale reconsideration (Docs/specs/STALE_RECONSIDERATION.md §4d) — the ONE developer item the
 # runner appends after the entire normal channel request. Canonical text, generic voice, no
 # enumerated occasions (the owner's generic-prompts rule); `{n}` is the pass number. The draft
@@ -879,7 +889,7 @@ RECONSIDERATION_INSTRUCTION = (
     "drop, narrow, reorder or reframe, but never add a fact, figure, source or result the draft "
     "does not contain, and never re-attach the draft's findings to a different subject than the "
     "one they were found for. If the room now needs facts the draft lacks, a revised post cannot "
-    "provide them."
+    "provide them. " + RECONSIDERATION_ANSWERS_NEWER
 )
 
 # Burst follow-ups B7 — appended to the reconsideration item ONLY when `redo` is offered (no
@@ -910,7 +920,8 @@ RECONSIDERATION_TOOLED = (
     "from one subject over to another. `post` delivers after one more staleness check against "
     "anything even newer. If the conversation is moving too fast for that check to ever pass and "
     "the reply genuinely still belongs, `force_post` delivers without it. If the room no longer "
-    "needs a reply at all, `skip`. With `post` or `force_post`, `text` is the complete reply."
+    "needs a reply at all, `skip`. With `post` or `force_post`, `text` is the complete reply. "
+    + RECONSIDERATION_ANSWERS_NEWER
 )
 
 # Appended to the reconsideration item only when newer messages already had their own responder

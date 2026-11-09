@@ -452,7 +452,7 @@ def _gate_context_sender_name(client_self: Any, payload: Dict[str, Any],
 def _gate_context_text(client_self: Any, payload: Dict[str, Any], sender_kind: str) -> str:
     """The words as the cohort renders them (`_event_to_message`): content Slack delivers outside
     `text` appended (never for our own posts, whose cards live there), then mentions resolved
-    from the cache with our own dropped. Both steps are pure and synchronous — no lookup warms
+    from the cache, our own as "@<handle>". Both steps are pure and synchronous — no lookup warms
     the cache here, so a never-seen mention renders as `@<id>`, still a visible addressee."""
     text = str(payload.get("text") or "")
     if sender_kind != "self":
@@ -461,7 +461,8 @@ def _gate_context_text(client_self: Any, payload: Dict[str, Any], sender_kind: s
             text = f"{text}\n\n{supplementary}" if text.strip() else supplementary
     return resolve_inbound_mentions(
         text, user_cache=getattr(client_self, "user_cache", None),
-        bot_user_id=getattr(client_self, "bot_user_id", None)) or ""
+        bot_user_id=getattr(client_self, "bot_user_id", None),
+        bot_handle=getattr(client_self, "bot_handle", None)) or ""
 
 
 def _feed_gate_context(client_self: Any, event: Any, *, from_mention: bool) -> None:

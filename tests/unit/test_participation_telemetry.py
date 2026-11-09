@@ -214,14 +214,15 @@ def test_the_contract_version_says_the_event_set_changed():
     `turn_id` and one-per-suppression-EVENT cardinality, and the `reconsider_start` /
     `reconsider_outcome` pair joins the turn population; v10 is edit_own_message —
     `turn_outcome` gains the always-present `edits` list and the destination kinds gain
-    `correction_announcement`. Each is a change an analysis written
+    `correction_announcement`; v11 adds `queue_covered`, a queued message retired with no
+    successor turn. Each is a change an analysis written
     against the older contract must be able to refuse.
 
     GATE_CONTRACT is asserted beside it because the two move independently — v2–v6 rows remain
     valid under their own contracts, and a reader has to be able to tell which one a row obeys.
-    It deliberately did NOT move at v8, v9 or v10: the gate is unchanged, so its rows still
+    It deliberately did NOT move at v8, v9, v10 or v11: the gate is unchanged, so its rows still
     pool."""
-    assert pt.CONTRACT_VERSION == 10
+    assert pt.CONTRACT_VERSION == 11
     assert pt.GATE_CONTRACT == "binary-v1"
 
 
@@ -1600,7 +1601,7 @@ def stream_render_row(**overrides):
     the rule that makes it necessary land together.
     """
     row = {
-        "v": 10, "at": 3.0, "session": "S", "gate_contract": "binary-v1",
+        "v": 11, "at": 3.0, "session": "S", "gate_contract": "binary-v1",
         "event": "stream_render", "turn_id": "t1",
         "channel_id": "C1", "H": "1.9",
         "periphery_floor_ts": "1.0", "inventory_start_ts": "0.5",
@@ -1626,11 +1627,12 @@ def test_the_ledger_has_no_compaction_vocabulary(tmp_path):
     That was the claim worth testing when the removal shipped inside v8: the turn population —
     turn_start, turn_outcome, stream_render, model_response, outbound_receipt — was unchanged in
     identity, and no completeness rule ever named the removed event, so no denominator anybody
-    computes off a v8 ledger was invalidated. The version sits at 10 NOW because stale
-    reconsideration (v9) and then edit_own_message (v10) each changed the contract for real —
+    computes off a v8 ledger was invalidated. The version sits at 11 NOW because stale
+    reconsideration (v9) and then edit_own_message (v10)
+    and queue_covered (v11) each changed the contract for real —
     unlike this removal, which still earned no bump of its own.
     """
-    assert pt.CONTRACT_VERSION == 10
+    assert pt.CONTRACT_VERSION == 11
     for name in ("compaction_snapshot", "SNAPSHOT_OPS", "OUTBOX_OPS", "BUILD_STATUSES",
                  "BUILD_REASON_STATUSES", "FIT_RESULTS", "OUTBOX_EVENT",
                  "canonical_body_bytes", "extract_canonical_body", "validate_outbox_body",
@@ -1651,17 +1653,17 @@ def test_the_ledger_has_no_compaction_vocabulary(tmp_path):
 
     ledger = tmp_path / "participation.jsonl"
     rows = [
-        {"v": 10, "at": 1.0, "session": "S", "gate_contract": "binary-v1",
+        {"v": 11, "at": 1.0, "session": "S", "gate_contract": "binary-v1",
          "event": "session_start", "build": "abc"},
-        {"v": 10, "at": 2.0, "session": "S", "gate_contract": "binary-v1", "event": "turn_start",
+        {"v": 11, "at": 2.0, "session": "S", "gate_contract": "binary-v1", "event": "turn_start",
          "channel_id": "C1", "trigger_ts": "1.0", "turn_id": "t1", "surface": "channel",
          "gated": False},
         stream_render_row(),
-        {"v": 10, "at": 4.0, "session": "S", "gate_contract": "binary-v1",
+        {"v": 11, "at": 4.0, "session": "S", "gate_contract": "binary-v1",
          "event": "turn_outcome", "channel_id": "C1", "trigger_ts": "1.0", "turn_id": "t1",
          "kind": "silence", "detached_started": False, "stream_build_present": True,
          "destinations": [], "edits": []},
-        {"v": 10, "at": 5.0, "session": "S", "gate_contract": "binary-v1",
+        {"v": 11, "at": 5.0, "session": "S", "gate_contract": "binary-v1",
          "event": "session_end"},
     ]
     ledger.write_text("".join(json.dumps(r) + "\n" for r in rows))
@@ -1693,20 +1695,20 @@ def _ledger(*, render=None, renders=None, stream_build_present=True, outcome_ext
     """A complete one-turn session, with the stream_render row(s) under test substituted in."""
     if renders is None:
         renders = [] if render is None else [render]
-    outcome = {"v": 10, "at": 4.0, "session": "S", "gate_contract": "binary-v1",
+    outcome = {"v": 11, "at": 4.0, "session": "S", "gate_contract": "binary-v1",
                "event": "turn_outcome", "channel_id": "C1", "trigger_ts": "1.0",
                "turn_id": "t1", "kind": "silence", "detached_started": False,
                "stream_build_present": stream_build_present, "destinations": [], "edits": []}
     outcome.update(outcome_extra or {})
     return [
-        {"v": 10, "at": 1.0, "session": "S", "gate_contract": "binary-v1",
+        {"v": 11, "at": 1.0, "session": "S", "gate_contract": "binary-v1",
          "event": "session_start", "build": "abc"},
-        {"v": 10, "at": 2.0, "session": "S", "gate_contract": "binary-v1",
+        {"v": 11, "at": 2.0, "session": "S", "gate_contract": "binary-v1",
          "event": "turn_start", "channel_id": "C1", "trigger_ts": "1.0", "turn_id": "t1",
          "surface": "channel", "gated": False},
         *renders,
         outcome,
-        {"v": 10, "at": 5.0, "session": "S", "gate_contract": "binary-v1",
+        {"v": 11, "at": 5.0, "session": "S", "gate_contract": "binary-v1",
          "event": "session_end"},
     ]
 
@@ -1936,16 +1938,16 @@ def test_a_turn_outcome_attaches_the_reconsider_facts_and_only_then(sink):
     assert rows[1]["reconsider"] == {"outcome": "posted_revised", "passes": 2, "forced": False}
 
 
-# -------------------------- the CV9 checker invariants, per §5 — unchanged and graded at CV10
+# -------------------------- the CV9 checker invariants, per §5 — unchanged and graded at the current contract
 
-def _v10(event, **fields):
-    row = {"v": 10, "at": 3.0, "session": "S", "gate_contract": "binary-v1", "event": event}
+def _current(event, **fields):
+    row = {"v": 11, "at": 3.0, "session": "S", "gate_contract": "binary-v1", "event": event}
     row.update(fields)
     return row
 
 
 def _suppression(turn_id="t1", **over):
-    row = _v10("stale_send", channel_id="C1", trigger_ts="1.0", turn_id=turn_id,
+    row = _current("stale_send", channel_id="C1", trigger_ts="1.0", turn_id=turn_id,
               last_seen_ts="1.0", observed_latest_ts="2.0", scope="thread",
               surface="reply", guard_mode="buffered")
     row.update(over)
@@ -1953,7 +1955,7 @@ def _suppression(turn_id="t1", **over):
 
 
 def _start(pass_number, turn_id="t1", **over):
-    row = _v10("reconsider_start", at=4.0 + pass_number, channel_id="C1", trigger_ts="1.0",
+    row = _current("reconsider_start", at=4.0 + pass_number, channel_id="C1", trigger_ts="1.0",
               turn_id=turn_id, scope=["thread", "C1", "1.0"], observed_latest_ts="2.0")
     row["pass"] = pass_number
     row.update(over)
@@ -1961,7 +1963,7 @@ def _start(pass_number, turn_id="t1", **over):
 
 
 def _outcome(outcome="skipped", passes=1, turn_id="t1", **over):
-    row = _v10("reconsider_outcome", at=8.0, channel_id="C1", trigger_ts="1.0",
+    row = _current("reconsider_outcome", at=8.0, channel_id="C1", trigger_ts="1.0",
               turn_id=turn_id, outcome=outcome, passes=passes)
     row.update(over)
     return row
@@ -1971,14 +1973,14 @@ def _reconsider_session(*middle):
     """One UNGATED channel turn (no attempt_id anywhere — the join is turn_id alone) that ended
     stale_suppressed, with the reconsideration rows under test in the middle."""
     return [
-        _v10("session_start", at=1.0, build="abc"),
-        _v10("turn_start", at=2.0, channel_id="C1", trigger_ts="1.0", turn_id="t1",
+        _current("session_start", at=1.0, build="abc"),
+        _current("turn_start", at=2.0, channel_id="C1", trigger_ts="1.0", turn_id="t1",
             surface="channel", gated=False),
         *middle,
-        _v10("turn_outcome", at=9.0, channel_id="C1", trigger_ts="1.0", turn_id="t1",
+        _current("turn_outcome", at=9.0, channel_id="C1", trigger_ts="1.0", turn_id="t1",
             kind="stale_suppressed", detached_started=False, stream_build_present=False,
             destinations=[], edits=[]),
-        _v10("session_end", at=10.0),
+        _current("session_end", at=10.0),
     ]
 
 
@@ -2123,9 +2125,9 @@ def test_a_dm_stale_send_with_a_turn_id_and_no_turn_start_is_tolerated(tmp_path)
     population — and a file holding the suppression row WITHOUT that pair (a rotated head, a
     ledger written before the pair existed) must never read as a violation."""
     rows = [
-        _v10("session_start", at=1.0, build="abc"),
+        _current("session_start", at=1.0, build="abc"),
         _suppression(turn_id="dm-turn", at=2.0),
-        _v10("session_end", at=3.0),
+        _current("session_end", at=3.0),
     ]
     code, names = _run_checker(tmp_path, rows)
     assert (code, names) == (0, [])
@@ -2195,9 +2197,9 @@ def test_a_v9_stale_send_must_carry_its_turn_id(tmp_path):
     orphan = _suppression()
     orphan.pop("turn_id")
     code, names = _run_checker(tmp_path, [
-        _v10("session_start", at=1.0, build="abc"),
+        _current("session_start", at=1.0, build="abc"),
         orphan,
-        _v10("session_end", at=3.0),
+        _current("session_end", at=3.0),
     ])
     assert code == 1 and "stale_send_missing_turn_id" in names
 
@@ -2209,9 +2211,9 @@ def test_a_stale_send_turn_id_must_be_a_non_empty_string(tmp_path):
     each by name instead."""
     for bad in (None, 7, ""):
         code, names = _run_checker(tmp_path, [
-            _v10("session_start", at=1.0, build="abc"),
+            _current("session_start", at=1.0, build="abc"),
             _suppression(turn_id=bad),
-            _v10("session_end", at=3.0),
+            _current("session_end", at=3.0),
         ])
         assert code == 1 and "stale_send_missing_turn_id" in names, bad
 
@@ -2224,12 +2226,12 @@ def test_turn_start_and_turn_outcome_null_turn_ids_are_violations_not_silent_dro
     for event, name in (("turn_start", "turn_start_missing_field"),
                         ("turn_outcome", "turn_outcome_missing_field")):
         code, names = _run_checker(tmp_path, [
-            _v10("session_start", at=1.0, build="abc"),
-            _v10("turn_start", at=1.5, turn_id=None if event == "turn_start" else "t1",
+            _current("session_start", at=1.0, build="abc"),
+            _current("turn_start", at=1.5, turn_id=None if event == "turn_start" else "t1",
                 channel_id="C1", surface="channel"),
-            _v10("turn_outcome", at=2.0, turn_id=None if event == "turn_outcome" else "t1",
+            _current("turn_outcome", at=2.0, turn_id=None if event == "turn_outcome" else "t1",
                 kind="reply", destinations=[], stream_build_present=True, edits=[]),
-            _v10("session_end", at=3.0),
+            _current("session_end", at=3.0),
         ])
         assert code == 1 and name in names, event
 
@@ -2386,11 +2388,11 @@ def test_the_nested_turn_outcome_reconsider_payload_is_checked(tmp_path):
 
 
 def test_the_checker_skips_v8_and_v9_rows_rather_than_grading_them(tmp_path):
-    """The version moved, so the checker's older-contract rule now covers v9 as well as v8: a
-    mixed file across the deploy is the normal state of the world, and grading v9 rows by v10
-    rules — every one of which lacks `edits` — would invent violations out of correct
+    """The version moved, so the checker's older-contract rule covers v9 as well as v8: a
+    mixed file across the deploy is the normal state of the world, and grading v9 rows by
+    current rules — every one of which lacks `edits` — would invent violations out of correct
     history."""
-    assert plc.CONTRACT_VERSION == 10
+    assert plc.CONTRACT_VERSION == 11
     rows = [
         {"v": 8, "at": 1.0, "session": "S8", "gate_contract": "binary-v1",
          "event": "turn_start", "channel_id": "C1", "trigger_ts": "1.0", "turn_id": "old",
@@ -2404,8 +2406,8 @@ def test_the_checker_skips_v8_and_v9_rows_rather_than_grading_them(tmp_path):
          "event": "turn_outcome", "channel_id": "C1", "trigger_ts": "1.0", "turn_id": "older",
          "kind": "silence", "detached_started": False, "stream_build_present": False,
          "destinations": []},
-        _v10("session_start", at=2.0, build="abc"),
-        _v10("session_end", at=3.0),
+        _current("session_start", at=2.0, build="abc"),
+        _current("session_end", at=3.0),
     ]
     code, names = _run_checker(tmp_path, rows)
     assert (code, names) == (0, [])
@@ -2489,13 +2491,13 @@ def _edit_entry(**over):
 def _edit_session(edits, destinations=None):
     """One ungated channel turn whose turn_outcome carries the edits under test."""
     return [
-        _v10("session_start", at=1.0, build="abc"),
-        _v10("turn_start", at=2.0, channel_id="C1", trigger_ts="1.0", turn_id="t1",
+        _current("session_start", at=1.0, build="abc"),
+        _current("turn_start", at=2.0, channel_id="C1", trigger_ts="1.0", turn_id="t1",
              surface="channel", gated=False),
-        _v10("turn_outcome", at=9.0, channel_id="C1", trigger_ts="1.0", turn_id="t1",
+        _current("turn_outcome", at=9.0, channel_id="C1", trigger_ts="1.0", turn_id="t1",
              kind="reply", detached_started=False, stream_build_present=False,
              destinations=list(destinations or []), edits=edits),
-        _v10("session_end", at=10.0),
+        _current("session_end", at=10.0),
     ]
 
 

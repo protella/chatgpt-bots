@@ -21,7 +21,7 @@ import ast
 import asyncio
 import inspect
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -42,6 +42,8 @@ from message_processor.reconsideration import (RECONSIDER_FUSE_PASSES, draft_fen
 from message_processor.stale_send_guard import (COMMITTED, PENDING, ConversationWatermarks,
                                                 StaleSendSuppressed)
 from message_processor.turn_runtime import TurnRuntime
+from message_processor.base import MessageProcessor, committed_queue_coverage
+from message_processor.thread_manager import AsyncThreadStateManager
 from openai_client.api.responses import (ReconsiderationDecision,
                                          ReconsiderationDecisionError,
                                          STALE_RECONSIDERATION_RESPONSE_FORMAT)
@@ -943,6 +945,111 @@ def test_framing_items_never_advance_a_scope_and_presence_is_metadata_only():
     assert suppressing_ts_present(stream, NEWER_TS) is False
     assert reviewed_through_map(lease, stream) == {
         ("thread", CH, TRIGGER_TS): TRIGGER_TS}
+
+
+# ------------------------------------------------------------------ queue coverage
+
+
+class _DrainStub:
+    """The REAL drain over a real AsyncThreadStateManager, with nothing else of the processor."""
+
+    _dispatch_pending_batch = MessageProcessor._dispatch_pending_batch
+    _retire_covered_messages = MessageProcessor._retire_covered_messages
+
+    def __init__(self, manager: AsyncThreadStateManager):
+        self.thread_manager = manager
+        self.db = None
+        self._add_message_with_token_management = MagicMock()
+        self._format_user_content_with_username = lambda content, m: content
+        self._schedule_async_call = MagicMock(side_effect=self._first_step)
+
+    @staticmethod
+    def _first_step(coro: Any) -> None:
+        """Take the catch-up's first step (where the handler is invoked), then discard it."""
+        try:
+            coro.send(None)
+        except (StopIteration, TypeError):
+            pass
+        finally:
+            coro.close()
+
+    def log_info(self, *a, **k): pass
+    def log_debug(self, *a, **k): pass
+    def log_warning(self, *a, **k): pass
+    def log_error(self, *a, **k): pass
+
+
+def _queued_follow_up() -> Message:
+    """M2: the same thread's follow-up, queued behind the running turn's lock."""
+    return Message(text="and the second part?", user_id="U2", channel_id=CH,
+                   thread_id=TRIGGER_TS, attachments=[],
+                   metadata={"ts": NEWER_TS, "sender_id": "U2"})
+
+
+async def _drain_after(rig: "_Rig", manager: AsyncThreadStateManager) -> MagicMock:
+    """Run the finished turn's drain exactly as process_message's cleanup does."""
+    client = MagicMock()
+    client.message_handler = MagicMock()
+    # The stub carries only what the drain touches; the rig's message is the turn's own.
+    drain = cast(Any, _DrainStub(manager))
+    with patch.object(config, "queue_drain_linger_seconds", 0.0):
+        await drain._dispatch_pending_batch(
+            rig.message, client, f"{CH}:{TRIGGER_TS}",
+            coverage=committed_queue_coverage(rig.turn))
+    return client
+
+
+@pytest.mark.asyncio
+async def test_a_reply_that_answers_the_queued_follow_up_retires_it(events, monkeypatch):
+    """The incident: M1's final post is suppressed by M2 (queued behind the lock), the review
+    posts ONE revised reply covering both — and the drain must not answer M2 a second time."""
+    rig = _Rig(monkeypatch, script=[ReconsiderationDecision(
+        decision="post", text="answers both", answers_newer=True)])
+    rig.race()
+    reply_ts = await rig.run(rig.accepting_deliver())
+    assert rig.turn.reconsider.outcome == "posted_revised"
+    # The site commits the delivered surface, complete, before the turn's cleanup drains.
+    rig.turn.mark_destination_committed(first_ts=reply_ts, kind="reply", text="answers both",
+                                        channel_id=CH, thread_root_ts=TRIGGER_TS)
+    manager = AsyncThreadStateManager(db=None)
+    manager.enqueue_pending(f"{CH}:{TRIGGER_TS}", _queued_follow_up())
+
+    client = await _drain_after(rig, manager)
+
+    client.message_handler.assert_not_called()                # no catch-up turn
+    assert manager.pending_count(f"{CH}:{TRIGGER_TS}") == 0
+    assert manager._in_dispatch == {} and manager._dispatch_batches == {}
+    (row,) = _named(events, "queue_covered")
+    assert (row["channel_id"], row["source_ts"], row["covering_trigger_ts"], row["reply_ts"],
+            row["cause"]) == (CH, NEWER_TS, TRIGGER_TS, reply_ts, "reconsideration")
+    assert _named(events, "turn_outcome") == [] and _named(events, "visible_action") == []
+
+
+@pytest.mark.parametrize("decision", [
+    ReconsiderationDecision(decision="post", text="answers only the first", answers_newer=False),
+    ReconsiderationDecision(decision="skip", text=None),
+])
+@pytest.mark.asyncio
+async def test_without_a_coverage_claim_the_follow_up_drains_as_today(decision, events,
+                                                                      monkeypatch):
+    rig = _Rig(monkeypatch, script=[decision])
+    rig.race()
+    if decision.decision == "skip":
+        with pytest.raises(StaleSendSuppressed):
+            await rig.run(rig.accepting_deliver())
+    else:
+        reply_ts = await rig.run(rig.accepting_deliver())
+        rig.turn.mark_destination_committed(first_ts=reply_ts, kind="reply", text="x",
+                                            channel_id=CH, thread_root_ts=TRIGGER_TS)
+    assert rig.turn.queue_coverage is None
+    manager = AsyncThreadStateManager(db=None)
+    queued = _queued_follow_up()
+    manager.enqueue_pending(f"{CH}:{TRIGGER_TS}", queued)
+
+    client = await _drain_after(rig, manager)
+
+    assert client.message_handler.call_args.args[0] is queued     # its own catch-up turn
+    assert _named(events, "queue_covered") == []
 
 
 # =============================================================================== the sites
@@ -3068,7 +3175,7 @@ async def test_a_failed_tooled_call_still_reports_redone_and_grades_clean(events
     outcome = _named(events, "reconsider_outcome")[0]
     assert outcome["redone"] is False
 
-    envelope = {"v": 10, "session": "S", "gate_contract": "binary-v1"}
+    envelope = {"v": 11, "session": "S", "gate_contract": "binary-v1"}
     turn_id = rig.turn.turn_id
     rows = [dict(envelope, at=1.0, event="session_start", build="abc"),
             dict(envelope, at=2.0, event="turn_start", channel_id=CH, trigger_ts=TRIGGER_TS,

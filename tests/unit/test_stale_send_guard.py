@@ -784,7 +784,7 @@ def test_the_new_kind_is_in_the_vocabulary_and_the_contract_moved():
     # v8 = the single-stream events on top of the binary gate. The version moves whenever the
     # ledger's field set or event cardinality changes, and this assertion exists so a field change
     # cannot ship without someone bumping it deliberately.
-    assert pt.CONTRACT_VERSION == 10
+    assert pt.CONTRACT_VERSION == 11
     assert pt.GATE_CONTRACT == "binary-v1"
 
 

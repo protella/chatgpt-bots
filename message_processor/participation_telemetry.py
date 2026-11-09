@@ -74,6 +74,12 @@ EVENTS.
                   queued attempt that a later catch-up turn absorbed: `attempt_id` is the
                   QUEUED source, and the `batched_into_*` fields name the successor turn that
                   answered on its behalf. See the linkage rule below.
+  queue_covered   DIAGNOSTIC, never terminal, and NEVER part of any denominator. One line per
+                  queued message RETIRED without a catch-up turn because a reconsidered reply
+                  already answered it (`cause="reconsideration"`): `source_ts` is the queued
+                  message, `covering_trigger_ts` the turn whose reply covered it, `reply_ts`
+                  that reply. A gated source carries its own (already `queued`-closed)
+                  `attempt_id`, exactly as `queue_link` does; nothing else is emitted for it.
   reaction        one attempt at one emoji: operation (add/remove) x result (added /
                   already_present / refused / failed / removed / remove_failed).
   turn_start      a turn opened (v8). Keyed by `turn_id`, not `attempt_id`: every turn writes
@@ -230,7 +236,10 @@ logger = setup_logger(name="slack_bot.ParticipationTelemetry")
 #     destination kind vocabulary gains `correction_announcement` (the executor-synthesized
 #     disclosure post, recorded as a committed destination); every CV9 reconsideration field
 #     and invariant is preserved unchanged.
-CONTRACT_VERSION = 10
+# v11: the `queue_covered` event — a queued message may now end with no successor turn at all,
+#     retired because a reconsidered reply already answered it, so the events a queued message
+#     can produce changed (it is linked by `queue_covered` instead of `queue_link`).
+CONTRACT_VERSION = 11
 
 # WHICH gate produced these lines. The rich multi-signal classifier was "rich-v1"; the one-bit
 # wake gate is "binary-v1". A different gate is a different population even at the same
@@ -979,6 +988,21 @@ def queue_link(source_attempt_id: str, *, batched_into_attempt_id: Optional[str]
            batched_into_channel_id=batched_into_channel_id,
            batched_into_trigger_ts=batched_into_trigger_ts,
            batched_into_gate_required=batched_into_gate_required)
+
+
+def queue_covered(channel_id: Optional[str], *, thread_root_ts: Optional[str],
+                  source_ts: Optional[str], covering_trigger_ts: Optional[str],
+                  reply_ts: Optional[str], cause: str = "reconsideration",
+                  attempt_id: Optional[str] = None) -> None:
+    """One queued message retired instead of drained: a posted reply already answered it.
+
+    DIAGNOSTIC and never terminal. The queued message's gate attempt (if it had one) already
+    closed with `kind=queued`; this adds no second outcome, and no turn is opened for it — the
+    line is the whole record of where its answer went (`reply_ts`, posted by the turn that
+    `covering_trigger_ts` triggered)."""
+    record("queue_covered", channel_id=channel_id, attempt_id=attempt_id,
+           thread_root_ts=thread_root_ts, source_ts=source_ts,
+           covering_trigger_ts=covering_trigger_ts, reply_ts=reply_ts, cause=cause)
 
 
 def reaction(channel_id: Optional[str], trigger_ts: Optional[str], *,

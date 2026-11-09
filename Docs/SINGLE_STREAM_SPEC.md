@@ -2,7 +2,7 @@
 
 Status: **IMPLEMENTED** (August 2026) — kept because code and tests cite it as the reference
 for the single-stream channel context and the participation-ledger telemetry contract
-(v8–v10). Section numbers (§4/§5/§10/§11) are load-bearing; don't renumber.
+(v8–v11). Section numbers (§4/§5/§10/§11) are load-bearing; don't renumber.
 
 ## 0. Goal
 
@@ -276,7 +276,7 @@ calibration in memory.
   let-the-exchange-end guidance (react or stay silent on landed closers) — the previously tabled
   "last word" item lands here.
 
-## 10. Telemetry — contract CV8 (CV9 and CV10 addenda below)
+## 10. Telemetry — contract CV8 (CV9, CV10 and CV11 addenda below)
 
 (Authoritative event list; §16 describes usage in the battery.)
 - `visible_action` stays **gate-attempt-only** with its one-terminal-per-attempt invariant and
@@ -393,6 +393,18 @@ exists for. So:
   what a DM is excused from is the missing `turn_start`, never a missing head.
 - `CONTRACT_VERSION` does NOT move: no event gained, lost or changed a field. Only the
   population widened, and the counts say so on their face.
+
+### CV11 addendum — queue_covered (2026-11-09)
+
+- **`queue_covered`** — DIAGNOSTIC, never terminal, never in a denominator. One row per queued
+  message RETIRED without a catch-up turn because the finishing turn's reconsidered reply (a
+  committed, complete `posted_*` delivery whose decision claimed `answers_newer`) already
+  answered it: `channel_id`, `thread_root_ts`, `source_ts`, `covering_trigger_ts`, `reply_ts`,
+  `cause="reconsideration"`, plus the source's own `attempt_id` when it was gated (it already
+  closed `queued`, exactly as with `queue_link`). No `turn_outcome` or `visible_action` is
+  written for the retired message.
+- `CONTRACT_VERSION` moves 10 → 11: a queued message may now end with no successor turn. Every
+  CV10 rule is otherwise unchanged; v10 rows are skipped by the older-contract rule.
 
 ## 11. Config & pinned rules
 

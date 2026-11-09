@@ -2368,10 +2368,14 @@ def _render_wake_source(source: Any, *, index: int, total: int) -> str:
 STALE_RECONSIDERATION_DECISION_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["decision", "text"],
+    "required": ["decision", "text", "answers_newer"],
     "properties": {
         "decision": {"enum": ["post", "force_post", "skip"]},
         "text": {"type": ["string", "null"]},
+        # The model's own claim that the reply it posts answers every newer message it was
+        # shown — what lets a queued follow-up be retired instead of answered twice. Never a
+        # timestamp: WHICH messages it covers is computed by the runner from the snapshot.
+        "answers_newer": {"type": "boolean"},
     },
 }
 
@@ -2390,11 +2394,12 @@ STALE_RECONSIDERATION_RESPONSE_FORMAT: Dict[str, Any] = {
 STALE_RECONSIDERATION_REDO_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["decision", "text", "interim"],
+    "required": ["decision", "text", "interim", "answers_newer"],
     "properties": {
         "decision": {"enum": ["post", "force_post", "skip", "redo"]},
         "text": {"type": ["string", "null"]},
         "interim": {"type": ["string", "null"]},
+        "answers_newer": {"type": "boolean"},
     },
 }
 
@@ -2422,6 +2427,10 @@ class ReconsiderationDecision:
     interim: Optional[str] = None
     tools_used: Tuple[str, ...] = ()
     tool_results: Tuple[Dict[str, Any], ...] = ()
+    # The reply posted fully answers every newer message the pass was shown. False whenever the
+    # field is absent or anything but a JSON true — a missed claim costs a duplicate reply, a
+    # wrong one silently drops a request.
+    answers_newer: bool = False
 
 
 class ReconsiderationDecisionError(Exception):
@@ -2437,14 +2446,16 @@ class ReconsiderationDecisionError(Exception):
 
 
 def _parse_reconsideration_payload(raw: str, *, allow_redo: bool = False
-                                   ) -> Optional[Tuple[str, Optional[str], Optional[str]]]:
-    """The strict schema's payload as (decision, text, interim), or None on ANY shape the
-    schema forbids.
+                                   ) -> Optional[Tuple[str, Optional[str], Optional[str], bool]]:
+    """The strict schema's payload as (decision, text, interim, answers_newer), or None on ANY
+    shape the schema forbids.
 
     Keys must be exactly the mode's set — {decision, text}, or {decision, text, interim} when
     redo was offered (additionalProperties is false and all are required) — the decision must
     be one of the mode's options (`redo` only when offered), and text/interim must be a string
-    or a real JSON null — nothing is coerced, exactly as `_parse_wake` refuses to guess. The
+    or a real JSON null — nothing is coerced, exactly as `_parse_wake` refuses to guess.
+    `answers_newer` is the one key whose absence is tolerated: missing, or anything but a JSON
+    true, it reads False — a decision is never lost over the coverage claim. The
     ENTIRE stripped text must be the JSON document: a strict structured output never carries
     prose around it, so surrounding content is schema-invalid, never salvaged by brace-hunting.
     """
@@ -2454,8 +2465,9 @@ def _parse_reconsideration_payload(raw: str, *, allow_redo: bool = False
     except (ValueError, TypeError):
         return None
     keys = {"decision", "text", "interim"} if allow_redo else {"decision", "text"}
-    if not isinstance(payload, dict) or set(payload.keys()) != keys:
+    if not isinstance(payload, dict) or set(payload.keys()) - {"answers_newer"} != keys:
         return None
+    answers_newer = payload.get("answers_newer") is True
     decision, draft = payload["decision"], payload["text"]
     interim = payload.get("interim")
     options = ("post", "force_post", "skip", "redo") if allow_redo else ("post", "force_post",
@@ -2466,7 +2478,7 @@ def _parse_reconsideration_payload(raw: str, *, allow_redo: bool = False
         return None
     if interim is not None and not isinstance(interim, str):
         return None
-    return decision, draft, interim
+    return decision, draft, interim, answers_newer
 
 
 def _completed_hosted_tools(response: Any) -> Tuple[Tuple[str, ...], Tuple[Dict[str, Any], ...]]:
@@ -2673,7 +2685,7 @@ async def create_reconsideration_decision(
         parsed = _parse_reconsideration_payload(out, allow_redo=redo_offered)
         if parsed is None:
             raise _fail("schema_invalid")
-        decision, draft, interim = parsed
+        decision, draft, interim, answers_newer = parsed
         if draft is not None and not draft.strip():
             draft = None                       # whitespace-only ≡ null (§4d)
         if interim is not None and not interim.strip():
@@ -2697,7 +2709,9 @@ async def create_reconsideration_decision(
                                     else ((), ()))
         _close_attempt(attempt_sink, attempts, status="ok", usage=usage_captured)
         return ReconsiderationDecision(decision=decision, text=draft, interim=interim,
-                                       tools_used=tools_used, tool_results=tool_results)
+                                       tools_used=tools_used, tool_results=tool_results,
+                                       answers_newer=answers_newer and decision in (
+                                           "post", "force_post"))
     finally:
         _close_attempt_error(attempt_sink, attempts, usage_captured)
 

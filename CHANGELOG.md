@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.4.11] - 2026-11-09
+
+### 🐛 Fixed
+
+- **No second answer to a follow-up the reply already covered.** When a follow-up arrived while
+  the bot was still answering, the bot rewrote its reply to cover both messages, then answered the
+  follow-up again on its own a few seconds later. When the rewritten reply already answers the
+  waiting follow-up, that follow-up is now dropped. One with a file attached, or one the reply
+  didn't fully answer, is still answered as before.
+- **Tags in a rewritten draft stay real tags.** Asked to tidy up a message that @-mentioned people
+  or other bots, the reply dropped the bot's own tag and turned the others into plain text, so the
+  draft couldn't be pasted as-is. Tags that are part of the text, the bot's own included, now come
+  back as real mentions, including in streamed replies. The bot still never responds to its own
+  posts.
+
+### 🔧 Changed
+
+- **Dependencies:** openai 3.46.0, pypdf 7.0.0, pandas 3.1.1 (plus coverage and pytest-env).
+
 ## [3.4.10] - 2026-11-03
 
 ### 🐛 Fixed

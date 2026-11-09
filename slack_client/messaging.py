@@ -40,6 +40,8 @@ from slack_client.event_handlers.feedback import (
 )
 from slack_client._host import _Host
 from slack_client.formatting.blocks import extract_supplementary_text
+from slack_client.formatting.text import (encode_outbound_chunk,
+                                          split_streamable_name_mention)
 from slack_client.normalizer import TimestampError, parse_ts
 from slack_client.utilities import is_user_shaped_id, strip_citations
 
@@ -425,6 +427,25 @@ def _mention_rewriter(client: Any) -> Callable[[str], str]:
     return lambda chunk: _BOT_OBJECT_MENTION_RE.sub(_sub, chunk)
 
 
+def _name_encoder(client: Any) -> Callable[[str, str], str]:
+    """"@Name" -> `<@ID>` for one prose chunk, given the character before it. The name map is
+    built once, on the first chunk that carries an "@". With no bot to ask, chunks pass as-is."""
+    build = getattr(client, "_build_name_to_id_map", None)
+    lut: List[Dict[str, str]] = []
+
+    def _encode(chunk: str, prev: str) -> str:
+        if not chunk or "@" not in chunk or not callable(build):
+            return chunk
+        if not lut:
+            try:
+                lut.append(build() or {})
+            except Exception:  # noqa: BLE001 — a cache read never breaks a send
+                lut.append({})
+        return encode_outbound_chunk(chunk, lut[0], prev)
+
+    return _encode
+
+
 def rewrite_bot_object_mentions(client: Any, text: str) -> str:
     """Outbound text with every `<@B…>` made postable: the bot's USER id when the cache knows it,
     otherwise the plain word `@bot`. Code spans are left exactly as written, and text with no such
@@ -617,6 +638,11 @@ class NativeStreamSession:
         # saw open.
         self._in_fence: bool = False
         self._in_inline: bool = False
+        # The last RAW character already released: whether an "@" opening the next delta follows
+        # a word character (an email, never a mention) is decided against it.
+        self._prev: str = ""
+        # The part of `_held` that is an unfinished "@Name" candidate (empty otherwise).
+        self._held_name: str = ""
 
     @visible_mutation
     async def start(self, initial_text: str = "", lease: Any = None) -> bool:
@@ -690,30 +716,58 @@ class NativeStreamSession:
         segments, self._in_fence, self._in_inline = _code_spans(
             scannable, in_fence=self._in_fence, in_inline=self._in_inline, terminal=False)
         rewrite = _mention_rewriter(self._owner)
+        encode = _name_encoder(self._owner)
         held = ""
+        held_name = ""
+        prev = self._prev
         out: List[str] = []
         last = len(segments) - 1
         for index, (chunk, is_code) in enumerate(segments):
             if is_code:
                 out.append(chunk)               # quoted verbatim, mentions and all
+                prev = chunk[-1:] or prev
                 continue
             if index == last:
                 # Only the FINAL prose run can still grow: anything before it is already
-                # terminated by the code run that follows.
+                # terminated by the code run that follows. A trailing "@Cl" may still become
+                # "@Claude", so it waits exactly like an unfinished `<@B…`.
                 chunk, held = split_streamable_bot_mention(chunk)
-            out.append(rewrite(chunk))
+                if not held:
+                    chunk, held = split_streamable_name_mention(chunk, prev)
+                    held_name = held
+            out.append(encode(rewrite(chunk), prev))
+            prev = chunk[-1:] or prev
+        self._prev = prev
         self._held = held + ticks
+        self._held_name = held_name
         return "".join(out)
 
     def _flush(self) -> str:
         """The stream is over: everything held goes out, since no delta can complete it now."""
         pending, self._held = self._held, ""
+        self._held_name = ""
         if not pending:
             return ""
         segments, self._in_fence, self._in_inline = _code_spans(
             pending, in_fence=self._in_fence, in_inline=self._in_inline, terminal=False)
         rewrite = _mention_rewriter(self._owner)
-        return "".join(chunk if is_code else rewrite(chunk) for chunk, is_code in segments)
+        encode = _name_encoder(self._owner)
+        out: List[str] = []
+        for chunk, is_code in segments:
+            out.append(chunk if is_code else encode(rewrite(chunk), self._prev))
+            self._prev = chunk[-1:] or self._prev
+        return "".join(out)
+
+    def withdraw_held_name(self) -> str:
+        """Give back a held, unfinished "@Name" candidate: it leaves the hold AND `_sent`, so a
+        part roll can carry it whole into the next part instead of finish() resolving half a
+        name. Returns the withdrawn raw text ("" when nothing of that kind is held)."""
+        fragment = self._held_name
+        if not fragment or self._held != fragment or not self._sent.endswith(fragment):
+            return ""
+        self._held = self._held_name = ""
+        self._sent = self._sent[:-len(fragment)]
+        return fragment
 
     @visible_mutation
     async def update(self, cumulative_text: str) -> bool:
@@ -1990,6 +2044,7 @@ class SlackMessagingMixin(_Host):
             # Strip MCP citations from text before sending to Slack
             text = strip_citations(text)
             text = rewrite_bot_object_mentions(self, text)
+            text = self._encode_mentions(text)
             await self.app.client.chat_update(  # unleased-ok: inside update_message, which authorizes at its entry when a caller supplies a lease
                 channel=channel_id,
                 ts=message_id,
@@ -4436,7 +4491,7 @@ class SlackMessagingMixin(_Host):
             # skip the markdown conversion to avoid double-processing
             if text.startswith("✨") or text.startswith("*Enhanced Prompt:*") or text.startswith("Enhancing your prompt:"):
                 # This is an enhanced prompt - it already has proper Slack formatting
-                formatted_text = text
+                formatted_text = self._encode_mentions(text)
             else:
                 # Format text for Slack using markdown conversion
                 formatted_text = self.format_text(text)
