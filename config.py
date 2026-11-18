@@ -114,12 +114,12 @@ def pipeline_status(stage: str, default: str, **fmt) -> str:
 
 
 # Model knowledge cutoff dates
-# Supported models: gpt-6-astra (default), gpt-6.1-sol, gpt-6.1-terra, gpt-6-luna, gpt-5.6-sol, gpt-5.6-terra,
+# Supported models: gpt-6.2-astra (default), gpt-6.2-sol, gpt-6.1-terra, gpt-6-luna, gpt-5.6-sol, gpt-5.6-terra,
 # gpt-5.6-luna, gpt-5.5 (gpt-6-luna doubles as the utility model)
 MODEL_KNOWLEDGE_CUTOFFS = {
-    # GPT-6 Astra (April 2026 cutoff, 1.05M context window, released September 3, 2026)
-    "gpt-6-astra": "April 30, 2026",
-    "gpt-6.1-sol": "April 30, 2026",
+    # GPT-6.2 Astra + Sol (1.05M context, 128K max output, released November 17, 2026)
+    "gpt-6.2-astra": "May 18, 2026",
+    "gpt-6.2-sol": "June 1, 2026",
     "gpt-6.1-terra": "June 1, 2026",
     "gpt-6-luna": "May 18, 2026",
 
@@ -136,7 +136,7 @@ MODEL_KNOWLEDGE_CUTOFFS = {
 }
 
 # The full user-selectable model set (order = modal display order)
-SUPPORTED_CHAT_MODELS = ["gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna",
+SUPPORTED_CHAT_MODELS = ["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.1-terra", "gpt-6-luna",
                          "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"]
 
 # What OPENAI_SERVICE_TIER may say. `standard` is OUR name for "send no service_tier at all" —
@@ -145,9 +145,20 @@ SUPPORTED_CHAT_MODELS = ["gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-l
 # honored only on the models below; everything else pays standard rates for nothing.
 SUPPORTED_SERVICE_TIERS = ("standard", "fast")
 # All verified live: `service_tier="fast"` returns 200 on each (5.6-sol/astra 2026-09-08;
-# gpt-6-luna 2026-09-23; gpt-6.1-sol 2026-09-29; gpt-6.1-terra 2026-10-28; served tier echoes `fast`).
-FAST_SERVICE_TIER_MODELS = frozenset({"gpt-5.6-sol", "gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra",
-                                      "gpt-6-luna"})
+# gpt-6-luna 2026-09-23; gpt-6.1-sol 2026-09-29; gpt-6.1-terra 2026-10-28; gpt-6.2-astra and
+# gpt-6.2-sol 2026-11-17; served tier echoes `fast`).
+FAST_SERVICE_TIER_MODELS = frozenset({"gpt-5.6-sol", "gpt-6.1-terra", "gpt-6-luna",
+                                      "gpt-6.2-astra", "gpt-6.2-sol"})
+
+# A retired chat model -> the model that replaced it (owner, 2026-11-17: everyone on GPT-6 Astra
+# or GPT-6.1 Sol moves to the 6.2 release of the same tier, chosen or not). Read by the every-boot
+# DB normalizer (user prefs, thread overrides, channel settings). gpt-6-sol goes straight to the
+# current Sol rather than through 6.1.
+RETIRED_MODEL_SUCCESSORS = {
+    "gpt-6-sol": "gpt-6.2-sol",
+    "gpt-6.1-sol": "gpt-6.2-sol",
+    "gpt-6-astra": "gpt-6.2-astra",
+}
 
 # The image models a channel or a person may select. Promoted here from the literal that used to
 # live inside the personal modal so the modal's option list and the channel resolver's allowlist
@@ -166,6 +177,8 @@ SUPPORTED_VERBOSITIES = ("low", "medium", "high")
 # GPT-6 Astra verified live 2026-09-08: low/medium/high/xhigh/max return 200; BOTH `none` and
 # `minimal` 400 with "Supported values are: 'low', 'medium', 'high', 'xhigh', and 'max'".
 # GPT-6.1 Sol verified live 2026-09-29: Astra's exact ladder (`none` and `minimal` both 400).
+# GPT-6.2 Astra and GPT-6.2 Sol verified live 2026-11-17: the same ladder (`none`/`minimal` 400,
+# temperature 400, verbosity / configuration_update / fast tier / prompt_cache_options all 200).
 # GPT-6 Luna verified live 2026-09-23: it carries the 5.6 ladder (`none` legal, `minimal` 400),
 # so GPT6_EFFORTS is the Astra/6.1-Sol ladder, not the family's. GPT-6.1 Terra verified live
 # 2026-10-28: Luna's shape (`none` legal, `minimal` 400, sampling only at `none`).
@@ -184,14 +197,15 @@ MIGRATED_EFFORTS = frozenset({"none", "minimal"})
 
 
 def _no_none_ladder(model: str) -> bool:
-    """Whether `model` is on the ladder without `none`: Astra and 6.1 Sol.
+    """Whether `model` is on the ladder without `none`: Astra, 6.1 Sol and both 6.2 models.
 
     ONE predicate, shared by `effort_ladder`, `clamp_effort` and `supports_sampling`. Astra and
-    gpt-6.1-sol (verified live 2026-09-29: `none`/`minimal` 400, sampling 400) are the named
+    gpt-6.1-sol (verified live 2026-09-29: `none`/`minimal` 400, sampling 400), gpt-6.2-astra and
+    gpt-6.2-sol (both verified live 2026-11-17, same shape) are the named
     exceptions; Luna, 6.1 Terra and any other `gpt-6*` carry the full `none..max` ladder, so a
     `startswith("gpt-6")` test here would clamp their legal `none` away.
     """
-    return (model or "").startswith(("gpt-6-astra", "gpt-6.1-sol"))
+    return (model or "").startswith(("gpt-6-astra", "gpt-6.1-sol", "gpt-6.2-astra", "gpt-6.2-sol"))
 
 
 def effective_channel_model(stored: Optional[str], fallback: str) -> str:
@@ -265,7 +279,7 @@ def supports_sampling(model: str, effort: str) -> bool:
     tolerated but any other value 400s ("'temperature' is not supported with this model"),
     and `top_p` 400s at every value including 1.0. So neither key is sent on Astra;
     relying on a tolerated value is how the next release breaks us. GPT-6.1 Sol behaves
-    identically (verified live 2026-09-29).
+    identically (verified live 2026-09-29), as do GPT-6.2 Astra and Sol (2026-11-17).
 
     5.5, the 5.6 family, GPT-6 Luna (verified live 2026-09-23) and GPT-6.1 Terra (2026-10-28) accept them only at
     `effort == "none"`; every other effort is a reasoning turn where temperature is forced to 1.0.
@@ -375,7 +389,7 @@ class BotConfig:
         default_factory=lambda: os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY") or "")
     
     # Model configuration
-    gpt_model: str = field(default_factory=lambda: os.getenv("GPT_MODEL", "gpt-6-astra"))
+    gpt_model: str = field(default_factory=lambda: os.getenv("GPT_MODEL", "gpt-6.2-astra"))
     utility_model: str = field(default_factory=lambda: os.getenv("UTILITY_MODEL", "gpt-6-luna"))
     image_model: str = field(
         default_factory=lambda: os.getenv("GPT_IMAGE_MODEL", "gpt-image-2.5-sunburst"))
@@ -1345,7 +1359,7 @@ class BotConfig:
         400k window with a 50k reserve.
 
         Args:
-            model: Model name (e.g., 'gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.5')
+            model: Model name (e.g., 'gpt-6.2-astra', 'gpt-5.6-sol', 'gpt-5.5')
 
         Returns:
             Buffered token limit for safe operation

@@ -250,7 +250,7 @@ class SettingsModal(LoggerMixin):
         from message_processor.channel_steering import POLICY_MAX_CHARS
         from message_processor.participation import MODE_TO_LEVEL, VALID_LEVELS
 
-        from config import (SUPPORTED_CHAT_MODELS, SUPPORTED_IMAGE_MODELS,
+        from config import (MIGRATED_EFFORTS, SUPPORTED_CHAT_MODELS, SUPPORTED_IMAGE_MODELS,
                             SUPPORTED_VERBOSITIES, clamp_effort, effective_channel_model,
                             effort_ladder)
 
@@ -312,10 +312,17 @@ class SettingsModal(LoggerMixin):
         # default effort is not necessarily one this channel's model accepts, and naming a value
         # the channel cannot run is the disagreement in a different place.
         effective_model = effective_channel_model(cs.get("model"), config.gpt_model)
+        # An explicit `none`/`minimal` carries the migration rule, not a fallback: switching a
+        # Luna channel at `none` to Astra or a 6.2 model must land on `low`, as the personal modal
+        # does. Left raw, `_select` renders it as inherit and a plain Save writes NULL. NULL stays
+        # NULL (inheritance is a choice), and other off-ladder rungs keep the inherit rendering.
+        stored_effort = cs.get("reasoning_effort")
+        if stored_effort in MIGRATED_EFFORTS:
+            stored_effort = clamp_effort(effective_model, stored_effort)
         effort_element = _select(
             "channel_reasoning_effort",
             [(e, e) for e in effort_ladder(effective_model)],
-            cs.get("reasoning_effort"),
+            stored_effort,
             _workspace_default(clamp_effort(effective_model, config.default_reasoning_effort)),
         )
         verbosity_element = _select(
@@ -954,7 +961,7 @@ class SettingsModal(LoggerMixin):
         blocks.append(reasoning_block)
 
         # Add note about xhigh reasoning and temperature availability. The sampling sentence only
-        # where the ladder has a `none`: Astra and 6.1 Sol never take temperature/top_p.
+        # where the ladder has a `none`: Astra, 6.1 Sol and 6.2 Astra/Sol never take temperature/top_p.
         effort_note = "_Extra High reasoning provides maximum accuracy but is slower and more expensive."
         if "none" in effort_values:
             effort_note += " Temperature/Top P controls are available when reasoning is set to None."
@@ -1639,7 +1646,7 @@ class SettingsModal(LoggerMixin):
 
         # Check if both temperature and top_p are changed for models that support them
         # (gpt-5.5, the 5.6 family and GPT-6 Luna support temp/top_p only with
-        # reasoning=none; Astra and 6.1 Sol never do)
+        # reasoning=none; Astra, 6.1 Sol and 6.2 Astra/Sol never do)
         from config import supports_sampling
         supports_temp = supports_sampling(model, validated.get('reasoning_effort') or '')
 
@@ -1673,8 +1680,8 @@ class SettingsModal(LoggerMixin):
         display_names = {
             # Taglines follow OpenAI's own model classification (developers.openai.com/api/docs/models
             # and learn.chatgpt.com/docs/models, read 2026-09-09), shortened to fit a picker row.
-            'gpt-6-astra': 'GPT-6 Astra (Most capable)',
-            'gpt-6.1-sol': 'GPT-6.1 Sol (Complex work, near-Astra)',
+            'gpt-6.2-astra': 'GPT-6.2 Astra (Most capable)',
+            'gpt-6.2-sol': 'GPT-6.2 Sol (Complex work at lower cost)',
             'gpt-6.1-terra': 'GPT-6.1 Terra (Balanced, everyday work)',
             'gpt-6-luna': 'GPT-6 Luna (Fast and affordable)',
             'gpt-5.6-sol': 'GPT-5.6 Sol (Complex professional work)',

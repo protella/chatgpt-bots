@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.4.13] - 2026-11-17
+
+### ✨ Added
+
+- **GPT-6.2 Astra and GPT-6.2 Sol.** Both are in the model picker (personal, channel and thread
+  settings). GPT-6.2 Astra is the new default. Picking either one shows the Low–Max effort list,
+  hides Temperature/Top P, and keeps the fast-tier option.
+
+### 🔧 Changed
+
+- **Everyone on GPT-6 Astra or GPT-6.1 Sol moves to the 6.2 release of the same model,** whether
+  they picked it or inherited it — personal settings, thread overrides and channel settings alike.
+  GPT-6 Astra and GPT-6.1 Sol leave the picker. A saved "None" effort lands on "Low", which the
+  6.2 models require.
+- **Dependencies:** openai 3.54.0.
+
+### 🐛 Fixed
+
+- **Switching a channel's model no longer resets its effort.** Moving a channel set to "None"
+  effort onto a model without "None" showed the effort as "inherit", so saving silently switched
+  the channel to the workspace default. It now shows "Low", as the personal settings do.
+
 ## [3.4.11] - 2026-11-09
 
 ### 🐛 Fixed

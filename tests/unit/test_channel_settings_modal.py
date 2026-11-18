@@ -439,7 +439,10 @@ async def test_an_old_modal_submission_preserves_the_new_fields(capability_db):
 # substituting the old gpt-6-sol id and label back into this render reproduces 6db10da8…ea6531.
 # RE-PINNED 2026-10-28 (GPT-6.1 Terra added). The delta is the one new picker row only:
 # stripping the gpt-6.1-terra option from the model select reproduces 0d3b281e…ad17f1ac.
-_PERSONAL_MODAL_GOLDEN = "f3f52a6fdb735dafd3a8416a2613f004ec9420065ce8d001abacdbd155b042c5"
+# RE-PINNED 2026-11-17 (gpt-6.2-astra + gpt-6.2-sol replace gpt-6-astra + gpt-6.1-sol). The delta
+# is the two top picker rows only: substituting the old gpt-6-astra / gpt-6.1-sol ids and labels
+# back in place of the 6.2 rows reproduces f3f52a6f…b042c5.
+_PERSONAL_MODAL_GOLDEN = "23517242ea9066f08d7c7ba2ff74ac21f7e7b2690eaa2e1a361010ec8d560580"
 
 
 @pytest.mark.asyncio
@@ -583,8 +586,33 @@ def test_a_gpt6_channel_is_offered_no_none_effort():
     channel pinned to Astra must not be shown a value that is a hard 400 there."""
     from config import GPT6_EFFORTS
     view = _capability_modal().build_channel_settings_modal(
-        "C1", {"model": "gpt-6-astra"}, "tag_only")
+        "C1", {"model": "gpt-6.2-astra"}, "tag_only")
     block = next(b for b in view["blocks"] if b.get("block_id") == "channel_effort_block")
     values = [o["value"] for o in block["element"]["options"]]
     assert values == ["inherit", *GPT6_EFFORTS]
     assert "none" not in values
+
+
+@pytest.mark.parametrize("model", ["gpt-6.2-astra", "gpt-6.2-sol"])
+@pytest.mark.parametrize("stored", ["none", "minimal"])
+def test_a_none_channel_moved_to_a_no_none_model_renders_low(model, stored):
+    """A Luna channel at `none` switched to a no-`none` model re-renders with `low` selected,
+    not inherit — inherit would make a plain Save write NULL and run the workspace effort."""
+    view = _capability_modal().build_channel_settings_modal(
+        "C1", {"model": model, "reasoning_effort": stored}, "tag_only")
+    block = next(b for b in view["blocks"] if b.get("block_id") == "channel_effort_block")
+    assert block["element"]["initial_option"]["value"] == "low"
+
+
+def test_an_inheriting_channel_effort_stays_inherit_on_a_no_none_model():
+    view = _capability_modal().build_channel_settings_modal(
+        "C1", {"model": "gpt-6.2-sol", "reasoning_effort": None}, "tag_only")
+    block = next(b for b in view["blocks"] if b.get("block_id") == "channel_effort_block")
+    assert block["element"]["initial_option"]["value"] == "inherit"
+
+
+def test_a_luna_channel_keeps_its_none():
+    view = _capability_modal().build_channel_settings_modal(
+        "C1", {"model": "gpt-6-luna", "reasoning_effort": "none"}, "tag_only")
+    block = next(b for b in view["blocks"] if b.get("block_id") == "channel_effort_block")
+    assert block["element"]["initial_option"]["value"] == "none"

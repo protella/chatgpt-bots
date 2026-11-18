@@ -66,7 +66,7 @@ class TestDefaults:
         # Astra leads: the list order is the modal's display order, and the workspace default
         # belongs at the top of it.
         assert SUPPORTED_CHAT_MODELS == [
-            "gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna", "gpt-5.6-sol",
+            "gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.1-terra", "gpt-6-luna", "gpt-5.6-sol",
             "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"
         ]
 
@@ -81,7 +81,7 @@ class TestDefaults:
         monkeypatch.delenv("UTILITY_MODEL", raising=False)
         monkeypatch.delenv("UTILITY_REASONING_EFFORT", raising=False)
         fresh = BotConfig()
-        assert fresh.gpt_model == "gpt-6-astra"
+        assert fresh.gpt_model == "gpt-6.2-astra"
         # The utility model is GPT-6 Luna: `none` is legal there, as it was on 5.6 Luna.
         assert fresh.utility_model == "gpt-6-luna"
         assert fresh.utility_reasoning_effort == "none"
@@ -239,12 +239,12 @@ def _build(**kwargs):
 
 class TestGpt6RequestShape:
     def test_gpt6_sends_neither_sampling_key(self):
-        params = _build(model="gpt-6-astra", reasoning_effort="medium",
+        params = _build(model="gpt-6.2-astra", reasoning_effort="medium",
                         temperature=0.7, top_p=0.9)
         assert "temperature" not in params
         assert "top_p" not in params
 
-    @pytest.mark.parametrize("model", ["gpt-6-astra", "gpt-6.1-sol"])
+    @pytest.mark.parametrize("model", ["gpt-6.2-astra", "gpt-6.2-sol"])
     def test_gpt6_sends_neither_sampling_key_at_the_lowest_effort_either(self, model):
         # There is no `none` on this ladder, so there is no branch where sampling comes back.
         params = _build(model=model, reasoning_effort="none", temperature=0.7)
@@ -252,14 +252,14 @@ class TestGpt6RequestShape:
         assert params["reasoning"] == {"effort": "low"}      # clamped, not passed through
 
     def test_gpt6_cache_shape(self):
-        params = _build(model="gpt-6-astra", reasoning_effort="medium",
+        params = _build(model="gpt-6.2-astra", reasoning_effort="medium",
                         prompt_cache_key="thread-key", layout="channel")
         assert "prompt_cache_retention" not in params
         assert params["prompt_cache_key"] == "thread-key"
         assert params["prompt_cache_options"] == {"ttl": "30m"}
 
     def test_a_caller_supplied_cache_option_still_wins_on_gpt6(self):
-        params = _build(model="gpt-6-astra", reasoning_effort="medium",
+        params = _build(model="gpt-6.2-astra", reasoning_effort="medium",
                         prompt_cache_key="k", layout="channel",
                         prompt_cache_options={"ttl": "30m", "scope": "x"})
         assert params["prompt_cache_options"] == {"ttl": "30m", "scope": "x"}
@@ -270,7 +270,7 @@ class TestGpt6RequestShape:
          is the plain timeout twin's shipped gap on 5.x. Letting
         GPT-6 inherit it dropped both the key and the ttl on every call down that path.
         """
-        params = _build(model="gpt-6-astra", reasoning_effort="medium",
+        params = _build(model="gpt-6.2-astra", reasoning_effort="medium",
                         prompt_cache_key="thread-key", legacy_cache_params=False)
         assert params["prompt_cache_key"] == "thread-key"
         assert params["prompt_cache_options"] == {"ttl": "30m"}
@@ -335,13 +335,13 @@ class TestEffortOverride:
     """
 
     def test_gpt6_keeps_the_baseline_and_appends_the_item_last(self):
-        params = _build(model="gpt-6-astra", reasoning_effort="low", effort_override="high")
+        params = _build(model="gpt-6.2-astra", reasoning_effort="low", effort_override="high")
         assert params["reasoning"] == {"effort": "low"}          # the baseline, untouched
         assert params["input"][-1] == {"type": "configuration_update",
                                        "reasoning": {"effort": "high"}}
         assert len(params["input"]) == 2
 
-    @pytest.mark.parametrize("model", ["gpt-6-astra", "gpt-6.1-sol"])
+    @pytest.mark.parametrize("model", ["gpt-6.2-astra", "gpt-6.2-sol"])
     def test_the_overridden_value_is_clamped_too(self, model):
         # A stored `none` reaching the override path must not become a 400 in an input item.
         params = _build(model=model, reasoning_effort="medium", effort_override="none")
@@ -350,7 +350,7 @@ class TestEffortOverride:
     def test_the_item_survives_the_channel_layout(self):
         # `_CHANNEL_TYPED_ITEMS` does not carry `configuration_update`, so an item appended
         # BEFORE the allowlist runs is silently dropped. It must be appended after.
-        params = _build(model="gpt-6-astra", reasoning_effort="low", effort_override="high",
+        params = _build(model="gpt-6.2-astra", reasoning_effort="low", effort_override="high",
                         system_prompt="sys", layout="channel", prompt_cache_key="k")
         assert params["input"][-1]["type"] == "configuration_update"
         assert params["reasoning"] == {"effort": "low"}
@@ -362,7 +362,7 @@ class TestEffortOverride:
         assert len(params["input"]) == 1
 
     def test_no_override_appends_nothing_on_gpt6(self):
-        params = _build(model="gpt-6-astra", reasoning_effort="low")
+        params = _build(model="gpt-6.2-astra", reasoning_effort="low")
         assert len(params["input"]) == 1
         assert params["reasoning"] == {"effort": "low"}
 
@@ -387,7 +387,7 @@ class TestEffortOverride:
             await R.create_streaming_response_with_tools(
                 MagicMock(), messages=[{"role": "user", "content": "hi"}],
                 tools=[], stream_callback=None,
-                model="gpt-6-astra", reasoning_effort="low", effort_override="high")
+                model="gpt-6.2-astra", reasoning_effort="low", effort_override="high")
 
         assert captured["effort_override"] == "high"
         assert captured["reasoning_effort"] == "low"

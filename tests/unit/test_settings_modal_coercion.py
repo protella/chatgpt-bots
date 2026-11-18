@@ -221,7 +221,7 @@ class TestShapeTierGrid:
                                        "gpt-image-2.5-sunburst"])
     def test_every_image_model_renders_a_valid_modal(self, modal, model):
         blocks = modal._build_modal_blocks({"image_model": model, "image_size": "auto"},
-                                           selected_model="gpt-6-astra")
+                                           selected_model="gpt-6.2-astra")
         for element in _selects(blocks):
             valid = {opt["value"] for opt in element["options"]}
             assert element["initial_option"]["value"] in valid, element.get("action_id")
@@ -232,7 +232,7 @@ class TestAstraModalLadder:
     def modal(self):
         return SettingsModal(db=MagicMock())
 
-    @pytest.mark.parametrize("model", ["gpt-6-astra", "gpt-6.1-sol"])
+    @pytest.mark.parametrize("model", ["gpt-6.2-astra", "gpt-6.2-sol"])
     def test_the_personal_effort_ladder_for_astra_excludes_none(self, modal, model):
         from config import GPT6_EFFORTS
         blocks = modal._add_gpt55_settings({}, model)
@@ -252,7 +252,7 @@ class TestAstraModalLadder:
     def test_a_stored_none_clamps_to_a_value_the_ladder_offers(self, modal):
         # The submit-time clamp already stops the 400; what this stops is the modal advertising
         # a choice it will silently overwrite.
-        blocks = modal._add_gpt55_settings({"reasoning_effort": "none"}, "gpt-6-astra")
+        blocks = modal._add_gpt55_settings({"reasoning_effort": "none"}, "gpt-6.2-astra")
         block = next(b for b in blocks if b.get("block_id") == "reasoning_block_gpt54")
         assert block["accessory"]["initial_option"]["value"] == "low"
 
@@ -298,7 +298,7 @@ class TestFastTierControl:
 
     def test_the_checkbox_renders_for_an_eligible_model_when_the_gate_is_open(
             self, modal, monkeypatch):
-        blocks = self._blocks(modal, monkeypatch, tier="fast", model="gpt-6-astra")
+        blocks = self._blocks(modal, monkeypatch, tier="fast", model="gpt-6.2-astra")
         assert len(blocks) == 1
         accessory = blocks[0]["accessory"]
         assert blocks[0]["block_id"] == "service_tier_block"
@@ -323,7 +323,7 @@ class TestFastTierControl:
         assert "gpt-5.6-luna" not in text
 
     def test_the_admin_gate_wins_over_an_eligible_model(self, modal, monkeypatch):
-        blocks = self._blocks(modal, monkeypatch, tier="standard", model="gpt-6-astra")
+        blocks = self._blocks(modal, monkeypatch, tier="standard", model="gpt-6.2-astra")
         assert len(blocks) == 1 and blocks[0]["type"] == "context"
         assert "Disabled by your system administrator." in blocks[0]["elements"][0]["text"]
 
@@ -332,7 +332,7 @@ class TestFastTierControl:
         # DELETE a stored opt-in. `service_tier` is personal and never thread-scoped.
         from config import config
         monkeypatch.setattr(config, "openai_service_tier", "fast")
-        assert modal._fast_tier_blocks({"service_tier": "fast"}, "gpt-6-astra", "thread") == []
+        assert modal._fast_tier_blocks({"service_tier": "fast"}, "gpt-6.2-astra", "thread") == []
 
 
 class TestFastTierExtraction:
@@ -360,7 +360,7 @@ class TestFastTierExtraction:
         assert "service_tier" not in modal.validate_settings(
             {"model": "gpt-5.5", "service_tier": "fast"})
         assert modal.validate_settings(
-            {"model": "gpt-6-astra", "service_tier": "fast"})["service_tier"] == "fast"
+            {"model": "gpt-6.2-astra", "service_tier": "fast"})["service_tier"] == "fast"
 
 
 class TestTierUnderAuto:

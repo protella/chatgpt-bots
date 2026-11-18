@@ -816,9 +816,9 @@ class TestGpt6Astra:
 
     def test_astra_is_the_first_supported_model(self):
         from config import SUPPORTED_CHAT_MODELS
-        assert SUPPORTED_CHAT_MODELS[0] == "gpt-6-astra"
+        assert SUPPORTED_CHAT_MODELS[0] == "gpt-6.2-astra"
 
-    @pytest.mark.parametrize("model", ["gpt-6-astra", "gpt-6.1-sol"])
+    @pytest.mark.parametrize("model", ["gpt-6.2-astra", "gpt-6.2-sol"])
     def test_the_ladder_has_no_none(self, model):
         from config import effort_ladder
         ladder = effort_ladder(model)
@@ -839,18 +839,18 @@ class TestGpt6Astra:
     ])
     def test_clamp_effort_on_astra(self, stored, expected):
         from config import clamp_effort
-        assert clamp_effort("gpt-6-astra", stored) == expected
-        assert clamp_effort("gpt-6.1-sol", stored) == expected   # probed 2026-09-29: same ladder
+        assert clamp_effort("gpt-6.2-astra", stored) == expected
+        assert clamp_effort("gpt-6.2-sol", stored) == expected   # probed 2026-11-17: same ladder
 
     @pytest.mark.parametrize("model, effort, expected", [
         # GPT-6 rejects temperature and top_p at every effort — `temperature=1.0` is tolerated,
         # but the API's own error text calls the parameter unsupported, and relying on a
         # tolerated value is how the next release breaks us.
-        ("gpt-6-astra", "none", False),
-        ("gpt-6-astra", "low", False),
-        ("gpt-6-astra", "max", False),
-        ("gpt-6.1-sol", "none", False),
-        ("gpt-6.1-sol", "low", False),
+        ("gpt-6.2-astra", "none", False),
+        ("gpt-6.2-astra", "low", False),
+        ("gpt-6.2-astra", "max", False),
+        ("gpt-6.2-sol", "none", False),
+        ("gpt-6.2-sol", "low", False),
         # Luna, 5.5 and 5.6 accept both, but only on a non-reasoning turn.
         ("gpt-6-luna", "none", True),
         ("gpt-6-luna", "low", False),
@@ -876,17 +876,18 @@ class TestGpt6Astra:
 
     def test_the_knowledge_cutoff_is_registered(self):
         from config import MODEL_KNOWLEDGE_CUTOFFS
-        assert MODEL_KNOWLEDGE_CUTOFFS["gpt-6-astra"] == "April 30, 2026"
-        assert MODEL_KNOWLEDGE_CUTOFFS["gpt-6.1-sol"] == "April 30, 2026"
+        assert MODEL_KNOWLEDGE_CUTOFFS["gpt-6.2-astra"] == "May 18, 2026"
+        assert MODEL_KNOWLEDGE_CUTOFFS["gpt-6.2-sol"] == "June 1, 2026"
         assert MODEL_KNOWLEDGE_CUTOFFS["gpt-6.1-terra"] == "June 1, 2026"
 
     def test_get_model_token_limit_takes_the_1_05m_branch(self, mock_env):
         config = BotConfig()
-        assert config.get_model_token_limit("gpt-6-astra") == int(
+        assert config.get_model_token_limit("gpt-6.2-astra") == int(
             config.gpt54_max_tokens * config.gpt54_token_buffer_percentage)
         # …which is NOT the conservative 400k window an unknown model would get.
-        assert config.get_model_token_limit("gpt-6-astra") != config.get_model_token_limit(
+        assert config.get_model_token_limit("gpt-6.2-astra") != config.get_model_token_limit(
             "unknown-model")
+
 
 
 class TestFastTierPreference:
@@ -895,7 +896,7 @@ class TestFastTierPreference:
     def test_both_eligible_models_are_in_the_set(self):
         from config import FAST_SERVICE_TIER_MODELS
         assert FAST_SERVICE_TIER_MODELS == frozenset(
-            {"gpt-5.6-sol", "gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna"})
+            {"gpt-5.6-sol", "gpt-6.1-terra", "gpt-6-luna", "gpt-6.2-astra", "gpt-6.2-sol"})
         assert "gpt-5.6-luna" not in FAST_SERVICE_TIER_MODELS
         assert "gpt-5.5" not in FAST_SERVICE_TIER_MODELS
 
@@ -925,10 +926,10 @@ class TestChannelEffortAcrossFamilies:
     """
 
     @pytest.mark.parametrize("model, stored, expected", [
-        ("gpt-6-astra", "none", "low"),        # no `none` on this ladder -> migration guidance
-        ("gpt-6-astra", "minimal", "low"),     # legacy token, same landing
-        ("gpt-6-astra", "high", "high"),       # on the ladder: untouched
-        ("gpt-6-astra", "max", "max"),         # Astra has `max`, unlike 5.5
+        ("gpt-6.2-astra", "none", "low"),      # no `none` on this ladder -> migration guidance
+        ("gpt-6.2-astra", "minimal", "low"),   # legacy token, same landing
+        ("gpt-6.2-astra", "high", "high"),     # on the ladder: untouched
+        ("gpt-6.2-astra", "max", "max"),       # Astra has `max`, unlike 5.5
         ("gpt-5.6-sol", "minimal", "none"),    # 5.6 translates `minimal` its own way
     ])
     def test_a_known_effort_is_clamped_against_the_resolved_model(
@@ -940,7 +941,7 @@ class TestChannelEffortAcrossFamilies:
         assert profile["reasoning_effort"] == expected
 
     @pytest.mark.parametrize("model, stored", [
-        ("gpt-6-astra", "turbo"),    # no family has ever accepted it: corruption
+        ("gpt-6.2-astra", "turbo"),  # no family has ever accepted it: corruption
         ("gpt-5.5", "max"),          # a rung the modal renders, absent HERE: respec 6.2
     ])
     def test_an_off_ladder_value_still_falls_back_to_the_clamped_default(

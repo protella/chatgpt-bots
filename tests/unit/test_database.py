@@ -768,7 +768,7 @@ class TestV3MigrationBackup:
         live = db2.conn.execute(
             "SELECT model, reasoning_effort FROM user_preferences WHERE slack_user_id='U1'"
         ).fetchone()
-        assert (live["model"], live["reasoning_effort"]) == ("gpt-6-astra", "high")
+        assert (live["model"], live["reasoning_effort"]) == ("gpt-6.2-astra", "high")
 
         # ... and exactly one pre-v3-upgrade backup was taken.
         pre = _backups(tmp_path, "pre-v3-upgrade")
@@ -816,7 +816,7 @@ class TestV3MigrationBackup:
         snap = sqlite3.connect(str(tmp_path / "backups" / mirror))
         row = snap.execute(
             "SELECT model FROM user_preferences WHERE slack_user_id='U1'").fetchone()
-        assert row[0] == "gpt-6-astra"  # already lost — hence the earlier backup
+        assert row[0] == "gpt-6.2-astra"  # already lost — hence the earlier backup
         snap.close()
         db2.conn.close()
 

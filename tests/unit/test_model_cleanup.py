@@ -1,4 +1,4 @@
-"""Model lineup — gpt-6-astra, gpt-6.1-sol, gpt-6.1-terra, gpt-6-luna, the GPT-5.6 family (sol/terra/luna) and gpt-5.5 are
+"""Model lineup — gpt-6.2-astra, gpt-6.2-sol, gpt-6.1-terra, gpt-6-luna, the GPT-5.6 family (sol/terra/luna) and gpt-5.5 are
 the selectable chat models; gpt-6-luna doubles as the utility model. Covers the supported-model
 surface (picker, validation, token limits) and the startup migrations/normalizers for
 stale user/thread model selections (one-time everyone->sol swap + every-startup clamp).
@@ -45,7 +45,7 @@ def modal():
 
 def test_knowledge_cutoffs_only_supported_models():
     assert set(MODEL_KNOWLEDGE_CUTOFFS) == {
-        "gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna", "gpt-5.6-sol",
+        "gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.1-terra", "gpt-6-luna", "gpt-5.6-sol",
         "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "default"
     }
 
@@ -58,7 +58,7 @@ def test_model_picker_offers_supported_lineup(modal):
     model_block = next(b for b in blocks if b.get("block_id") == "model_block")
     options = [o["value"] for o in model_block["accessory"]["options"]]
     assert options == SUPPORTED_CHAT_MODELS
-    assert options == ["gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna",
+    assert options == ["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.1-terra", "gpt-6-luna",
                        "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"]
 
 
@@ -261,33 +261,33 @@ def test_the_normalizer_preserves_a_stored_astra_selection(temp_db):
     EVERY migration pass. A user could select Astra, use it, restart the bot, and find
     themselves silently back on Sol."""
     temp_db._run_migrations()
-    _insert_user(temp_db, "U1", "gpt-6-astra", "high")
+    _insert_user(temp_db, "U1", "gpt-6.2-astra", "high")
     temp_db.conn.execute(
         "INSERT INTO threads (thread_id, channel_id, thread_ts, config_json) VALUES (?, ?, ?, ?)",
-        ("C1:9", "C1", "9", json.dumps({"model": "gpt-6-astra", "reasoning_effort": "xhigh"})),
+        ("C1:9", "C1", "9", json.dumps({"model": "gpt-6.2-astra", "reasoning_effort": "xhigh"})),
     )
     temp_db._run_migrations()
 
     row = temp_db.conn.execute(
         "SELECT model, reasoning_effort FROM user_preferences WHERE slack_user_id = 'U1'"
     ).fetchone()
-    assert (row["model"], row["reasoning_effort"]) == ("gpt-6-astra", "high")
+    assert (row["model"], row["reasoning_effort"]) == ("gpt-6.2-astra", "high")
 
     cfg = json.loads(temp_db.conn.execute(
         "SELECT config_json FROM threads WHERE thread_id = 'C1:9'").fetchone()["config_json"])
-    assert cfg == {"model": "gpt-6-astra", "reasoning_effort": "xhigh"}
+    assert cfg == {"model": "gpt-6.2-astra", "reasoning_effort": "xhigh"}
 
 
 def test_the_normalizer_clamps_a_stored_none_effort_on_gpt6(temp_db):
     """`none` is a hard 400 on gpt-6 and it is the default UTILITY effort, so it is sitting in
     real rows today. OpenAI's own migration guidance is to start at `low`."""
     temp_db._run_migrations()
-    _insert_user(temp_db, "U1", "gpt-6-astra", "none")
-    _insert_user(temp_db, "U2", "gpt-6-astra", "minimal")
+    _insert_user(temp_db, "U1", "gpt-6.2-astra", "none")
+    _insert_user(temp_db, "U2", "gpt-6.2-astra", "minimal")
     _insert_user(temp_db, "U3", "gpt-5.6-sol", "none")     # still legal there — untouched
     temp_db.conn.execute(
         "INSERT INTO threads (thread_id, channel_id, thread_ts, config_json) VALUES (?, ?, ?, ?)",
-        ("C2:1", "C2", "1", json.dumps({"model": "gpt-6-astra", "reasoning_effort": "none"})),
+        ("C2:1", "C2", "1", json.dumps({"model": "gpt-6.2-astra", "reasoning_effort": "none"})),
     )
     temp_db._run_migrations()
 
@@ -300,7 +300,7 @@ def test_the_normalizer_clamps_a_stored_none_effort_on_gpt6(temp_db):
 
     cfg = json.loads(temp_db.conn.execute(
         "SELECT config_json FROM threads WHERE thread_id = 'C2:1'").fetchone()["config_json"])
-    assert cfg == {"model": "gpt-6-astra", "reasoning_effort": "low"}
+    assert cfg == {"model": "gpt-6.2-astra", "reasoning_effort": "low"}
 
 
 def test_the_normalizer_leaves_a_luna_none_alone(temp_db):
@@ -309,7 +309,7 @@ def test_the_normalizer_leaves_a_luna_none_alone(temp_db):
     temp_db._run_migrations()
     _insert_user(temp_db, "U1", "gpt-6-luna", "none")
     _insert_user(temp_db, "U2", "gpt-6-luna", "minimal")
-    _insert_user(temp_db, "U3", "gpt-6-astra", "none")
+    _insert_user(temp_db, "U3", "gpt-6.2-astra", "none")
     temp_db.conn.execute(
         "INSERT INTO threads (thread_id, channel_id, thread_ts, config_json) VALUES (?, ?, ?, ?)",
         ("C3:1", "C3", "1", json.dumps({"model": "gpt-6-luna", "reasoning_effort": "none"})),
@@ -322,7 +322,7 @@ def test_the_normalizer_leaves_a_luna_none_alone(temp_db):
             "SELECT slack_user_id, model, reasoning_effort FROM user_preferences")
     }
     assert rows == {"U1": ("gpt-6-luna", "none"), "U2": ("gpt-6-luna", "none"),
-                    "U3": ("gpt-6-astra", "low")}
+                    "U3": ("gpt-6.2-astra", "low")}
 
     cfg = json.loads(temp_db.conn.execute(
         "SELECT config_json FROM threads WHERE thread_id = 'C3:1'").fetchone()["config_json"])
@@ -330,38 +330,48 @@ def test_the_normalizer_leaves_a_luna_none_alone(temp_db):
 
 
 def test_the_normalizer_renames_gpt6_sol_to_its_successor(temp_db):
-    """gpt-6.1-sol replaced gpt-6-sol. Every stored Sol pick — user, thread, channel — moves to
-    the successor instead of being reset to the workspace default, and since 6.1 Sol has
-    Astra's ladder, a stored `none`/`minimal` lands on `low` the same boot. Run twice: the
-    normalizer runs on every startup and must converge."""
+    """Every retired id moves to its tier's successor (config.RETIRED_MODEL_SUCCESSORS) — user,
+    thread, channel — instead of being reset to the workspace default. Both successors carry
+    Astra's ladder, so a stored `none`/`minimal` lands on `low` the same boot; NULL stays NULL
+    and a Luna `none` is untouched. Run twice: the normalizer runs on every startup and must
+    converge."""
+    retired = [("gpt-6-sol", "gpt-6.2-sol"), ("gpt-6.1-sol", "gpt-6.2-sol"),
+               ("gpt-6-astra", "gpt-6.2-astra")]
     temp_db._run_migrations()
-    _insert_user(temp_db, "U1", "gpt-6-sol", "none")
-    _insert_user(temp_db, "U2", "gpt-6-sol", "minimal")
-    _insert_user(temp_db, "U3", "gpt-6-sol", "high")
-    _insert_user(temp_db, "U4", "gpt-6-sol")
+    expected_users, expected_threads, expected_channels = {}, {}, {}
+    for n, (old, new) in enumerate(retired):
+        for effort, landed in [("none", "low"), ("minimal", "low"), ("high", "high"),
+                               (None, None)]:
+            key = f"{n}{effort}"
+            _insert_user(temp_db, f"U{key}", old, effort)
+            if effort is None:   # the column defaults to 'medium'; NULL is a distinct state
+                temp_db.conn.execute(
+                    "UPDATE user_preferences SET reasoning_effort = NULL "
+                    "WHERE slack_user_id = ?", (f"U{key}",))
+            expected_users[f"U{key}"] = (new, landed)
+            cfg = {"model": old, "verbosity": "high"}
+            if effort is not None:
+                cfg["reasoning_effort"] = effort
+            temp_db.conn.execute(
+                "INSERT INTO threads (thread_id, channel_id, thread_ts, config_json) "
+                "VALUES (?, ?, ?, ?)", (f"T{key}:1", f"T{key}", "1", json.dumps(cfg)))
+            expected_threads[f"T{key}:1"] = {
+                **cfg, "model": new, **({"reasoning_effort": landed} if effort else {})}
+            temp_db.conn.execute(
+                "INSERT INTO channel_settings (channel_id, model, reasoning_effort) "
+                "VALUES (?, ?, ?)", (f"C{key}", old, effort))
+            expected_channels[f"C{key}"] = (new, landed)
+    _insert_user(temp_db, "ULUNA", "gpt-6-luna", "none")
+    expected_users["ULUNA"] = ("gpt-6-luna", "none")
+    luna_cfg = {"model": "gpt-6-luna", "reasoning_effort": "none"}
     temp_db.conn.execute(
-        "UPDATE user_preferences SET reasoning_effort = NULL WHERE slack_user_id = 'U4'")
-    _insert_user(temp_db, "U5", "gpt-6-luna", "none")
-    threads = {
-        "T1:1": {"model": "gpt-6-sol", "reasoning_effort": "none", "verbosity": "high"},
-        "T2:1": {"model": "gpt-6-sol", "reasoning_effort": "minimal"},
-        "T3:1": {"model": "gpt-6-sol", "reasoning_effort": "high", "temperature": 0.4},
-        "T4:1": {"model": "gpt-6-sol"},
-        "T5:1": {"model": "gpt-6-luna", "reasoning_effort": "none"},
-    }
-    for thread_id, cfg in threads.items():
-        channel_id, ts = thread_id.split(":")
-        temp_db.conn.execute(
-            "INSERT INTO threads (thread_id, channel_id, thread_ts, config_json) "
-            "VALUES (?, ?, ?, ?)", (thread_id, channel_id, ts, json.dumps(cfg)))
-    for channel_id, model, effort in [("C1", "gpt-6-sol", "none"),
-                                      ("C2", "gpt-6-sol", "minimal"),
-                                      ("C3", "gpt-6-sol", "high"),
-                                      ("C4", "gpt-6-sol", None),
-                                      ("C5", "gpt-6-luna", "none")]:
-        temp_db.conn.execute(
-            "INSERT INTO channel_settings (channel_id, model, reasoning_effort) VALUES (?, ?, ?)",
-            (channel_id, model, effort))
+        "INSERT INTO threads (thread_id, channel_id, thread_ts, config_json) "
+        "VALUES (?, ?, ?, ?)", ("TLUNA:1", "TLUNA", "1", json.dumps(luna_cfg)))
+    expected_threads["TLUNA:1"] = luna_cfg
+    temp_db.conn.execute(
+        "INSERT INTO channel_settings (channel_id, model, reasoning_effort) VALUES (?, ?, ?)",
+        ("CLUNA", "gpt-6-luna", "none"))
+    expected_channels["CLUNA"] = ("gpt-6-luna", "none")
 
     temp_db._run_migrations()
     temp_db._run_migrations()
@@ -371,33 +381,58 @@ def test_the_normalizer_renames_gpt6_sol_to_its_successor(temp_db):
         for r in temp_db.conn.execute(
             "SELECT slack_user_id, model, reasoning_effort FROM user_preferences")
     }
-    assert users == {"U1": ("gpt-6.1-sol", "low"), "U2": ("gpt-6.1-sol", "low"),
-                     "U3": ("gpt-6.1-sol", "high"), "U4": ("gpt-6.1-sol", None),
-                     "U5": ("gpt-6-luna", "none")}
-
+    assert users == expected_users
     stored = {
         r["thread_id"]: json.loads(r["config_json"])
         for r in temp_db.conn.execute("SELECT thread_id, config_json FROM threads")
     }
-    assert stored == {
-        "T1:1": {"model": "gpt-6.1-sol", "reasoning_effort": "low", "verbosity": "high"},
-        "T2:1": {"model": "gpt-6.1-sol", "reasoning_effort": "low"},
-        "T3:1": {"model": "gpt-6.1-sol", "reasoning_effort": "high", "temperature": 0.4},
-        "T4:1": {"model": "gpt-6.1-sol"},
-        "T5:1": {"model": "gpt-6-luna", "reasoning_effort": "none"},
-    }
-
+    assert stored == expected_threads
     channels = {
         r["channel_id"]: (r["model"], r["reasoning_effort"])
         for r in temp_db.conn.execute(
             "SELECT channel_id, model, reasoning_effort FROM channel_settings")
     }
-    assert channels == {"C1": ("gpt-6.1-sol", "low"), "C2": ("gpt-6.1-sol", "low"),
-                        "C3": ("gpt-6.1-sol", "high"), "C4": ("gpt-6.1-sol", None),
-                        "C5": ("gpt-6-luna", "none")}
+    assert channels == expected_channels
 
+
+@pytest.mark.parametrize("model", ["gpt-6.2-astra", "gpt-6.2-sol"])
+def test_the_normalizer_clamps_a_gpt62_none_to_low(temp_db, model):
+    """GPT-6.2 Astra and Sol carry Astra's ladder (probed 2026-11-17): a stored `none` or
+    `minimal` on a user, thread or channel lands on `low` every boot; `high` is untouched."""
+    temp_db._run_migrations()
+    _insert_user(temp_db, "U1", model, "none")
+    _insert_user(temp_db, "U2", model, "minimal")
+    _insert_user(temp_db, "U3", model, "high")
+    temp_db.conn.execute(
+        "INSERT INTO threads (thread_id, channel_id, thread_ts, config_json) VALUES (?, ?, ?, ?)",
+        ("C9:1", "C9", "1", json.dumps({"model": model, "reasoning_effort": "none"})),
+    )
+    for channel_id, effort in [("C1", "none"), ("C2", "minimal"), ("C3", "high")]:
+        temp_db.conn.execute(
+            "INSERT INTO channel_settings (channel_id, model, reasoning_effort) VALUES (?, ?, ?)",
+            (channel_id, model, effort))
+
+    temp_db._run_migrations()
+
+    users = {
+        r["slack_user_id"]: (r["model"], r["reasoning_effort"])
+        for r in temp_db.conn.execute(
+            "SELECT slack_user_id, model, reasoning_effort FROM user_preferences")
+    }
+    assert users == {"U1": (model, "low"), "U2": (model, "low"), "U3": (model, "high")}
+    cfg = json.loads(temp_db.conn.execute(
+        "SELECT config_json FROM threads WHERE thread_id = 'C9:1'").fetchone()["config_json"])
+    assert cfg == {"model": model, "reasoning_effort": "low"}
+    channels = {
+        r["channel_id"]: (r["model"], r["reasoning_effort"])
+        for r in temp_db.conn.execute(
+            "SELECT channel_id, model, reasoning_effort FROM channel_settings")
+    }
+    assert channels == {"C1": (model, "low"), "C2": (model, "low"), "C3": (model, "high")}
 
 # --- one-time GPT-6 Astra migration (everyone -> astra, effort preserved) ---
+# The swap still writes gpt-6-astra; the every-boot normalizer that follows it in the same
+# `_run_migrations` pass renames that to its successor, so each end state below is gpt-6.2-astra.
 
 def _drop_gpt6_sentinel(db):
     """Simulate a pre-Astra database. `init_schema` already ran the migrations on this
@@ -434,12 +469,12 @@ def test_gpt6_migration_moves_every_user_to_astra_keeping_their_effort(temp_db):
     }
     assert rows == {
         # a previously stored quality moves too — everyone lands on high
-        "U1": ("gpt-6-astra", "medium", "gpt-image-2.5-sunburst", "high"),
-        "U4": ("gpt-6-astra", "low", "gpt-image-2.5-sunburst", "high"),
-        "U2": ("gpt-6-astra", "xhigh", "gpt-image-2.5-sunburst", "high"),
-        "U3": ("gpt-6-astra", "low", "gpt-image-2.5-sunburst", "high"),
-        "U5": ("gpt-6-astra", "high", "gpt-image-2.5-sunburst", "high"),
-        "U6": ("gpt-6-astra", "high", "gpt-image-2.5-sunburst", "high"),
+        "U1": ("gpt-6.2-astra", "medium", "gpt-image-2.5-sunburst", "high"),
+        "U4": ("gpt-6.2-astra", "low", "gpt-image-2.5-sunburst", "high"),
+        "U2": ("gpt-6.2-astra", "xhigh", "gpt-image-2.5-sunburst", "high"),
+        "U3": ("gpt-6.2-astra", "low", "gpt-image-2.5-sunburst", "high"),
+        "U5": ("gpt-6.2-astra", "high", "gpt-image-2.5-sunburst", "high"),
+        "U6": ("gpt-6.2-astra", "high", "gpt-image-2.5-sunburst", "high"),
     }
 
 
@@ -539,7 +574,7 @@ def test_gpt6_migration_rewrites_thread_overrides_in_place(temp_db):
     cfg = json.loads(temp_db.conn.execute(
         "SELECT config_json FROM threads WHERE thread_id = 'C3:1'").fetchone()["config_json"])
     assert cfg == {
-        "model": "gpt-6-astra",
+        "model": "gpt-6.2-astra",
         "reasoning_effort": "low",
         "image_model": "gpt-image-2.5-sunburst",
         "image_quality": "high",
@@ -600,7 +635,7 @@ def test_gpt6_migration_swaps_channel_overrides_and_leaves_null_models_alone(tem
             "SELECT channel_id, model, reasoning_effort, image_model FROM channel_settings")
     }
     assert rows == {
-        "C3": ("gpt-6-astra", "high", "gpt-image-2.5-sunburst"),
+        "C3": ("gpt-6.2-astra", "high", "gpt-image-2.5-sunburst"),
         "C4": (None, None, None),
     }
 
@@ -647,7 +682,7 @@ def test_gpt6_migration_survives_a_database_without_the_channel_image_column(tem
     row = temp_db.conn.execute(
         "SELECT model, image_model FROM user_preferences WHERE slack_user_id = 'U1'"
     ).fetchone()
-    assert (row["model"], row["image_model"]) == ("gpt-6-astra", "gpt-image-2.5-sunburst")
+    assert (row["model"], row["image_model"]) == ("gpt-6.2-astra", "gpt-image-2.5-sunburst")
 
 
 def test_gpt6_migration_does_not_run_a_second_time(temp_db):
@@ -658,7 +693,7 @@ def test_gpt6_migration_does_not_run_a_second_time(temp_db):
     temp_db._run_migrations()
     assert temp_db.conn.execute(
         "SELECT model FROM user_preferences WHERE slack_user_id = 'U1'"
-    ).fetchone()["model"] == "gpt-6-astra"
+    ).fetchone()["model"] == "gpt-6.2-astra"
 
     temp_db.conn.execute(
         "UPDATE user_preferences SET model = 'gpt-5.6-sol' WHERE slack_user_id = 'U1'")
@@ -740,10 +775,10 @@ def test_gpt6_migration_rolls_back_entirely_when_a_later_update_fails(temp_db):
     ).fetchone()
     # Quality moves for everyone, `low` included.
     assert (row["model"], row["reasoning_effort"], row["image_model"],
-            row["image_quality"]) == ("gpt-6-astra", "high", "gpt-image-2.5-sunburst", "high")
+            row["image_quality"]) == ("gpt-6.2-astra", "high", "gpt-image-2.5-sunburst", "high")
     cfg = json.loads(temp_db.conn.execute(
         "SELECT config_json FROM threads WHERE thread_id = 'C9:1'").fetchone()["config_json"])
-    assert cfg == {"model": "gpt-6-astra", "reasoning_effort": "high"}
+    assert cfg == {"model": "gpt-6.2-astra", "reasoning_effort": "high"}
 
 
 # --- the Astra swap runs BEFORE the 5.6 normalizers (codex: ordering) ---
@@ -767,15 +802,15 @@ def test_gpt55_max_survives_the_swap_as_astra_max(temp_db):
     row = temp_db.conn.execute(
         "SELECT model, reasoning_effort FROM user_preferences WHERE slack_user_id = 'U1'"
     ).fetchone()
-    assert (row["model"], row["reasoning_effort"]) == ("gpt-6-astra", "max")
+    assert (row["model"], row["reasoning_effort"]) == ("gpt-6.2-astra", "max")
 
     cfg = json.loads(temp_db.conn.execute(
         "SELECT config_json FROM threads WHERE thread_id = 'C8:1'").fetchone()["config_json"])
-    assert cfg == {"model": "gpt-6-astra", "reasoning_effort": "max"}
+    assert cfg == {"model": "gpt-6.2-astra", "reasoning_effort": "max"}
 
     chan = temp_db.conn.execute(
         "SELECT model, reasoning_effort FROM channel_settings WHERE channel_id = 'C8'").fetchone()
-    assert (chan["model"], chan["reasoning_effort"]) == ("gpt-6-astra", "max")
+    assert (chan["model"], chan["reasoning_effort"]) == ("gpt-6.2-astra", "max")
 
 
 def test_database_predating_both_sentinels_lands_on_astra_with_efforts_kept(temp_db):
@@ -795,9 +830,9 @@ def test_database_predating_both_sentinels_lands_on_astra_with_efforts_kept(temp
             "SELECT slack_user_id, model, reasoning_effort FROM user_preferences")
     }
     assert rows == {
-        "U1": ("gpt-6-astra", "high"),
-        "U2": ("gpt-6-astra", "xhigh"),
-        "U3": ("gpt-6-astra", "low"),   # `none` is off Astra's ladder
+        "U1": ("gpt-6.2-astra", "high"),
+        "U2": ("gpt-6.2-astra", "xhigh"),
+        "U3": ("gpt-6.2-astra", "low"),   # `none` is off Astra's ladder
     }
 
     columns = _columns(temp_db, "user_preferences")

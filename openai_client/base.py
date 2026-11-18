@@ -183,7 +183,7 @@ def _build_request_params(
     max_output_tokens = max_output_tokens or config.default_max_tokens
     top_p = top_p if top_p is not None else config.default_top_p
     # Clamp guards against stored/legacy efforts the model rejects (`minimal` on 5.6 and
-    # GPT-6 Luna, `max` on 5.5, both `none` and `minimal` on Astra and 6.1 Sol).
+    # GPT-6 Luna, `max` on 5.5, both `none` and `minimal` on Astra, 6.1 Sol and 6.2 Astra/Sol).
     gpt6 = model.startswith("gpt-6")
     effort = clamp_effort(model, reasoning_effort or config.default_reasoning_effort)
     config_update: Optional[Dict[str, Any]] = None
@@ -247,7 +247,8 @@ def _build_request_params(
 
     # gpt-5.5, the 5.6 family and GPT-6 Luna allow temperature/top_p when reasoning=none
     # (5.6 verified live 2026-07-09, Luna 2026-09-23: effort=none + temperature/top_p -> 200).
-    # Astra and 6.1 Sol allow neither at any effort (verified live 2026-09-08 / 2026-09-29), so
+    # Astra, 6.1 Sol and 6.2 Astra/Sol allow neither at any effort (verified live 2026-09-08 /
+    # 2026-09-29 / 2026-11-17), so
     # they take no branch here.
     # On a GPT-6 override the API judges sampling against the EFFECTIVE (post-update) effort
     # (live-probed 2026-09-23: base `none` + temperature + update->`high` = 400), so that is the
