@@ -4,6 +4,40 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.5.0] - 2026-11-23
+
+### ✨ Added
+
+- **Stop button.** Slack's own Stop control shows while the bot works; pressing it ends the reply
+  where it is and stops that thread's background work. Needs the `agent_session_stopped` event in
+  the app manifest (`SLACK_STOP_BUTTON`).
+- **Live plan card.** On multi-step work the bot writes a short plan ("<name> (n of m done)") whose
+  steps tick off as it goes, with a one-line result per step. Background jobs use the same card
+  (`SLACK_NATIVE_PLAN_CARD`).
+- **Step cards.** When there's no plan, each tool step shows as a live card inside the streamed
+  reply; repeated steps merge ("Searching Slack (5 searches)"), and only the pages the answer
+  actually cites are listed as sources, titled and deduped (`SLACK_STREAM_TASK_CARDS`).
+- **Wider Slack search on @mentions.** An @mention in a channel also searches Slack's own index, so
+  relevant discussion from other channels can be found (`SLACK_CHANNEL_NATIVE_SEARCH`).
+- **Progress on name-woken channel messages.** When the bot is called by name (no @) it adds 👀 as
+  soon as it commits to work; in a thread a temporary progress card shows until the answer lands
+  (`SLACK_HELD_TURN_PROGRESS`).
+
+### 🔧 Changed
+
+- **The settings button rides the reply itself,** on the last part of a long reply, instead of a
+  separate message (`SLACK_BUFFERED_ONESHOT_STREAM`).
+- **No "Tools Used" line** under replies that show a plan or step cards.
+- **Dependencies:** openai 3.57.0, slack-sdk 3.48.0, pypdf 7.1.1.
+
+### 🐛 Fixed
+
+- **The bot can edit its own streamed replies again.** Asked to edit a reply that carried the
+  settings button, it refused because the message shape wasn't recognised.
+- **Re-sending the bot's own file works.** Asked for its earlier file again under a new name (the
+  same CSV as a .tsv, say), the copy was blocked as if it were the user's own upload, so the reply
+  named a file that never arrived. Only the user's own files are held back now.
+
 ## [3.4.13] - 2026-11-17
 
 ### ✨ Added

@@ -46,6 +46,14 @@ for _dev_barrier_var in ('DEV_TURN_BARRIERS', 'DEV_TURN_BARRIERS_DIR', 'DEV_TURN
 # absent variable is one load_dotenv() will happily supply from .env.
 os.environ['WORKSPACE_CONTEXT_FILE'] = ''
 
+# THE AGENT-SURFACES FLAGS ARE OFF FOR THE SUITE (Docs/specs/slack_agent_surfaces_round.md).
+# The dev .env turns all five on for the live demo; without this every "flag off is unchanged"
+# test would silently run the ON path. A test that wants one sets it with monkeypatch / config.
+for _surface_flag in ('SLACK_STOP_BUTTON', 'SLACK_NATIVE_PLAN_CARD', 'SLACK_STREAM_TASK_CARDS',
+                      'SLACK_CHANNEL_NATIVE_SEARCH', 'SLACK_BUFFERED_ONESHOT_STREAM',
+                      'SLACK_HELD_TURN_PROGRESS'):
+    os.environ[_surface_flag] = 'false'
+
 @pytest.fixture
 def mock_env(monkeypatch):
     """Mock environment variables for testing"""

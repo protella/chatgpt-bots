@@ -1313,6 +1313,22 @@ def test_a_turn_outcome_carries_the_destination_contract_miss(sink):
     assert sink("turn_outcome")[0]["destination_contract_miss"] is True
 
 
+def test_a_turn_ended_by_slack_stop_carries_stopped_by_user(sink, tmp_path):
+    """Spec §A.3: written only when true, and the v11 checker grades the row clean."""
+    pt.turn_start("C1", "10.0", turn_id="s:14", surface="dm", gated=False)
+    pt.emit_turn_outcome(_turn(turn_id="s:14"), channel_id="C1", trigger_ts="10.0",
+                         kind="reply", stopped_by_user=True)
+    pt.turn_start("C1", "11.0", turn_id="s:15", surface="dm", gated=False)
+    pt.emit_turn_outcome(_turn(turn_id="s:15"), channel_id="C1", trigger_ts="11.0",
+                         kind="reply")
+
+    stopped, plain = sink("turn_outcome")
+    assert stopped["stopped_by_user"] is True
+    assert "stopped_by_user" not in plain
+    report = plc.check_paths([str(tmp_path / pt.LOG_NAME)])
+    assert [v for v in report.violations if v.name.startswith("turn_outcome")] == []
+
+
 def test_a_turn_that_placed_its_own_reply_writes_no_miss(sink):
     """Written ONLY when true, the same convention the terminal copy follows: a column that is
     false on nearly every row costs bytes on every line to say nothing."""

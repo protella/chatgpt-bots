@@ -159,6 +159,19 @@ class TestExecute:
         raw.containers.files.create.assert_awaited_once()
         assert raw.containers.files.create.call_args.kwargs["container_id"] == "cntr_abc"
 
+    async def test_a_users_file_is_never_posted_back_but_our_own_output_may_be(self):
+        """Prod 2026-11-23: asked for the bot's own earlier CSV again as a .tsv, the model
+        mounted it and wrote a byte-identical copy; suppressing it left a reply naming a file
+        that never arrived. Only the user's bytes are an ingredient they already hold."""
+        file_mount._MOUNTS.clear()
+        ctx, _ = _ctx(entries=[_entry(), _entry(file_id="file_doc_2", filename="ours.csv",
+                                                 origin="generated", slack_file_id="F2")])
+        await file_mount.execute_mount_file(ctx, {"file_id": "file_doc_1"})
+        assert len(file_mount.mounted_digests(ctx)) == 1
+        await file_mount.execute_mount_file(ctx, {"file_id": "file_doc_2"})
+        assert len(ctx.mounted_files) == 2
+        assert len(file_mount.mounted_digests(ctx)) == 1      # ours is publishable
+
     async def test_recycled_container_is_refused_without_uploading(self):
         # F15: the sandbox idle-expired mid-turn and its id landed in container_gone_sink (the
         # SAME list the API records dead containers into). Mounting into the corpse would be

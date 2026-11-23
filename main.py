@@ -21,8 +21,9 @@ from message_processor.participation import (GateContextBuilder, ParticipationEn
 from message_processor.reconsideration import intercept_stale_send
 from message_processor.stale_send_guard import (ConversationWatermarks,
                                                 StaleSendSuppressed, scopes_for_message,
-                                                ts_key)
+                                                thread_scope, ts_key)
 from message_processor import turn_runtime
+from message_processor import user_stop
 from message_processor.tool_provenance import (build_provenance, build_result_digests,
                                                build_result_digests_summarized,
                                                reattribute_reply)
@@ -266,6 +267,14 @@ class ChatBotV2:
             self.processor = MessageProcessor(db=self.client.db)
             # Give the client a reference to the processor for thread state updates
             self.client.processor = self.processor
+            # Native Stop (spec §A.2): the Stop handler clears the status only when no
+            # foreground turn is left in the thread to clear it on its own way out.
+            self.client.turn_running_in_thread = self._turn_running_in_thread
+            # …and the session status follows the thread's background work (spec §A.4).
+            from slack_client.event_handlers import agent_session
+            slack_client = self.client
+            self.processor.thread_manager.background_listener = (
+                lambda key: agent_session.background_changed(slack_client, key))
             # Phase F: judgment layer for unprompted channel participation.
             self.participation_engine = ParticipationEngine(self.processor.openai_client)
             # F52: expose the engine to the Slack facade's edit-reply path (message_events) so a
@@ -480,6 +489,11 @@ class ChatBotV2:
         if existing is None:
             existing = self.__dict__["_watermarks"] = ConversationWatermarks()
         return existing
+
+    def _turn_running_in_thread(self, channel_id: str, thread_ts: str) -> bool:
+        """Does any foreground turn hold a live lease on this thread?"""
+        scope = thread_scope(channel_id, thread_ts, None)
+        return bool(scope and self.watermarks.leases_for((scope,)))
 
     async def _run_participation_gate(self, message: Message, client: BaseClient):
         """The gate, plus the one thing that must happen whether or not we speak.
@@ -1208,6 +1222,10 @@ class ChatBotV2:
                              f"{covered_by} before admission — not run")
             return
         lease = self.watermarks.begin_turn(message)
+        # Native Stop (spec §A.3): the turn's admission time. A Stop pressed after this moment
+        # applies to this turn; the text handler reads it as `since`.
+        if isinstance(meta_in, dict):
+            meta_in[user_stop.SINCE_KEY] = time.time()
         # A drained catch-up's trigger is admitted: the batch it carries is owned by this turn's
         # lease from here, no longer by the drain (burst follow-ups R3-1). Synchronous, before
         # any await, so no window opens between the two owners.
@@ -1470,6 +1488,16 @@ class ChatBotV2:
                             # returns None on its accounted delivery_failed and
                             # delivery_exception endings, or rethrows the suppression to the
                             # terminal catch below.
+                            # Native Stop (§A.3, review 2): a stopped turn publishes nothing more,
+                            # this rescue send included.
+                            rescue_stop: Optional[Callable[[], bool]] = None
+                            if config.slack_stop_button:
+                                from message_processor.handlers.text import (_stop_requested,
+                                                                             _stop_since)
+
+                                def _rescue_stopped() -> bool:
+                                    return _stop_requested(message, _stop_since(turn, message))
+                                rescue_stop = _rescue_stopped
                             try:
                                 sent_ts = await cast(Any, client).send_message(
                                     message.channel_id,
@@ -1481,7 +1509,11 @@ class ChatBotV2:
                                     receipts=turn.receipt_ledger,
                                     receipt_class="assistant_reply",
                                     on_first_accept=_observe_reply,
+                                    **({"stop_check": rescue_stop} if rescue_stop else {}),
                                 )
+                                if (sent_ts is None and rescue_stop is not None and rescue_stop()
+                                        and isinstance(response.metadata, dict)):
+                                    response.metadata["user_stopped"] = True
                             except StaleSendSuppressed as stale:
                                 sent_ts = await intercept_stale_send(
                                     processor=self.processor, client=client,
@@ -2003,6 +2035,11 @@ class ChatBotV2:
                 # open, so a newer turn that finishes early cannot erase the watermark an older,
                 # still-running turn is about to read.
                 lease.close()
+                # Native Stop (spec §A.4): every ending (reply, error, silence, Stop,
+                # suppression) settles the agent session, after the lease is gone.
+                if config.slack_stop_button:
+                    from slack_client.event_handlers import agent_session
+                    agent_session.turn_ended(client, message.channel_id)
 
     @staticmethod
     def _turn_population_surface(message: Message) -> str:
@@ -2057,7 +2094,10 @@ class ChatBotV2:
             kind=kind or self._classify_visible_action(response, turn),
             detached_started=bool(meta.get("background_job_started")
                                   or getattr(turn, "visible_action_committed", False)),
-            attempt_id=participation_telemetry.attempt_id_for(message))
+            attempt_id=participation_telemetry.attempt_id_for(message),
+            stopped_by_user=bool(meta.get("user_stopped")),
+            # §G GR12: ms are measured from admission (main.py's stamp at lease open).
+            admitted_at=(message.metadata or {}).get(user_stop.SINCE_KEY))
 
     def _schedule_channel_memory(self, message: Message, turn) -> None:
         """Extract a durable channel fact from what this turn COMMITTED, if it committed anything.

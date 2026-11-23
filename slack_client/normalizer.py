@@ -343,6 +343,95 @@ async def prime_bot_actor_ids(client: Any, payloads: Iterable[Any]) -> None:
         logger.debug(f"bot actor id priming skipped: {e}")
 
 
+def _rich_leaf(el: Dict[str, Any]) -> str:
+    """One rich_text leaf in the mrkdwn shape Slack's own `text` uses (mentions stay raw)."""
+    t = el.get("type")
+    if t == "text":
+        text = str(el.get("text") or "")
+        style = el.get("style")
+        if isinstance(style, dict) and style.get("code") and text.strip():
+            return f"`{text}`"
+        return text
+    if t == "link":
+        url = str(el.get("url") or "")
+        label = str(el.get("text") or "")
+        if not url:
+            return label
+        return f"<{url}|{label}>" if label and label != url else f"<{url}>"
+    if t == "user":
+        return f"<@{el['user_id']}>" if el.get("user_id") else ""
+    if t == "channel":
+        return f"<#{el['channel_id']}>" if el.get("channel_id") else ""
+    if t == "usergroup":
+        return f"<!subteam^{el['usergroup_id']}>" if el.get("usergroup_id") else ""
+    if t == "broadcast":
+        return f"<!{el['range']}>" if el.get("range") else ""
+    if t == "emoji":
+        return f":{el['name']}:" if el.get("name") else ""
+    if t == "date":
+        return str(el.get("fallback") or el.get("timestamp") or "")
+    return ""
+
+
+def _rich_inline(elements: Any) -> str:
+    return "".join(_rich_leaf(el) for el in (elements if isinstance(elements, list) else [])
+                   if isinstance(el, dict))
+
+
+def _rich_element(el: Dict[str, Any]) -> str:
+    """One top-level rich_text element, newlines and structure kept as written."""
+    t = el.get("type")
+    if t == "rich_text_section":
+        return _rich_inline(el.get("elements"))
+    if t == "rich_text_preformatted":
+        body = _rich_inline(el.get("elements"))
+        return f"```\n{body}\n```"
+    if t == "rich_text_quote":
+        body = _rich_inline(el.get("elements"))
+        return "\n".join(f"> {line}" for line in body.split("\n"))
+    if t == "rich_text_list":
+        ordered = el.get("style") == "ordered"
+        raw_indent = el.get("indent")
+        indent = raw_indent if isinstance(raw_indent, int) else 0
+        lines = []
+        for n, item in enumerate(el.get("elements") or [], start=1):
+            if not isinstance(item, dict):
+                continue
+            marker = f"{n}." if ordered else "•"
+            lines.append(f"{'    ' * indent}{marker} {_rich_element(item)}")
+        return "\n".join(lines)
+    return ""
+
+
+def carded_answer_text(payload: Dict[str, Any]) -> Optional[str]:
+    """The ANSWER of one of our own messages that carries step cards, or None for any other.
+
+    Agent surfaces §C.6: Slack's top-level `text` for a natively streamed message with
+    `task_card` blocks concatenates the card titles with the answer ("Searching the web" glued
+    to the reply). History must read what we said, so such a message is read from its
+    `rich_text` blocks instead — the answer alone, the cards left out. Its own walker, not the
+    supplementary renderer: paragraphs and line breaks survive exactly, and nothing is capped.
+    The live stream and the cold DM rebuild both read it here."""
+    blocks = payload.get("blocks") if isinstance(payload, dict) else None
+    if not isinstance(blocks, list) or not any(
+            isinstance(b, dict) and b.get("type") == "task_card" for b in blocks):
+        return None
+    out = ""
+    for block in blocks:
+        if not (isinstance(block, dict) and block.get("type") == "rich_text"):
+            continue
+        for el in block.get("elements") or []:
+            if not isinstance(el, dict):
+                continue
+            piece = _rich_element(el)
+            if not piece:
+                continue
+            if out and not out.endswith("\n"):
+                out += "\n"
+            out += piece
+    return out.strip("\n")
+
+
 def _is_tombstone(payload: Dict[str, Any]) -> bool:
     if payload.get("subtype") == "tombstone":
         return True
@@ -382,6 +471,10 @@ def normalize_slack_message(client: Any, payload: Any, *, channel_id: Optional[s
 
     sender_type = _sender_type(client, payload)
     raw_text = str(payload.get("text") or "")
+    if sender_type == "self":
+        carded = carded_answer_text(payload)
+        if carded is not None:
+            raw_text = carded
     # F48: content Slack delivers outside `text` (pasted tables, webhook fields) is real
     # awareness — but never for our OWN messages, whose status cards live in exactly those
     # fields and would replay as somebody's evidence (the F47 attribution bug).

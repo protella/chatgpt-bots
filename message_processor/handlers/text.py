@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import re
 import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence, cast
@@ -13,7 +14,7 @@ from message_processor.context_meter import (ContextIrreducible, ContextOverLimi
 from message_processor.dm_reconsideration import pin_dm_turn_context
 from message_processor.reconsideration import intercept_stale_send
 from message_processor.routing_facts import POSTURE_THREAD
-from message_processor.stale_send_guard import StaleSendSuppressed
+from message_processor.stale_send_guard import StaleSendSuppressed, visible_mutation
 from message_processor.utilities import effective_request_model
 from message_processor.destination_tools import (SET_REPLY_DESTINATION,
                                                  DestinationMarkerReader,
@@ -31,9 +32,14 @@ from message_processor.message_markers import (
     continuation_trailer,
     entity_safe_cut,
     part_prefix,
+    part_prefix_markdown,
     segment_separator,
 )
 from streaming import FenceHandler, NativeStreamCoordinator, RateLimitManager, StreamingBuffer
+from streaming.native_sink import ENDING_DELIVERED, ENDING_HANDOFF, StepCards
+from message_processor.plan_tool import (PLAN_RESULT_MAX, PLAN_STEP_TITLE_MAX, PLAN_TITLE_MAX,
+                                         UPDATE_PLAN)
+from message_processor import user_stop
 from message_processor.tool_registry import SURFACE_CHANNEL, SURFACE_DM, SandboxHolder, ToolContext
 from message_processor import (canvas_tools, file_mount, gate_context, image_catalog,
                                image_service, image_tools, thread_files)
@@ -157,6 +163,207 @@ _WORK_CLAIM_HOSTED_TOOLS = frozenset({
 _PRE_TOOL_FLUSH_TOOLS = frozenset({
     "local:edit_image", "local:create_image_asset", "local:generate_image",
 })
+
+# The status phrases local tools get while they run. Instant tools (reactions, …) have none and
+# show nothing — the legacy status line and the native step cards read the same table.
+_LOCAL_STATUS_LABELS = {
+    "fetch_channel_history": "Reading channel history",
+    "fetch_thread_messages": "Reading a thread",
+}
+
+# --- Agent surfaces (Docs/specs/slack_agent_surfaces_round.md) ---------------------------------
+# §C.4: a step card's lifecycle state -> Slack's task status, and its title ceiling.
+_STEP_STATUS = {"start": "in_progress", "complete": "complete", "failed": "error"}
+_STEP_TITLE_MAX = 80
+
+
+def _step_title(client: Any, title: str) -> str:
+    """A step card's title: plain, one line, at most `_STEP_TITLE_MAX` chars, and never a raw
+    bot-object mention."""
+    from slack_client.messaging import rewrite_bot_object_mentions
+    text = " ".join(rewrite_bot_object_mentions(client, title or "").split())
+    if len(text) > _STEP_TITLE_MAX:
+        text = text[:_STEP_TITLE_MAX - 1].rstrip() + "…"
+    return text
+
+
+def _stop_since(turn: Any, message: Optional[Message] = None) -> float:
+    """§A.3: the turn's admission instant (epoch seconds). main.py stamps it on the message when
+    the turn's lease opens (`user_stop.SINCE_KEY`); without that stamp it is fixed at the first
+    handler entry and shared by every retry. Only a Stop pressed AFTER it can stop the turn, so a
+    delayed or retried Stop event never ends the user's next message."""
+    meta = getattr(message, "metadata", None) if message is not None else None
+    admitted = meta.get(user_stop.SINCE_KEY) if isinstance(meta, dict) else None
+    if isinstance(admitted, (int, float)) and not isinstance(admitted, bool):
+        return float(admitted)
+    if turn is None:
+        return time.time()
+    since = getattr(turn, "_user_stop_since", None)
+    if not isinstance(since, (int, float)) or isinstance(since, bool):
+        since = time.time()
+        try:
+            setattr(turn, "_user_stop_since", since)
+        except Exception:  # noqa: BLE001 — a turn that refuses attributes just re-reads now
+            pass
+    return float(since)
+
+
+def _stop_requested(message: Message, since: float) -> bool:
+    """Has the native Stop been pressed in this turn's thread since `since`?"""
+    meta = message.metadata or {}
+    threads = {t for t in (getattr(message, "thread_id", None), meta.get("ts"),
+                           meta.get("thread_ts")) if t}
+    return any(user_stop.stop_requested_since(message.channel_id, str(t), since) is not None
+               for t in threads)
+
+
+# §C (live review): short step-card labels; anything without one reads "Using <tool name>".
+_LOCAL_STEP_LABELS = {
+    "add_bookmark": "Adding a bookmark",
+    "cancel_background_job": "Cancelling a background job",
+    "cancel_scheduled_message": "Cancelling a scheduled message",
+    "create_channel_canvas": "Creating a canvas",
+    "create_image_asset": "Making an image",
+    "delete_canvas": "Deleting a canvas",
+    "delete_own_message": "Deleting a message",
+    "edit_canvas": "Editing a canvas",
+    "edit_image": "Editing an image",
+    "edit_own_message": "Editing a message",
+    "export_conversation": "Exporting the conversation",
+    "fetch_channel_history": "Reading channel history",
+    "fetch_channel_info": "Checking channel info",
+    "fetch_pinned_messages": "Reading pinned messages",
+    "fetch_thread_messages": "Reading a thread",
+    "fetch_url": "Opening a link",
+    "fetch_url_to_sandbox": "Downloading a file",
+    "forget_fact": "Forgetting a fact",
+    "generate_image": "Starting an image",
+    "get_message_permalink": "Getting a message link",
+    "import_web_image": "Importing an image",
+    "list_bookmarks": "Checking bookmarks",
+    "list_canvases": "Checking canvases",
+    "list_channel_members": "Checking channel members",
+    "list_facts": "Reviewing saved facts",
+    "list_sandbox_files": "Checking sandbox files",
+    "list_scheduled_messages": "Checking scheduled messages",
+    "lookup_channel": "Looking up a channel",
+    "lookup_user": "Looking up a person",
+    "mount_file": "Opening a file",
+    "no_response_needed": "Staying quiet",
+    "pin_message": "Pinning a message",
+    "post_to_thread": "Posting to a thread",
+    "react_to_message": "Reacting",
+    "read_canvas": "Reading a canvas",
+    "read_document": "Reading a document",
+    "remember_fact": "Remembering a fact",
+    "remove_bookmark": "Removing a bookmark",
+    "remove_reaction": "Removing a reaction",
+    "reset_sandbox": "Resetting the sandbox",
+    "resolve_channel_name": "Looking up a channel",
+    "schedule_message": "Scheduling a message",
+    "search_slack": "Searching Slack",
+    "search_stored_knowledge": "Checking saved notes",
+    "search_workspace_emoji": "Finding an emoji",
+    "set_channel_participation": "Updating channel settings",
+    "set_channel_purpose": "Setting the channel purpose",
+    "set_channel_topic": "Setting the channel topic",
+    "start_background_job": "Starting a background job",
+    "update_background_job": "Updating a background job",
+    "update_fact": "Updating a fact",
+    "view_image": "Looking at an image",
+}
+_HOSTED_STEP_LABELS = {
+    "web_search": "Searching the web",
+    "code_interpreter": "Running code",
+    "file_search": "Searching files",
+    "image_generation": "Generating an image",
+}
+# Arguments that ARE the step's detail line (the query, the page), first match wins.
+_STEP_DETAIL_ARGS = ("query", "url", "q")
+
+
+# A step's result line counts these, per tool; any other tool's `count` reads "results".
+_STEP_COUNT_UNITS = {
+    "search_slack": "matches",
+    "fetch_thread_messages": "messages",
+    "fetch_channel_history": "messages",
+}
+# Error codes that mean "we were not let in", which reads better than a bare "Failed".
+_STEP_ACCESS_ERRORS = frozenset({
+    "not_in_channel", "channel_not_found", "access_denied", "missing_scope", "not_allowed",
+    "forbidden", "not_authorized", "is_archived", "unauthorized"})
+
+
+def _local_step_outcome(name: str, result: Any, ok: bool) -> Optional[Dict[str, Any]]:
+    """A local step's result in counting form for its plan card: a count it reported, or a
+    short status. None when the result carries nothing obvious."""
+    if not ok:
+        code = result.get("error") if isinstance(result, dict) else None
+        return {"text": "Couldn't access it" if code in _STEP_ACCESS_ERRORS else "Failed"}
+    if isinstance(result, dict):
+        count = result.get("count")
+        if isinstance(count, int) and not isinstance(count, bool):
+            return {"count": count, "unit": _STEP_COUNT_UNITS.get(name, "results")}
+    return None
+
+
+def _hosted_step_outcome(tool: str, state: str, ev: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """A hosted step's result: a search's own sources, a sandbox run's done/failed."""
+    if state == "failed":
+        return {"text": "Failed"}
+    if state != "complete":
+        return None
+    if tool == "web_search":
+        sources = [u for u in (ev.get("sources") or []) if isinstance(u, str)]
+        count = ev.get("source_count")
+        count = count if isinstance(count, int) and count > 0 else len(sources)
+        if not count:
+            return None
+        from streaming.native_sink import _domain
+        domains: List[str] = []
+        for url in sources:
+            host = _domain(url)
+            if host and host not in domains:
+                domains.append(host)
+        return {"count": count, "unit": "results", "domains": domains}
+    if tool == "code_interpreter":
+        return {"text": "Done"}
+    return None
+
+
+def _local_step_detail(arguments: Any) -> Optional[str]:
+    if isinstance(arguments, str):
+        try:
+            import json
+            arguments = json.loads(arguments or "{}")
+        except ValueError:
+            return None
+    if not isinstance(arguments, dict):
+        return None
+    for name in _STEP_DETAIL_ARGS:
+        value = arguments.get(name)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _stamp_user_stop(response: Any, message: Message, turn: Any) -> Any:
+    """§A.3 / review 1.5: every turn that ends on the Stop button says so, whichever ending it
+    took (a reaction, a started job, words posted elsewhere, a stop found at the last stopStream)."""
+    if (config.slack_stop_button and isinstance(response, Response)
+            and _stop_requested(message, _stop_since(turn, message))):
+        if response.metadata is None:
+            response.metadata = {}
+        response.metadata["user_stopped"] = True
+    return response
+
+
+def _user_stopped_response(model: Optional[str]) -> Response:
+    """A turn the user stopped before anything visible existed: it ends silent."""
+    return Response(type="text", content="",
+                    metadata={"streamed": True, "terminal_action": "no_reply",
+                              "silence_reason": "user_requested_silence",
+                              "model": model, "posted": False, "user_stopped": True})
 
 
 # --- CV8 `model_response.fork_reason`: why THIS handler entry is issuing API calls at all ---
@@ -781,6 +988,10 @@ class TextHandlerMixin(_Host):
             conduct = getattr(prompts, "CHANNEL_CROSS_THREAD_CONDUCT_SUFFIX", "")
             if conduct:
                 paragraphs.append(conduct)
+        # Agent surfaces §F (R3): the plan contract, keyed on THIS attempt's exposed tools —
+        # a flag-off, tool-disabled or hosted-only attempt never mentions a tool it lacks.
+        if registry is not None and UPDATE_PLAN in exposed:
+            paragraphs.append(prompts.UPDATE_PLAN_CONTRACT_SUFFIX)
         if registry is not None and expose_no_reply and config.enable_no_reply_tool:
             no_reply_available = "no_response_needed" in exposed
             if no_reply_available:
@@ -1297,7 +1508,8 @@ class TextHandlerMixin(_Host):
         # above, and the handlers reach this point with their lists filtered at different places.
         local_names = {c.get("name") for c in merged if c.get("name")}
         provenance = build_provenance(
-            merged, [name for name in external if name not in local_names])
+            [c for c in merged if c.get("name") != UPDATE_PLAN],     # §F R19: display only
+            [name for name in external if name not in local_names])
         for record in records:
             self._persist_tool_provenance(
                 record.channel_id, record.first_ts,
@@ -1380,6 +1592,20 @@ class TextHandlerMixin(_Host):
         thread_config = await pinned_thread_config(
             self, thread_state, message, channel_turn, turn=turn)
 
+        # Agent surfaces §A.3.1: the native Stop was pressed before this turn said anything.
+        # It ends silent, before any model call; a placeholder already up comes down.
+        if config.slack_stop_button:
+            stop_since = _stop_since(turn, message)
+            if not visible_already_committed and _stop_requested(message, stop_since):
+                self.log_info("user_stop: turn stopped before any reply — ending silent")
+                if thinking_id or lazy_surface_ts:
+                    await self._cleanup_silent_stream(
+                        client, message.channel_id, None, thinking_id, lazy_surface_ts,
+                        "user-stop",
+                        receipts=getattr(turn, "receipt_ledger", None) if turn is not None
+                        else None)
+                return _user_stopped_response(thread_config.get("model"))
+
         # Check if streaming is enabled and supported (respecting user prefs)
         # Allow streaming on retry if the failure was just MCP-related (not a streaming failure)
         streaming_enabled = thread_config.get('enable_streaming', config.enable_streaming)
@@ -1402,13 +1628,14 @@ class TextHandlerMixin(_Host):
         should_stream = (can_stream and not _context_retry and not _mcp_buffered_retry
                          and (retry_count == 0 or failed_mcp_server is not None))
         if should_stream:
-            return await self._handle_streaming_text_response(
+            streamed = await self._handle_streaming_text_response(
                 user_content, thread_state, client, message, thinking_id, attachment_urls,
                 exclude_mcp_server=failed_mcp_server,
                 visible_already_committed=visible_already_committed,
                 artifacts_acc=artifacts_acc, turn=turn, lazy_surface_ts=lazy_surface_ts,
                 channel_steering_text=channel_steering_text,
             )
+            return _stamp_user_stop(streamed, message, turn)
         
         # Fall back to non-streaming logic
         thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
@@ -1662,7 +1889,7 @@ class TextHandlerMixin(_Host):
                     aggregate_segments=True,
                     # Same free-tool accounting the streaming loop gets: bookkeeping must not
                     # spend the budget a real tool needs, on either path.
-                    free_tools=(SET_REPLY_DESTINATION,),
+                    free_tools=(SET_REPLY_DESTINATION, UPDATE_PLAN),
                     model=model,
                     temperature=thread_config["temperature"],
                     max_tokens=thread_config["max_tokens"],
@@ -1683,7 +1910,10 @@ class TextHandlerMixin(_Host):
                     # It now also carries the PERSON'S own choice: fast is a personal setting,
                     # and a channel is not one person, so a channel turn never buys it.
                     service_tier_eligible=(not channel_turn
-                                           and thread_config.get("service_tier") == "fast")
+                                           and thread_config.get("service_tier") == "fast"),
+                    # §A.3: the Stop is checked before every round and every dispatch.
+                    **({"stop_check": lambda: _stop_requested(message, _stop_since(turn, message))}
+                       if config.slack_stop_button else {}),
                 )
                 response_text = result["text"]
                 response_segments = result.get("segments")
@@ -2083,7 +2313,8 @@ class TextHandlerMixin(_Host):
         tool_provenance = []
         stored_content = response_text
         if config.enable_tool_provenance:
-            tool_provenance = build_provenance(local_tool_calls, tools_actually_used)
+            tool_provenance = build_provenance(
+                [c for c in local_tool_calls if c.get("name") != UPDATE_PLAN], tools_actually_used)
             # F12: attach MCP result digests (result memory) alongside the names/gists.
             # F16: when summarization is on, overlong outputs are compressed by the utility
             # model here at persist time (once) instead of hard-truncated; off → today's cut.
@@ -2114,6 +2345,12 @@ class TextHandlerMixin(_Host):
             cleanup_coro = self._async_post_response_cleanup(thread_state, thread_key)
             self._schedule_async_call(cleanup_coro)
 
+        # §A.3: this path shows nothing until main.py delivers what it returns — a Stop pressed
+        # while it worked means nothing is delivered at all.
+        if config.slack_stop_button and _stop_requested(message, _stop_since(turn, message)):
+            self.log_info("user_stop: Stop pressed before delivery — the buffered reply is dropped")
+            return _user_stopped_response(thread_config.get("model"))
+
         return Response(
             type="text",
             content=response_text,
@@ -2129,18 +2366,34 @@ class TextHandlerMixin(_Host):
 
     async def _cleanup_silent_stream(self, client, channel_id: str, native_coord,
                                      message_id: Optional[str], current_message_id: Optional[str],
-                                     context: str, receipts=None) -> None:
+                                     context: str, receipts=None,
+                                     keep_cards: bool = False, stopped: bool = False,
+                                     ending: str = ENDING_DELIVERED) -> None:
         """Tear down a streamed turn that will post NOTHING (honored no_reply / reaction-only).
 
         Abandons any live native stream (reporting a failed stop) and deletes EVERY distinct
         message we created — the original placeholder AND the stream/seed message. They differ
         when native started after a placeholder, or a legacy seed replaced a status-only None;
         deleting only current_message_id would orphan the other. Best-effort: individual
-        failures are logged, never raised."""
+        failures are logged, never raised.
+
+        `keep_cards` (§C live review): a native stream that holds only step cards the reader
+        already watched is STOPPED with the cards as they stand, not deleted — `stopped` closes
+        them as errors (the user's Stop), otherwise as complete."""
+        kept: set = set()
         if native_coord is not None and native_coord.started:
-            if not await native_coord.abandon():
+            if (keep_cards and not native_coord.failed and not native_coord.hidden
+                    and native_coord.part_ts
+                    and getattr(getattr(native_coord, "steps", None), "shown", False)):
+                closed = (await native_coord.finish_stopped() if stopped
+                          else await native_coord.finalize("", ending=ending))
+                if closed:
+                    kept = set(native_coord.part_ts)
+                else:
+                    self.log_warning(f"Card-only stream stop failed during {context} cleanup")
+            elif not await native_coord.abandon():
                 self.log_warning(f"Native stream abandon failed during {context} cleanup")
-        for ts in {t for t in (message_id, current_message_id) if t}:
+        for ts in {t for t in (message_id, current_message_id) if t and t not in kept}:
             try:
                 if not await client.delete_message(channel_id, ts):  # unleased-ok: teardown — removing a surface can never be a stale answer
                     self.log_debug(f"Could not delete message {ts} during {context} cleanup")
@@ -2242,6 +2495,48 @@ class TextHandlerMixin(_Host):
         # Spec §5: this turn's receipt ledger, read once. Every surface this handler mints or
         # promotes claims it here; every surface it deletes releases it.
         receipts = getattr(turn, "receipt_ledger", None) if turn is not None else None
+
+        # Agent surfaces (Docs/specs/slack_agent_surfaces_round.md), each behind its own flag;
+        # with both off nothing below is consulted and every call is what it was.
+        # §A.3 — the native Stop is cooperative: polled at checkpoints, never a cancellation.
+        stop_on = bool(config.slack_stop_button)
+        stop_since = _stop_since(turn, message) if stop_on else 0.0
+        stop_seen = False
+        # Raw text of legacy parts already closed by an overflow — with the buffer's last shown
+        # text, what a stopped legacy stream really put on screen (§A.3 / review 1.4).
+        legacy_closed_raw: List[str] = []
+        # The background job's ack was claimed by this turn's cards-only stream (live review).
+        job_ack_claimed = False
+        # The final send refused because the Stop came first (review 2.4).
+        stop_blocked_send = False
+        # §C — the turn's step cards, recorded synchronously, drained by the native stream.
+        step_cards: Optional[StepCards] = StepCards() if config.slack_stream_task_cards else None
+        # §G (GR1–GR13): a HELD turn (silence-capable or destination-open) still buffers its
+        # whole answer; once it commits to work it shows a TEMPORARY progress card — its own
+        # message, a chrome receipt — deleted on back-out or right after the answer lands. The
+        # card's ts lives ONLY here: never a surface, destination, receipt of an answer, keeper
+        # or anything the delivery accounting reads.
+        held_on = bool(config.slack_held_turn_progress and step_cards is not None
+                       and turn is not None and hasattr(client, "post_status_card")
+                       and hasattr(client, "delete_message"))
+        held_card: Dict[str, Any] = {"ts": None, "want_card": False, "frozen": False,
+                                     "dead": False, "removed": False, "text_claimed": False,
+                                     "last_blocks": None,
+                                     # Owner 2026-11-21: a turn whose destination is still open
+                                     # (a top-level trigger) shows 👀 only, never a late card.
+                                     "dest_open": bool(
+                                         turn is not None
+                                         and not getattr(turn, "destination_selected", True)
+                                         and not getattr(turn, "destination_locked", False))}
+        held_lock = asyncio.Lock()
+        # Why the card goes on this attempt's way out (answer, stop, silence, job, failure,
+        # retry, suppressed) — set at each ending, read by the cleanup in `finally`.
+        held_end_reason = "failure"
+        # Review 10: the hook is bound to THIS attempt; tasks this attempt starts inherit it.
+        held_attempt = object()
+        if held_on:
+            from message_processor.turn_runtime import HELD_ATTEMPT
+            HELD_ATTEMPT.set(held_attempt)
 
         thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
         # This turn's pinned capability profile, and the model it names — resolved before the
@@ -2555,11 +2850,24 @@ class TextHandlerMixin(_Host):
                 held = marker_reader.flush()
                 if held:
                     buffer.add_chunk(held)
+                    await _held_text(held)
                 # Keyed on buffered text AFTER the flush: a round whose every character was held
                 # still produced text, and testing before the release would have read it as a
                 # tool-only round and left the next segment with no gap in front of it.
                 if buffer.get_complete_text().strip():
                     pending_segment_break = True
+
+            # §C live review: on an ADDRESSED turn whose destination is bound (a DM thread, a
+            # mention thread — never a buffered or silence-capable one, which has no
+            # coordinator), the first tool step opens the native stream with the card alone, so
+            # the reader watches the step happen rather than meeting it after the first prose.
+            if (step_cards is not None and step_cards.has_pending and native_coord is not None
+                    and not native_coord.started and not native_coord.failed
+                    and destination_bound and not final_post_only and not _user_stopped()):
+                if progress_task and not progress_task.done():
+                    progress_task.cancel()
+                    await await_cancelled_progress(progress_task)
+                await _open_native_stream(from_step=True)
 
             # HOSTED-TOOL ACCOUNTING, AND IT RUNS BEFORE THE NATIVE EARLY RETURN BELOW
             # (codex round-3 #1a). What follows that return is STATUS RENDERING, which a started
@@ -2569,6 +2877,9 @@ class TextHandlerMixin(_Host):
             # attribution line and a cross-thread post's provenance read these counters. Skipping
             # them for native turns lost the tool from every account of the turn.
             _account_hosted_tool(tool_type, status)
+            # §G: a tool event refreshes a held turn's card (opened only by plan/work signals).
+            if _held_active() and held_card["ts"] is not None:
+                await _held_service()
 
             # Native mode: once the stream owns the visible message the placeholder is
             # gone — status edits would hit a deleted ts. Log tool activity instead.
@@ -2589,6 +2900,10 @@ class TextHandlerMixin(_Host):
                         self.log_info(
                             f"Pre-tool native flush: pushed the round's preamble to Slack "
                             f"before {tool_type} blocks")
+                # §C: a tool event is the boundary that keeps a step card live while it runs.
+                if (step_cards is not None and step_cards.has_pending
+                        and not native_coord.hidden and not _user_stopped()):
+                    await _push_native_steps()
                 self.log_debug(f"Tool event during native stream (status suppressed): {tool_type} {status}")
                 return
 
@@ -2644,11 +2959,7 @@ class TextHandlerMixin(_Host):
                 elif tool_type.startswith("local:"):
                     # Local function-call-loop tools (history fetch, reactions, …)
                     tool_name = tool_type[6:]
-                    local_status_labels = {
-                        "fetch_channel_history": "Reading channel history",
-                        "fetch_thread_messages": "Reading a thread",
-                    }
-                    label = local_status_labels.get(tool_name)
+                    label = _LOCAL_STATUS_LABELS.get(tool_name)
                     if label:  # instant tools (e.g. reactions) don't need a status line
                         status_msg = f"{config.circle_loader_emoji} {label}..."
                         try:
@@ -2730,6 +3041,7 @@ class TextHandlerMixin(_Host):
             """
             if turn is None or not ts:
                 return
+            turn.note_first_visible("answer")   # §G GR12: a confirmed answer surface
             from message_processor.turn_runtime import DEST_KIND_STREAM
             turn.note_destination_observed(
                 channel_id=thread_state.channel_id, first_ts=ts, kind=DEST_KIND_STREAM,
@@ -2805,6 +3117,338 @@ class TextHandlerMixin(_Host):
         # the telemetry marker — is identity-bound to it.
         hidden_stale: List[BaseException] = []
 
+        def _user_stopped() -> bool:
+            """§A.3: has the user pressed Stop on this turn? Sticky once true."""
+            nonlocal stop_seen
+            if not stop_on:
+                return False
+            if not stop_seen and ((native_coord is not None and native_coord.user_stopped)
+                                  or _stop_requested(message, stop_since)):
+                stop_seen = True
+                self.log_info("user_stop: Stop pressed — the turn ends with what it already "
+                              "delivered")
+            return stop_seen
+
+        def _claim_job_ack() -> bool:
+            """The background job's one line of voice, claimed by THIS turn's open cards-only
+            stream so the reader gets ONE message, not a card stream plus a separate ack. Called
+            synchronously by the job dispatch (`turn.job_ack_sink`); True means the job must not
+            post its own ack — the turn delivers it into the stream (live review)."""
+            nonlocal job_ack_claimed
+            # R18: ELIGIBLE is enough — an addressed turn bound to a thread with a native sink —
+            # even if no stream is open yet (the job is often dispatched before anything is
+            # visible). The turn then owns the ack: into its stream, opening one if needed, or
+            # posted by the turn itself, exactly once.
+            if (step_cards is None or native_coord is None or native_coord.failed
+                    or native_coord.hidden or not destination_bound or final_post_only
+                    or visible_content_delivered or _user_stopped()):
+                return False
+            job_ack_claimed = True
+            return True
+
+        async def _deliver_job_ack() -> bool:
+            """Deliver a claimed job ack: into the open stream, stopped there with the footer;
+            if the stream is gone, as the job would have posted it. True = it rode the stream."""
+            nonlocal job_ack_claimed
+            if not job_ack_claimed:
+                return False
+            job_ack_claimed = False
+            from message_processor.research_tools import _JOB_ACK_TEXT
+            if (native_coord is not None and not native_coord.started
+                    and not native_coord.failed and not native_coord.hidden):
+                await _open_native_stream(from_step=True)   # cards (if any) + the ack, one message
+            if (native_coord is not None and native_coord.active
+                    and not native_coord.user_stopped):
+                blocks = None
+                if native_coord.thread_ts is not None and hasattr(client, "attachable_footer_blocks"):
+                    try:
+                        blocks = client.attachable_footer_blocks(
+                            message.channel_id, thread_config.get("model"))
+                    except Exception as footer_err:  # noqa: BLE001
+                        self.log_debug(f"Job-ack footer build failed: {footer_err}")
+                if await native_coord.finalize(_JOB_ACK_TEXT, blocks=blocks,
+                                               ending=ENDING_HANDOFF):
+                    return True
+            try:
+                await client.send_message(message.channel_id, reply_target, _JOB_ACK_TEXT,  # unleased-ok: the background job's own ack, posted here only in its place — job chrome for a job that already started, unleased exactly like the job's post
+                                          receipts=receipts, receipt_class="background_job")
+            except Exception as ack_err:  # noqa: BLE001 — chrome, never the turn
+                self.log_debug(f"Job ack post failed: {ack_err}")
+            return False
+
+        if turn is not None and step_cards is not None:
+            setattr(turn, "job_ack_sink", _claim_job_ack)
+
+        def _plan_text(text: Any, limit: int) -> str:
+            """R14: a model-written display field goes through the answer's own sanitizers
+            (bot-mention rewrite, dead sandbox links) and is then clipped."""
+            from slack_client.messaging import rewrite_bot_object_mentions
+            clean = " ".join(rewrite_bot_object_mentions(
+                client, strip_sandbox_links(str(text or ""))).split())
+            return clean if len(clean) <= limit else clean[:limit - 1].rstrip() + "…"
+
+        async def _apply_model_plan(plan: Dict[str, Any]) -> None:
+            """§F, the attempt-owned plan sink (R5): apply one validated snapshot, then ask the
+            stream to show it at the next allowed boundary (R12)."""
+            if step_cards is None:
+                return
+            steps = [{"id": st["id"], "title": _plan_text(st["title"], PLAN_STEP_TITLE_MAX),
+                      "status": st["status"],
+                      "result": (_plan_text(st["result"], PLAN_RESULT_MAX)
+                                 if st.get("result") else None)}
+                     for st in plan.get("steps") or []]
+            step_cards.apply_plan(_plan_text(plan.get("title"), PLAN_TITLE_MAX), steps)
+            if _held_active() and turn is not None:
+                # §G GR5 (a): a validated plan commits a held turn — latched before any await;
+                # the 👀 and the card go through the one work-claim entry (GR6). A later,
+                # result-only update refreshes the open card the same way.
+                turn.note_progress_signal("plan")
+                await turn.claim_work(client, message, signal="plan")
+            # R11: let every sibling call of this round apply its snapshot first, so the drain
+            # renders the round's LAST word, never one mid-batch.
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            await _plan_flush()
+
+        async def _plan_flush() -> None:
+            """R12: the normal drain, through the normal checks (pending text first, held
+            mentions, the rate limiter). An addressed turn with no stream yet opens one, plan
+            only, exactly as a first tool step does."""
+            if (step_cards is None or native_coord is None or native_coord.failed
+                    or native_coord.hidden or _user_stopped()):
+                return
+            if not native_coord.started:
+                if destination_bound and not final_post_only:
+                    if progress_task and not progress_task.done():
+                        progress_task.cancel()
+                        await await_cancelled_progress(progress_task)
+                    await _open_native_stream(from_step=True)
+                return
+            if step_cards.has_pending:
+                await _push_native_steps()
+
+        if turn is not None and step_cards is not None:
+            setattr(turn, "plan_sink", _apply_model_plan)
+
+        def _held_active() -> bool:
+            """§G: this attempt may still show held progress (a held turn, writer not frozen)."""
+            return bool(held_on and final_post_only and not held_card["frozen"])
+
+        def _held_blocks() -> Optional[list]:
+            """GR3/GR4: a native plan block rendered from a READ-ONLY snapshot of the steps."""
+            if step_cards is None:
+                return None
+            snap = step_cards.progress_snapshot()
+            if snap is None:
+                return None
+            title, tasks = snap
+            cards = []
+            for t in tasks:
+                task: Dict[str, Any] = {"type": "task_card", "task_id": t["id"],
+                                        "title": t["title"], "status": t["status"]}
+                if t.get("result"):
+                    task["details"] = {"type": "rich_text", "elements": [
+                        {"type": "rich_text_section",
+                         "elements": [{"type": "text", "text": t["result"]}]}]}
+                cards.append(task)
+            return [{"type": "plan", "title": title, "tasks": cards}]
+
+        @visible_mutation
+        async def _held_post(blocks: list) -> None:
+            """GR10: the accepted post, its chrome receipt and the ts capture are one protected
+            operation. An uncertain create is recorded and never retried (no second card)."""
+            from slack_client.messaging import HELD_PROGRESS_EVENT, HELD_PROGRESS_TEXT
+            try:
+                ts = await client.post_status_card(
+                    message.channel_id, reply_target, HELD_PROGRESS_TEXT, blocks,
+                    receipts=receipts, receipt_class="chrome",
+                    metadata={"event_type": HELD_PROGRESS_EVENT, "event_payload": {}})
+            except Exception as card_error:  # noqa: BLE001 — chrome; the answer proceeds
+                held_card["dead"] = True
+                if turn is not None:
+                    turn.held_card_blocked = True   # review 8: never a second card this turn
+                self.log_warning(f"Held progress card create uncertain: {card_error}")
+                return
+            if not ts:
+                held_card["dead"] = True
+                if turn is not None:
+                    turn.held_card_blocked = True
+                return
+            held_card["ts"] = ts
+            held_card["last_blocks"] = blocks
+            if turn is not None:
+                turn.held_card_opened = True
+                turn.note_first_visible("card")
+
+        async def _held_service() -> None:
+            """Show or refresh the card when this held turn may (serialized; a frozen writer or
+            a late callback never reopens it)."""
+            if (not _held_active() or held_card["dead"] or not held_card["want_card"]
+                    or (turn is not None and turn.held_card_blocked and held_card["ts"] is None)):
+                return
+            async with held_lock:
+                if not _held_active() or held_card["dead"]:
+                    return
+                if turn is not None and turn.held_card_blocked and held_card["ts"] is None:
+                    return
+                # GR1: an open destination shows 👀 only; a top-level reply shows 👀 only.
+                if (held_card["dest_open"] or not destination_bound or reply_target is None
+                        or _user_stopped()):
+                    return
+                blocks = _held_blocks()
+                if blocks is None:
+                    return                  # nothing displayable yet: 👀 suffices
+                if held_card["ts"] is None:
+                    await _held_post(blocks)
+                elif blocks != held_card["last_blocks"]:
+                    from slack_client.messaging import HELD_PROGRESS_TEXT
+                    result = await client.update_status_card(
+                        message.channel_id, held_card["ts"], HELD_PROGRESS_TEXT, blocks)
+                    if result:
+                        held_card["last_blocks"] = blocks
+
+        async def _held_signal(kind: str) -> None:
+            """The attempt's hook (`turn.held_progress_hook`): plan and slow work may open the
+            card; first answer text earns 👀 only (GR5)."""
+            if not _held_active():
+                return
+            if turn is not None:
+                turn.note_progress_signal(kind)     # GR5/review 16: held-eligible turns only
+            if kind in ("plan", "work"):
+                held_card["want_card"] = True
+                await _held_service()
+
+        async def _held_text(text: Optional[str]) -> None:
+            """GR5 (c): the first non-whitespace, marker-stripped answer text — 👀 only."""
+            if (_held_active() and turn is not None and not held_card["text_claimed"]
+                    and text and text.strip()):
+                held_card["text_claimed"] = True
+                await turn.claim_work(client, message, signal="text")
+
+        async def _held_freeze() -> None:
+            """GR7: no card write after this — an in-flight one finishes first."""
+            if held_on:
+                async with held_lock:
+                    held_card["frozen"] = True
+
+        async def _held_remove(reason: str) -> None:
+            """GR7/GR9: freeze, then delete the card. The chrome receipt is aborted only on a
+            CONFIRMED delete; a failed delete keeps the chrome and is recorded. Idempotent."""
+            if not held_on:
+                return
+            async with held_lock:
+                # The lock is held ACROSS the delete, and `removed` is set only once it has
+                # completed: a cancel mid-delete leaves the card for the `finally` to retry.
+                held_card["frozen"] = True
+                ts = held_card["ts"]
+                if ts is None or held_card["removed"]:
+                    return
+                gone = False
+                try:
+                    gone = bool(await client.delete_message(message.channel_id, ts))  # unleased-ok: taking temporary chrome DOWN is never a stale answer
+                except Exception as delete_error:  # noqa: BLE001
+                    self.log_debug(f"Held progress card delete failed: {delete_error}")
+                held_card["removed"] = True
+            if gone:
+                if receipts is not None:
+                    try:
+                        await receipts.abort(ts)
+                    except Exception as receipt_error:  # noqa: BLE001
+                        self.log_debug(f"Held card receipt abort failed: {receipt_error}")
+                if turn is not None:
+                    turn.held_card_removed = reason     # the last successful reason wins
+            elif turn is not None:
+                turn.held_card_remove_failed = True
+                turn.held_card_blocked = True           # review 8: no replacement card
+
+        def _held_remove_soon() -> None:
+            """Review 5: delete at the answer's FIRST confirmed accept (a sync callback)."""
+            if held_on and held_card["ts"] is not None and not held_card["removed"]:
+                held_pending.append(asyncio.ensure_future(_held_remove("answer")))
+
+        def _held_detach() -> None:
+            if turn is not None and getattr(turn, "held_progress_hook", None) == (
+                    held_attempt, _held_signal):
+                turn.held_progress_hook = None
+
+        held_pending: List[Any] = []
+        if held_on and turn is not None:
+            turn.held_progress_hook = (held_attempt, _held_signal)
+
+        def _accepted_on_stop() -> str:
+            """What the room actually has on a stopped turn: the native stream's accepted text,
+            or the legacy parts already closed plus the text last shown in the current one."""
+            if (native_coord is not None and native_coord.started and not native_coord.failed
+                    and not native_coord.hidden):
+                return native_coord.accepted_text()
+            if not visible_content_delivered:
+                return ""
+            return "".join(legacy_closed_raw) + (buffer.last_sent_text or "")
+
+        def _on_hosted_progress(ev: Dict[str, Any]) -> None:
+            """§C.4, SYNCHRONOUS (called between two tokens): one hosted call's step card. A
+            short label for a title; the query or page rides as the card's detail line."""
+            if step_cards is None or not isinstance(ev, dict):
+                return
+            if ev.get("kind") == "citations":
+                try:
+                    step_cards.add_citations(list(ev.get("items") or []))
+                except Exception as cite_error:  # noqa: BLE001 — a card never breaks the stream
+                    self.log_debug(f"citations dropped: {cite_error}")
+                return
+            if ev.get("kind") != "hosted":
+                return
+            try:
+                call_id = ev.get("call_id")
+                state = ev.get("state")
+                tool = ev.get("tool")
+                status = _STEP_STATUS.get(state) if isinstance(state, str) else None
+                if not call_id or status is None or not isinstance(tool, str):
+                    return
+                label = ev.get("label") if isinstance(ev.get("label"), str) else None
+                details: Optional[str] = None
+                if tool == "mcp":
+                    server = ev.get("server") if isinstance(ev.get("server"), str) else None
+                    title = f"Asking {server or label or 'a connected tool'}"
+                    details = label if label and label != server else None
+                elif tool == "web_search":
+                    title = ("Opening a page" if ev.get("action") == "open_page"
+                             else _HOSTED_STEP_LABELS[tool])
+                    details = label
+                elif tool in _HOSTED_STEP_LABELS:
+                    title = _HOSTED_STEP_LABELS[tool]
+                else:
+                    return
+                sources = ev.get("sources") if tool == "web_search" else None
+                step_cards.record(f"hosted:{call_id}", _step_title(client, title), status,
+                                  sources, details=details,
+                                  outcome=_hosted_step_outcome(tool, str(state), ev),
+                                  kind=tool)
+            except Exception as card_error:  # noqa: BLE001 — a card never breaks the stream
+                self.log_debug(f"step card dropped: {card_error}")
+
+        def _on_local_step(ev: Dict[str, Any]) -> None:
+            """§C.4, SYNCHRONOUS: one local call's step card. Every dispatched local tool gets
+            one (a specific label, else "Using <tool name>") — except the destination
+            bookkeeping call, which is plumbing the reader never asked about."""
+            if step_cards is None or not isinstance(ev, dict):
+                return
+            try:
+                name = str(ev.get("name") or "")
+                state = ev.get("state")
+                status = _STEP_STATUS.get(state) if isinstance(state, str) else None
+                if (not name or name in (SET_REPLY_DESTINATION, UPDATE_PLAN) or status is None
+                        or not ev.get("id")):
+                    return
+                title = _LOCAL_STEP_LABELS.get(name) or f"Using {name.replace('_', ' ')}"
+                outcome = (_local_step_outcome(name, ev.get("result"), state == "complete")
+                           if state in ("complete", "failed") else None)
+                step_cards.record(str(ev["id"]), _step_title(client, title), status,
+                                  details=_local_step_detail(ev.get("arguments")),
+                                  outcome=outcome)
+            except Exception as card_error:  # noqa: BLE001 — a card never breaks the stream
+                self.log_debug(f"step card dropped: {card_error}")
+
         def _bind_destination() -> None:
             """Fix this turn's reply target, once. Idempotent.
 
@@ -2848,6 +3492,8 @@ class TextHandlerMixin(_Host):
                     char_limit=message_char_limit, logger=self.log_debug,
                     user_id=message.user_id,
                     receipts=receipts,
+                    # §C: step cards ride this turn's stream (every part) in chunks mode.
+                    chunks_mode=step_cards is not None, steps=step_cards,
                 )
 
         # Structurally placed turns bind now, so nothing about their lifecycle changes.
@@ -2858,7 +3504,7 @@ class TextHandlerMixin(_Host):
         progress_task = None
         first_chunk_received = False
 
-        async def _flush_native_pending(force: bool) -> None:
+        async def _flush_native_pending(force: bool, with_steps: bool = True) -> None:
             """Append the buffer's cumulative text to the native stream now.
 
             Appends are otherwise token-driven, so a finished round's preamble would sit
@@ -2894,7 +3540,12 @@ class TextHandlerMixin(_Host):
             # append — stripping them at finalize (as we used to) is far too late, because
             # the link is already in Slack by then.
             cumulative = stream_safe_text(buffer.get_complete_text())
-            ok, overflow = await native_coord.update(cumulative)
+            if with_steps:
+                ok, overflow = await native_coord.update(cumulative)
+            else:
+                ok, overflow = await native_coord.update(cumulative, with_steps=False)
+            if native_coord.user_stopped:
+                return      # §A.3.3: Slack stopped the stream; the prefix stands, nothing failed
             if overflow is not None:
                 # Part rolled: the just-closed part's visible text was delivered (M4 — the
                 # buffer is about to be reset to the newline-stripped remainder, so record
@@ -2929,6 +3580,83 @@ class TextHandlerMixin(_Host):
                 else:
                     self.log_warning("Native stream went inert — continuing with legacy updates")
 
+        async def _open_native_stream(from_step: bool) -> None:
+            """Mint this turn's native stream: the old surface comes down first, then
+            chat.startStream. Opened by the first word of the answer — or, on an addressed turn
+            with step cards (§C, live review), by the first tool step, card only."""
+            nonlocal lazy_surface_owned, message_id, current_message_id
+            if native_coord is None:
+                return
+            # ONE LIVE SURFACE, ALWAYS. chat.startStream MINTS a message, so the old
+            # surface has to be gone BEFORE it runs, not after. Deleting afterwards was
+            # best-effort and its result was ignored, so a failed delete left the turn
+            # owning two live messages — the abandoned indicator/partial AND the stream.
+            # If the old surface cannot be removed, native does not start at all: keep
+            # streaming into the surface we already have (legacy edits, below).
+            stand_down = False
+            if message_id:
+                removed = False
+                try:
+                    removed = bool(await client.delete_message(message.channel_id, message_id))  # unleased-ok: teardown — removing a surface can never be a stale answer
+                    if removed and receipts is not None:
+                        await receipts.abort(message_id)
+                except Exception as e:  # noqa: BLE001
+                    self.log_debug(f"Could not remove the old surface for native streaming: {e}")
+                if removed:
+                    if lazy_surface_owned == message_id:
+                        lazy_surface_owned = None
+                    message_id = None
+                    current_message_id = None
+                else:
+                    stand_down = True
+                    native_coord.failed = True
+                    self.log_info(
+                        "Could not clear the existing surface — native streaming stood "
+                        "down rather than leave a second message behind")
+            if not stand_down:
+                try:
+                    native_started = await native_coord.start(lease=_send_lease())
+                except StaleSendSuppressed as stale:
+                    # Ruling 2/3: complete-then-reconsider. Register the ORIGINAL
+                    # refusal — the API layer buffers the rest of the generation with
+                    # nothing visible, and the finished draft reaches the runner
+                    # carrying this exact exception, never a second one manufactured
+                    # by re-attempting a send the lease already refuses.
+                    hidden_stale.append(stale)
+                    if from_step:
+                        return      # the hidden-buffer mode now owns this turn's delivery
+                    raise
+                if native_started:
+                    # `native_coord.part_ts` is now this attempt's ledger of owned
+                    # messages (one per part) — the error path reconciles it, so an MCP
+                    # retry inherits the stream instead of minting a second one.
+                    current_message_id = native_coord.current_ts or current_message_id
+                else:
+                    self.log_info("Native streaming unavailable — using legacy streaming updates")
+
+        async def _push_native_steps() -> None:
+            """§C.2 at a tool event: the text that came BEFORE the tool goes first (text only),
+            then the pending step cards on their own append — a live card while the tool runs.
+            Not at a safe boundary (text still pending or withheld) ⇒ the cards wait for the next
+            append, which carries them ahead of its text."""
+            nonlocal current_message_id
+            if native_coord is None or step_cards is None or not native_coord.active:
+                return
+            if buffer.has_pending_update():
+                await _flush_native_pending(force=True, with_steps=False)
+            if (not step_cards.has_pending or buffer.has_pending_update()
+                    or not native_coord.active or not rate_limiter.can_make_request()):
+                return
+            rate_limiter.record_request_attempt()
+            if await native_coord.push_steps():
+                rate_limiter.record_success()
+            else:
+                rate_limiter.record_failure(is_rate_limit=False)
+                current_message_id = _legacy_fallback_target(
+                    None, native_coord.current_ts, current_message_id)
+                self.log_warning("Native stream went inert on a step card — continuing with "
+                                 "legacy updates")
+
         # Define the streaming callback
         async def _drop_surface(surface_ts) -> None:
             """Take a surface down when the guard refuses to write into it. Leaving a loading
@@ -2957,6 +3685,10 @@ class TextHandlerMixin(_Host):
             # If we've aborted, ignore further chunks
             if streaming_aborted:
                 return
+            # §A.3.2: after a Stop nothing more is delivered — the finish below works with what
+            # the room already has.
+            if stop_on and _user_stopped():
+                return
 
             # Cancel progress updater on first real chunk (not the None completion signal)
             if not first_chunk_received and text_chunk is not None:
@@ -2982,12 +3714,17 @@ class TextHandlerMixin(_Host):
                     held = marker_reader.flush()
                     if held:
                         buffer.add_chunk(held)
+                        await _held_text(held)
                 else:
                     text_chunk = marker_reader.feed(text_chunk)
                     # The moment the marker parses, the answer's destination is known and a
                     # surface may finally exist. Everything before it stayed unbound and buffered.
                     if marker_reader.destination is not None and not destination_bound:
                         _bind_destination()
+                        # §G GR5: binding may release an EARLIER plan/work signal (a marker-only
+                        # chunk never creates the text signal itself).
+                        if held_card["want_card"]:
+                            await _held_service()
                     if not text_chunk:
                         return
 
@@ -3028,7 +3765,12 @@ class TextHandlerMixin(_Host):
             # this buffer.
             if final_post_only:
                 if text_chunk:
+                    await _held_text(text_chunk)
                     buffer.add_chunk(text_chunk)
+                    # Review 13: a hosted completion recorded after the last tool callback still
+                    # reaches the card (Slack is called only when the card changed).
+                    if held_card["ts"] is not None:
+                        await _held_service()
                 return
 
             # ---- Native sink (Phase G): append-only streaming replaces the edit loop ----
@@ -3036,50 +3778,7 @@ class TextHandlerMixin(_Host):
                 if text_chunk is None:
                     return  # tail + attribution are appended by finalize() after the API call
                 if not native_coord.started:
-                    # ONE LIVE SURFACE, ALWAYS. chat.startStream MINTS a message, so the old
-                    # surface has to be gone BEFORE it runs, not after. Deleting afterwards was
-                    # best-effort and its result was ignored, so a failed delete left the turn
-                    # owning two live messages — the abandoned indicator/partial AND the stream.
-                    # If the old surface cannot be removed, native does not start at all: keep
-                    # streaming into the surface we already have (legacy edits, below).
-                    stand_down = False
-                    if message_id:
-                        removed = False
-                        try:
-                            removed = bool(await client.delete_message(message.channel_id, message_id))  # unleased-ok: teardown — removing a surface can never be a stale answer
-                            if removed and receipts is not None:
-                                await receipts.abort(message_id)
-                        except Exception as e:  # noqa: BLE001
-                            self.log_debug(f"Could not remove the old surface for native streaming: {e}")
-                        if removed:
-                            if lazy_surface_owned == message_id:
-                                lazy_surface_owned = None
-                            message_id = None
-                            current_message_id = None
-                        else:
-                            stand_down = True
-                            native_coord.failed = True
-                            self.log_info(
-                                "Could not clear the existing surface — native streaming stood "
-                                "down rather than leave a second message behind")
-                    if not stand_down:
-                        try:
-                            native_started = await native_coord.start(lease=_send_lease())
-                        except StaleSendSuppressed as stale:
-                            # Ruling 2/3: complete-then-reconsider. Register the ORIGINAL
-                            # refusal — the API layer buffers the rest of the generation with
-                            # nothing visible, and the finished draft reaches the runner
-                            # carrying this exact exception, never a second one manufactured
-                            # by re-attempting a send the lease already refuses.
-                            hidden_stale.append(stale)
-                            raise
-                        if native_started:
-                            # `native_coord.part_ts` is now this attempt's ledger of owned
-                            # messages (one per part) — the error path reconciles it, so an MCP
-                            # retry inherits the stream instead of minting a second one.
-                            current_message_id = native_coord.current_ts or current_message_id
-                        else:
-                            self.log_info("Native streaming unavailable — using legacy streaming updates")
+                    await _open_native_stream(from_step=False)
                 if not native_coord.failed:
                     buffer.add_chunk(text_chunk)
                     await _flush_native_pending(force=False)
@@ -3231,6 +3930,7 @@ class TextHandlerMixin(_Host):
                         if result["success"]:
                             # The first part's visible text was just delivered (M4).
                             visible_content_delivered = True
+                            legacy_closed_raw.append(first_part_raw)
                             if first_delivered_ts is None:
                                 first_delivered_ts = current_message_id
                                 _note_stream_observed(first_delivered_ts)
@@ -3530,6 +4230,16 @@ class TextHandlerMixin(_Host):
             # has any (every other path is one round), and the marker parser needs them — see
             # `consume_destination_marker`.
             response_segments: Optional[List[str]] = None
+            # Agent surfaces: the stop hook and the step-card feeds, passed only when their flag
+            # is on so a flag-off call carries exactly the keywords it always did.
+            surface_kwargs: Dict[str, Any] = {}
+            if stop_on:
+                surface_kwargs["stop_check"] = _user_stopped
+            if step_cards is not None:
+                surface_kwargs["progress_callback"] = _on_hosted_progress
+                surface_kwargs["step_callback"] = _on_local_step
+                # Each search's own sources, for its plan card's result line.
+                surface_kwargs["include_search_sources"] = True
             if tools and registry is not None:
                 # Local tools present — streaming function-call loop (intermediate tool
                 # rounds don't stream text; the final round streams normally). Hold the
@@ -3552,7 +4262,7 @@ class TextHandlerMixin(_Host):
                     aggregate_segments=True,
                     # set_reply_destination is BOOKKEEPING: it produces nothing and must never
                     # take a round slot a real tool needs (F37 free-tool accounting).
-                    free_tools=(SET_REPLY_DESTINATION,),
+                    free_tools=(SET_REPLY_DESTINATION, UPDATE_PLAN),
                     prior_committed=visible_already_committed,
                     model=model,
                     temperature=thread_config["temperature"],
@@ -3577,7 +4287,8 @@ class TextHandlerMixin(_Host):
                     # the fast tier (see the non-streaming twin), and the one that carries
                     # the person's own choice. Personal setting, so never on a channel turn.
                     service_tier_eligible=(not channel_turn
-                                           and thread_config.get("service_tier") == "fast")
+                                           and thread_config.get("service_tier") == "fast"),
+                    **surface_kwargs,
                 )
                 response_text = loop_result["text"]
                 response_segments = loop_result.get("segments")
@@ -3622,7 +4333,10 @@ class TextHandlerMixin(_Host):
                     container_gone_sink=containers_gone,
                     hidden_suppression_sink=hidden_stale,
                     service_tier_eligible=(not channel_turn
-                                           and thread_config.get("service_tier") == "fast")
+                                           and thread_config.get("service_tier") == "fast"),
+                    **({"progress_callback": _on_hosted_progress, "include_search_sources": True}
+                       if step_cards is not None else {}),
+                    **({"stop_check": _user_stopped} if stop_on else {}),
                 )
             else:
                 # Generate response without tools
@@ -3642,8 +4356,16 @@ class TextHandlerMixin(_Host):
                     meter=meter,
                     hidden_suppression_sink=hidden_stale,
                     service_tier_eligible=(not channel_turn
-                                           and thread_config.get("service_tier") == "fast")
+                                           and thread_config.get("service_tier") == "fast"),
+                    **({"stop_check": _user_stopped} if stop_on else {}),
                 )
+
+            # §A.3 / review 1.4: a stopped turn's answer is ONLY what Slack accepted — never
+            # words the model wrote that the room did not see.
+            user_stopped = _user_stopped()
+            if user_stopped:
+                response_text = _accepted_on_stop()
+                response_segments = None
 
             # F32: artifacts the model produced this turn. The reply text may carry dead
             # `sandbox:/mnt/data/...` links to them — strip those before the text is stored or
@@ -3751,9 +4473,12 @@ class TextHandlerMixin(_Host):
             if terminal_action == "no_reply":
                 self.log_info(
                     f"no_response_needed (streamed) — ending turn without words: {silence_reason}")
+                acked = await _deliver_job_ack()
+                held_end_reason = "silence"     # §G: why the held card goes
                 await self._cleanup_silent_stream(
-                    client, message.channel_id, native_coord, message_id, current_message_id,
-                    "no_reply", receipts=receipts)
+                    client, message.channel_id, None if acked else native_coord, message_id,
+                    None if acked else current_message_id,
+                    "no_reply", receipts=receipts, keep_cards=step_cards is not None)
                 return Response(
                     type="text",
                     content="",
@@ -3777,9 +4502,10 @@ class TextHandlerMixin(_Host):
             # returned no text — delete the placeholder and post nothing.
             if self._is_reaction_only(response_text, local_tool_calls):
                 self.log_info("Reaction-only streamed response (react tool) — removing placeholder")
+                held_end_reason = "silence"     # §G: why the held card goes
                 await self._cleanup_silent_stream(
                     client, message.channel_id, native_coord, message_id, current_message_id,
-                    "reaction-only", receipts=receipts)
+                    "reaction-only", receipts=receipts, keep_cards=step_cards is not None)
                 return Response(
                     type="text",
                     content="",
@@ -3797,9 +4523,15 @@ class TextHandlerMixin(_Host):
             # torn down instead of flushed. If preamble already reached Slack, leave it alone.
             if background_job_started and not visible_content_delivered:
                 self.log_info("start_background_job started — suppressing the turn's ack reply (card owns it)")
+                # A claimed job ack goes INTO the open cards stream, which stops there: one
+                # message carrying the steps and the job's line of voice.
+                acked = await _deliver_job_ack()
+                held_end_reason = "job"     # §G: why the held card goes
                 await self._cleanup_silent_stream(
-                    client, message.channel_id, native_coord, message_id, current_message_id,
-                    "deep_research", receipts=receipts)
+                    client, message.channel_id, None if acked else native_coord, message_id,
+                    None if acked else current_message_id,
+                    "deep_research", receipts=receipts, keep_cards=step_cards is not None,
+                    ending=ENDING_HANDOFF)
                 return Response(
                     type="text",
                     content="",
@@ -3811,6 +4543,7 @@ class TextHandlerMixin(_Host):
                     # because a suppressed ack reply looks identical either way.
                     metadata={"streamed": True, "background_job_started": True,
                               "model": thread_config.get("model"), "posted": False,
+                              **({"footer_attached": True} if acked else {}),
                               "artifact_containers": artifact_containers,
                               "sandbox_image_assets": sandbox_assets,
                               "mounted_digests": mounted_digests,
@@ -3831,9 +4564,10 @@ class TextHandlerMixin(_Host):
                 # §5.4a's write is NOT here any more. This branch is one of five endings a
                 # cross-thread post can take, and the write only ever reached this one; it now
                 # runs once, above the whole cascade.
+                held_end_reason = "silence"     # §G: why the held card goes
                 await self._cleanup_silent_stream(
                     client, message.channel_id, native_coord, message_id, current_message_id,
-                    "words-elsewhere", receipts=receipts)
+                    "words-elsewhere", receipts=receipts, keep_cards=step_cards is not None)
                 return Response(
                     type="text",
                     content="",
@@ -3845,6 +4579,21 @@ class TextHandlerMixin(_Host):
                               "response_reaction_committed":
                                   _reaction_committed(local_tool_calls)}
                 )
+
+            # §A.3.5: stopped before anything visible existed — the turn ends silent (a buffered
+            # answer is never posted, an empty stream or placeholder comes down).
+            if user_stopped and not visible_content_delivered:
+                if hidden_stale:
+                    # A hidden stale draft the Stop discarded: the refusal is still the turn's
+                    # ending, accounted exactly as before.
+                    raise hidden_stale[0]
+                self.log_info("user_stop: nothing visible yet — the stopped turn ends silent")
+                held_end_reason = "stop"     # §G: why the held card goes
+                await self._cleanup_silent_stream(
+                    client, message.channel_id, native_coord, message_id, current_message_id,
+                    "user-stop", receipts=receipts, keep_cards=step_cards is not None,
+                    stopped=True)
+                return _user_stopped_response(thread_config.get("model"))
 
             # Top-level channel replies stay chrome-free; attribution rides only in threads and
             # DMs. Binding is idempotent: it already happened at the first word of a streamed
@@ -3869,7 +4618,16 @@ class TextHandlerMixin(_Host):
             # then raised UnboundLocalError and ate the whole reply — which is exactly what a
             # "compute this and build me a deck" turn does.
             tools_note = ""
-            if (attribution_tools or exclude_mcp_server) and show_attribution:
+            # Owner decision: a reply whose stream SHOWS step cards drops the visible "Tools
+            # Used" line — the plan already says what ran. Only the line: `tools_used` (and with
+            # it provenance and the destination record) is untouched.
+            # Owner 2026-11-20: a model-written plan drops it too (supersedes R19).
+            cards_shown = bool(step_cards is not None
+                               and (step_cards.auto_cards_shown or step_cards.model_active)
+                               and native_coord is not None and native_coord.started
+                               and not native_coord.failed and not native_coord.hidden)
+            if ((attribution_tools or exclude_mcp_server) and show_attribution
+                    and not user_stopped and not cards_shown):
                 if attribution_tools:
                     # Show successful tools
                     if exclude_mcp_server:
@@ -3898,6 +4656,24 @@ class TextHandlerMixin(_Host):
             # legacy final-correction edit against the native message's ts.
             native_finalized = False
             footer_blocks = None
+            # Owner rule: the footer rides the reply's LAST message. Where a legacy edit or an
+            # overflow continuation is that message, it carries the footer too (flag-gated by
+            # the one-shot flag; top-level replies stay chrome-free).
+            legacy_footer_attached = False
+
+            def _legacy_footer() -> Optional[list]:
+                from slack_client.messaging import footer_rides_markdown
+                if (not footer_rides_markdown(message.channel_id, reply_target)
+                        or (turn is not None and turn.final_post_only)
+                        or not hasattr(client, "attachable_footer_blocks")
+                        or not hasattr(client, "attach_footer_markdown")):
+                    return None
+                try:
+                    return client.attachable_footer_blocks(message.channel_id,
+                                                           thread_config.get("model"))
+                except Exception as footer_err:  # noqa: BLE001
+                    self.log_debug(f"Legacy footer build failed: {footer_err}")
+                    return None
             # F52/F8: True once the settings footer has ridden a delivered message on the
             # direct final-post path (which has no native stream to attach to).
             direct_footer_attached = False
@@ -3922,8 +4698,21 @@ class TextHandlerMixin(_Host):
                 # its delta lands in the wrong place. `final` releases anything held back
                 # mid-stream that turned out to be innocent.
                 final_streamed = stream_safe_text(buffer.get_complete_text(), final=True)
-                native_finalized = await native_coord.finalize(
-                    final_streamed, suffix=suffix, blocks=footer_blocks)
+                if user_stopped:
+                    # §A.3 / review 1.4: nothing more goes into a stopped stream — no tail, no
+                    # withheld text; open cards close as errors.
+                    native_finalized = await native_coord.finish_stopped(blocks=footer_blocks)
+                elif step_cards is not None:
+                    # §C.5: open step cards end complete on success.
+                    native_finalized = await native_coord.finalize(
+                        final_streamed, suffix=suffix, blocks=footer_blocks, success=True)
+                else:
+                    native_finalized = await native_coord.finalize(
+                        final_streamed, suffix=suffix, blocks=footer_blocks)
+                if native_coord.user_stopped and not user_stopped:
+                    # The Stop surfaced at the final stopStream: the tail never landed.
+                    user_stopped = stop_seen = True
+                    response_text = native_coord.accepted_text()
                 current_message_id = native_coord.current_ts or current_message_id
                 if native_finalized:
                     current_part = native_coord.part
@@ -3986,6 +4775,79 @@ class TextHandlerMixin(_Host):
                     # than on a placeholder that may never have carried the answer.
                     direct_send_meta: dict = {}
 
+                    def _answer_accepted(ts: str) -> None:
+                        """The answer's first part is in the room: record it, and retire the
+                        held card at once (review 5), not after the remaining parts."""
+                        _note_stream_observed(ts)
+                        _held_remove_soon()
+
+                    async def _oneshot_native_post(body: str) -> Optional[str]:
+                        """§E: deliver `body` as ONE native stream — start with the whole body,
+                        stop with the footer blocks — so the settings button rides the reply.
+                        Returns the reply ts, or None for "use send_message" (out of scope,
+                        refused, rejected, or ambiguous and not found). A FRESH session per
+                        call; StaleSendSuppressed from the lease propagates unchanged."""
+                        if not (config.slack_buffered_oneshot_stream and effective_target
+                                and direct_footer_blocks
+                                and hasattr(client, "supports_native_streaming")
+                                and client.supports_native_streaming()
+                                and hasattr(client, "begin_native_stream")):
+                            return None
+                        raw = stream_safe_text(body or "", final=True)
+                        if not raw.strip() or len(raw) > message_char_limit:
+                            return None     # longer replies keep today's path (no rolls)
+                        # §F R1/R2: a buffered turn that wrote a plan carries the FINAL plan in
+                        # this same message (chunks mode, so the plan and the body share it).
+                        # Review 6: rendered from a COPY, so a stale refusal of this attempt
+                        # can never consume the plan a revised answer will carry.
+                        plan_chunks = (copy.deepcopy(step_cards).close(ENDING_DELIVERED)
+                                       if step_cards is not None and step_cards.model_active
+                                       else None)
+                        if plan_chunks:
+                            session = client.begin_native_stream(
+                                message.channel_id, effective_target, user_id=message.user_id,
+                                chunks_mode=True)
+                        else:
+                            session = client.begin_native_stream(
+                                message.channel_id, effective_target, user_id=message.user_id)
+                        # The WHOLE body in the opening call, nothing held for a later delta;
+                        # an ambiguous start is reconciled against the exact payload sent,
+                        # inside the same visible-mutation protection (review 1.14/2.13/2.16).
+                        started = await session.start_whole(
+                            raw, lease=_send_lease(),
+                            reconcile=getattr(client, "_reconcile_uncertain_post", None),
+                            **({"task_chunks": plan_chunks} if plan_chunks else {}))
+                        ts = getattr(session, "ts", None) if started else None
+                        if not ts:
+                            return None     # refused / rejected / not found: send_message
+                        await _held_remove("answer")    # review 5: the answer is accepted
+                        reconciled = getattr(session, "start_outcome", None) == "reconciled"
+                        if reconciled:
+                            self.log_info("One-shot stream start was ambiguous but the reply "
+                                          "landed — closing it with the footer")
+                        _note_stream_observed(ts)
+                        if receipts is not None:
+                            try:
+                                await receipts.note_post(ts, thread_root_ts=effective_target,
+                                                         receipt_class="assistant_reply")
+                            except Exception as receipt_err:  # noqa: BLE001
+                                self.log_debug(f"One-shot stream receipt failed: {receipt_err}")
+                        # Close it with the footer; a definitive refusal of the blocks closes it
+                        # plain (review 2.14). The footer rode ONLY if Slack accepted the stop
+                        # carrying it (2.15); a stop that timed out leaves the footer unknown,
+                        # and a second Configure row is not posted on a guess.
+                        await session.finish(blocks=direct_footer_blocks,
+                                             close_on_block_reject=True)
+                        stop_outcome = getattr(session, "stop_outcome", None)
+                        from slack_client.messaging import Delivery
+                        direct_send_meta["delivery"] = Delivery(
+                            first_ts=ts, text=raw, complete=True, parts_delivered=1,
+                            parts_total=1, split=False)
+                        direct_send_meta["footer_attached"] = stop_outcome in ("ok", "ambiguous")
+                        if reconciled:
+                            direct_send_meta["reconciled"] = True
+                        return ts
+
                     async def _direct_final_post(
                             text: str, extra_tools: Optional[Sequence[str]] = None,
                             extra_results: Sequence[Dict[str, Any]] = ()) -> Optional[str]:
@@ -3998,7 +4860,12 @@ class TextHandlerMixin(_Host):
                         runner's loop as the next pass). `extra_tools` (not None) marks a
                         tooled reconsideration's text: its hosted tools join this turn's
                         attribution and provenance before the footer is rendered (R3-5)."""
-                        nonlocal response_text
+                        nonlocal response_text, stop_blocked_send
+                        if _user_stopped():
+                            # Review 2.4: the Stop came before the send — nothing is posted,
+                            # on the first attempt or a reconsidered one.
+                            stop_blocked_send = True
+                            return None
                         if extra_tools is not None:
                             text = reattribute_reply(
                                 text, tools_used, mcp_results, extra_tools, extra_results,
@@ -4010,7 +4877,17 @@ class TextHandlerMixin(_Host):
                         response_text = consume_destination_marker(text, turn=turn,
                                                                    message=message)
                         direct_send_meta.clear()
-                        return await client.send_message(
+                        # §E: a buffered threaded reply that fits one part posts as a one-shot
+                        # native stream, so the settings button rides the reply itself.
+                        oneshot_ts = await _oneshot_native_post(response_text)
+                        if oneshot_ts:
+                            return oneshot_ts
+                        if _user_stopped():
+                            # Review 2: a Stop during a refused/ambiguous one-shot stops here.
+                            stop_blocked_send = True
+                            return None
+                        direct_send_meta.clear()
+                        posted = await client.send_message(
                             message.channel_id, effective_target, response_text,
                             blocks=direct_footer_blocks, meta_out=direct_send_meta,
                             lease=_send_lease(), receipts=receipts,
@@ -4018,7 +4895,14 @@ class TextHandlerMixin(_Host):
                             # The first accepted part is a surface the room can already read,
                             # so it is recorded before the rest of a split runs rather than
                             # after.
-                            on_first_accept=_note_stream_observed)
+                            on_first_accept=_answer_accepted,
+                            # A footer refusal's plain retry checks the Stop like the first try.
+                            **({"stop_check": _user_stopped} if stop_on else {}))
+                        if posted is None and _user_stopped():
+                            stop_blocked_send = True
+                        if posted:
+                            await _held_remove("answer")        # GR7: after the answer landed
+                        return posted
 
                     # STALE_RECONSIDERATION §4b/§5-r5-1: True when a reconsidered delivery
                     # returned None — the runner already emitted error_dropped(delivery_failed
@@ -4037,8 +4921,15 @@ class TextHandlerMixin(_Host):
                     # carrying THAT original exception — re-attempting the send first would
                     # only manufacture a second refusal from the same suppressed lease.
                     hidden_suppression = hidden_stale[0] if hidden_stale else None
+                    # §G GR7: freeze the held card's writer before final delivery.
+                    await _held_freeze()
                     try:
                         if hidden_suppression is not None:
+                            await _held_remove("suppressed")    # GR2: before the runner
+                            if _user_stopped():
+                                # Review 3: a stopped turn skips reconsideration — a stop.
+                                held_end_reason = "stop"
+                                return _user_stopped_response(thread_config.get("model"))
                             posted_ts = await intercept_stale_send(
                                 processor=self, client=client, message=message, turn=turn,
                                 lease=_send_lease(),
@@ -4055,12 +4946,25 @@ class TextHandlerMixin(_Host):
                         # this site keeps delivering through the closure above.
                         if hidden_suppression is not None:
                             raise      # the runner already ran and rethrew: that is the ending
+                        await _held_remove("suppressed")        # GR2: before the runner
+                        if _user_stopped():
+                            held_end_reason = "stop"            # review 3
+                            return _user_stopped_response(thread_config.get("model"))
                         posted_ts = await intercept_stale_send(
                             processor=self, client=client, message=message, turn=turn,
                             lease=_send_lease(), suppressed=stale, draft=response_text,
                             deliver=_direct_final_post, channel_turn=channel_turn)
                         if posted_ts is None:
                             reconsider_owned_failure = True
+                    if stop_blocked_send:
+                        self.log_info("user_stop: Stop pressed before the final post — nothing "
+                                      "posted")
+                        held_end_reason = "stop"     # §G: why the held card goes
+                        await self._cleanup_silent_stream(
+                            client, message.channel_id, native_coord, message_id,
+                            current_message_id, "user-stop", receipts=receipts,
+                            keep_cards=step_cards is not None, stopped=True)
+                        return _user_stopped_response(thread_config.get("model"))
                     if posted_ts:
                         current_message_id = posted_ts
                         visible_content_delivered = True
@@ -4101,14 +5005,17 @@ class TextHandlerMixin(_Host):
                 # We're on an overflow message - just remove the loading indicator
                 self.log_debug(f"Removing loading indicator from part {current_part}")
                 try:
-                    # Get the current display text without loading indicator
-                    final_part_text = buffer.get_complete_text()
+                    # Get the current display text without loading indicator. A stopped turn
+                    # keeps exactly what was last shown (review 1.4).
+                    final_part_text = (buffer.last_sent_text if user_stopped
+                                       else buffer.get_complete_text())
                     if final_part_text:
                         # Add tools attribution to the final overflow message if tools were used.
                         # attribution_tools, NOT tools_used: this branch was missed when
                         # code_interpreter became invisible, so an overflowing answer still
                         # footed "Tools Used: code_interpreter".
-                        if (attribution_tools or exclude_mcp_server) and show_attribution:
+                        if ((attribution_tools or exclude_mcp_server) and show_attribution
+                                and not user_stopped and not cards_shown):
                             if attribution_tools:
                                 if exclude_mcp_server:
                                     tools_note = f"\n\n_Tools Used: {', '.join(attribution_tools)} (failed: {exclude_mcp_display})_"
@@ -4119,8 +5026,10 @@ class TextHandlerMixin(_Host):
                             final_part_text = final_part_text + tools_note
                             self.log_debug(f"Added tools attribution to overflow part {current_part}")
 
+                        part_body = final_part_text
                         # Add the part indicator
                         final_part_text = f"{part_prefix(current_part)}{final_part_text}"
+                        part_footer = _legacy_footer()
 
                         # W1: the buffer can outgrow the limit between the last
                         # mid-stream update and completion. Without this check the
@@ -4142,7 +5051,11 @@ class TextHandlerMixin(_Host):
                                 f"{CONTINUATION_HEAD}\n\n{overflow_text}",
                                 lease=_send_lease(), surface="legacy_update",
                                 meta_out=overflow_meta, receipts=receipts,
-                                receipt_class="assistant_reply")
+                                receipt_class="assistant_reply",
+                                **({"blocks": part_footer} if part_footer else {}),
+                                **({"stop_check": _user_stopped} if part_footer and stop_on
+                                   else {}))
+                            legacy_footer_attached = bool(overflow_meta.get("footer_attached"))
                             delivery_split = True
                             overflow_delivery = overflow_meta.get("delivery")
                             if not overflow_ts or (overflow_delivery is not None
@@ -4159,6 +5072,14 @@ class TextHandlerMixin(_Host):
                             final_result = await client.update_message_streaming(
                                 message.channel_id, current_message_id, final_part_text,
                                 lease=_send_lease(), receipts=receipts)
+                            if (final_result["success"] and part_footer
+                                    and not final_result.get("truncated")):
+                                # Exactly the text that edit showed — never more (a stopped
+                                # turn's last shown text included).
+                                legacy_footer_attached = await client.attach_footer_markdown(
+                                    message.channel_id, current_message_id,
+                                    f"{part_prefix_markdown(current_part)}{part_body}",
+                                    part_footer, thread_root_ts=reply_target)
                         if final_result["success"]:
                             visible_content_delivered = True
                         else:
@@ -4205,7 +5126,7 @@ class TextHandlerMixin(_Host):
                         (`delivery_failed`). The normal path keeps its current unconditional
                         behavior."""
                         nonlocal response_text, delivery_split, delivery_complete, \
-                            delivered_text_override
+                            delivered_text_override, legacy_footer_attached
                         # W4: same choke point as the direct post above — a reconsidered draft is
                         # model output, and no marker survives into the message it becomes.
                         response_text = consume_destination_marker(text, turn=turn,
@@ -4228,15 +5149,20 @@ class TextHandlerMixin(_Host):
                                     "continuation tail (r4-2)")
                                 return None
 
-                            # Send the rest as new messages
+                            # Send the rest as new messages — the last one carries the footer.
                             overflow_text = response_text[cut:].lstrip()
                             overflow_meta: Dict[str, Any] = {}
+                            tail_footer = _legacy_footer()
                             overflow_ts = await client.send_message(
                                 message.channel_id, reply_target,
                                 f"{CONTINUATION_HEAD}\n\n{overflow_text}",
                                 lease=_send_lease(), surface="legacy_update",
                                 meta_out=overflow_meta, receipts=receipts,
-                                receipt_class="assistant_reply")
+                                receipt_class="assistant_reply",
+                                **({"blocks": tail_footer} if tail_footer else {}),
+                                **({"stop_check": _user_stopped} if tail_footer and stop_on
+                                   else {}))
+                            legacy_footer_attached = bool(overflow_meta.get("footer_attached"))
                             delivery_split = True
                             overflow_delivery = overflow_meta.get("delivery")
                             if not overflow_ts or (overflow_delivery is not None
@@ -4256,6 +5182,12 @@ class TextHandlerMixin(_Host):
                             message.channel_id, current_message_id, response_text,
                             lease=_send_lease(), receipts=receipts)
                         if final_result["success"]:
+                            whole_footer = _legacy_footer()
+                            if (whole_footer and current_message_id
+                                    and not final_result.get("truncated")):
+                                legacy_footer_attached = await client.attach_footer_markdown(
+                                    message.channel_id, current_message_id, response_text,
+                                    whole_footer, thread_root_ts=reply_target)
                             return current_message_id
                         self.log_error(f"Final correction update failed: {final_result.get('error', 'Unknown error')}")
                         return None
@@ -4266,6 +5198,8 @@ class TextHandlerMixin(_Host):
                         """The §4b delivery closure for the covered correction branches. A
                         tooled reconsideration's text (`extra_tools` not None) is re-attributed
                         from this turn's merged tools first (R3-5)."""
+                        if _user_stopped():
+                            return None     # review 2.4: a Stop came first — nothing revealed
                         if extra_tools is not None:
                             text = reattribute_reply(
                                 text, tools_used, mcp_results, extra_tools, extra_results,
@@ -4323,7 +5257,12 @@ class TextHandlerMixin(_Host):
             # the provenance digests below, which can take many seconds. Post it now through the
             # same method main.py uses (every rule of its own still applies), under the same
             # gate main.py applies, and tell main.py it is done.
-            footer_attached = bool((native_finalized and footer_blocks) or direct_footer_attached)
+            # A stream Slack stopped (§A.3.3) "finalized" without taking the chrome.
+            native_took_footer = bool(native_finalized and footer_blocks
+                                      and not (native_coord is not None
+                                               and native_coord.user_stopped))
+            footer_attached = bool(native_took_footer or direct_footer_attached
+                                   or legacy_footer_attached)
             footer_posted = False
             post_footer = getattr(client, "maybe_post_response_footer", None)
             if (post_footer is not None and not footer_attached
@@ -4346,7 +5285,8 @@ class TextHandlerMixin(_Host):
             tool_provenance = []
             stored_content = response_text
             if config.enable_tool_provenance:
-                tool_provenance = build_provenance(local_tool_calls, tools_used)
+                tool_provenance = build_provenance(
+                    [c for c in local_tool_calls if c.get("name") != UPDATE_PLAN], tools_used)
                 # F12: attach MCP result digests (result memory) alongside the names/gists.
                 # F16: summarization (when on) compresses overlong outputs once here rather
                 # than hard-truncating; off → today's cut.
@@ -4392,6 +5332,9 @@ class TextHandlerMixin(_Host):
             # `visible_content_delivered` are what produced `delivered_ts` — it reached its final
             # text. An INTERRUPTED stream never gets here with a delivered ts, so it stays
             # observed-only, which is exactly what turn_outcome should report about it.
+            if user_stopped:
+                # A stopped answer is not a whole one, and must never retire queued follow-ups.
+                delivery_complete = False
             if turn is not None and delivered_ts:
                 from message_processor.turn_runtime import (DEST_KIND_REPLY, DEST_KIND_SPLIT,
                                                             DEST_KIND_STREAM)
@@ -4460,6 +5403,9 @@ class TextHandlerMixin(_Host):
                            "artifact_containers": artifact_containers,
                            "sandbox_image_assets": sandbox_assets,
                            "mounted_digests": mounted_digests}
+            if user_stopped:
+                # §A.3: main.py reads this to record the turn as ended by the user's Stop.
+                stream_meta["user_stopped"] = True
             if final_post_failed:
                 # Nothing reached Slack. `streamed` False is what makes main.py post the text
                 # itself; leave `posted` UNSET rather than False so it derives the outcome from
@@ -4487,6 +5433,12 @@ class TextHandlerMixin(_Host):
             # and run a second attempt behind that state.
             raise
         except Exception as e:
+            # §G GR9: the held card is retired BEFORE any retry, replay or fallback, and this
+            # attempt's hook is detached so it can never open a card in its successor.
+            _held_detach()
+            for pending in held_pending:
+                await asyncio.gather(pending, return_exceptions=True)
+            await _held_remove("retry")
             # CONTEXT_METER §3.5: an overflow either earns the turn's ONE recovery — compaction
             # here, then the buffered fallback below reassembles and runs once more — or ends the
             # turn as the generic error. It never rides the fallback as an ordinary retry.
@@ -4567,6 +5519,8 @@ class TextHandlerMixin(_Host):
             if native_coord is not None and native_coord.started and not native_coord.finished:
                 if not await native_coord.abandon():
                     self.log_warning("Native stream abandon failed before non-streaming fallback")
+            if job_ack_claimed:
+                await _deliver_job_ack()    # the stream is gone: posted the way the job would
 
             # Try to remove the loading indicator if we have a visible message —
             # the lazy legacy seed (status-only DMs) lives in current_message_id,
@@ -4789,6 +5743,16 @@ class TextHandlerMixin(_Host):
             # is read defensively here rather than assumed.
             self._persist_destination_provenance(
                 turn, locals().get("local_tool_calls"), locals().get("tools_used"))
+            if turn is not None and getattr(turn, "job_ack_sink", None) is _claim_job_ack:
+                setattr(turn, "job_ack_sink", None)
+            if turn is not None and getattr(turn, "plan_sink", None) is _apply_model_plan:
+                setattr(turn, "plan_sink", None)
+            # §G: every remaining exit (silence, Stop, job handoff, a raise, a cancel) — the
+            # held card never outlives its attempt.
+            _held_detach()
+            for pending in held_pending:
+                await asyncio.gather(pending, return_exceptions=True)
+            await _held_remove(held_end_reason)
             # The progress updater edits Slack on a timer, so it must not outlive this method on
             # ANY exit — a cancellation (shutdown, an early stand-down) included, which bypasses
             # every branch that otherwise stops it.

@@ -391,6 +391,9 @@ class AsyncThreadStateManager(LoggerMixin):
         # thread_key -> {job_id -> {job_id, task, started_at, task_summary}}. Used for the
         # per-thread concurrency cap and shutdown (cancel/await the tasks).
         self._active_research: Dict[str, Dict[str, dict]] = {}
+        # Called with the thread_key whenever a job or generation registers or finishes
+        # (native Stop's agent-session status, spec §A.4). Sync; must never raise.
+        self.background_listener: Optional[Callable[[str], None]] = None
         # Threads whose warm in-memory state is missing at least one Slack message
         # (e.g. a message dropped from an overfull pending queue, or a crash mid-queue).
         # The next request on that thread refetches from Slack (the transcript) before
@@ -611,8 +614,11 @@ class AsyncThreadStateManager(LoggerMixin):
             "generation_id": generation_id,
             "task": task,
             "started_at": time.monotonic(),
+            # Wall clock, for ordering against a Slack event ts (native Stop, spec §A.2).
+            "started_epoch": time.time(),
             "prompt_summary": prompt_summary,
         }
+        self._notify_background(thread_key)
 
     def attach_generation_task(self, thread_key: str, generation_id: str, task: asyncio.Task):
         """Store the scheduled task handle (minted after the id, needed for shutdown).
@@ -658,8 +664,18 @@ class AsyncThreadStateManager(LoggerMixin):
             bucket.pop(generation_id, None)
             if not bucket:
                 self._active_generations.pop(thread_key, None)
+            self._notify_background(thread_key)
             return True
         return False
+
+    def _notify_background(self, thread_key: str) -> None:
+        listener = self.background_listener
+        if listener is None:
+            return
+        try:
+            listener(thread_key)
+        except Exception as e:  # noqa: BLE001 — a status hook never reaches the job
+            self.log_debug(f"background listener failed for {thread_key}: {e}")
 
     def generations_in_flight(self, thread_key: str) -> List[dict]:
         """Advisory list of in-flight generation entries for this thread, oldest first.
@@ -713,10 +729,12 @@ class AsyncThreadStateManager(LoggerMixin):
             "job_id": job_id,
             "task": task,
             "started_at": time.monotonic(),
+            "started_epoch": time.time(),   # see register_generation
             "task_summary": task_summary,
             "mode": mode,
             "deliverables": list(deliverables or []),
         }
+        self._notify_background(thread_key)
 
     def attach_research_task(self, thread_key: str, job_id: str, task: asyncio.Task):
         """Store the scheduled task handle (minted after the id, needed for shutdown).
@@ -748,6 +766,7 @@ class AsyncThreadStateManager(LoggerMixin):
             bucket.pop(job_id, None)
             if not bucket:
                 self._active_research.pop(thread_key, None)
+            self._notify_background(thread_key)
             return True
         return False
 
@@ -785,6 +804,16 @@ class AsyncThreadStateManager(LoggerMixin):
                     "task_summary": g.get("prompt_summary"),
                     "kind": "image_generation"}
                    for g in self.generations_in_flight(thread_key))
+        return out
+
+    def background_started_epochs(self, thread_key: str) -> Dict[str, Optional[float]]:
+        """Wall-clock start of every piece of cancellable work in this thread, by id. Kept out
+        of `cancellable_in_flight`, whose shape is model-facing."""
+        out: Dict[str, Optional[float]] = {
+            str(j_id): e.get("started_epoch")
+            for j_id, e in (self._active_research.get(thread_key) or {}).items()}
+        out.update({str(g.get("generation_id")): g.get("started_epoch")
+                    for g in self.generations_in_flight(thread_key)})
         return out
 
     def request_background_cancel(self, thread_key: str, job_id: Optional[str],

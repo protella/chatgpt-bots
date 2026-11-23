@@ -275,6 +275,10 @@ async def execute_mount_file(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str
         return _err("mount_failed",
                     f"Could not place {_safe_name(entry['filename'])} in the sandbox.")
 
+    # Where the bytes came from. A file WE published earlier in this thread is not an
+    # ingredient the user already holds: asked to re-deliver it (as a .tsv, say), the
+    # byte-identical copy IS the deliverable, so the publisher must not suppress it.
+    record["origin"] = entry.get("origin")
     _remember_mount(key, record)
     logger.info(f"Mounted {file_id} ({record['filename']}, {len(data)} bytes) "
                 f"at {record['path']}")
@@ -409,6 +413,8 @@ def mounted_digests(ctx: ToolContext) -> List[str]:
     """
     out: List[str] = []
     for m in (getattr(ctx, "mounted_files", None) or []):
+        if m.get("origin") == "generated":
+            continue    # our own earlier output: re-delivering it is not posting theirs back
         for key in ("digest", "digest_raw"):
             digest = m.get(key)
             if digest:

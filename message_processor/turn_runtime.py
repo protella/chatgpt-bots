@@ -49,6 +49,7 @@ P3 added the other half of that sentence: what the turn has CAUSED.
 """
 
 import asyncio
+import contextvars
 import time
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -444,6 +445,17 @@ class EditRecord:
     error: Optional[str] = None
 
 
+# §G review 10: the streaming attempt a task runs under (tool tasks inherit it at creation).
+HELD_ATTEMPT: "contextvars.ContextVar[Optional[object]]" = contextvars.ContextVar(
+    "held_attempt", default=None)
+
+
+def held_progress_enabled() -> bool:
+    """§G GR13: held-turn progress acts only with SLACK_STREAM_TASK_CARDS on too."""
+    return bool(getattr(config, "slack_held_turn_progress", False)
+                and getattr(config, "slack_stream_task_cards", False))
+
+
 @dataclass
 class TurnRuntime:
     """Per-turn presentation + work-claim state. Created in main.py, threaded to the handlers."""
@@ -524,6 +536,20 @@ class TurnRuntime:
     ack_attempt_id: Optional[str] = None
     visible_action_committed: bool = False
     _claiming: bool = field(default=False, repr=False)
+    # §G (held-turn progress): the current streaming attempt's progress hook — an async
+    # callable(signal) the attempt installs and detaches by identity — and the turn's facts for
+    # the noise study (first signal, first CONFIRMED visible cue, the temporary card's fate).
+    held_progress_hook: Any = field(default=None, repr=False)
+    held_first_signal: Optional[str] = None
+    held_first_signal_at: Optional[float] = None
+    held_first_visible: Optional[str] = None
+    held_first_visible_at: Optional[float] = None
+    held_card_opened: bool = False
+    held_card_removed: Optional[str] = None
+    held_card_remove_failed: bool = False
+    # Review 8: once a card create was uncertain or a delete failed, NO later attempt of this
+    # turn creates another card (a second card can never be told from the first).
+    held_card_blocked: bool = False
     # --- the channel stream this turn is answering from (spec §1-§4) ---
     # H, pinned at admission and NEVER refreshed. Every fetch, every window predicate and every
     # retry reads this one value, so two attempts of one turn cannot answer different questions.
@@ -1230,7 +1256,20 @@ class TurnRuntime:
             return None
         return getattr(message, "thread_id", None) if message is not None else self.reply_thread_id
 
-    async def claim_work(self, client: Any, message: Any) -> None:
+    def note_progress_signal(self, kind: str) -> None:
+        """§G GR5: the turn's FIRST commitment signal, latched once, synchronously. Called only
+        for held-eligible turns (the attempt's hook decides)."""
+        if self.held_first_signal is None and held_progress_enabled():
+            self.held_first_signal = kind
+            self.held_first_signal_at = time.time()
+
+    def note_first_visible(self, kind: str) -> None:
+        """§G GR12: the turn's first CONFIRMED visible cue (a placed 👀, a posted card…)."""
+        if self.held_first_visible is None and held_progress_enabled():
+            self.held_first_visible = kind
+            self.held_first_visible_at = time.time()
+
+    async def claim_work(self, client: Any, message: Any, signal: str = "work") -> None:
         """Real work is starting: stake the 👀 claim on the triggering message.
 
         Idempotent — many tools may call this in one turn, and exactly one reaction lands.
@@ -1240,6 +1279,23 @@ class TurnRuntime:
         to retract.
 
         Purely additive and fails silent — an emoji is never worth failing a turn over."""
+        # §G GR5: slow work (or a plan / first answer text, named by `signal`) is a commitment
+        # signal for a held turn, independent of whether the 👀 below can be placed. The hook is
+        # bound to the attempt that installed it (review 10): a caller running under another
+        # attempt's context — an old attempt's still-running tool — never reaches it.
+        installed = self.held_progress_hook
+        hook = None
+        if isinstance(installed, tuple) and len(installed) == 2:
+            token, fn = installed
+            if token is HELD_ATTEMPT.get():
+                hook = fn
+        if hook is not None:
+            try:
+                await hook(signal)
+            except asyncio.CancelledError:
+                raise
+            except Exception as hook_error:  # noqa: BLE001 — progress chrome never fails work
+                logger.debug(f"Held progress hook failed: {hook_error}")
         # A hosted tool's claim runs in the turn's own task (the Responses stream's callback), so
         # a stand-down's settle retracts it through `ack_lease`. Any other caller is a local
         # tool's own task, which a cancel of the turn would not stop: that turn is ineligible.
@@ -1276,6 +1332,8 @@ class TurnRuntime:
                     channel_id, react_ts, config.ack_reaction_emoji),
                 timeout=config.tool_call_timeout)
             self.ack_lease = lease
+            if lease is not None:
+                self.note_first_visible("reaction")
             self.ack_target_ts = react_ts
             self.ack_channel_id = channel_id
             # The work-claim 👀 never goes through execute_react_tool, so without this it is the

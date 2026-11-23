@@ -35,6 +35,8 @@ class SlackBotHost:
     markdown_converter: Any
     message_handler: Optional[Callable[..., Any]]
     settings_modal: Any
+    # Injected by main.py at construction: is a foreground turn running in (channel, thread_ts)?
+    turn_running_in_thread: Optional[Callable[[str, str], bool]]
 
     # --- class-level configuration -------------------------------------------------------------
     MAX_MESSAGE_LENGTH: int
@@ -51,6 +53,7 @@ class SlackBotHost:
     _maybe_set_assistant_thread_title: Callable[..., Any]
     bot_user_id_for: Callable[..., Any]
     classify_sender: Callable[..., Any]
+    clear_assistant_status: Callable[..., Any]
     format_text: Callable[..., Any]
     get_message_permalink_tool: Callable[..., Any]
     get_user_timezone: Callable[..., Any]

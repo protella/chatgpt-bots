@@ -628,6 +628,7 @@ class OpenAIClient(LoggerMixin):
         hidden_suppression_sink: Optional[List[BaseException]] = None,
         meter: Optional[Any] = None,
         round_index: int = 0,
+        stop_check: Optional[Callable[[], bool]] = None,
     ) -> str:
         return await responses_api.create_streaming_response(
             self,
@@ -651,6 +652,7 @@ class OpenAIClient(LoggerMixin):
             hidden_suppression_sink=hidden_suppression_sink,
             meter=meter,
             round_index=round_index,
+            stop_check=stop_check,
         )
 
     async def create_streaming_response_with_tools(
@@ -685,6 +687,8 @@ class OpenAIClient(LoggerMixin):
         hidden_suppression_sink: Optional[List[BaseException]] = None,
         meter: Optional[Any] = None,
         round_index: int = 0,
+        stop_check: Optional[Callable[[], bool]] = None,
+        include_search_sources: bool = False,
     ) -> str:
         return await responses_api.create_streaming_response_with_tools(
             self,
@@ -716,6 +720,8 @@ class OpenAIClient(LoggerMixin):
             hidden_suppression_sink=hidden_suppression_sink,
             meter=meter,
             round_index=round_index,
+            stop_check=stop_check,
+            include_search_sources=include_search_sources,
         )
 
     async def create_text_response_with_tool_loop(

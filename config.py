@@ -617,6 +617,25 @@ class BotConfig:
     # must be verified live on the dev bot before enabling. Flip to true after that.
     slack_native_streaming: bool = field(default_factory=lambda: os.getenv("SLACK_NATIVE_STREAMING", "false").lower() == "true")
 
+    # --- Slack agent surfaces round (Docs/specs/slack_agent_surfaces_round.md) ---
+    # Each DEFAULT OFF; on in dev for the owner demo. Off = byte-identical to before.
+    # Native Stop button: handle agent_session_stopped (cancel the requester's turn + the
+    # thread's background work, then clear the session status).
+    slack_stop_button: bool = field(default_factory=lambda: os.getenv("SLACK_STOP_BUTTON", "false").lower() == "true")
+    # Background-job status card rendered as Slack's native plan block of task cards.
+    slack_native_plan_card: bool = field(default_factory=lambda: os.getenv("SLACK_NATIVE_PLAN_CARD", "false").lower() == "true")
+    # Tool steps shown as task_update cards inside natively streamed replies.
+    slack_stream_task_cards: bool = field(default_factory=lambda: os.getenv("SLACK_STREAM_TASK_CARDS", "false").lower() == "true")
+    # @mentioned channel turns also query Slack's native index (assistant.search.context).
+    slack_channel_native_search: bool = field(default_factory=lambda: os.getenv("SLACK_CHANNEL_NATIVE_SEARCH", "false").lower() == "true")
+    # Buffered (gate-woken) threaded replies post via a one-shot native stream so the
+    # settings button rides the reply instead of a separate message.
+    slack_buffered_oneshot_stream: bool = field(default_factory=lambda: os.getenv("SLACK_BUFFERED_ONESHOT_STREAM", "false").lower() == "true")
+    # §G: a held turn (silence-capable or destination-open) shows a temporary progress card
+    # once it commits to work, deleted on back-out or right after the answer lands. Acts only
+    # with SLACK_STREAM_TASK_CARDS on.
+    slack_held_turn_progress: bool = field(default_factory=lambda: os.getenv("SLACK_HELD_TURN_PROGRESS", "false").lower() == "true")
+
     # --- Assistant status indicator (Phase 3.2): assistant.threads.setStatus ---
     # Transient "thinking/working" status on the assistant-thread surface. Additive + best-effort:
     # it no-ops gracefully in plain channels (where the visible progress comes from streaming text).

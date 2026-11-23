@@ -99,6 +99,27 @@ def _footer_message(text="Old inline answer.", edited=None):
             ]}
 
 
+# A natively streamed reply as Slack stores it (probed 2026-11-20): optional leading
+# task_card blocks (or one plan), ONE rich_text body, then the settings button on stopStream.
+_TASK_CARD = {"type": "task_card", "block_id": "task-s1", "task_id": "s1",
+              "title": "Searching the web", "status": "complete"}
+_TASK_CARD_2 = {"type": "task_card", "block_id": "task-s2", "task_id": "s2",
+                "title": "Reading the results", "status": "complete"}
+_PLAN_BLOCK = {"type": "plan", "block_id": "pl1", "title": "Checking (2 of 2 done)",
+               "tasks": [{"type": "task_card", "task_id": "t1", "title": "Read",
+                          "status": "complete"}]}
+_RICH = {"type": "rich_text", "block_id": "Umtgb9", "elements": [
+    {"type": "rich_text_section", "elements": [{"type": "text", "text": "Old streamed answer."}]}]}
+_STREAMED_ACTIONS = {"type": "actions", "block_id": "pZKUm", "elements": [
+    {"type": "button", "action_id": "open_channel_settings",
+     "text": {"type": "plain_text", "text": "Configure", "emoji": True}, "value": "x"}]}
+
+
+def _streamed_message(blocks, text="Old streamed answer. Configure button"):
+    return {"ts": TS, "text": text, "bot_id": "BBOT", "thread_ts": ROOT,
+            "blocks": copy.deepcopy(blocks)}
+
+
 def _db(rows=None):
     default = [{"message_ts": TS, "state": "finalized", "receipt_class": "assistant_reply",
                 "thread_root_ts": ROOT}]
@@ -943,10 +964,24 @@ async def test_footer_reply_rebuild_preserves_the_actions_block_byte_for_byte():
         {"type": "section", "text": {"type": "mrkdwn", "text": "x"}},
         {"type": "actions", "elements": [
             {"type": "static_select", "action_id": "open_channel_settings"}]}]),
+    # Streamed shapes outside [task_card… | plan, rich_text, settings-actions?].
+    lambda m: m.update(blocks=[copy.deepcopy(_TASK_CARD), copy.deepcopy(_PLAN_BLOCK),
+                               copy.deepcopy(_RICH), copy.deepcopy(FOOTER_ACTIONS)]),
+    lambda m: m.update(blocks=[copy.deepcopy(_PLAN_BLOCK), copy.deepcopy(_PLAN_BLOCK),
+                               copy.deepcopy(_RICH)]),
+    lambda m: m.update(blocks=[copy.deepcopy(_RICH), copy.deepcopy(_RICH),
+                               copy.deepcopy(FOOTER_ACTIONS)]),
+    lambda m: m.update(blocks=[copy.deepcopy(_TASK_CARD), copy.deepcopy(_RICH),
+                               {"type": "actions", "elements": [
+                                   {"type": "button", "action_id": "research_cancel"}]}]),
+    lambda m: m.update(blocks=[copy.deepcopy(_TASK_CARD), copy.deepcopy(FOOTER_ACTIONS)]),
+    lambda m: m.update(blocks=[copy.deepcopy(_RICH), {"type": "context", "elements": []},
+                               copy.deepcopy(FOOTER_ACTIONS)]),
 ], ids=["files", "attachments", "rich_text_plus_section", "two_sections", "unknown_action",
         "extra_footer_element", "three_blocks", "empty_actions",
         "section_accessory", "section_fields", "duplicate_settings_buttons",
-        "non_button_element"])
+        "non_button_element", "task_card_plus_plan", "two_plans", "two_rich_texts",
+        "streamed_unknown_action", "task_card_without_body", "rich_text_then_context"])
 async def test_every_unsupported_shape_is_refused(mutate):
     message = _plain_message()
     mutate(message)
@@ -1457,3 +1492,52 @@ async def test_the_refusal_shim_logs_the_error_name_and_translates_nothing():
     host._execute_edit_own_message = raising_inner
     with pytest.raises(StaleSendSuppressed):
         await host.execute_edit_own_message(_ctx(host, turn=TurnRuntime()), dict(ARGS))
+
+
+# A replacement far past the inline-footer caps (180 chars / two newlines): the streamed shape
+# renders rich_text, which never folds, so long text is fine.
+_LONG_TEXT = "\n\n".join(f"Paragraph {i}: the cap is **48000** dollars, not 36000. " * 3
+                         for i in range(5))
+
+
+@pytest.mark.parametrize("lead,actions", [
+    ([], _STREAMED_ACTIONS),
+    ([_TASK_CARD, _TASK_CARD_2], _STREAMED_ACTIONS),
+    ([_PLAN_BLOCK], _STREAMED_ACTIONS),
+    ([_TASK_CARD], None),
+    ([_PLAN_BLOCK], None),
+], ids=["rich_text_actions", "task_cards", "plan", "task_card_no_actions", "plan_no_actions"])
+async def test_streamed_reply_rebuild_keeps_lead_and_actions_byte_for_byte(lead, actions):
+    live_blocks = list(lead) + [_RICH] + ([actions] if actions else [])
+    world = _World(_streamed_message(live_blocks))
+    host = _host(world)
+    turn = TurnRuntime()
+    args = dict(ARGS, new_text=_LONG_TEXT)
+    out = await host.execute_edit_own_message(_ctx(host, turn=turn), args)
+    assert out["ok"] is True and out["edited"] is True
+    sent = world.update_kwargs[0]
+    assert sent["blocks"] == (list(lead) + [{"type": "markdown", "text": _LONG_TEXT}]
+                              + ([actions] if actions else []))
+    assert sent["text"] == host.format_text(strip_citations(_LONG_TEXT))
+
+
+async def test_streamed_reply_ambiguous_update_reconciles_on_the_stored_rich_text():
+    """Slack stores the sent markdown block as rich_text: reconcile matches the body by type
+    and the carried-over blocks exactly."""
+    world = _World(_streamed_message([_TASK_CARD, _RICH, _STREAMED_ACTIONS]))
+    host = _host(world)
+    formatted = host.format_text(strip_citations(NEW_TEXT))
+
+    def landed_as_rich_text():
+        world.message["text"] = formatted
+        world.message["blocks"] = [copy.deepcopy(_TASK_CARD),
+                                   {"type": "rich_text", "block_id": "New1", "elements": []},
+                                   copy.deepcopy(_STREAMED_ACTIONS)]
+        world.message["edited"] = {"ts": "1700007777.000000"}
+
+    world.update_raises = TimeoutError("socket dropped mid-response")
+    world.on_update_raise = landed_as_rich_text
+    turn = TurnRuntime()
+    out = await host.execute_edit_own_message(_ctx(host, turn=turn), dict(ARGS))
+    assert out["ok"] is True and world.update_attempts == 1
+    assert turn.edits[0].state == EDIT_STATE_COMMITTED

@@ -7,7 +7,7 @@ import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Mapping,
+from typing import (TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Mapping,
                     Optional, Tuple, cast)
 from uuid import uuid4
 
@@ -20,6 +20,7 @@ from message_processor.client_contract import HistoryFetchError, Message
 from config import (SUPPORTED_CHAT_MODELS, config, dev_epoch_fence_requested,
                     pipeline_status_markers, valid_emoji_name)
 from message_processor import gate_context, participation_telemetry
+from message_processor import user_stop
 from message_processor.stale_send_guard import StaleSendSuppressed, visible_mutation
 from message_processor.turn_runtime import (DEST_KIND_CORRECTION_ANNOUNCEMENT,
                                             EDIT_STATE_COMMITTED, EditRecord, EffectRevoked,
@@ -39,10 +40,11 @@ from slack_client.event_handlers.feedback import (
     should_offer_feedback,
 )
 from slack_client._host import _Host
+from slack_client.event_handlers import agent_session
 from slack_client.formatting.blocks import extract_supplementary_text
 from slack_client.formatting.text import (encode_outbound_chunk,
                                           split_streamable_name_mention)
-from slack_client.normalizer import TimestampError, parse_ts
+from slack_client.normalizer import TimestampError, carded_answer_text, parse_ts
 from slack_client.utilities import is_user_shaped_id, strip_citations
 
 import re as _re
@@ -555,6 +557,30 @@ _SELF_STATUS_MARKERS = (
 )
 
 
+# §G GR8: the held-turn progress card's recognizable chrome shape — a constant fallback text and
+# a message-metadata event type. It is temporary chrome, never bot presence or an answer.
+HELD_PROGRESS_TEXT = "⏳ Working on a reply…"
+HELD_PROGRESS_EVENT = "held_progress"
+# Slack hands published emoji back in colon form, so a history read sees this spelling.
+_HELD_PROGRESS_TEXTS = frozenset({HELD_PROGRESS_TEXT,
+                                  ":hourglass_flowing_sand: Working on a reply…"})
+
+
+def is_held_progress_message(msg: Any) -> bool:
+    """A held-turn progress card: its metadata event type, or its constant fallback text (either
+    emoji spelling) TOGETHER WITH a plan block. A message without the plan block is never a card,
+    whatever its text — a real reply is never hidden by this."""
+    if not isinstance(msg, dict):
+        return False
+    meta = msg.get("metadata")
+    if isinstance(meta, dict) and meta.get("event_type") == HELD_PROGRESS_EVENT:
+        return True
+    blocks = msg.get("blocks")
+    has_plan = isinstance(blocks, list) and any(
+        isinstance(b, dict) and b.get("type") == "plan" for b in blocks)
+    return has_plan and (msg.get("text") or "") in _HELD_PROGRESS_TEXTS
+
+
 def is_self_chrome_message(text: str, msg: dict, *, markers=None) -> bool:
     """True when a message is our OWN transient UI chrome — a status/placeholder line
     (":emoji: Thinking…"), a progress checklist ("✓ …"), the legacy processing notice, the
@@ -573,6 +599,9 @@ def is_self_chrome_message(text: str, msg: dict, *, markers=None) -> bool:
     otherwise silently alter the bytes an admitted turn was already committed to."""
     try:
         text = text or ""
+        # §G GR8: a held-turn progress card is chrome, wherever it is read.
+        if is_held_progress_message(msg):
+            return True
         # F1 progress-checklist ("✓ …") — carries an invisible marker, not the ":emoji:" shape.
         if is_checklist_status_text(text):
             return True
@@ -597,6 +626,80 @@ def is_self_chrome_message(text: str, msg: dict, *, markers=None) -> bool:
     return False
 
 
+def _slack_error_code(error: BaseException) -> str:
+    """The Slack error code a failed Web API call carries ("" when it carries none)."""
+    response = getattr(error, "response", None)
+    try:
+        code = response.get("error") if response is not None else None
+    except Exception:  # noqa: BLE001 — a response shape we don't know is just "no code"
+        code = None
+    return code if isinstance(code, str) else ""
+
+
+def _md_chunk(text: str) -> Dict[str, Any]:
+    return {"type": "markdown_text", "text": text}
+
+
+def _definitive_rejection(error: BaseException) -> bool:
+    """Slack's own "no": an ok:false error body on an HTTP 200. Anything else — a 5xx, a
+    transport failure — may have landed, so it is never read as proof nothing happened."""
+    if not isinstance(error, SlackApiError):
+        return False
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", 200 if isinstance(response, dict) else None)
+    return status == 200 and bool(_slack_error_code(error))
+
+
+# Owner rule: the settings footer rides the reply's LAST message, never a message of its own.
+# A reply too long or too tall for the inline section carries it under a `markdown` block, which
+# Slack stores as rich_text exactly like a streamed reply (probed 2026-11-20) — so it never
+# collapses behind "Show more" the way a long section does. Slack's cap for the block's text:
+_MARKDOWN_BLOCK_MAX = 12000
+# The continuation head in markdown form; Slack stores **bold** as the canonical *bold* shape.
+_CONTINUATION_HEAD_MD = f"*{CONTINUATION_HEAD}*"
+
+
+def _markdown_footer_blocks(markdown: str, footer_blocks: Optional[list]) -> Optional[list]:
+    """The reply as a markdown block plus the footer row, or None when it cannot ride."""
+    if not footer_blocks or not markdown.strip() or len(markdown) > _MARKDOWN_BLOCK_MAX:
+        return None
+    return [{"type": "markdown", "text": markdown}] + list(footer_blocks)
+
+
+def footer_rides_markdown(channel_id: Optional[str], thread_id: Optional[str]) -> bool:
+    """Flag-gated: channel THREAD replies only. A top-level reply stays chrome-free, and a DM
+    keeps its own trailing strip (the feedback thumbs and settings, once per thread)."""
+    return bool(config.slack_buffered_oneshot_stream and thread_id and channel_id
+                and not str(channel_id).startswith("D"))
+
+
+_BLOCK_REFUSALS = frozenset({"invalid_blocks", "invalid_blocks_format", "invalid_arguments",
+                             "markdown_text_conflict"})
+_AMBIGUOUS_API_ERRORS = frozenset({"internal_error", "fatal_error", "service_unavailable",
+                                   "request_timeout", "ratelimited_unknown"})
+
+
+def _blocks_refused(error: BaseException) -> bool:
+    """Slack's definitive "no" to the BLOCKS of a post (nothing landed)."""
+    return _definitive_rejection(error) and _slack_error_code(error) in _BLOCK_REFUSALS
+
+
+def _ambiguous_api_error(error: BaseException) -> bool:
+    """An API error that may follow a partial success: a 5xx, or Slack's internal_error."""
+    if not isinstance(error, SlackApiError):
+        return False
+    return not _definitive_rejection(error) or _slack_error_code(error) in _AMBIGUOUS_API_ERRORS
+
+
+class _AmbiguousPost(Exception):
+    """A footer-carrying post whose outcome Slack left uncertain — routed to reconciliation."""
+
+
+# §A.3.3 / review 2.3: how long a `message_not_in_streaming_state` refusal waits for the Stop
+# event it most likely belongs to before it is treated as an ordinary stream failure.
+_STOP_EVENT_GRACE_S = 3.0
+
+
 class NativeStreamSession:
     """Adapter over Slack's native streaming API (chat.startStream/appendStream/stopStream).
 
@@ -612,8 +715,26 @@ class NativeStreamSession:
 
     def __init__(self, client, channel_id: str, thread_id: str, logger=None,
                  team_id: Optional[str] = None, user_id: Optional[str] = None,
-                 owner: Any = None):
+                 owner: Any = None, chunks_mode: bool = False):
         self._client = client
+        # CHUNKS MODE (agent surfaces §C), fixed for the session's life: every text call speaks
+        # `chunks=[{"type": "markdown_text", …}]` so task_update step cards can ride the same
+        # calls. Slack refuses a stream that mixes `markdown_text` and `chunks`, so the mode is
+        # never switched mid-stream. Off ⇒ the calls are byte-identical to before.
+        self.chunks_mode = bool(chunks_mode)
+        # §A.3.3: Slack stopped this stream itself (the native Stop button). Set only when an
+        # append/stop fails with `message_not_in_streaming_state` on a ts the Stop event named:
+        # the delivered prefix stands, and the caller must neither fall back nor republish.
+        self.stopped_by_user = False
+        # §E.3: how `start` ended — "ok", "refused" (fence/preflight; Slack never called),
+        # "rejected" (Slack answered with an error), "ambiguous" (transport error: the message
+        # may exist). None until start runs. `start_attempted_at` anchors a reconcile.
+        self.start_outcome: Optional[str] = None
+        self.start_attempted_at: Optional[float] = None
+        # The exact opening payload chat.startStream was handed (what a reconcile must match).
+        self.opening_payload: str = ""
+        # How the last finish() ended (see finish).
+        self.stop_outcome: Optional[str] = None
         # The BOT (not the web client) — the only object that holds the bot_id -> user_id cache
         # the outbound mention guard reads. Optional so a caller with no bot still works; the
         # guard then falls back to "@bot", which is still never a raw `<@B…>`.
@@ -645,12 +766,20 @@ class NativeStreamSession:
         self._held_name: str = ""
 
     @visible_mutation
-    async def start(self, initial_text: str = "", lease: Any = None) -> bool:
+    async def start(self, initial_text: str = "", lease: Any = None,
+                    task_chunks: Optional[List[Dict[str, Any]]] = None,
+                    release_all: bool = False) -> bool:
         """`lease` (stale guard): chat.startStream MINTS the reply message, so this is a first
         answer surface. Checked before the call, never after — once a stream is up, the rest of
-        the answer follows it."""
+        the answer follows it.
+
+        `task_chunks` (chunks mode only): step cards buffered before the stream existed; they
+        open the message, ahead of any opening text. `release_all`: the opening text is the
+        WHOLE message (the §E one-shot), so nothing is held back for a later delta — a trailing
+        name or mention goes out rewritten in this one call."""
         if lease is not None:
             lease.authorize("native_start")
+        self.start_outcome = "refused"
         # EPOCH FENCE: chat.startStream MINTS the reply message, so refusing here refuses the
         # whole stream — appendStream and stopStream key off a ts that will never exist. The
         # session goes inert exactly as it does on any other start failure.
@@ -681,26 +810,138 @@ class NativeStreamSession:
                 self._log(f"native streaming requires a {missing} — falling back to legacy")
             self.active = False
             return False
+        self.start_attempted_at = time.time()
         try:
             opening = self._releasable(initial_text or "")
-            resp = await self._client.chat_startStream(  # unleased-ok: inside NativeStreamSession.start, which authorized at its entry
-                channel=self._channel,
-                thread_ts=self._thread,
-                markdown_text=opening or None,
-                recipient_team_id=self._team_id,
-                recipient_user_id=self._user_id,
-            )
+            if release_all:
+                opening += self._flush()
+            self.opening_payload = opening
+            if self.chunks_mode:
+                # Never empty, never mixed: an empty start carries only the buffered step
+                # cards, or nothing at all.
+                chunks = list(task_chunks or []) + ([_md_chunk(opening)] if opening else [])
+                start_kwargs: Dict[str, Any] = {"task_display_mode": "plan"}
+                if chunks:
+                    start_kwargs["chunks"] = chunks
+                resp = await self._client.chat_startStream(  # unleased-ok: inside NativeStreamSession.start, which authorized at its entry
+                    channel=self._channel,
+                    thread_ts=self._thread,
+                    recipient_team_id=self._team_id,
+                    recipient_user_id=self._user_id,
+                    **start_kwargs,
+                )
+            else:
+                resp = await self._client.chat_startStream(  # unleased-ok: inside NativeStreamSession.start, which authorized at its entry
+                    channel=self._channel,
+                    thread_ts=self._thread,
+                    markdown_text=opening or None,
+                    recipient_team_id=self._team_id,
+                    recipient_user_id=self._user_id,
+                )
             self.ts = resp.get("ts")
             self._sent = initial_text or ""
             self.active = bool(self.ts)
+            # A success that names no message proves nothing either way.
+            self.start_outcome = "ok" if self.active else "ambiguous"
             if self.active and lease is not None:
                 lease.commit()      # the reply message exists; the rest belongs with it
             return self.active
         except Exception as e:  # noqa: BLE001 - best-effort, never fatal
+            # Only Slack's own "no" (ok:false on an HTTP 200) proves nothing was minted; a 5xx
+            # or a transport failure may have landed after Slack created the message.
+            self.start_outcome = "rejected" if _definitive_rejection(e) else "ambiguous"
             if self._log:
                 self._log(f"native stream start failed, will fall back: {e}")
             self.active = False
             return False
+
+    @visible_mutation
+    async def start_whole(self, body: str, lease: Any = None,
+                          reconcile: Optional[Callable[..., Awaitable[Optional[str]]]] = None,
+                          task_chunks: Optional[List[Dict[str, Any]]] = None) -> bool:
+        """§E one-shot: start with the WHOLE body, nothing held. An ambiguous start is
+        reconciled against the exact payload sent, INSIDE the same visible-mutation protection
+        (as send_message does), so a deferred stand-down can never cancel the turn between a
+        message Slack minted and the record of it. A found message becomes this session's
+        stream (it can still be stopped with the footer)."""
+        started = await self.start(body, lease=lease, release_all=True,
+                                   task_chunks=task_chunks)
+        if started or self.start_outcome != "ambiguous" or reconcile is None:
+            return started
+        payload = getattr(self, "opening_payload", "") or ""
+        if not payload.strip():
+            return False
+        try:
+            if task_chunks:
+                found = await reconcile(self._channel, self._thread, payload,
+                                        self.start_attempted_at or time.time(), contained=True)
+            else:
+                found = await reconcile(self._channel, self._thread, payload,
+                                        self.start_attempted_at or time.time())
+        except Exception as e:  # noqa: BLE001 — a failed lookup is "not found"
+            if self._log:
+                self._log(f"one-shot stream reconcile failed: {e}")
+            found = None
+        if not found:
+            return False
+        self.ts = str(found)
+        self._sent = body
+        self.active = True
+        self.start_outcome = "reconciled"
+        if lease is not None:
+            lease.commit()          # the reply is in the room
+        return True
+
+    async def clear_session_status(self) -> None:
+        """§C.5: a part stopped with session_status=processing and no next part opened — put the
+        session back to `active` so the Stop button / thinking state does not linger."""
+        setter = getattr(self._client, "agents_sessions_setStatus", None)
+        if setter is None or not self._thread:
+            return
+        try:
+            await setter(channel_id=self._channel, thread_ts=self._thread, status="active")
+        except Exception as e:  # noqa: BLE001 — status chrome, best-effort
+            if self._log:
+                self._log(f"could not clear the agent session status: {e}")
+
+    def _stop_recorded(self) -> bool:
+        if user_stop.stream_was_stopped(self._channel, self._thread, self.ts):
+            return True
+        since = self.start_attempted_at
+        return since is not None and user_stop.stop_requested_since(
+            self._channel, self._thread, since) is not None
+
+    async def _stopped_by_slack(self, error: BaseException) -> bool:
+        """§A.3.3: is this failure Slack telling us the user pressed Stop on THIS stream?
+
+        Slack can refuse the append before its Stop event reaches us, so a refusal with no Stop
+        on record waits briefly for one (§2.3); none in time ⇒ today's failure handling."""
+        if not config.slack_stop_button:
+            return False
+        code = _slack_error_code(error) or ("message_not_in_streaming_state"
+                                            if "message_not_in_streaming_state" in str(error)
+                                            else "")
+        if code != "message_not_in_streaming_state":
+            return False
+        deadline = time.monotonic() + _STOP_EVENT_GRACE_S
+        while not self._stop_recorded():
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(0.1)
+        self.stopped_by_user = True
+        self.stop_outcome = "stopped_by_user"
+        self.active = False
+        if self._log:
+            self._log("native stream was stopped from Slack — the delivered prefix stands")
+        return True
+
+    def accepted_text(self) -> str:
+        """The raw text of this part Slack actually accepted: what was sent, minus anything
+        still withheld (a held mention never reached Slack)."""
+        sent = self._sent
+        if self._held and sent.endswith(self._held):
+            sent = sent[:-len(self._held)]
+        return sent
 
     def _releasable(self, raw: str) -> str:
         """The part of `self._held + raw` that may go out NOW, rewritten; the rest is held.
@@ -769,34 +1010,88 @@ class NativeStreamSession:
         self._sent = self._sent[:-len(fragment)]
         return fragment
 
+    @property
+    def holding(self) -> bool:
+        """Raw text is withheld (a possible mention or code delimiter): not a safe boundary."""
+        return bool(self._held)
+
+    async def _append_chunks(self, chunks: List[Dict[str, Any]]) -> None:
+        await self._client.chat_appendStream(channel=self._channel, ts=self.ts, chunks=chunks)
+
     @visible_mutation
-    async def update(self, cumulative_text: str) -> bool:
-        """Append the new tail of ``cumulative_text`` since the last update."""
+    async def update(self, cumulative_text: str,
+                     task_chunks: Optional[List[Dict[str, Any]]] = None) -> bool:
+        """Append the new tail of ``cumulative_text`` since the last update.
+
+        `task_chunks` (chunks mode only) ride the same appendStream call, AHEAD of the text
+        delta; the caller passes them only at a safe boundary. Step cards are auxiliary: a
+        Slack refusal of a call carrying them drops the cards and keeps the answer streaming."""
         if not self.active or self.ts is None:
             return False
         delta = cumulative_text[len(self._sent):] if cumulative_text.startswith(self._sent) else cumulative_text
-        if not delta:
+        tasks = list(task_chunks or []) if self.chunks_mode else []
+        if not delta and not tasks:
             return True
-        outgoing = self._releasable(delta)
+        outgoing = self._releasable(delta) if delta else ""
         # The whole delta is a possible mention prefix: nothing may be appended yet, but the
         # cumulative mark still advances or the next tick would resend it.
-        if not outgoing:
+        if not outgoing and not tasks:
             self._sent = cumulative_text
             return True
         try:
-            await self._client.chat_appendStream(channel=self._channel, ts=self.ts, markdown_text=outgoing)
+            if self.chunks_mode:
+                text_part = [_md_chunk(outgoing)] if outgoing else []
+                try:
+                    await self._append_chunks(tasks + text_part)
+                except Exception as card_error:  # noqa: BLE001
+                    if not tasks or not _definitive_rejection(card_error):
+                        raise
+                    if self._log:
+                        self._log(f"step cards refused, dropped: {card_error}")
+                    if text_part:
+                        await self._append_chunks(text_part)
+            else:
+                await self._client.chat_appendStream(channel=self._channel, ts=self.ts, markdown_text=outgoing)
             self._sent = cumulative_text
             return True
         except Exception as e:  # noqa: BLE001
+            if await self._stopped_by_slack(e):
+                return True
+            if tasks and not outgoing:
+                # A cards-only append carried no answer text: the cards are dropped, the stream
+                # carries on — a card can never strand the answer.
+                if self._log:
+                    self._log(f"step-card append failed, dropped: {e}")
+                self._sent = cumulative_text
+                return True
             if self._log:
                 self._log(f"native stream append failed: {e}")
             self.active = False
             return False
 
+    def _drop_held(self) -> str:
+        self._held = self._held_name = ""
+        return ""
+
     @visible_mutation
-    async def finish(self, final_text: Optional[str] = None, blocks=None) -> bool:
+    async def finish(self, final_text: Optional[str] = None, blocks=None,
+                     task_chunks: Optional[List[Dict[str, Any]]] = None,
+                     session_status: Optional[str] = None,
+                     release_held: bool = True,
+                     close_on_block_reject: bool = False) -> bool:
+        """Close the stream. `blocks` ride only the stop. `task_chunks` and `session_status`
+        are chunks-mode only: the final step-card states, and the session state an
+        intermediate (rolled) part leaves behind.
+
+        `release_held=False` (a stopped turn): text still withheld never reached Slack and is
+        dropped rather than revealed. `close_on_block_reject` (§E): when Slack definitively
+        refuses the stop's blocks, close the stream with a plain stop. `stop_outcome` records
+        what happened: "ok" (the stop as asked, blocks included), "closed_without_blocks",
+        "ambiguous", "failed" or "stopped_by_user"."""
         if self.ts is None:
             return False
+        if self.stopped_by_user:
+            return True     # Slack already closed it; nothing left to say into it
         try:
             kwargs: Dict[str, Any] = {"channel": self._channel, "ts": self.ts}
             if final_text is not None and final_text.startswith(self._sent):
@@ -805,14 +1100,51 @@ class NativeStreamSession:
                 tail = final_text
             else:
                 tail = ""
+            # Whether the stream sat at a safe boundary BEFORE the final text is released: if
+            # it did, step cards go ahead of that text; if text was held, they go after it, so
+            # a card never splits a withheld "@Na" from the "me" that completes it.
+            boundary = not self._held
             # THE FLUSH. The stream is over, so a held fragment will never be completed by
             # another delta: it goes out now, rewritten, rather than being lost.
-            released = self._releasable(tail) + self._flush()
-            if released:
+            released = self._releasable(tail) + (self._flush() if release_held
+                                                 else self._drop_held())
+            if self.chunks_mode:
+                tasks = list(task_chunks or [])
+                text_part = [_md_chunk(released)] if released else []
+                chunks = tasks + text_part if boundary else text_part + tasks
+                # Content goes out on an append (the probed shape); the stop then carries only
+                # blocks / session status, so a blocks-only stop sends no empty markdown chunk.
+                if chunks:
+                    try:
+                        await self._append_chunks(chunks)
+                    except Exception as card_error:  # noqa: BLE001
+                        if not tasks or not _definitive_rejection(card_error):
+                            raise
+                        if self._log:
+                            self._log(f"final step cards refused, dropped: {card_error}")
+                        if text_part:
+                            await self._append_chunks(text_part)
+                if session_status is not None:
+                    kwargs["session_status"] = session_status
+            elif released:
                 kwargs["markdown_text"] = released
             if blocks is not None:
                 kwargs["blocks"] = blocks
-            await self._client.chat_stopStream(**kwargs)
+            try:
+                await self._client.chat_stopStream(**kwargs)
+                self.stop_outcome = "ok"
+            except Exception as stop_error:  # noqa: BLE001
+                if not (close_on_block_reject and blocks is not None
+                        and _definitive_rejection(stop_error)):
+                    raise
+                if self._log:
+                    self._log(f"stop with blocks refused ({stop_error}); closing without them")
+                kwargs.pop("blocks", None)
+                kwargs.pop("markdown_text", None)
+                # The footer was refused: whatever the plain stop does, it cannot attach it.
+                self.stop_outcome = "blocks_refused"
+                await self._client.chat_stopStream(**kwargs)
+                self.stop_outcome = "closed_without_blocks"
             self.active = False
             # The stream is a reply surface from its first byte; what it holds once stopped is
             # the part as delivered. Partial appends are never recorded — only this.
@@ -820,11 +1152,14 @@ class NativeStreamSession:
                              self._sent + tail)
             return True
         except Exception as e:  # noqa: BLE001
+            if await self._stopped_by_slack(e):
+                return True
+            if self.stop_outcome != "blocks_refused":
+                self.stop_outcome = "failed" if _definitive_rejection(e) else "ambiguous"
             if self._log:
                 self._log(f"native stream stop failed: {e}")
             self.active = False
             return False
-
 
 class WorkspaceEmojiCache:
     """Process-lifetime cache of the workspace's CUSTOM emoji shorthand names (emoji.list).
@@ -1202,6 +1537,72 @@ class SlackMessagingMixin(_Host):
     # it also survives the narrower right-hand thread flexpane and multi-line (list) replies.
     _FOOTER_INLINE_MAX = 180
 
+    def _markdown_tail_for(self, raw: str, chunk: str) -> Optional[str]:
+        """The markdown whose formatting is EXACTLY `chunk` — the last part of a reply that
+        was split as before (format first, then split) — so that part can carry the footer
+        under a markdown block of the very same content. None when no raw suffix formats to it
+        (a tail that opens inside a fence, say): the part then posts as before, plain."""
+        target = (chunk or "").strip()
+        if not target:
+            return None
+        starts = [0] + [i + 1 for i, ch in enumerate(raw) if ch == "\n"]
+        expected = max(0, len(raw) - len(chunk))
+        tried = 0
+        for start in sorted(starts, key=lambda st: abs(st - expected)):
+            if tried >= 200:
+                break
+            tried += 1
+            tail = raw[start:]
+            try:
+                if self.format_text(tail).strip() == target:
+                    return self._markdown_body(tail)
+            except Exception:  # noqa: BLE001 — no match is the safe answer
+                return None
+        return None
+
+    def _markdown_body(self, text: str) -> str:
+        """`text` ready for a markdown block: the same outbound hygiene `format_text` applies
+        (self-prefix strip, mention encoding), without the mrkdwn conversion."""
+        from slack_client.formatting.text import strip_leading_self_prefix
+        text = strip_leading_self_prefix(text, getattr(config, "self_prefix_names", None))
+        encode = getattr(self, "_encode_mentions", None)
+        return encode(text) if callable(encode) else text
+
+    @visible_mutation
+    async def attach_footer_markdown(self, channel_id: str, message_ts: str, markdown: str,
+                                     footer_blocks: Optional[list],
+                                     thread_root_ts: Optional[str] = None) -> bool:
+        """Put the settings footer ON a reply that already landed (a legacy-edited stream's
+        final message): rewrite it as a markdown block of the same text plus the footer row.
+        Owner rule — the footer rides the reply's last message. False = it did not; the caller
+        falls back to the separate footer post."""
+        body = self._markdown_body(rewrite_bot_object_mentions(self, strip_citations(markdown)))
+        blocks = _markdown_footer_blocks(body, footer_blocks)
+        if blocks is None:
+            return False
+        # The same epoch fence the standalone footer checks, immediately before the write.
+        if _epoch_refused(self, channel_id, "response_footer"):
+            return False
+        fallback = self.format_text(body)
+        try:
+            await self.app.client.chat_update(  # unleased-ok: chrome attached to a reply that already landed — the answer text is unchanged
+                channel=channel_id, ts=message_ts, text=fallback, blocks=blocks)
+            return True
+        except Exception as e:  # noqa: BLE001 — chrome; the separate footer covers it
+            if _definitive_rejection(e):
+                self.log_debug(f"Footer attach by edit refused: {e}")
+                return False
+            # A timeout or 5xx may have landed: reconcile the message itself, and report the
+            # footer attached when it is there — never a second Configure row on a guess.
+            try:
+                landed = await self._reconcile_uncertain_update(
+                    channel_id, message_ts, thread_root_ts, "streamed", fallback, blocks)
+            except Exception as check_error:  # noqa: BLE001
+                self.log_debug(f"Footer attach reconcile failed: {check_error}")
+                landed = False
+            self.log_debug(f"Footer attach by edit uncertain ({e}); landed={landed}")
+            return bool(landed)
+
     def _compose_reply_with_footer(self, formatted_text: str, footer_blocks: list):
         """Blocks that render the REPLY TEXT plus the footer actions row.
 
@@ -1259,7 +1660,8 @@ class SlackMessagingMixin(_Host):
                            receipts: Any = None,
                            receipt_kind: Optional[str] = None,
                            receipt_class: Optional[str] = None,
-                           on_first_accept: Optional[Callable[[str], None]] = None
+                           on_first_accept: Optional[Callable[[str], None]] = None,
+                           stop_check: Optional[Callable[[], bool]] = None
                            ) -> Optional[str]:
         """Send a text message to Slack, splitting if needed.
 
@@ -1301,6 +1703,9 @@ class SlackMessagingMixin(_Host):
         def _set_attached(v: bool) -> None:
             if meta_out is not None:
                 meta_out["footer_attached"] = v
+        # The user's Stop (when the caller wires one): a stopped turn publishes nothing more.
+        if stop_check is not None and stop_check():
+            return None
         # STALE GUARD: the last thing before Slack. Raises StaleSendSuppressed rather than
         # posting, so a superseded answer is never created — and deliberately OUTSIDE the try
         # below, which turns exceptions into a None return the caller reads as "the send
@@ -1327,6 +1732,11 @@ class SlackMessagingMixin(_Host):
                 post_kwargs = dict(channel=channel_id, thread_ts=thread_id, text=formatted_text,
                                    unfurl_links=unfurl, unfurl_media=unfurl)
                 composed = self._compose_reply_with_footer(formatted_text, blocks) if blocks else None
+                # Too long or too tall for the inline section: the footer still rides THIS
+                # message, under a markdown block of the same reply (flag-gated).
+                rides = bool(blocks) and footer_rides_markdown(channel_id, thread_id)
+                if composed is None and rides:
+                    composed = _markdown_footer_blocks(self._markdown_body(text), blocks)
                 if composed is not None:
                     # text stays as the notification fallback; blocks carry the visible reply.
                     post_kwargs["blocks"] = composed
@@ -1342,11 +1752,35 @@ class SlackMessagingMixin(_Host):
                 # only ever READ in the ambiguous branch below.
                 attempt_start = time.time()
                 try:
-                    result = await self.app.client.chat_postMessage(**post_kwargs)  # unleased-ok: inside send_message, which authorized before this try
+                    try:
+                        result = await self.app.client.chat_postMessage(**post_kwargs)  # unleased-ok: inside send_message, which authorized before this try
+                    except SlackApiError as post_error:
+                        if not (rides and "blocks" in post_kwargs):
+                            # Definitive API rejection — nothing landed. Let the outer handler
+                            # return None so the caller's single retry is correct; no reconcile
+                            # (there is no ambiguity to resolve, and this path must add zero
+                            # extra work).
+                            raise
+                        if _ambiguous_api_error(post_error):
+                            # A 5xx / internal_error may have landed WITH the footer: the
+                            # sibling reconciliation below decides, never a blind retry.
+                            raise _AmbiguousPost(post_error) from post_error
+                        if not _blocks_refused(post_error):
+                            raise
+                        # Slack refused the footer blocks: the reply goes out exactly as the
+                        # old path posted it (and the separate footer covers it) — under a
+                        # fresh guard check, never a second send on one authorization.
+                        self.log_warning(f"Footer blocks refused ({post_error}); posting plain")
+                        post_kwargs.pop("blocks", None)
+                        composed = None
+                        if lease is not None:
+                            lease.authorize(surface)
+                        _epoch_authorize(self, channel_id, f"send_message:{surface}")
+                        if stop_check is not None and stop_check():
+                            return None
+                        attempt_start = time.time()
+                        result = await self.app.client.chat_postMessage(**post_kwargs)  # unleased-ok: reauthorized on the lines above
                 except SlackApiError:
-                    # Definitive API rejection — nothing landed. Let the outer handler return
-                    # None so the caller's single retry is correct; no reconcile (there is no
-                    # ambiguity to resolve, and this path must add zero extra work).
                     raise
                 except Exception as transport_error:
                     # AMBIGUOUS transport failure (timeout / connection reset raised AFTER the
@@ -1407,11 +1841,22 @@ class SlackMessagingMixin(_Host):
                 # remainder is ABORTED — later chunks around a hole read worse than an
                 # honest cut — and a loud truncation note posts in its place. Silent
                 # partial delivery is never acceptable (Codex review find).
+                # Split exactly as before (format first, then split) — the parts' text is
+                # byte-identical. The footer rides the LAST part (owner rule, flag-gated) only
+                # when that part's own markdown can be recovered exactly; otherwise it posts as
+                # before and the separate footer covers it.
                 chunks = self._split_message(formatted_text)
                 last = len(chunks) - 1
+                tail_blocks: Optional[list] = None
+                if bool(blocks) and footer_rides_markdown(channel_id, thread_id) and last > 0:
+                    tail_md = self._markdown_tail_for(text, chunks[last])
+                    if tail_md is not None:
+                        tail_blocks = _markdown_footer_blocks(
+                            f"{_CONTINUATION_HEAD_MD}\n\n{tail_md}", blocks)
                 first_ts = None
                 delivered_parts = 0
                 truncated_at: Optional[int] = None
+                footer_rode = False
                 for i, chunk in enumerate(chunks):
                     body = chunk
                     if i > 0:
@@ -1422,10 +1867,22 @@ class SlackMessagingMixin(_Host):
                     unfurl = bool(getattr(config, "enable_link_previews", False))
                     chunk_kwargs = dict(channel=channel_id, thread_ts=thread_id, text=body,
                                         unfurl_links=unfurl, unfurl_media=unfurl)
+                    if i == last and tail_blocks is not None:
+                        chunk_kwargs["blocks"] = tail_blocks
                     if username:
                         chunk_kwargs["username"] = username  # F30: labelled findings
                     posted = False
-                    for attempt in (1, 2):
+                    stop_ended = False
+                    attempt = 0
+                    while attempt < 2:
+                        attempt += 1
+                        result = None
+                        # A Stop pressed while earlier parts posted (or during a retry wait)
+                        # ends the reply here: no further part, no "cut off" notice.
+                        if (i > 0 or attempt > 1) and stop_check is not None and stop_check():
+                            stop_ended = True
+                            break
+                        chunk_started = time.time()
                         try:
                             # REAUTHORIZE before every mutation while the lease is still
                             # pending. The retry below waits a second or more, which is ample
@@ -1436,45 +1893,71 @@ class SlackMessagingMixin(_Host):
                             if lease is not None:
                                 lease.authorize(surface)
                             result = await self.app.client.chat_postMessage(**chunk_kwargs)  # unleased-ok: reauthorized on the line above, every attempt
-                            if first_ts is None:
-                                first_ts = result.get("ts")
-                                # The FIRST chunk landing is the moment the turn became
-                                # visible. Waiting until the loop finished meant a suppression
-                                # could still be raised against a reply already half in the
-                                # room — and a half answer is worse than a late one. The
-                                # caller's record is appended here for the same reason: from
-                                # this instant the room can read us, whatever happens next.
-                                if lease is not None and first_ts:
-                                    lease.commit()
-                                _note_first_accept(on_first_accept, first_ts)
-                            delivered_parts = i + 1
-                            # EVERY part earns its own receipt — the split is a delivery
-                            # detail, and parts 2..N are as much of the answer as part 1.
-                            # They finalize together when the turn settles.
-                            await self._record_receipt(
-                                channel_id, result.get("ts"), receipts=receipts,
-                                receipt_kind=receipt_kind, receipt_class=receipt_class,
-                                thread_root_ts=thread_id,
-                                site="send_message_split")
-                            if receipt_class == "assistant_reply":
-                                _gate_ring_reply(self, channel_id, thread_id,
-                                                 result.get("ts"), chunk)
-                            posted = True
-                            break
                         except SlackApiError as chunk_error:
-                            self.log_error(
-                                f"Error sending message chunk {i + 1}/{last + 1} "
-                                f"(attempt {attempt}/2): {chunk_error}")
-                            if attempt == 2:
-                                break
-                            # Honor Slack's Retry-After on 429s; brief pause otherwise.
-                            delay = 1.0
-                            try:
-                                delay = float(cast(Any, getattr(chunk_error, "response", None))
-                                              .headers.get("Retry-After", 1))
-                            except Exception:
-                                pass
-                            await asyncio.sleep(min(max(delay, 0.5), 30.0))
+                            if "blocks" in chunk_kwargs and _blocks_refused(chunk_error):
+                                # The footer blocks were refused (on any attempt): the part
+                                # posts as before, plain, with its own attempts, and the
+                                # separate footer covers it. A Stop pressed meanwhile ends it.
+                                self.log_warning(f"Footer blocks refused ({chunk_error}); "
+                                                 "posting the last part plain")
+                                chunk_kwargs.pop("blocks", None)
+                                attempt -= 1
+                                if stop_check is not None and stop_check():
+                                    stop_ended = True
+                                    break
+                                continue
+                            if "blocks" in chunk_kwargs and _ambiguous_api_error(chunk_error):
+                                # It may have landed, footer and all: reconcile before any
+                                # retry, and never resend a part that is already in the room.
+                                found = await self._reconcile_uncertain_post(
+                                    channel_id, thread_id, body, chunk_started)
+                                if found:
+                                    result = {"ts": found}
+                            if result is None:
+                                self.log_error(
+                                    f"Error sending message chunk {i + 1}/{last + 1} "
+                                    f"(attempt {attempt}/2): {chunk_error}")
+                                if attempt == 2:
+                                    break
+                                # Honor Slack's Retry-After on 429s; brief pause otherwise.
+                                delay = 1.0
+                                try:
+                                    delay = float(cast(Any, getattr(chunk_error, "response", None))
+                                                  .headers.get("Retry-After", 1))
+                                except Exception:
+                                    pass
+                                await asyncio.sleep(min(max(delay, 0.5), 30.0))
+                                continue
+                        if "blocks" in chunk_kwargs:
+                            footer_rode = True
+                        if first_ts is None:
+                            first_ts = result.get("ts")
+                            # The FIRST chunk landing is the moment the turn became
+                            # visible. Waiting until the loop finished meant a suppression
+                            # could still be raised against a reply already half in the
+                            # room — and a half answer is worse than a late one. The
+                            # caller's record is appended here for the same reason: from
+                            # this instant the room can read us, whatever happens next.
+                            if lease is not None and first_ts:
+                                lease.commit()
+                            _note_first_accept(on_first_accept, first_ts)
+                        delivered_parts = i + 1
+                        # EVERY part earns its own receipt — the split is a delivery
+                        # detail, and parts 2..N are as much of the answer as part 1.
+                        # They finalize together when the turn settles.
+                        await self._record_receipt(
+                            channel_id, result.get("ts"), receipts=receipts,
+                            receipt_kind=receipt_kind, receipt_class=receipt_class,
+                            thread_root_ts=thread_id,
+                            site="send_message_split")
+                        if receipt_class == "assistant_reply":
+                            _gate_ring_reply(self, channel_id, thread_id,
+                                             result.get("ts"), chunk)
+                        posted = True
+                        break
+                    if not posted and stop_ended:
+                        truncated_at = i + 1      # the user's Stop: no "cut off" notice
+                        break
                     if not posted:
                         missing = last + 1 - i
                         truncated_at = i + 1
@@ -1510,6 +1993,7 @@ class SlackMessagingMixin(_Host):
                     # the caller's own text for a complete split described a delivery in markdown
                     # the room never received.
                     complete = truncated_at is None
+                    _set_attached(footer_rode and complete)
                     delivered = "\n\n".join(chunks[:delivered_parts])
                     _report_delivery(meta_out, Delivery(
                         first_ts=first_ts, text=delivered, complete=complete,
@@ -1544,7 +2028,8 @@ class SlackMessagingMixin(_Host):
         return " ".join(text.split())
 
     async def _reconcile_uncertain_post(self, channel_id: str, thread_id: Optional[str],
-                                        formatted_text: str, attempt_start: float) -> Optional[str]:
+                                        formatted_text: str, attempt_start: float,
+                                        contained: bool = False) -> Optional[str]:
         """After an AMBIGUOUS transport failure on a single-message post, look for the message we
         just tried to send in recent history. Returns its ts when our OWN bot posted matching
         text at or after `attempt_start` (the instant just before this post), else None (the
@@ -1591,6 +2076,8 @@ class SlackMessagingMixin(_Host):
             for msg in messages:
                 if not self.is_own_message(msg):
                     continue
+                if is_held_progress_message(msg):
+                    continue        # §G: a temporary progress card is never the answer
                 try:
                     if float(msg.get("ts", 0)) < cutoff:
                         continue
@@ -1600,6 +2087,10 @@ class SlackMessagingMixin(_Host):
                 if not candidate:
                     continue
                 if candidate == target:
+                    return msg.get("ts")
+                # A carded stream's history text is its task titles plus the prose, so a carded
+                # one-shot matches on the prose being CONTAINED (never shorter than a sentence).
+                if contained and len(target) >= 20 and target in candidate:
                     return msg.get("ts")
                 # Full-prefix match (Slack may append/trim chrome around the fallback text) only
                 # when BOTH normalized strings are long — otherwise a short reply is a prefix of an
@@ -2073,7 +2564,9 @@ class SlackMessagingMixin(_Host):
     async def post_status_card(self, channel_id: str, thread_id: str, text: str,
                                blocks: list, username: Optional[str] = None,
                                receipts: Any = None, *,
-                               receipt_class: Optional[str]) -> Optional[str]:
+                               receipt_class: Optional[str],
+                               error_out: Optional[Dict[str, str]] = None,
+                               metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """F30.1: post a blocks status card (e.g. the deep-research todo card). Returns the
         posted ts, or None on failure. `text` is the CONSTANT notification fallback; `blocks`
         carry the visible card. `username` optionally labels the poster (needs the
@@ -2081,7 +2574,8 @@ class SlackMessagingMixin(_Host):
         can retry unlabeled). Best-effort — never raises, EXCEPT the §11.9/§11.13 contract:
         `receipt_class` is REQUIRED (its producers pass `background_job` — the §4 inventory,
         never hardcoded in the transport), and receipts-without-class is a programming error
-        raised BEFORE Slack."""
+        raised BEFORE Slack. `error_out`, when given, receives the Slack error code under
+        "error" on a failed post, so a caller can tell a rejected payload from anything else."""
         if receipts is not None and receipt_class is None:
             raise ValueError(
                 "post_status_card: receipts passed without receipt_class (EDIT §4/§11.9)")
@@ -2092,6 +2586,8 @@ class SlackMessagingMixin(_Host):
                           unfurl_links=False, unfurl_media=False)
             if username:
                 kwargs["username"] = username
+            if metadata:
+                kwargs["metadata"] = metadata
             result = await self.app.client.chat_postMessage(**kwargs)  # unleased-ok: post_ephemeral-style helper for chrome/notices, not the turn's answer
             # A background job's own status surface: chrome STATE (never in the stream),
             # class per the caller's §4 stamp (research status/checklist ⇒ background_job).
@@ -2102,6 +2598,10 @@ class SlackMessagingMixin(_Host):
             return result.get("ts")
         except SlackApiError as e:
             self.log_warning(f"Status card post failed: {e}")
+            if error_out is not None:
+                response = getattr(e, "response", None)
+                error_out["error"] = str((response.get("error") if response is not None
+                                          else None) or "")
             return None
 
     @visible_mutation
@@ -2226,6 +2726,12 @@ class SlackMessagingMixin(_Host):
                 for msg in slack_messages:
                     text = msg.get("text", "")
                     sender_type = self.classify_sender(msg)
+                    # Agent surfaces §C.6: our own carded reply reads as its answer alone, the
+                    # same reader the live stream uses (Slack's `text` glues card titles on).
+                    if sender_type == "self":
+                        carded = carded_answer_text(msg)
+                        if carded is not None:
+                            text = carded
                     # Skip our OWN transient chrome and pure UI-helper blocks (same rule as before).
                     if sender_type == "self" and is_self_chrome_message(text, msg):
                         continue
@@ -2369,15 +2875,18 @@ class SlackMessagingMixin(_Host):
         )
 
     def begin_native_stream(self, channel_id: str, thread_id: str,
-                            user_id: Optional[str] = None) -> "NativeStreamSession":
+                            user_id: Optional[str] = None,
+                            chunks_mode: bool = False) -> "NativeStreamSession":
         """Create a (not-yet-started) NativeStreamSession bound to this channel/thread.
 
         chat.startStream requires recipient_team_id (workspace, resolved once via auth.test
         in _ensure_self_identity) AND recipient_user_id (the triggering user, plumbed in by
-        the handler) for channel streaming — both are threaded onto the session here."""
+        the handler) for channel streaming — both are threaded onto the session here.
+        `chunks_mode` (agent surfaces §C) is fixed for the session's life."""
         return NativeStreamSession(
             self.app.client, channel_id, thread_id, logger=self.log_debug,
-            team_id=getattr(self, "self_team_id", None), user_id=user_id, owner=self)
+            team_id=getattr(self, "self_team_id", None), user_id=user_id, owner=self,
+            chunks_mode=chunks_mode)
 
     @visible_mutation
     async def set_assistant_status(self, channel_id: str, thread_id: str,
@@ -2431,6 +2940,8 @@ class SlackMessagingMixin(_Host):
             if texts:
                 kwargs["loading_messages"] = texts
             await self.app.client.assistant_threads_setStatus(**kwargs)
+            if status_text:
+                agent_session.note_status_set(self, channel_id, thread_id)  # spec §A.4
             return True
         except SlackApiError as e:
             # Most common in a plain channel: not an assistant thread -> just skip it.
@@ -2446,7 +2957,9 @@ class SlackMessagingMixin(_Host):
         """Clear the assistant status: bare status="" with NO loading_messages (the API
         rejects an empty array and treats "" as the clear signal). Needed explicitly for
         native-streamed replies — Slack's auto-clear keys on chat.postMessage only."""
-        return await self.set_assistant_status(channel_id, thread_id, status="")
+        cleared = await self.set_assistant_status(channel_id, thread_id, status="")
+        agent_session.note_status_cleared(self, channel_id, thread_id)  # spec §A.4
+        return cleared
 
     async def _react_add(self, channel_id: str, message_ts: str, emoji: str) -> tuple:
         """The raw add, returning (ok, added).
@@ -4034,6 +4547,14 @@ class SlackMessagingMixin(_Host):
             rebuilt_blocks = [{"type": "section",
                               "text": {"type": "mrkdwn", "text": formatted_body}}
                               ] + [footer_actions]
+        elif shape_kind == "streamed":
+            # A `markdown` block, which Slack stores as a rich_text block (probed 2026-11-20):
+            # the same unfolded body a native stream leaves, unlike a section block, which
+            # folds behind "Show more". Lead and actions blocks ride along untouched.
+            kept = cast(Dict[str, Any], footer_actions)
+            rebuilt_blocks = (list(kept["lead"])
+                              + [{"type": "markdown", "text": f"{prefix}{new_text}{suffix}"}]
+                              + ([kept["actions"]] if kept["actions"] is not None else []))
         try:
             await self._update_edited_message(channel_id, message_ts, replacement,
                                               blocks=rebuilt_blocks)
@@ -4112,7 +4633,7 @@ class SlackMessagingMixin(_Host):
 
     @staticmethod
     def _classify_edit_shape(live: dict) -> Optional[tuple]:
-        """§6: exactly two supported shapes, everything else refused.
+        """§6: three supported shapes, everything else refused.
 
         ("plain", None) — no files/attachments, and either NO blocks or exactly ONE
         Slack-minted `rich_text` mirror block (§11.25: Slack materializes one on every plain
@@ -4123,7 +4644,9 @@ class SlackMessagingMixin(_Host):
         the section may carry ONLY `type`/`text` (+ the Slack-minted `block_id`) with mrkdwn
         text — an `accessory`, `fields` or any other decoration cannot be faithfully rebuilt;
         the actions block must carry EXACTLY ONE element, a BUTTON with action_id
-        `open_channel_settings` — duplicates and other element types are unsupported. None —
+        `open_channel_settings` — duplicates and other element types are unsupported.
+        ("streamed", {"lead", "actions"}) — a natively streamed reply, see
+        `_classify_streamed_shape`. None —
         unsupported (files, attachments, rich-text or research blocks, unknown actions): never
         silently dropped, never retained around a contradictory edit."""
         if live.get("files") or live.get("attachments"):
@@ -4140,6 +4663,9 @@ class SlackMessagingMixin(_Host):
         if len(blocks) == 1 and isinstance(blocks[0], dict) \
                 and blocks[0].get("type") == "rich_text":
             return "plain", None
+        streamed = SlackMessagingMixin._classify_streamed_shape(blocks)
+        if streamed is not None:
+            return streamed
         if len(blocks) == 1:
             section, actions = None, blocks[0]
         elif len(blocks) == 2:
@@ -4155,16 +4681,46 @@ class SlackMessagingMixin(_Host):
             if (not isinstance(section_text, dict)
                     or section_text.get("type") != "mrkdwn"):
                 return None
-        if not isinstance(actions, dict) or actions.get("type") != "actions":
-            return None
-        elements = actions.get("elements") or []
-        if len(elements) != 1:
-            return None
-        element = elements[0]
-        if (not isinstance(element, dict) or element.get("type") != "button"
-                or element.get("action_id") != "open_channel_settings"):
+        if not SlackMessagingMixin._is_settings_actions(actions):
             return None
         return "footer", actions
+
+    @staticmethod
+    def _is_settings_actions(actions: Any) -> bool:
+        """The one actions block an edit may carry over: EXACTLY ONE element, a button with
+        action_id `open_channel_settings`."""
+        if not isinstance(actions, dict) or actions.get("type") != "actions":
+            return False
+        elements = actions.get("elements") or []
+        if len(elements) != 1:
+            return False
+        element = elements[0]
+        return (isinstance(element, dict) and element.get("type") == "button"
+                and element.get("action_id") == "open_channel_settings")
+
+    @staticmethod
+    def _classify_streamed_shape(blocks: list) -> Optional[tuple]:
+        """A natively streamed reply: [lead…, rich_text, actions?] where lead is one or more
+        `task_card` blocks or exactly one `plan` block, and the optional trailing actions block
+        is the settings button. A lone [rich_text] is the plain shape, not this one.
+
+        Returns ("streamed", {"lead": [...], "actions": block-or-None}) — the lead and actions
+        blocks are carried over byte-for-byte; only the rich_text body is replaced — or None."""
+        body = list(blocks)
+        actions: Optional[dict] = None
+        if body and isinstance(body[-1], dict) and body[-1].get("type") == "actions":
+            if not SlackMessagingMixin._is_settings_actions(body[-1]):
+                return None
+            actions = body.pop()
+        if not body or not isinstance(body[-1], dict) or body[-1].get("type") != "rich_text":
+            return None
+        lead = body[:-1]
+        if not lead and actions is None:
+            return None                              # [rich_text] alone is "plain"
+        lead_types = [b.get("type") if isinstance(b, dict) else None for b in lead]
+        if lead and not (all(t == "task_card" for t in lead_types) or lead_types == ["plan"]):
+            return None
+        return "streamed", {"lead": lead, "actions": actions}
 
     async def _edit_permalink(self, ctx, channel_id: str, message_ts: str) -> Optional[str]:
         """§5 preflight step 3: the permalink for the synthesized disclosure, via the existing
@@ -4209,6 +4765,20 @@ class SlackMessagingMixin(_Host):
             return False
         if shape_kind == "footer":
             return _blocks_match(fetched.get("blocks"), rebuilt_blocks)
+        if shape_kind == "streamed":
+            # Slack stores the sent `markdown` block as a rich_text block, so the body is
+            # matched by type; the carried-over blocks must match exactly.
+            sent = list(rebuilt_blocks or [])
+            got = fetched.get("blocks") or []
+            if len(got) != len(sent):
+                return False
+            for g, b in zip(got, sent):
+                if b.get("type") == "markdown":
+                    if not isinstance(g, dict) or g.get("type") != "rich_text":
+                        return False
+                elif not _blocks_match([g], [b]):
+                    return False
+            return True
         return True
 
     # --- delete_own_message local tool (T5a) ---
@@ -4508,7 +5078,10 @@ class SlackMessagingMixin(_Host):
                     truncated += '\n```'
                 
                 formatted_text = truncated + continuation_trailer()
-            
+                was_truncated = True
+            else:
+                was_truncated = False
+
             # Call Slack API's chat_update method
             result = await self.app.client.chat_update(  # unleased-ok: inside update_message_streaming, which already authorized at its entry
                 channel=channel_id,
@@ -4531,7 +5104,10 @@ class SlackMessagingMixin(_Host):
                 "success": True,
                 "rate_limited": False,
                 "retry_after": None,
-                "result": result
+                "result": result,
+                # What the room now shows, and whether the backstop cut it (a footer edit
+                # must never show more than this).
+                "truncated": was_truncated,
             }
             
         except SlackApiError as e:

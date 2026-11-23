@@ -630,6 +630,38 @@ def _web_search_action_evidence(item: Any) -> Optional[str]:
     return " | ".join(parts) or None
 
 
+async def _close_stopped_stream(self: Any, response: Any, chars: int) -> None:
+    """The user pressed Stop (§A.3.2): close the model stream rather than leaving it to drain
+    unread. Best-effort — a close that fails changes nothing about what the user already has."""
+    closer = getattr(response, "close", None)
+    if callable(closer):
+        try:
+            closing = closer()
+            if closing is not None and hasattr(closing, "__await__"):
+                await closing
+        except Exception as close_error:  # noqa: BLE001
+            self.log_debug(f"Closing the stopped model stream failed: {close_error}")
+    self.log_info(f"User stopped the stream after {chars} chars")
+
+
+def _web_search_source_urls(item: Any, limit: int = 10) -> List[str]:
+    """The URLs a completed search call's OWN action names as its sources, deduped, at most
+    `limit` (agent surfaces §C.4: a step card cites only what that call touched — never the
+    answer's aggregated citations). Empty for a non-search action or a call with no sources."""
+    action = getattr(item, "action", None)
+    if action is None or _action_field(action, "type") not in (None, "search"):
+        return []
+    raw = _action_field(action, "sources")
+    urls: List[str] = []
+    for source in raw if isinstance(raw, (list, tuple)) else []:
+        url = source.get("url") if isinstance(source, dict) else getattr(source, "url", None)
+        if isinstance(url, str) and url and url not in urls:
+            urls.append(url)
+        if len(urls) >= limit:
+            break
+    return urls
+
+
 def _web_search_query(item: Any) -> Optional[str]:
     """The single query for the internal observer event (status cards, DEBUG logs).
 
@@ -638,6 +670,24 @@ def _web_search_query(item: Any) -> Optional[str]:
     first, which beats today's None when only `queries` is populated."""
     queries = _web_search_queries(item)
     return queries[0] if queries else None
+
+
+def _url_citation_pairs(item: Any) -> List[Dict[str, str]]:
+    """{"url", "title"} for each `url_citation` on an assistant message, deduped by url in
+    first-seen order — what the answer actually CITED (the step cards' sources panel)."""
+    out: List[Dict[str, str]] = []
+    seen: set = set()
+    for part in getattr(item, "content", None) or []:
+        annotations = (part.get("annotations") if isinstance(part, dict)
+                       else getattr(part, "annotations", None)) or []
+        for ann in annotations:
+            get = ann.get if isinstance(ann, dict) else (lambda k, a=ann: getattr(a, k, None))
+            url, title = get("url"), get("title")
+            if get("type") != "url_citation" or not isinstance(url, str) or not url or url in seen:
+                continue
+            seen.add(url)
+            out.append({"url": url, "title": title if isinstance(title, str) else ""})
+    return out
 
 
 def _url_citations(item: Any) -> List[str]:
@@ -729,7 +779,8 @@ def _web_search_results(item: Any) -> List[str]:
 
 def _request_includes(function_call_sink: Optional[List[Dict[str, Any]]],
                       mcp_results_sink: Optional[List[Dict[str, Any]]],
-                      tools: Optional[List[Any]]) -> Optional[List[str]]:
+                      tools: Optional[List[Any]],
+                      search_sources: bool = False) -> Optional[List[str]]:
     """The `include` list for one Responses request, or None when it would be empty.
 
     Two independent asks, each gated on the sink that consumes it:
@@ -747,12 +798,15 @@ def _request_includes(function_call_sink: Optional[List[Dict[str, Any]]],
     includes: List[str] = []
     if function_call_sink is not None:
         includes.append("reasoning.encrypted_content")
-    if mcp_results_sink is not None or function_call_sink is not None:
-        for tool in tools or []:
-            tool_type = tool.get("type") if isinstance(tool, dict) else getattr(tool, "type", None)
-            if isinstance(tool_type, str) and tool_type.startswith("web_search"):
-                includes.append("web_search_call.results")
-                break
+    searches = any(isinstance(t, str) and t.startswith("web_search") for t in (
+        (tool.get("type") if isinstance(tool, dict) else getattr(tool, "type", None))
+        for tool in tools or []))
+    if searches and (mcp_results_sink is not None or function_call_sink is not None):
+        includes.append("web_search_call.results")
+    # Agent surfaces (plan step cards): each search's own sources, for its result line. Asked
+    # for only by a caller showing step cards, so every other request is unchanged.
+    if searches and search_sources:
+        includes.append("web_search_call.action.sources")
     return includes or None
 
 
@@ -1248,9 +1302,13 @@ async def create_streaming_response(
     hidden_suppression_sink: Optional[List[BaseException]] = None,
     meter: Optional[Any] = None,
     round_index: int = 0,
+    stop_check: Optional[Callable[[], bool]] = None,
 ) -> str:
     """
     Create a streaming text response using the Responses API
+
+    ``stop_check`` (agent surfaces §A.3.2): polled before each event; True closes the model
+    stream and returns what was forwarded, with no completion flush.
 
     Args:
         messages: List of message dictionaries
@@ -1325,7 +1383,11 @@ async def create_streaming_response(
         stream_error: Optional[Exception] = None
 
         # Process streaming events with timeout protection
+        stopped = False
         async for event in self._safe_stream_iteration(response, operation_type):
+            if stop_check is not None and stop_check():
+                stopped = True
+                break
             try:
                 
                 # Get event type
@@ -1509,6 +1571,8 @@ async def create_streaming_response(
 
         # A failed terminal event is raised here (outside the per-event try that would have
         # swallowed it) so it propagates like every other API error.
+        if stopped:
+            await _close_stopped_stream(self, response, len(complete_text))
         if stream_error is not None:
             raise stream_error
         _close_attempt(attempt_sink, attempts, status="ok", usage=usage_captured)
@@ -1575,6 +1639,8 @@ async def create_streaming_response_with_tools(
     meter: Optional[Any] = None,
     round_index: int = 0,
     hosted_carry_sink: Optional[List[str]] = None,
+    stop_check: Optional[Callable[[], bool]] = None,
+    include_search_sources: bool = False,
 ) -> str:
     """
     Create streaming text response with tools (e.g., web search)
@@ -1619,6 +1685,12 @@ async def create_streaming_response_with_tools(
             in any of them re-raises the stored suppression instead of itself (ruling 5).
         hosted_carry_sink: Optional list; the tool loop's round-local record of what this
             round's hosted tools found (see `_capture_hosted_carry`)
+        stop_check: Optional SYNCHRONOUS predicate, polled before each event (agent surfaces
+            §A.3.2). True means the user pressed Stop: the model stream is closed, nothing more
+            is consumed or forwarded, no completion flush is sent, and the text forwarded so
+            far is returned. Hosted payloads to ``progress_callback`` also carry ``call_id``
+            (the call's item id, resolved through ``response.output_item.added``) and, on a
+            completed web search, ``sources`` (that call's own action source URLs).
 
     Returns:
         Complete generated text response
@@ -1644,7 +1716,8 @@ async def create_streaming_response_with_tools(
         # Stateless tool loop: reasoning items must round-trip between rounds, which
         # requires their encrypted content when store=False. Web-search passages ride the
         # same parameter for result memory and the loop's round carry — see _request_includes.
-        include=_request_includes(function_call_sink, mcp_results_sink, tools),
+        include=_request_includes(function_call_sink, mcp_results_sink, tools,
+                                  search_sources=include_search_sources),
         prompt_cache_key=prompt_cache_key,
         prompt_cache_options=prompt_cache_options,
         layout=layout,
@@ -1715,6 +1788,19 @@ async def create_streaming_response_with_tools(
         request_seq = _next_request_seq()
         summaries: Dict[Tuple[int, str, Optional[int]], str] = {}
         hosted_seen: set = set()
+        # output_index -> item id, from `response.output_item.added`: a lifecycle event that
+        # names only its index still resolves to the call it belongs to (§C.4).
+        item_ids_by_index: Dict[int, str] = {}
+
+        def _call_id(event: Any) -> str:
+            """The item id a hosted event belongs to, or "" when it cannot be resolved."""
+            item_id = getattr(event, "item_id", None)
+            if isinstance(item_id, str) and item_id.strip():
+                return item_id.strip()
+            index = getattr(event, "output_index", None)
+            if isinstance(index, int) and not isinstance(index, bool):
+                return item_ids_by_index.get(index, "")
+            return ""
 
         def _emit_progress(payload: Dict[str, Any]) -> None:
             """Hand one live-progress payload to the observer.
@@ -1764,7 +1850,9 @@ async def create_streaming_response_with_tools(
                             "label": None, "text": merged})
 
         def _emit_hosted(tool: str, state: str, item_id: str,
-                         label: Optional[str] = None) -> None:
+                         label: Optional[str] = None, call_id: str = "",
+                         sources: Optional[List[str]] = None,
+                         extra: Optional[Dict[str, Any]] = None) -> None:
             """One hosted call's lifecycle, at most once per (tool, state, item).
 
             Deduped because the same fact can arrive twice — a lifecycle event and then the
@@ -1779,9 +1867,15 @@ async def create_streaming_response_with_tools(
                 if token in hosted_seen:
                     return
                 hosted_seen.add(token)
-            _emit_progress({"kind": "hosted", "state": state, "request_seq": request_seq,
-                            "item_id": item_id, "summary_index": None, "tool": tool,
-                            "label": label, "text": None})
+            payload: Dict[str, Any] = {"kind": "hosted", "state": state,
+                                       "request_seq": request_seq, "item_id": item_id,
+                                       "summary_index": None, "tool": tool, "label": label,
+                                       "text": None, "call_id": call_id}
+            if sources:
+                payload["sources"] = sources
+            if extra:
+                payload.update(extra)
+            _emit_progress(payload)
 
         def _emit_hosted_lifecycle(event: Any, event_type: Any) -> None:
             """The streamed lifecycle events, which are the only place a START is announced.
@@ -1791,10 +1885,13 @@ async def create_streaming_response_with_tools(
                 return
             tool = ("web_search" if ".web_search_call." in event_type else
                     "code_interpreter" if ".code_interpreter_call." in event_type else
-                    "mcp" if ".mcp_call." in event_type else None)
+                    "mcp" if ".mcp_call." in event_type else
+                    "file_search" if ".file_search_call." in event_type else
+                    "image_generation" if ".image_generation_call." in event_type else None)
             if tool is None:
                 return
-            if event_type.endswith((".searching", ".interpreting", ".in_progress")):
+            if event_type.endswith((".searching", ".interpreting", ".in_progress",
+                                    ".generating")):
                 state = "start"
             elif event_type.endswith(".failed"):
                 state = "failed"
@@ -1802,10 +1899,19 @@ async def create_streaming_response_with_tools(
                 return              # `.completed` is reported off the item, with its label
             data = getattr(event, "data", event)
             label = (_mcp_label(event) or _mcp_label(data)) if tool == "mcp" else None
-            _emit_hosted(tool, state, _event_item_id(event), label)
+            server = (_progress_str(getattr(event, "server_label", None))
+                      or _progress_str(getattr(data, "server_label", None))) if tool == "mcp" else None
+            _emit_hosted(tool, state, _event_item_id(event), label, call_id=_call_id(event),
+                         extra={"server": server} if server else None)
 
         # Process streaming events with timeout protection
+        stopped = False
         async for event in self._safe_stream_iteration(response, operation_type):
+            if stop_check is not None and stop_check():
+                # §A.3.2, cooperative: the user pressed Stop. Nothing more is consumed or
+                # forwarded; the caller finishes the turn with what was already delivered.
+                stopped = True
+                break
             try:
 
                 # Get event type
@@ -1824,6 +1930,12 @@ async def create_streaming_response_with_tools(
                     if (function_call_sink is not None and hasattr(event, 'item')
                             and getattr(event.item, 'type', None) == 'function_call'):
                         saw_function_call = True
+                    if progress_callback:
+                        added_index = getattr(event, "output_index", None)
+                        added_id = _progress_str(getattr(getattr(event, "item", None), "id", None))
+                        if (isinstance(added_index, int) and not isinstance(added_index, bool)
+                                and added_id):
+                            item_ids_by_index[added_index] = added_id
                     continue  # Skip without logging
                 elif isinstance(event_type, str) and event_type.startswith(
                         "response.reasoning_summary"):
@@ -1915,7 +2027,13 @@ async def create_streaming_response_with_tools(
                             # searched for. Progress, not a count — the completion event above
                             # is the one the consumer bills.
                             _emit_hosted("web_search", _hosted_status(item),
-                                         _event_item_id(item), _web_search_label(item))
+                                         _event_item_id(item), _web_search_label(item),
+                                         call_id=_progress_str(getattr(item, "id", None)) or "",
+                                         sources=_web_search_source_urls(item),
+                                         extra={"action": _progress_str(_action_field(
+                                             getattr(item, "action", None), "type")),
+                                                "source_count": len(_web_search_source_urls(
+                                                    item, limit=10_000))})
                             # F12: the observer event is fire-and-forget telemetry — capture
                             # the same query as durable evidence, or the next turn has only
                             # the bare tool name to reason from.
@@ -1934,7 +2052,10 @@ async def create_streaming_response_with_tools(
                             if not tool_error:
                                 await _emit_tool_event({"kind": "mcp", "server_label": server_label})
                             _emit_hosted("mcp", _hosted_status(item), _event_item_id(item),
-                                         _mcp_label(item))
+                                         _mcp_label(item),
+                                         call_id=_progress_str(getattr(item, "id", None)) or "",
+                                         extra={"server": _progress_str(server_label)}
+                                         if _progress_str(server_label) else None)
                             if tool_callback and server_label:
                                 tool_id = f"mcp:{server_label}"
                                 try:
@@ -1976,12 +2097,26 @@ async def create_streaming_response_with_tools(
                                 "container_id": getattr(item, "container_id", None),
                             })
                             _emit_hosted("code_interpreter", _hosted_status(item),
-                                         _event_item_id(item))
+                                         _event_item_id(item),
+                                         call_id=_progress_str(getattr(item, "id", None)) or "")
                         elif item_type == 'message':
                             # F12: the completed message carries the `url_citation`
                             # annotations naming the pages the answer cited — the streamed
                             # text deltas do not. No-ops when nothing was cited.
                             _capture_web_search(mcp_results_sink, item)
+                            # Live progress: what the answer cited, for the step cards' final
+                            # sources (labelled by title).
+                            if progress_callback:
+                                cited = _url_citation_pairs(item)
+                                if cited:
+                                    _emit_progress({"kind": "citations", "items": cited,
+                                                    "request_seq": request_seq})
+                        elif item_type in ('file_search_call', 'image_generation_call'):
+                            # Live progress only (step cards): how the call ended.
+                            _emit_hosted("file_search" if item_type == 'file_search_call'
+                                         else "image_generation", _hosted_status(item),
+                                         _event_item_id(item),
+                                         call_id=_progress_str(getattr(item, "id", None)) or "")
                     continue
                 elif event_type in ["response.done", "response.completed",
                                      "response.incomplete", "response.failed"]:
@@ -2095,6 +2230,8 @@ async def create_streaming_response_with_tools(
                 self.log_warning(f"Error processing stream event: {event_error}")
                 continue
 
+        if stopped:
+            await _close_stopped_stream(self, response, len(complete_text))
         # A failed terminal event is raised here (outside the per-event try that would have
         # swallowed it) so it reaches the outer handler and propagates like any other error.
         if stream_error is not None:

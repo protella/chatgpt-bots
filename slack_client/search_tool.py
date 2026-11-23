@@ -21,6 +21,7 @@ from slack_client.messaging import is_self_chrome_message
 from slack_client.normalizer import (ORIGIN_HISTORY, ORIGIN_REPLIES, TimestampError,
                                      normalize_slack_message, parse_ts, prime_bot_actor_ids)
 from message_processor.tool_registry import stage_discovered_edit_target, stage_discovered_root
+from message_processor.fail_cards import FAIL_RETRY_RERUN
 
 
 class SearchBackend(Enum):
@@ -272,6 +273,9 @@ class _ChannelScan:
         self.receipt_rows: Dict[str, Dict[str, Any]] = {}
         self.unfetched_roots = False
         self.stopped_reason: Optional[str] = None
+        # True once Slack refused or failed ANY fetch, whatever reason ends up winning the
+        # coverage precedence: the native-index merge (spec §D.2) runs only on a clean scan.
+        self.fetch_error = False
         self._seq = 0
         self._pool: List[Tuple[Tuple[int, int, float, Tuple[int, int]], int, _ScanCandidate]] = []
         self._self_pool: List[
@@ -280,6 +284,8 @@ class _ChannelScan:
     # -- stops ---------------------------------------------------------------------------
 
     def stop(self, reason: str) -> None:
+        if "_error" in reason:
+            self.fetch_error = True
         if _stop_rank(reason) < _stop_rank(self.stopped_reason):
             self.stopped_reason = reason
 
@@ -476,6 +482,29 @@ _TOKEN_ERRORS = {
 # The only channel types the API accepts. The env gate is intersected with this.
 _VALID_CHANNEL_TYPES = {"public_channel", "private_channel", "im", "mpim"}
 
+# SLACK_CHANNEL_NATIVE_SEARCH (spec §D.2): the index call — the channel-shape check included —
+# runs only after a successful scan and gets this long. Any failure or timeout returns the scan
+# result unchanged.
+_NATIVE_INDEX_BUDGET_SECONDS = 5.0
+# …and never past the search tool's own timeout: the index gets at most what is left of it minus
+# this margin, so a slow index can only lose itself, never the finished scan. Nothing left → no
+# index.
+_NATIVE_INDEX_TIMEOUT_MARGIN_SECONDS = 1.0
+
+
+@dataclass
+class _IndexMerge:
+    """What the index pass needs from the scan it is merged into (spec §D.3).
+
+    `seen` holds the scan's `(channel, ts)` pairs and grows with every index hit admitted, so the
+    index can neither repeat a scan hit nor itself. `limit` is the REMAINDER of the caller's limit
+    once the scan hits have taken their places.
+    """
+
+    trigger_key: Tuple[int, int]
+    seen: Set[Tuple[str, str]]
+    limit: int
+
 
 class SlackSearchToolMixin(_Host):
     """`search_slack` — ONE tool name over TWO backends, split by surface (`search_backend_for`).
@@ -541,6 +570,11 @@ class SlackSearchToolMixin(_Host):
         _authorize_channel_read: Any
         _access_denied: Any
         _delivery_redirect: Any
+        # The request-scoped single-flight memo and its scope key (history mixin), and the
+        # own-message test (utilities mixin) — used by the native-index merge.
+        _memoized_access: Any
+        _access_scope: Any
+        is_own_message: Any
 
     # The DM surface's wording, frozen: DM tool bytes are a contract, and W3 is a channel
     # feature. The channel variant below adds the one sentence `thread_ts` earns.
@@ -567,6 +601,19 @@ class SlackSearchToolMixin(_Host):
         "read: partial coverage is not the same as no matches, and a recent reply under a "
         "thread root older than that span is not reachable this way."
     )
+    # SLACK_CHANNEL_NATIVE_SEARCH (spec §D.4): the same description with its reach sentence
+    # replaced, because an @mentioned turn also merges Slack's own index. STABLE PER SURFACE — it
+    # follows the flag, never whether this request carries a token, so the cached prefix does not
+    # fork between a mention and an ambient turn.
+    _SEARCH_CHANNEL_REACH_SENTENCE = (
+        "It reads this channel only, never the wider workspace, and never anything posted after "
+        "the message you are answering.")
+    _SEARCH_CHANNEL_DESCRIPTION_NATIVE = _SEARCH_CHANNEL_DESCRIPTION.replace(
+        _SEARCH_CHANNEL_REACH_SENTENCE,
+        "It reads this channel, and when you were @mentioned its results can also include other "
+        "public channels — each such result carries its channel id and, when Slack supplies "
+        "it, its channel_name. It never returns anything posted after the message you are "
+        "answering.")
 
     def _search_tool_schema(self, description: str) -> Dict[str, Any]:
         return {
@@ -603,10 +650,13 @@ class SlackSearchToolMixin(_Host):
         executor refuses an explicitly non-channel scope rather than silently narrowing it.
         The DM schema keeps its own bytes, because a DM keeps its own backend and result shape.
         """
+        description = (self._SEARCH_CHANNEL_DESCRIPTION_NATIVE
+                       if config.slack_channel_native_search
+                       else self._SEARCH_CHANNEL_DESCRIPTION)
         return {
             "type": "function",
             "name": "search_slack",
-            "description": self._SEARCH_CHANNEL_DESCRIPTION,
+            "description": description,
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -737,15 +787,23 @@ class SlackSearchToolMixin(_Host):
         if not query:
             return {"ok": False, "error": "bad_arguments", "message": "query is required."}
         if search_backend_for(ctx) is SearchBackend.IN_CHANNEL_SCAN:
-            return await self._execute_in_channel_scan(ctx, args, query)
+            return await self._execute_in_channel_scan(ctx, args, query,
+                                                       started_at=time.monotonic())
         return await self._execute_assistant_context(ctx, args, query)
 
-    async def _execute_assistant_context(self, ctx, args: Dict[str, Any],
-                                         query: str) -> Dict[str, Any]:
+    async def _execute_assistant_context(self, ctx, args: Dict[str, Any], query: str,
+                                         merge: Optional[_IndexMerge] = None
+                                         ) -> Dict[str, Any]:
         """THE DM PATH, UNCHANGED. Every line below is pre-split behaviour — the action-token
         gate, the channel-type bound, the `in:<#…>` scope operator, the delivery filter, the
         result bytes. DM tool bytes are a contract; nothing here may drift with the channel
-        backend."""
+        backend.
+
+        `merge` is set ONLY by the channel scan's native-index pass (spec §D.3) and changes
+        nothing when absent: it fences hits strictly before the trigger, drops our own, dedupes
+        against the scan — all before the limit, the delivery check, author lookup and shaping —
+        caps at the scan's remainder, labels each hit with its channel, and STAGES NOTHING.
+        """
         if not getattr(ctx, "action_token", None):
             # Older/replayed events (or non-AI-app surfaces) carry no token.
             # Log the cause: the registry's generic "-> error" line alone left four
@@ -779,6 +837,11 @@ class SlackSearchToolMixin(_Host):
         # filtering. Channel scope already constrained the API to the current channel via in:<#…>,
         # so its top-N is already deliverable — no widening needed there.
         api_limit = 20 if (filtering_active and scope == "workspace") else requested_limit
+        if merge is not None:
+            # The fence, self-drop and dedupe all discard hits before the limit applies, so the
+            # merge always asks for the API's max and keeps only its remainder.
+            requested_limit = merge.limit
+            api_limit = 20
 
         # Channel scope must constrain at the API, not merely post-filter the top-N: a
         # workspace-wide query whose highest-ranked hits all live in other channels
@@ -842,6 +905,8 @@ class SlackSearchToolMixin(_Host):
                 continue
             source = self._parse_search_source_id(m)
             team_ids = self._parse_search_source_team_ids(m)
+            if merge is not None and not self._admit_index_hit(m, source, merge):
+                continue
             # Channel scope was constrained at the API with in:<#…>; keep the post-filter as
             # belt-and-braces so a stray cross-channel hit can't ride a channel-scoped query.
             if scope == "channel" and ctx.channel_id and source != ctx.channel_id:
@@ -855,6 +920,10 @@ class SlackSearchToolMixin(_Host):
                 if not deliverable:
                     continue
             kept.append((m, source, team_ids))
+            if merge is not None:
+                # Only a KEPT hit claims its (channel, ts): a copy withheld above must not
+                # shadow a later, well-formed copy of the same message.
+                merge.seen.add((str(source), str(m.get("message_ts") or m.get("ts"))))
             if len(kept) >= requested_limit:
                 break
 
@@ -891,17 +960,177 @@ class SlackSearchToolMixin(_Host):
                 # pre-W3 shape exactly, and the DM schema (which never mentions the field) says
                 # the same thing.
                 entry["thread_ts"] = self._hit_thread_root(m)
+            if merge is not None:
+                entry["channel_name"] = self._index_channel_label(m)
             results.append(entry)
 
         payload = {"ok": True, "query": query, "scope": scope,
                    "count": len(results), "results": results}
-        self._enroll_search_roots(ctx, payload, kept)
+        if merge is None:
+            # An index hit merged into a channel scan is read-only context: it never stages a
+            # root or an edit target (spec §D.3).
+            self._enroll_search_roots(ctx, payload, kept)
         return payload
+
+    def _admit_index_hit(self, m: Dict[str, Any], source: Optional[str],
+                         merge: _IndexMerge) -> bool:
+        """One index hit through the §D.3 filters, in order: a parseable ts STRICTLY before the
+        trigger, not authored by us, not already seen as `(channel, ts)`. An admitted hit is added
+        to `seen`, so a repeated hit in the index's own answer is dropped too."""
+        ts = m.get("message_ts") or m.get("ts")
+        if not isinstance(ts, str) or not ts:
+            return False
+        try:
+            if parse_ts(ts) >= merge.trigger_key:
+                return False
+        except TimestampError:
+            return False
+        # The hit's whole identity (bot_id, app_id, api_app_id …), with the index's author field
+        # standing in for `user` when the hit has none.
+        if self.is_own_message({**m, "user": m.get("user") or m.get("author_user_id")}):
+            return False
+        if not self._index_hit_channel_agrees(m, source):
+            return False
+        return (str(source), ts) not in merge.seen
+
+    @staticmethod
+    def _index_hit_channel_agrees(m: Dict[str, Any], source: Optional[str]) -> bool:
+        """Every channel identity the hit carries must name ONE channel (codex 2.10): top-level
+        `channel_id`, the nested `channel` (id or bare string), and the permalink's
+        `/archives/<C>` segment and `cid`. Authorization keys on `source`; a hit whose label or
+        link points somewhere else would ride the current-channel exemption with another
+        channel's content. A permalink we cannot read a channel from counts as disagreement."""
+        if not source:
+            return False
+        named: List[Any] = [m.get("channel_id")]
+        ch = m.get("channel")
+        named.append(ch.get("id") if isinstance(ch, dict) else ch)
+        permalink = m.get("permalink")
+        if permalink:
+            if not isinstance(permalink, str):
+                return False
+            try:
+                parts = urlsplit(permalink)
+                params = parse_qs(parts.query)
+            except ValueError:
+                return False
+            segments = [seg for seg in parts.path.split("/") if seg]
+            if "archives" not in segments or segments.index("archives") + 1 >= len(segments):
+                return False
+            named.append(segments[segments.index("archives") + 1])
+            named.extend(params.get("cid") or [])
+        return all(value == source for value in named if value)
+
+    @staticmethod
+    def _index_channel_label(m: Dict[str, Any]) -> Optional[str]:
+        """The hit's channel NAME, when Slack supplied one; None otherwise."""
+        name = m.get("channel_name")
+        if not name:
+            ch = m.get("channel")
+            name = ch.get("name") if isinstance(ch, dict) else None
+        return name if isinstance(name, str) and name else None
+
+    def _native_search_eligible(self, ctx: Any) -> bool:
+        """Spec §D.1, minus the channel-shape check (which costs a call and runs inside the
+        index budget): the flag, a non-DM surface, and a trigger that is ONE live app_mention
+        from the requester carrying its OWN action_token.
+
+        * `wake_source == "app_mention"` with `origin_membership_attested` — the attestation is
+          stamped only at Slack's own delivery of a human's message, so the edit path's synthetic
+          addressed dispatch and the welcome replay (which reuse the app_mention route) fail it;
+        * the token on the context is the one on the trigger message itself (`ts` matches);
+        * not a replay: no queue drain of any size, no carried history, no fail-card rerun.
+        """
+        if not config.slack_channel_native_search or getattr(ctx, "is_dm", False):
+            return False
+        token = getattr(ctx, "action_token", None)
+        if not isinstance(token, str) or not token:
+            return False
+        if getattr(ctx, "origin_membership_attested", False) is not True:
+            return False
+        meta = getattr(getattr(ctx, "message", None), "metadata", None)
+        if not isinstance(meta, dict):
+            return False
+        if meta.get("wake_source") != "app_mention" or meta.get("action_token") != token:
+            return False
+        trigger_ts = getattr(ctx, "trigger_ts", None)
+        if not trigger_ts or str(meta.get("ts")) != str(trigger_ts):
+            return False
+        # ANY queue drain (a one-message catch-up stamps 1) or fail-card rerun is a replay of an
+        # earlier event, and that event's token does not authorize a fresh workspace search.
+        if meta.get("queued_batch_size") is not None or meta.get("batched_history"):
+            return False
+        if meta.get(FAIL_RETRY_RERUN) is True:
+            return False
+        return True
+
+    async def _current_channel_is_plain(self, ctx: Any, channel_id: str) -> bool:
+        """True only for a channel Slack positively says is neither a group DM nor an IM. One
+        request-memoized conversations.info; anything unreadable is False (no index)."""
+        async def _probe() -> bool:
+            resp = await self.app.client.conversations_info(channel=channel_id)
+            ch = (resp.get("channel") or {}) if resp else {}
+            if not isinstance(ch, dict):
+                return False
+            return ch.get("is_mpim") is False and ch.get("is_im") is not True
+
+        return bool(await self._memoized_access(
+            ctx, ("native_search_plain_channel", self._access_scope(), channel_id),
+            _probe, False))
+
+    async def _merge_native_index(self, ctx: Any, args: Dict[str, Any], query: str,
+                                  payload: Dict[str, Any], *, channel_id: str,
+                                  trigger_key: Tuple[int, int], limit: int,
+                                  started_at: float) -> None:
+        """Spec §D.2/§D.3: fold Slack's index into a SUCCESSFUL scan result, in place.
+
+        Scan hits keep their places; index hits fill the remainder of the caller's limit. Any
+        failure, refusal or timeout leaves the payload exactly as the scan built it.
+        """
+        results: List[Dict[str, Any]] = payload["results"]
+        remaining = limit - len(results)
+        if remaining <= 0:
+            return
+        budget = min(_NATIVE_INDEX_BUDGET_SECONDS,
+                     started_at + float(config.search_tool_timeout_seconds)
+                     - _NATIVE_INDEX_TIMEOUT_MARGIN_SECONDS - time.monotonic())
+        if budget <= 0:
+            self.log_info(f"search_tool: no tool budget left for the native index of "
+                          f"{channel_id} — scan only")
+            return
+        merge = _IndexMerge(
+            trigger_key=trigger_key,
+            seen={(str(r.get("channel")), str(r.get("ts"))) for r in results},
+            limit=remaining)
+
+        async def _index() -> Optional[Dict[str, Any]]:
+            if not await self._current_channel_is_plain(ctx, channel_id):
+                return None
+            return await self._execute_assistant_context(ctx, args, query, merge=merge)
+
+        try:
+            index = await asyncio.wait_for(_index(), timeout=budget)
+        except asyncio.TimeoutError:
+            self.log_warning(f"search_tool: native index timed out for {channel_id} — scan only")
+            return
+        except Exception as e:  # noqa: BLE001 — the scan result stands on any index failure
+            self.log_warning(f"search_tool: native index failed for {channel_id}: {e}")
+            return
+        if not isinstance(index, dict) or index.get("ok") is not True:
+            reason = (index or {}).get("error") if isinstance(index, dict) else "not_eligible"
+            self.log_info(f"search_tool: native index skipped for {channel_id} ({reason})")
+            return
+        hits = [h for h in (index.get("results") or []) if isinstance(h, dict)][:remaining]
+        results.extend(hits)
+        payload["count"] = len(results)
+        payload["coverage"]["index_hits"] = len(hits)
+        self.log_info(f"search_tool: native index added {len(hits)} hit(s) to the scan of "
+                      f"{channel_id}")
 
     # ------------------------------------------------ the in-channel scan (§S3–S7, §S10)
 
-    async def _execute_in_channel_scan(self, ctx, args: Dict[str, Any],
-                                       query: str) -> Dict[str, Any]:
+    async def _execute_in_channel_scan(self, ctx, args: Dict[str, Any], query: str,
+                                       started_at: Optional[float] = None) -> Dict[str, Any]:
         """Keyword-scan the CURRENT channel on the BOT token.
 
         NO SLACK FAILURE ESCAPES: a refused page, a spent budget and a malformed page all become
@@ -924,6 +1153,8 @@ class SlackSearchToolMixin(_Host):
         NOTHING FETCHED IS PERSISTED (CLAUDE.md rule 4): pages are scored and dropped, the
         database is READ for receipt evidence and never written.
         """
+        if started_at is None:
+            started_at = time.monotonic()
         channel_id = getattr(ctx, "channel_id", None)
         if not channel_id:
             return {"ok": False, "error": "bad_arguments",
@@ -1005,6 +1236,13 @@ class SlackSearchToolMixin(_Host):
                    "count": len(results), "results": results, "coverage": coverage}
         self._enroll_search_roots(ctx, payload, kept)
         self._stage_scan_edit_targets(ctx, channel_id, scan, payload, kept)
+        # AFTER staging, so only scan hits can ever have staged anything (spec §D.3).
+        # Only on a CLEAN scan: a history read Slack refused must not be backfilled from the
+        # index, whose current-channel exemption would hand back what the refusal withheld.
+        if not scan.fetch_error and self._native_search_eligible(ctx):
+            await self._merge_native_index(ctx, args, query, payload, channel_id=channel_id,
+                                           trigger_key=trigger_key, limit=limit,
+                                           started_at=started_at)
         return payload
 
     def _normalize_scanned(self, raw: Any, channel_id: str, origin: str) -> Optional[Any]:

@@ -77,12 +77,63 @@ def _note_turn_tool_call(tool_context: Any, record: Dict[str, Any]) -> None:
     never breaks a round.
     """
     note = getattr(getattr(tool_context, "turn", None), "note_tool_call", None)
-    if note is None:
-        return
+    if note is None or record.get("name") == "update_plan":
+        return      # §F R19: the plan is a display, never tool provenance
     try:
         note(record)
     except Exception:  # noqa: BLE001 — a ledger write never fails a tool round
         pass
+
+
+class _StepEmitter:
+    """Agent surfaces §C.4: the step-card feed for LOCAL calls, beside (never instead of) the
+    `(tool_name, status)` callback. One id per dispatched occurrence (`local:<n>`), a start
+    before dispatch, and a terminal read off the actual result. A call answered by an override
+    (over budget, excess bookkeeping, a rejected or duplicate terminal) never ran and emits
+    nothing. Synchronous, and never able to break a round."""
+
+    def __init__(self, callback: Callable[[Dict[str, Any]], Any]) -> None:
+        self._callback = callback
+        self._seq = 0
+
+    def _emit(self, key: str, call: Dict[str, Any], state: str, result: Any = None) -> None:
+        try:
+            self._callback({"kind": "local", "id": key, "name": call.get("name"),
+                            "state": state, "arguments": call.get("arguments"),
+                            "result": result})
+        except Exception as e:  # noqa: BLE001 — a step card never fails a tool round
+            logger.debug(f"step_callback error: {e}")
+
+    def start(self, call: Dict[str, Any]) -> str:
+        self._seq += 1
+        key = f"local:{self._seq}"
+        self._emit(key, call, "start")
+        return key
+
+    def finish(self, key: str, call: Dict[str, Any], ok: bool, result: Any = None) -> None:
+        self._emit(key, call, "complete" if ok else "failed", result)
+
+    def start_upfront(self, dispatch_calls: List[Dict[str, Any]]) -> Dict[int, str]:
+        """Starts for the calls that begin running at once: every ordinary call and the FIRST
+        change of each canvas chain. A later chained change starts only when it actually runs
+        (it may never: an earlier failure makes it "not run"), so it is announced afterwards."""
+        from message_processor.tool_registry import _canvas_chain_key
+        keys: Dict[int, str] = {}
+        chains: set = set()
+        for call in dispatch_calls:
+            chain = _canvas_chain_key(call)
+            if chain is None or chain not in chains:
+                keys[id(call)] = self.start(call)
+            if chain is not None:
+                chains.add(chain)
+        return keys
+
+    def settle(self, keys: Dict[int, str], call: Dict[str, Any], result: Any, ok: bool) -> None:
+        """The terminal for one dispatched call; a dependency skip ("not run") emits nothing."""
+        if isinstance(result, dict) and result.get("error") == "not_run":
+            return
+        key = keys.get(id(call)) or self.start(call)
+        self.finish(key, call, ok, result)
 
 
 async def _run_tool_round(
@@ -95,7 +146,9 @@ async def _run_tool_round(
     tool_callback: Optional[Callable[[str, str], Any]] = None,
     result_overrides: Optional[Dict[int, Any]] = None,
     hosted_carry: Optional[List[str]] = None,
-) -> None:
+    steps: Optional[_StepEmitter] = None,
+    stop_check: Optional[Callable[[], bool]] = None,
+) -> bool:
     """Dispatch one round's calls, then replay the round's items (reasoning items in
     place, each function_call followed by its function_call_output) onto the input.
     ``hosted_carry`` is the round's hosted-tool findings (see ``_replay_hosted_carry``).
@@ -125,6 +178,12 @@ async def _run_tool_round(
         await _notify(f"local:{call.get('name')}", "started")
 
     dispatch_calls = [c for c in calls if id(c) not in overrides]
+    # §A.3: the last moment a Stop can keep this round's side effects from starting — after
+    # every await above, immediately before dispatch. Nothing runs, nothing is replayed.
+    if stop_check is not None and stop_check():
+        self.log_info("Stop pressed before dispatch — this round's tools were not run")
+        return False
+    step_keys = steps.start_upfront(dispatch_calls) if steps is not None else {}
     dispatched = await registry.dispatch_all(tool_context, dispatch_calls)
     dispatched_by_id = {id(c): r for c, r in zip(dispatch_calls, dispatched)}
     result_by_id = {}
@@ -144,9 +203,12 @@ async def _run_tool_round(
         self.log_info(f"Local tool '{call.get('name')}' -> "
                       f"{'ok' if ok else 'error: ' + _err_code(result)}")
         result_by_id[id(call)] = result
+        if steps is not None and oid not in overrides:
+            steps.settle(step_keys, call, result, ok)
         await _notify(f"local:{call.get('name')}", "completed")
 
     _replay_round_items(sink, input_items, result_by_id, tool_context, hosted_carry)
+    return True
 
 
 def _replay_round_items(sink: List[Dict[str, Any]], input_items: List[Dict[str, Any]],
@@ -684,6 +746,8 @@ async def _handle_no_reply_terminal(
     free_tools: Optional[Iterable[str]] = None,
     committed_text: str = "",
     hosted_carry: Optional[List[str]] = None,
+    steps: Optional[_StepEmitter] = None,
+    stop_check: Optional[Callable[[], bool]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Terminal round: no_response_needed ends the turn's WORDS. It does not cancel the round.
 
@@ -759,6 +823,11 @@ async def _handle_no_reply_terminal(
     for call in exec_calls:
         await _notify(f"local:{call.get('name')}", "started")
     dispatch_calls = [c for c in exec_calls if id(c) not in overrides]
+    if stop_check is not None and stop_check():
+        self.log_info("Stop pressed before dispatch — the terminal round was not run")
+        return {"user_stopped": True}
+    step_keys = (steps.start_upfront([c for c in dispatch_calls if c is not terminal_call])
+                 if steps is not None else {})
     results = await registry.dispatch_all(tool_context, dispatch_calls)
     dispatched_by_id = {id(c): r for c, r in zip(dispatch_calls, results)}
     result_by_id: Dict[int, Any] = {}
@@ -787,6 +856,8 @@ async def _handle_no_reply_terminal(
                                  _turn_record(record, dispatched=id(call) not in overrides))
             self.log_info(f"Local tool '{call.get('name')}' -> "
                           f"{'ok' if ok else 'error: ' + _err_code(result)}")
+        if steps is not None and call is not terminal_call and id(call) not in overrides:
+            steps.settle(step_keys, call, result, ok)
         await _notify(f"local:{call.get('name')}", "completed")
     _merge_used(tools_used_all, [c.get("name") for c in exec_calls if c.get("name")],
                 tool_context)
@@ -823,9 +894,14 @@ async def create_text_response_with_tool_loop(
     prior_committed: bool = False,
     free_tools: Optional[Iterable[str]] = None,
     aggregate_segments: bool = False,
+    stop_check: Optional[Callable[[], bool]] = None,
     **params: Any,
 ) -> Dict[str, Any]:
     """Non-streaming response with local tool execution.
+
+    ``stop_check`` (agent surfaces §A.3): the user's native Stop, checked before every model
+    request and immediately before every dispatch. Once true the loop returns at once with
+    ``"user_stopped": True`` — no further request, no further tool.
 
     ``free_tools`` (F37) names BOOKKEEPING calls — they produce nothing a user can see, so they
     do not spend the productive budget and never displace a real tool. Same rule the streaming
@@ -911,10 +987,18 @@ async def create_text_response_with_tool_loop(
     # 0 (CONTEXT_METER §3.5).
     request_round = 0
 
+    def _stopped_result() -> Dict[str, Any]:
+        self.log_info("Tool loop ended by the user's Stop — no further rounds or tools")
+        return {"text": join_segments(segments) if aggregate_segments else "",
+                "segments": list(segments), "tools_used": tools_used_all,
+                "local_tool_calls": local_tool_calls, "user_stopped": True}
+
     while True:
         # W3, request side: picks up a container a BRIDGE tool created during the previous
         # round's dispatch, which lands in the holder after the response-side check has run.
         tools = await _adopt_and_pin(tool_context, params.get("artifacts_sink"), tools)
+        if stop_check is not None and stop_check():
+            return _stopped_result()
         sink: List[Dict[str, Any]] = []
         carry: List[str] = []       # this round's hosted findings, replayed with its calls
         # return_metadata=True makes this a metadata dict, which the declared `-> str` omits.
@@ -983,7 +1067,9 @@ async def create_text_response_with_tool_loop(
                     silence_reason, tools_used_all, local_tool_calls,
                     remaining_budget=config.max_tool_calls_per_turn - total_calls,
                     result_overrides=suppressed or None, free_tools=free_tools,
-                    hosted_carry=carry)
+                    hosted_carry=carry, stop_check=stop_check)
+                if outcome is not None and outcome.get("user_stopped"):
+                    return _stopped_result()
                 if outcome is not None:
                     return outcome
                 # The executor refused: the round ran, its outputs are on the input, and the
@@ -1020,11 +1106,12 @@ async def create_text_response_with_tool_loop(
                                          config.max_tool_calls_per_round),
             }
             _charge(calls, suppressed)
-            await _run_tool_round(
-                self, registry, tool_context, sink, input_items, local_tool_calls,
-                result_overrides={**suppressed,
-                                  **_terminal_overrides(calls, terminal_call, terminal_result)},
-                hosted_carry=carry)
+            if not await _run_tool_round(
+                    self, registry, tool_context, sink, input_items, local_tool_calls,
+                    result_overrides={**suppressed,
+                                      **_terminal_overrides(calls, terminal_call, terminal_result)},
+                    hosted_carry=carry, stop_check=stop_check):
+                return _stopped_result()
             _merge_used(tools_used_all, [c.get("name") for c in calls if c.get("name")],
                         tool_context)
             if _capped():
@@ -1042,8 +1129,10 @@ async def create_text_response_with_tool_loop(
                 over_budget, config.max_tool_calls_per_turn - total_calls))
         suppressed = {**suppressed, **over_budget}
         _charge(calls, suppressed)
-        await _run_tool_round(self, registry, tool_context, sink, input_items, local_tool_calls,
-                              result_overrides=suppressed or None, hosted_carry=carry)
+        if not await _run_tool_round(self, registry, tool_context, sink, input_items,
+                                     local_tool_calls, result_overrides=suppressed or None,
+                                     hosted_carry=carry, stop_check=stop_check):
+            return _stopped_result()
         _merge_used(tools_used_all, [c.get("name") for c in calls if c.get("name")],
                         tool_context)
 
@@ -1091,6 +1180,8 @@ async def create_streaming_response_with_tool_loop(
     aggregate_segments: bool = False,
     pre_round_input_callback: Optional[_PreRoundCallback] = None,
     terminal_tools: Optional[Iterable[str]] = None,
+    stop_check: Optional[Callable[[], bool]] = None,
+    step_callback: Optional[Callable[[Dict[str, Any]], Any]] = None,
     **params: Any,
 ) -> Dict[str, Any]:
     """Streaming response with local tool execution.
@@ -1143,6 +1234,16 @@ async def create_streaming_response_with_tool_loop(
     `deliver`). Once a round has run one of them with an ok result, the loop returns right after
     that round: no further model call, so no wind-down round and no cap warning. A call that
     came back as an error is not terminal — the model goes again, as with any other tool.
+
+    ``stop_check`` (agent surfaces §A.3.2) is the user's native Stop, polled before every round
+    and inside every streamed round. Once it reads True no further round is requested and no
+    further tool is dispatched; calls already dispatched finish (nothing is cancelled) and their
+    results are discarded. The loop returns the text already streamed with
+    ``"user_stopped": True``.
+
+    ``step_callback`` (§C.4) receives one SYNCHRONOUS ``{"kind": "local", "id", "name",
+    "state": "start"|"complete"|"failed"}`` per dispatched local call — a separate feed that
+    leaves ``tool_callback``'s contract untouched.
     """
     rounds_cap = int(max_tool_rounds) if max_tool_rounds is not None else config.max_tool_rounds
     calls_cap = (int(max_tool_calls) if max_tool_calls is not None
@@ -1222,6 +1323,11 @@ async def create_streaming_response_with_tool_loop(
         if not productive and calls:
             if round_state["hosted_seen"] and uncapped:
                 return
+            # §F R6: a round that did hosted work and whose only local call was the plan
+            # display costs nothing — the plan rides the search, it must not end the turn's
+            # budget early. A plan-ONLY round still bills as a free round (the runaway guard).
+            if round_state["hosted_seen"] and any(c.get("name") == "update_plan" for c in free):
+                return
             budget["free_calls"] += len(free)
             budget["free_rounds"] += 1
             return
@@ -1280,6 +1386,25 @@ async def create_streaming_response_with_tool_loop(
     segments: List[str] = []
     # Which request of this loop is going out (see the non-streaming twin).
     request_round = 0
+    steps = _StepEmitter(step_callback) if step_callback is not None else None
+    if stop_check is not None:
+        # Forwarded to every streamed round, so a Stop also ends the round being generated.
+        params["stop_check"] = stop_check
+
+    def _stopped() -> bool:
+        return bool(stop_check is not None and stop_check())
+
+    async def _stopped_return() -> Dict[str, Any]:
+        """§A.3.2: the user stopped the turn. What already streamed is the answer."""
+        await _flush_stream_end(self, stream_callback, params.get("hidden_suppression_sink"))
+        self.log_info("Tool loop ended by the user's Stop — no further rounds or tools")
+        return {
+            "text": join_segments(segments) if aggregate_segments else (segments[-1] if segments else ""),
+            "segments": list(segments),
+            "tools_used": tools_used_all,
+            "local_tool_calls": local_tool_calls,
+            "user_stopped": True,
+        }
 
     async def _terminal_return(records_before: int) -> Optional[Dict[str, Any]]:
         """The loop's return when the round just run landed an ok call to a terminal tool.
@@ -1299,6 +1424,8 @@ async def create_streaming_response_with_tool_loop(
         }
 
     while True:
+        if _stopped():
+            return await _stopped_return()
         # W3, request side: picks up a container a BRIDGE tool created during the previous
         # round's dispatch, which lands in the holder after the response-side check has run.
         tools = await _adopt_and_pin(tool_context, params.get("artifacts_sink"), tools)
@@ -1306,6 +1433,8 @@ async def create_streaming_response_with_tool_loop(
         # already on the input, so a caller can add to it here (a job's mid-run steering notes)
         # and know the items sit after complete tool pairs.
         await _inject_pre_round_items(self, pre_round_input_callback, input_items)
+        if _stopped():
+            return await _stopped_return()      # re-checked after the awaits above (§A.3)
         sink: List[Dict[str, Any]] = []
         carry: List[str] = []       # this round's hosted findings, replayed with its calls
         round_state["hosted_seen"] = False       # per ROUND: set by _watch_tool_events below
@@ -1335,6 +1464,9 @@ async def create_streaming_response_with_tool_loop(
             segments.append(text)
         if (text or "").strip():
             visible_committed = True
+        if _stopped():
+            # The round's calls (complete or cut off) are never dispatched.
+            return await _stopped_return()
         # W3: after the response, before this round's local calls dispatch — so a bridge tool in
         # a mixed round finds the hosted container instead of minting a rival one, and so the
         # array the NEXT request sends already names it.
@@ -1393,7 +1525,10 @@ async def create_streaming_response_with_tool_loop(
                     silence_reason, tools_used_all, local_tool_calls,
                     remaining_budget=calls_cap - budget["calls"],
                     result_overrides=suppressed or None, tool_callback=tool_callback,
-                    free_tools=free_tools, committed_text=text, hosted_carry=carry)
+                    free_tools=free_tools, committed_text=text, hosted_carry=carry,
+                    steps=steps, stop_check=stop_check)
+                if outcome is not None and outcome.get("user_stopped"):
+                    return await _stopped_return()
                 if outcome is not None:
                     return outcome
                 # The executor refused: the round ran (its committed preamble and outputs are
@@ -1427,11 +1562,13 @@ async def create_streaming_response_with_tool_loop(
             _charge(calls, suppressed)
             _replay_committed_text(input_items, text)
             records_before = len(local_tool_calls)
-            await _run_tool_round(
-                self, registry, tool_context, sink, input_items, local_tool_calls, tool_callback,
-                result_overrides={**suppressed,
-                                  **_terminal_overrides(calls, terminal_call, terminal_result)},
-                hosted_carry=carry)
+            if not await _run_tool_round(
+                    self, registry, tool_context, sink, input_items, local_tool_calls,
+                    tool_callback,
+                    result_overrides={**suppressed,
+                                      **_terminal_overrides(calls, terminal_call, terminal_result)},
+                    hosted_carry=carry, steps=steps, stop_check=stop_check):
+                return await _stopped_return()
             _merge_used(tools_used_all, [c.get("name") for c in calls if c.get("name")],
                         tool_context)
             finished = await _terminal_return(records_before)
@@ -1453,10 +1590,11 @@ async def create_streaming_response_with_tool_loop(
         _charge(calls, suppressed)
         _replay_committed_text(input_items, text)
         records_before = len(local_tool_calls)
-        await _run_tool_round(
-            self, registry, tool_context, sink, input_items, local_tool_calls, tool_callback,
-            result_overrides=suppressed or None, hosted_carry=carry,
-        )
+        if not await _run_tool_round(
+                self, registry, tool_context, sink, input_items, local_tool_calls, tool_callback,
+                result_overrides=suppressed or None, hosted_carry=carry, steps=steps,
+                stop_check=stop_check):
+            return await _stopped_return()
         _merge_used(tools_used_all, [c.get("name") for c in calls if c.get("name")],
                         tool_context)
         finished = await _terminal_return(records_before)

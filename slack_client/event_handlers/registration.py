@@ -10,6 +10,7 @@ from message_processor import gate_context, reply_cache
 from message_processor.participation import describe_attachment
 from slack_client import admission_watermark
 from slack_client._host import _Host
+from slack_client.event_handlers import agent_session
 from slack_client.event_handlers import feedback as feedback_handlers
 from slack_client.formatting.blocks import extract_supplementary_text
 from slack_client.formatting.text import resolve_inbound_mentions
@@ -615,6 +616,13 @@ class SlackRegistrationMixin(_Host):
         @track_ingress
         async def handle_app_context_changed(event):
             await self._handle_app_context_changed(event)
+
+        # Native Stop button (spec §A.2). Always registered so Bolt acks it; a no-op when
+        # SLACK_STOP_BUTTON is off.
+        @self.app.event("agent_session_stopped")
+        @track_ingress
+        async def handle_agent_session_stopped(event):
+            await agent_session.handle_agent_session_stopped(self, event)
 
         # --- Track 4: channel join behavior ---
         @self.app.event("member_joined_channel")

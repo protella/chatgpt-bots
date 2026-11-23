@@ -1439,7 +1439,9 @@ class TestProvenanceEchoIsStripped:
         # ...but the native stream is APPEND-ONLY, so it cannot strip after the fact: it must
         # do it at the append AND at the finalize, through the prefix-stable transform. A
         # strip that only ran at finalize is exactly how a dead sandbox link reached a user.
-        assert src.count("stream_safe_text(") == 2
+        # The third is the one-shot native stream of a buffered reply (agent surfaces §E), which
+        # sends its whole body through the same transform.
+        assert src.count("stream_safe_text(") == 3
         assert "stream_safe_text(buffer.get_complete_text(), final=True)" in src
 
 

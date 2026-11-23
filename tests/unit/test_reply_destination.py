@@ -1359,7 +1359,8 @@ def test_both_tool_loops_are_told_the_destination_tool_is_free():
     for method in (TextHandlerMixin._handle_text_response,
                    TextHandlerMixin._handle_streaming_text_response):
         src = inspect.getsource(method)
-        assert "free_tools=(SET_REPLY_DESTINATION,)" in src, method.__name__
+        # §F: the plan display is free bookkeeping too, on both loops.
+        assert "free_tools=(SET_REPLY_DESTINATION, UPDATE_PLAN)" in src, method.__name__
 
 
 @pytest.mark.asyncio

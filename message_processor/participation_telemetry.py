@@ -1159,7 +1159,9 @@ def turn_outcome(channel_id: Optional[str], trigger_ts: Optional[str], *,
                  edits: Optional[List[Dict[str, Any]]] = None,
                  destination_contract_miss: Optional[bool] = None,
                  preempted_by: Optional[str] = None,
-                 fail_card: Optional[str] = None) -> None:
+                 fail_card: Optional[str] = None,
+                 stopped_by_user: bool = False,
+                 held: Optional[Dict[str, Any]] = None) -> None:
     """What one turn ended up doing. Exactly one per `turn_start`.
 
     `destinations` is the OBSERVED set — every surface Slack accepted, whether or not it reached
@@ -1217,6 +1219,15 @@ def turn_outcome(channel_id: Optional[str], trigger_ts: Optional[str], *,
     `fail_card` rides ONLY a fail-closed row (one carrying `error`): `posted` when the turn's
     fail-closed card reached the room, `silent` when it was withheld or did not land. The cause is
     the row's `error` code.
+
+    `stopped_by_user` rides ONLY a turn that ended on Slack's native Stop button (spec §A.3),
+    written only when true like `destination_contract_miss`.
+
+    `held` (spec §G GR12, flag-gated, optional fields, no contract bump) carries the held-turn
+    progress facts: `first_signal`/`first_signal_ms`, `first_visible`/`first_visible_ms` (ms
+    from admission, confirmed cues only), `held_card_opened`, `held_card_removed`,
+    `held_card_remove_failed`. Unavailable values are dropped like every other None. No plan
+    text, ever.
     """
     _soft_check(kind, KINDS, "turn_outcome kind")
     record("turn_outcome", channel_id=channel_id, trigger_ts=trigger_ts, turn_id=turn_id,
@@ -1227,12 +1238,16 @@ def turn_outcome(channel_id: Optional[str], trigger_ts: Optional[str], *,
            edits=list(edits or []),
            destination_contract_miss=True if destination_contract_miss else None,
            preempted_by=preempted_by if kind == "superseded" else None,
-           fail_card=fail_card if error else None)
+           fail_card=fail_card if error else None,
+           stopped_by_user=True if stopped_by_user else None,
+           **(held or {}))
 
 
 def emit_turn_outcome(turn: Any, *, channel_id: Optional[str], trigger_ts: Optional[str],
                       kind: str, detached_started: bool = False,
-                      attempt_id: Optional[str] = None) -> bool:
+                      attempt_id: Optional[str] = None,
+                      stopped_by_user: bool = False,
+                      admitted_at: Optional[float] = None) -> bool:
     """Assemble a turn's outcome from the turn itself. True when this call emitted it.
 
     Reads the TurnRuntime rather than being handed a payload, so the outer finally cannot report
@@ -1277,11 +1292,33 @@ def emit_turn_outcome(turn: Any, *, channel_id: Optional[str], trigger_ts: Optio
             destination_contract_miss=bool(
                 getattr(turn, "destination_contract_miss", False)),
             preempted_by=getattr(getattr(turn, "send_lease", None), "preempted_by", None),
-            fail_card=getattr(turn, "fail_card", None))
+            fail_card=getattr(turn, "fail_card", None), stopped_by_user=stopped_by_user,
+            held=held_progress_fields(turn, admitted_at))
         return True
     except Exception as e:  # noqa: BLE001 — a lost line is never worth a lost turn
         logger.debug(f"Participation turn outcome not written: {e}")
         return False
+
+
+def held_progress_fields(turn: Any, admitted_at: Optional[float]) -> Optional[Dict[str, Any]]:
+    """§G GR12: the held-turn progress facts for `turn_outcome`, or None with the flag off."""
+    if (not getattr(config, "slack_held_turn_progress", False)
+            or not getattr(config, "slack_stream_task_cards", False) or turn is None):
+        return None
+
+    def _ms(at: Any) -> Optional[int]:
+        if not isinstance(at, (int, float)) or not isinstance(admitted_at, (int, float)):
+            return None
+        return max(0, int(round((at - admitted_at) * 1000)))
+
+    return {"first_signal": getattr(turn, "held_first_signal", None),
+            "first_signal_ms": _ms(getattr(turn, "held_first_signal_at", None)),
+            "first_visible": getattr(turn, "held_first_visible", None),
+            "first_visible_ms": _ms(getattr(turn, "held_first_visible_at", None)),
+            "held_card_opened": True if getattr(turn, "held_card_opened", False) else None,
+            "held_card_removed": getattr(turn, "held_card_removed", None),
+            "held_card_remove_failed":
+                True if getattr(turn, "held_card_remove_failed", False) else None}
 
 
 def stream_render(*, turn_id: Optional[str], origin_thread_ts: Optional[str] = None,

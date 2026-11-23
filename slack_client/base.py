@@ -304,6 +304,11 @@ class SlackBot(SlackMessageEventsMixin,  # type: ignore[misc]
         # ambient turn would otherwise talk us into rewriting. MPIMs are refused there too —
         # channel-shaped everywhere else, but the app carries no MPIM topic scope.
         register_channel_admin_tools(registry)
+        # Agent surfaces §F: the model-written plan its streamed reply shows. LAST, and only with
+        # the step-card flag on, so every flag-off tool array keeps its exact bytes and order.
+        if config.slack_stream_task_cards:
+            from message_processor.plan_tool import register_plan_tool
+            register_plan_tool(registry)
         return registry
 
     # Async versions required by BaseClient

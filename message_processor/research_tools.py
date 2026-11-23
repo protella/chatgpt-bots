@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import hashlib
 import importlib
 import re
 import time
@@ -1437,6 +1438,37 @@ def _card_outcome(result: Any) -> Tuple[bool, Optional[float], bool]:
     return ok, retry_after, getattr(result, "permanent", False) is True
 
 
+# --- §B: native plan card (SLACK_NATIVE_PLAN_CARD) ----------------------------------------
+# The Slack errors that say "this payload is not a plan block Slack will take", definitively.
+# Only these flip a card to the legacy render; anything else (429, network, missing scope) is
+# handled exactly as it was.
+_PLAN_REJECTION_ERRORS = frozenset({"invalid_blocks", "invalid_arguments"})
+# Todo status -> plan task status while the job runs.
+_PLAN_TASK_STATUS = {"pending": "pending", "in_progress": "in_progress", "done": "complete"}
+# The plan title when the job somehow has no task text: Slack needs a non-empty title.
+_PLAN_TITLE_FALLBACK = "Background job"
+
+
+def _plan_task_ids(texts: List[str]) -> List[str]:
+    """Stable task ids: a short hash of each item's normalized text, so a reorder keeps ids
+    and a rename mints a new task. Repeats get -2, -3 suffixes in list order."""
+    out: List[str] = []
+    seen: Dict[str, int] = {}
+    for text in texts:
+        norm = " ".join(text.split()).lower()
+        base = "t" + hashlib.sha1(norm.encode("utf-8")).hexdigest()[:10]
+        n = seen.get(base, 0) + 1
+        seen[base] = n
+        out.append(base if n == 1 else f"{base}-{n}")
+    return out
+
+
+def _plan_rejected(error: Any) -> bool:
+    """Is this Slack error code a definitive rejection of the plan payload? Literal strings
+    only, so an attribute a mock invented can never flip a card."""
+    return isinstance(error, str) and error in _PLAN_REJECTION_ERRORS
+
+
 def _now_label(clock: Callable[[], time.struct_time] = time.localtime) -> str:
     """Sender-local 'H:MM AM/PM' stamp for the card's context line."""
     return time.strftime("%I:%M %p", clock()).lstrip("0")
@@ -1472,7 +1504,7 @@ class _ResearchCard:
                  clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], Any] = asyncio.sleep,
                  now_label: Callable[[], str] = _now_label,
-                 receipts=None):
+                 receipts=None, short_name: Optional[str] = None):
         # The card is the JOB's chrome, owned by the job's ledger — the turn that dispatched
         # the job is long over by the time it posts.
         self.receipts = receipts
@@ -1488,6 +1520,9 @@ class _ResearchCard:
         # The task is NOT rendered — the user typed it one message ago. Kept only so a caller
         # can still identify the card in logs.
         self._task = task
+        # §B: the job's short name (the model's topic tag the username label is built from),
+        # the native plan's title. None ⇒ the title falls back to a gist of the task.
+        self._short_name = short_name
         self._phase = "Researching…"
         # The workspace's animated loader rather than a static ⏳ — a job that runs for minutes
         # should look alive. Custom emoji render fine in a block's mrkdwn; the progress
@@ -1548,6 +1583,9 @@ class _ResearchCard:
         # Set when Slack says this card can never be written again. The job carries on.
         self._disabled = False
         self._writer_task: Optional[asyncio.Future] = None
+        # §B: render the native plan block. Cleared for the card's lifetime the first time
+        # Slack definitively rejects the plan payload, after which it renders legacy blocks.
+        self._native_plan = bool(getattr(config, "slack_native_plan_card", False))
         self._wake_event = asyncio.Event()
         self._terminal_done = asyncio.Event()
         self._lock = asyncio.Lock()
@@ -1666,11 +1704,100 @@ class _ResearchCard:
                 {"type": "mrkdwn", "text": f"· {static}"}]
 
     def _blocks(self) -> List[Dict[str, Any]]:
+        if self._native_plan:
+            return self._plan_blocks()
+        return self._legacy_blocks()
+
+    def _legacy_blocks(self) -> List[Dict[str, Any]]:
         return [
             {"type": "section",
              "text": {"type": "mrkdwn", "text": "\n".join(self._visible_lines())}},
             {"type": "context", "elements": self._context_elements()},
         ]
+
+    def _plan_tasks(self) -> List[Dict[str, Any]]:
+        """The todo list as plan task objects. Terminal pins every item: success means all
+        complete; a failed, cancelled or partial ending marks every unfinished item error."""
+        items = self.todos.items()
+        ids = _plan_task_ids([t.text for t in items])
+        tasks: List[Dict[str, Any]] = []
+        for todo, task_id in zip(items, ids):
+            if self._terminal is None:
+                status = _PLAN_TASK_STATUS.get(todo.status, "pending")
+            elif self._failed:
+                status = "complete" if todo.status == "done" else "error"
+            else:
+                status = "complete"
+            tasks.append({"type": "task_card", "task_id": task_id, "title": todo.text,
+                          "status": status})
+        return tasks
+
+    def _plan_context_lines(self) -> List[str]:
+        """The legacy card's verdict, live line and static context, one line each."""
+        lines: List[str] = []
+        if self._terminal is not None:
+            lines.append(f"{self._status_emoji} {self._terminal}")
+        lead = self._lead_segment()
+        if lead:
+            lines.append(lead)
+        lines.append(self._static_context())
+        return lines
+
+    def _plan_blocks(self) -> List[Dict[str, Any]]:
+        """§B: a native plan block rendered from the todo state, plus a trailing plain_text
+        context block (model- and web-authored text is never parsed as mrkdwn)."""
+        name = _gist(self._short_name or "", 60) or _gist(self._task or "", 60)
+        tasks = self._plan_tasks()
+        title = name or _PLAN_TITLE_FALLBACK
+        if tasks:
+            done = sum(1 for t in tasks if t["status"] == "complete")
+            title = f"{title} ({done} of {len(tasks)} done)"
+        return [
+            {"type": "plan", "title": title, "tasks": tasks},
+            {"type": "context",
+             "elements": [{"type": "plain_text", "text": "\n".join(self._plan_context_lines()),
+                           "emoji": True}]},
+        ]
+
+    async def _post_card(self, username: Optional[str]
+                         ) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+        """Post the card once; returns (ts, the blocks that went out). With the native plan
+        on, a definitive rejection re-renders the same state as legacy blocks and posts that
+        immediately, with the same username, before any label handling sees the failure."""
+        client = self.client
+        blocks = self._blocks()
+        if not self._native_plan:
+            if username:
+                ts = await client.post_status_card(
+                    self.channel_id, self.thread_root, _CARD_FALLBACK_TEXT, blocks,
+                    username=username, receipts=self.receipts,
+                    receipt_class="background_job")
+            else:
+                ts = await client.post_status_card(
+                    self.channel_id, self.thread_root, _CARD_FALLBACK_TEXT, blocks,
+                    receipts=self.receipts, receipt_class="background_job")
+            return ts, blocks
+        error_out: Dict[str, str] = {}
+        ts = await client.post_status_card(
+            self.channel_id, self.thread_root, _CARD_FALLBACK_TEXT, blocks,
+            username=username, receipts=self.receipts, receipt_class="background_job",
+            error_out=error_out)
+        if ts is None and _plan_rejected(error_out.get("error")):
+            self._native_plan = False
+            self.processor.log_info(
+                f"Native plan card rejected ({error_out.get('error')}) — "
+                "this card renders legacy blocks")
+            blocks = self._blocks()
+            if username:
+                ts = await client.post_status_card(
+                    self.channel_id, self.thread_root, _CARD_FALLBACK_TEXT, blocks,
+                    username=username, receipts=self.receipts,
+                    receipt_class="background_job")
+            else:
+                ts = await client.post_status_card(
+                    self.channel_id, self.thread_root, _CARD_FALLBACK_TEXT, blocks,
+                    receipts=self.receipts, receipt_class="background_job")
+        return ts, blocks
 
     # --- posting / observing ---
     async def start(self) -> None:
@@ -1680,13 +1807,10 @@ class _ResearchCard:
         client = self.client
         if not hasattr(client, "post_status_card"):
             return
-        blocks = self._blocks()
+        blocks: List[Dict[str, Any]] = []
         ts = None
         if self.label:
-            ts = await client.post_status_card(
-                self.channel_id, self.thread_root, _CARD_FALLBACK_TEXT, blocks,
-                username=self.label, receipts=self.receipts,
-                receipt_class="background_job")
+            ts, blocks = await self._post_card(self.label)
             if ts is None:
                 setattr(self.processor, _RESEARCH_LABEL_DISABLED_ATTR, True)
                 self.processor.log_info(
@@ -1694,9 +1818,7 @@ class _ResearchCard:
                     "posting unlabeled for the rest of this process")
                 self.label = None
         if ts is None:
-            ts = await client.post_status_card(
-                self.channel_id, self.thread_root, _CARD_FALLBACK_TEXT, blocks,
-                receipts=self.receipts, receipt_class="background_job")
+            ts, blocks = await self._post_card(None)
         self.ts = ts
         if ts is not None:
             # The post IS the first write: it starts the pacing window and it is what the card
@@ -2026,7 +2148,13 @@ class _ResearchCard:
         async with self._lock:
             if self._finished or self._disabled or self.ts is None:
                 return
+            was_native = self._native_plan
             ok = await self._safe_update(blocks)
+            if not ok and was_native and not self._native_plan:
+                # §B: Slack refused the plan payload. The same state goes out as legacy
+                # blocks now, and only what Slack accepted is acked.
+                blocks = self._blocks()
+                ok = await self._safe_update(blocks)
             if ok:
                 self._next_write_at = self._clock() + _CARD_WRITE_INTERVAL_S
                 self._acked_blocks = blocks
@@ -2110,6 +2238,11 @@ class _ResearchCard:
         if ok:
             self._cooldown_until = 0.0
             return True
+        if self._native_plan and _plan_rejected(getattr(result, "error", None)):
+            self._native_plan = False
+            self.processor.log_info(
+                f"Native plan card rejected ({getattr(result, 'error', '')}) — "
+                "this card renders legacy blocks")
         if retry_after is not None:
             self._cooldown_until = self._clock() + retry_after
             self.processor.log_debug(
@@ -2433,6 +2566,10 @@ async def execute_start_background_job(ctx: ToolContext, args: Dict[str, Any]) -
     # Snapshot the CURRENT turn's full conversation input by DEEP COPY so mutations after this
     # call can't change what the job sees (CLAUDE.md: always full context, never a window).
     snapshot = copy.deepcopy(list(getattr(ctx, "current_input", None) or []))
+    # Agent surfaces §F (R4): the chat turn's update_plan contract never reaches a job, whose
+    # registry has no such tool (jobs keep update_todos).
+    from message_processor.prompts import strip_plan_contract
+    snapshot = strip_plan_contract(snapshot)
     system_prompt = getattr(ctx, "system_prompt", None)
     model = getattr(ctx, "model", None) or config.gpt_model
     # The user's image settings (the image MODEL is a hard constraint) have to ride along, or
@@ -2453,12 +2590,17 @@ async def execute_start_background_job(ctx: ToolContext, args: Dict[str, Any]) -
         # WHAT is running, not merely that something is.
         tm.register_research(thread_key, job_id, _gist(task), mode=mode,
                              deliverables=[d["filename"] for d in deliverables])
+    # The turn may carry the ack on its own open card stream; if its sink claims it, the job
+    # does not post the standalone ack message. No sink ⇒ the job posts it, as always.
+    ack_sink = getattr(getattr(ctx, "turn", None), "job_ack_sink", None)
+    post_ack = not (callable(ack_sink) and ack_sink())
     coro = _run_background_job(
         processor=processor, client=client, channel_id=channel_id,
         thread_root=thread_root, thread_key=thread_key, job_id=job_id,
         task=task, mode=mode, label_hint=label_hint, snapshot=snapshot,
         system_prompt=system_prompt, model=model, plan=plan,
         deliverables=deliverables, thread_config=thread_config, revises=revises,
+        post_ack=post_ack,
         # WHO asked, carried into the job so its build phase can authorize a channel read on
         # their behalf. Read here, off the live turn's context, because that is the only place
         # the identity exists — a detached job has no event to re-derive it from.
@@ -3649,7 +3791,8 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
                               revises: Optional[List[str]] = None,
                               requester_user_id: Optional[str] = None,
                               requester_is_human: bool = False,
-                              requester_is_dm: bool = False) -> None:
+                              requester_is_dm: bool = False,
+                              post_ack: bool = True) -> None:
     """The detached job. It PRODUCES; it does not deliver.
 
     Post the live status card, RESEARCH (web_search + MCP, consumed as an internal stream so the
@@ -3698,7 +3841,7 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
     card = _ResearchCard(processor=processor, client=client, channel_id=channel_id,
                          thread_root=thread_root, task=task, todos=_TodoState(plan),
                          label=_research_label(processor, label_source),
-                         receipts=receipts)
+                         receipts=receipts, short_name=label_hint or None)
     # Set the moment the build phase's container binding could exist, cleared once released.
     # Read by the `finally`, so it must exist before the try.
     build_ledger_key: Optional[str] = None
@@ -3754,11 +3897,13 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
         # suppressed) — a REGULAR message ahead of the card, in the bot's own identity, so it
         # survives the card's in-place updates. Best-effort like every piece of job chrome: a
         # failed ack must never kill the job, and CancelledError still propagates.
-        try:
-            await client.send_message(channel_id, thread_root, _JOB_ACK_TEXT,
-                                      receipts=receipts, receipt_class="background_job")
-        except Exception as e:  # noqa: BLE001 — chrome, not the job
-            processor.log_debug(f"Background job {job_id}: ack post failed: {e}")
+        # Skipped when the dispatching turn's own card stream already carried it (post_ack).
+        if post_ack:
+            try:
+                await client.send_message(channel_id, thread_root, _JOB_ACK_TEXT,
+                                          receipts=receipts, receipt_class="background_job")
+            except Exception as e:  # noqa: BLE001 — chrome, not the job
+                processor.log_debug(f"Background job {job_id}: ack post failed: {e}")
 
         # The card post has to survive a cancel that lands mid-flight. `_finalize` returns early
         # while `ts` is None, so a cancel arriving after Slack accepted the post but before the

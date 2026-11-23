@@ -1,3 +1,7 @@
+from typing import Any
+
+from config import config
+
 SLACK_SYSTEM_PROMPT = """You are ChatGPT, a teammate in this corporate Slack workspace — a colleague, not a corporate assistant. Talk like a person on the team.
 
 Voice: write the way a sharp coworker writes in Slack — a teammate in the room, not an assistant parked at a desk waiting for tasks. Lead with the answer — the first sentence should be the thing they asked for, explanation after if it's needed. Contractions, casual phrasing, and normal shorthand ("imo", "tbh", "lgtm") are fine when they fit the room. Read the register and match it: a quick question gets a quick answer, and when the room is bantering — including teasing pointed straight at you — give it back in kind: brief, witty, one beat, matched to the room's energy. Match the warmth, not the cruelty: joke about tools, about the situation, or about yourself, never about a coworker's competence, character, or vulnerability, and never turn what someone said at their own expense into your judgment of them. Teasing aimed at you still earns a quick comeback; the joke just never lands on the person. A little self-aware humor about being a bot lands well. But never force a joke, and never do bits when someone actually needs help — read which moment you're in first. Shift into structured, thorough mode only when the situation actually calls for it — a real technical question, a decision, something someone will act on. Skip the assistant-isms: no "Great question!", no "I'd be happy to help", no restating what was asked, no tidy closing summary nobody asked for. If one line covers it, send one line. Have opinions and state them plainly; hedge only when genuinely unsure. An opinion needs standing: your positions come from what you can read, check, or do — evidence in front of you, results you produce — never from experiences you do not have. What a product or tool is like to live with day to day, or whether one beats another to work with, belongs to the people who use them; you can report what they say and check what can be checked, but that judgment is not yours to endorse or dispute, in words or by reaction. Playing along never licenses making things up — the truthfulness rules below hold in every register, playful ones included.
@@ -682,16 +686,32 @@ _TOOLS_ETIQUETTE_CLOSER = "--- END TOOLS ETIQUETTE ---"
 _END_OF_TURN_PREFIX = "- End of turn:"
 
 
-def _derive_channel_tools_guidance() -> str:
+# SLACK_CHANNEL_NATIVE_SEARCH (spec §D.4): an @mentioned channel turn's search_slack also merges
+# Slack's own index, which reaches other public channels. The shared etiquette's channel clause
+# says the opposite, so the CHANNEL derivation swaps it when the flag is on. The DM etiquette is
+# never touched, and the text does not depend on whether this request carries a token — the
+# prompt is stable per surface, like the schema it describes.
+_SEARCH_CHANNEL_REACH_CLAUSE = "it cannot look into other channels from there;"
+_SEARCH_CHANNEL_REACH_CLAUSE_NATIVE = (
+    "when you were @mentioned, its results can also include other public channels;")
+
+
+def _derive_channel_tools_guidance(native_search: bool = False) -> str:
     """The DM etiquette minus its DM-only bullets, plus the channel-only ones."""
     lines = [line for line in LOCAL_TOOLS_GUIDANCE.split("\n")
              if not line.startswith(DM_ONLY_TOOL_BULLET_PREFIXES)]
+    if native_search:
+        lines = [line.replace(_SEARCH_CHANNEL_REACH_CLAUSE, _SEARCH_CHANNEL_REACH_CLAUSE_NATIVE)
+                 for line in lines]
     closer = lines.index(_TOOLS_ETIQUETTE_CLOSER)
     at = next((i for i, line in enumerate(lines) if line.startswith(_END_OF_TURN_PREFIX)), closer)
     return "\n".join(lines[:at] + list(CHANNEL_ONLY_TOOL_BULLETS) + lines[at:])
 
 
-CHANNEL_LOCAL_TOOLS_GUIDANCE = _derive_channel_tools_guidance()
+# Bound at import from the process's config: the flag is an .env setting, fixed for the life of
+# the process, and `utilities` reads this name off the module at call time.
+CHANNEL_LOCAL_TOOLS_GUIDANCE = _derive_channel_tools_guidance(
+    native_search=bool(config.slack_channel_native_search))
 
 # ---------------------------------------------------------------- the window guidance (§2i, A6)
 #
@@ -717,6 +737,10 @@ WINDOW_GUIDANCE_REACH_CLAUSES = {
     "fetch_thread_messages": ("fetch_thread_messages reads a whole thread, including one whose "
                               "start is out of view"),
 }
+# The search clause under SLACK_CHANNEL_NATIVE_SEARCH (spec §D.4) — same reach statement as the
+# etiquette's, appended to the flag-off clause.
+WINDOW_GUIDANCE_SEARCH_NATIVE_SUFFIX = (
+    ", and when you were @mentioned its results can also include other public channels")
 
 # THE LOAD-BEARING PART. The head stops a confident wrong quote; the TAIL stops the far more
 # likely failure — "I don't see any discussion of X here" said about a channel that discussed X
@@ -752,6 +776,8 @@ def render_window_guidance(reach_tools=REACH_TOOLS) -> str:
     parts = [WINDOW_GUIDANCE_WINDOW]
     if names:
         clauses = [WINDOW_GUIDANCE_REACH_CLAUSES[name] for name in names]
+        if config.slack_channel_native_search and "search_slack" in names:
+            clauses[0] += WINDOW_GUIDANCE_SEARCH_NATIVE_SUFFIX  # REACH_TOOLS order: search first
         parts.append(WINDOW_GUIDANCE_REACH.format(reach_list="; ".join(clauses)))
     verify = [WINDOW_GUIDANCE_VERIFY_HEAD]
     if names:
@@ -759,6 +785,45 @@ def render_window_guidance(reach_tools=REACH_TOOLS) -> str:
     verify.append(WINDOW_GUIDANCE_VERIFY_TAIL)
     parts.append(" ".join(verify))
     return "\n\n".join(parts)
+
+# Agent surfaces §F (R3/R6): the update_plan contract. Rides the per-attempt contract join ONLY
+# when this attempt exposes the tool, so flag-off, tool-disabled and hosted-only requests keep
+# their bytes. A principle, not a case list.
+UPDATE_PLAN_CONTRACT_SUFFIX = (
+    "[Plan: when answering takes tool work, show the person your plan with update_plan — call it "
+    "in the same response as your first tool call, never as a round of its own. Keep it true as "
+    "you go: stable step ids, each finished step marked complete or error with one plain line on "
+    "what it found, given in the next update you would make anyway; a step you drop is marked "
+    "complete with the result \"Skipped\". Never spend a round only to post results — the "
+    "reply's ending settles whatever is left. When no tools are needed, there is no plan.]"
+)
+
+
+def strip_plan_contract(items: Any) -> Any:
+    """`items` (a request's input) without the update_plan contract paragraph (R4). Removes the
+    paragraph and the blank line joining it, from string and content-part developer items; any
+    other item is returned untouched. A copy only where something changed."""
+    para = UPDATE_PLAN_CONTRACT_SUFFIX
+
+    def _cut(text: str) -> str:
+        if para not in text:
+            return text
+        return text.replace("\n\n" + para, "").replace(para + "\n\n", "").replace(para, "")
+
+    out = []
+    for item in items if isinstance(items, list) else []:
+        if isinstance(item, dict) and item.get("role") == "developer":
+            content = item.get("content")
+            if isinstance(content, str) and para in content:
+                item = {**item, "content": _cut(content)}
+            elif isinstance(content, list):
+                parts = [({**p, "text": _cut(p["text"])} if isinstance(p, dict)
+                          and isinstance(p.get("text"), str) and para in p["text"] else p)
+                         for p in content]
+                if parts != content:
+                    item = {**item, "content": parts}
+        out.append(item)
+    return out if isinstance(items, list) else items
 
 # CROSS-THREAD CONDUCT: a channel-wide, post-breakpoint paragraph carried whenever post_to_thread
 # is exposed on a channel turn — on ADDRESSED turns as well as silence-capable ones. The restraint

@@ -351,9 +351,13 @@ class SlackMessageEventsMixin(_Host):
         bot_present = False
         humans = set()
         other_bots = set()
+        from slack_client.messaging import is_held_progress_message
         for m in msgs:
             if self.is_own_message(m):
-                bot_present = True
+                # §G GR8: a held turn's temporary progress card is chrome, not presence — it
+                # must never turn the next message into a continuation or an "already replied".
+                if not is_held_progress_message(m):
+                    bot_present = True
             elif self.classify_sender(m) == "human":
                 uid = m.get("user")
                 if uid:
