@@ -1111,7 +1111,11 @@ class NativeStreamSession:
             if self.chunks_mode:
                 tasks = list(task_chunks or [])
                 text_part = [_md_chunk(released)] if released else []
-                chunks = tasks + text_part if boundary else text_part + tasks
+                # Cards go first only while the message holds no text yet. Once text has
+                # streamed, a card between it and this tail makes Slack start a new block,
+                # breaking the sentence mid-line (and eating the joining space).
+                cards_first = boundary and not self._sent
+                chunks = tasks + text_part if cards_first else text_part + tasks
                 # Content goes out on an append (the probed shape); the stop then carries only
                 # blocks / session status, so a blocks-only stop sends no empty markdown chunk.
                 if chunks:

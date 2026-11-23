@@ -133,6 +133,22 @@ async def test_chunks_mode_never_sends_markdown_text_or_an_empty_chunk():
 
 
 @pytest.mark.asyncio
+async def test_final_cards_never_split_text_that_already_streamed():
+    sdk = _SDK()
+    steps = StepCards()
+    steps.record("hosted:ws_1", "Searching the web", "in_progress")
+    coord = NativeStreamCoordinator(_Client(sdk), CH, TRIGGER_TS, char_limit=3000,
+                                    chunks_mode=True, steps=steps)
+    assert await coord.start()
+    assert (await coord.update("New York arabica coffee"))[0]
+    assert await coord.finalize("New York arabica coffee futures fell 3%.", blocks=FOOTER)
+
+    final = sdk.calls[-2][1]["chunks"]
+    assert final[0] == {"type": "markdown_text", "text": " futures fell 3%."}
+    assert {c["type"] for c in final[1:]} <= {"plan_update", "task_update"}
+
+
+@pytest.mark.asyncio
 async def test_step_cards_wait_while_a_mention_is_withheld():
     sdk = _SDK()
     steps = StepCards()
